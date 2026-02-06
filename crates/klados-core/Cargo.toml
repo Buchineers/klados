@@ -1,0 +1,22 @@
+[package]
+name = "klados-core"
+version = "0.1.0"
+edition = "2024"
+description = "Core data structures for klados MAF solver"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+pace26io = { workspace = true }
+fixedbitset = { workspace = true }
+
+[dev-dependencies]
+iai-callgrind = "0.16"
+criterion = "0.5"
+
+[[bench]]
+name = "tree_ops"
+harness = false
+
+[[bench]]
+name = "iai_benchmark"
+harness = false
