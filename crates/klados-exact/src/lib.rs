@@ -3,6 +3,7 @@
 //! Each approach is implemented as its own solver and registered here.
 
 mod fpt;
+mod shi_mestel;
 
 use klados_core::{Instance, SolverStats, Tree};
 
@@ -18,7 +19,10 @@ pub trait ExactSolver {
 
 /// Return all available exact solvers.
 pub fn available_solvers() -> Vec<Box<dyn ExactSolver>> {
-    vec![Box::new(fpt::FptSolver::new())]
+    vec![
+        Box::new(fpt::FptSolver::new()),
+        Box::new(shi_mestel::ShiMestelSolver::new()),
+    ]
 }
 
 /// Lookup solver by name (case-insensitive).
@@ -26,6 +30,9 @@ pub fn solver_by_name(name: &str) -> Option<Box<dyn ExactSolver>> {
     let name = name.trim().to_ascii_lowercase();
     if name == "fpt" {
         return Some(Box::new(fpt::FptSolver::new()));
+    }
+    if name == "shi-mestel" || name == "shimestel" {
+        return Some(Box::new(shi_mestel::ShiMestelSolver::new()));
     }
     for solver in available_solvers() {
         if solver.name().eq_ignore_ascii_case(&name) {
@@ -42,6 +49,12 @@ mod tests {
     #[test]
     fn test_registry_has_fpt() {
         let solver = solver_by_name("whidden");
+        assert!(solver.is_some());
+    }
+
+    #[test]
+    fn test_registry_has_shi_mestel() {
+        let solver = solver_by_name("shi-mestel");
         assert!(solver.is_some());
     }
 }
