@@ -32,10 +32,10 @@ fn load_instance(path: &str) -> Option<(Tree, IndexedBinTree, u32)> {
 fn count_leaves_pointer(tree: &IndexedBinTree) -> u32 {
     fn recurse(node: &IndexedBinTree, sum: &mut u32) {
         match node {
-            pace26io::binary_tree::IndexedBinTree::Leaf(label) => {
+            IndexedBinTree::Leaf(label) => {
                 *sum = sum.wrapping_add(label.0);
             }
-            pace26io::binary_tree::IndexedBinTree::Node(boxed) => {
+            IndexedBinTree::Node(boxed) => {
                 let (_, left, right) = boxed.as_ref();
                 recurse(left, sum);
                 recurse(right, sum);
