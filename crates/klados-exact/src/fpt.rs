@@ -99,11 +99,14 @@ impl FptForest {
     }
 }
 
-/// Baseline Whidden-style FPT solver for two trees.
+/// Whidden-style FPT solver generalized for multiple trees.
 pub struct FptSolver {
     config: SolverConfig,
     stats: SolverStats,
     memo: FxHashMap<Vec<usize>, usize>,
+    num_leaves: usize,
+    multi_tree: bool,
+    pendants_first: bool,
 }
 
 impl FptSolver {
@@ -112,6 +115,9 @@ impl FptSolver {
             config: SolverConfig::default(),
             stats: SolverStats::default(),
             memo: FxHashMap::default(),
+            num_leaves: 0,
+            multi_tree: false,
+            pendants_first: false,
         }
     }
 
@@ -120,6 +126,9 @@ impl FptSolver {
             config,
             stats: SolverStats::default(),
             memo: FxHashMap::default(),
+            num_leaves: 0,
+            multi_tree: false,
+            pendants_first: false,
         }
     }
 
@@ -128,172 +137,285 @@ impl FptSolver {
     }
 
     pub fn solve(&mut self, instance: &Instance) -> Option<Vec<Tree>> {
-        if instance.num_trees() != 2 {
-            return Some(trivial_forest(&instance.trees[0], instance.num_leaves));
+        if instance.trees.is_empty() {
+            return None;
         }
 
-        let t1 = &instance.trees[0];
-        let t2 = &instance.trees[1];
+        // Single tree: the entire tree is the MAF
+        if instance.num_trees() == 1 {
+            return Some(vec![instance.trees[0].clone()]);
+        }
 
-        let f1 = FptForest::from_tree(t1.clone());
-        let f2 = FptForest::from_tree(t2.clone());
+        self.num_leaves = instance.num_leaves as usize;
+        self.multi_tree = instance.num_trees() > 2;
+
         let max_depth = self
             .config
             .max_depth
             .unwrap_or(instance.num_leaves as usize);
 
+        let f1 = FptForest::from_tree(instance.trees[0].clone());
+        let forests: Vec<FptForest> = instance.trees[1..]
+            .iter()
+            .map(|t| FptForest::from_tree(t.clone()))
+            .collect();
+
+        // For multi-tree, try both branch orderings (pendants_first and original).
+        let orderings: &[bool] = if self.multi_tree {
+            &[true, false]
+        } else {
+            &[false]
+        };
+
+        let mut best: Option<Vec<Tree>> = None;
+        let mut best_maf_size = usize::MAX;
+
         for k in 0..=max_depth {
-            self.memo.clear();
-            if let Some(solution) = self.search(f1.clone(), f2.clone(), k) {
-                return Some(self.reconstruct_components(t1, &solution));
+            if k + 1 >= best_maf_size {
+                break;
+            }
+            for &pf in orderings {
+                self.pendants_first = pf;
+                self.memo.clear();
+                trace!("search: k={}, pendants_first={}", k, pf);
+                if let Some(sol) = self.search(f1.clone(), forests.clone(), k) {
+                    let components = self.reconstruct_components_multi(instance, &sol);
+                    let maf_size = components.len();
+                    trace!("found: k={}, pf={}, maf_size={}", k, pf, maf_size);
+                    if maf_size < best_maf_size {
+                        best_maf_size = maf_size;
+                        best = Some(components);
+                    }
+                }
+            }
+            if best_maf_size <= k + 1 {
+                break;
             }
         }
 
-        Some(trivial_forest(&instance.trees[0], instance.num_leaves))
+        best.or_else(|| {
+            Some(trivial_forest(
+                &instance.trees[0],
+                instance.num_leaves,
+            ))
+        })
     }
 
     fn search(
         &mut self,
         mut f1: FptForest,
-        mut f2: FptForest,
-        budget: usize,
-    ) -> Option<FptForest> {
+        mut forests: Vec<FptForest>,
+        max_cuts: usize,
+    ) -> Option<Vec<FptForest>> {
         self.stats.nodes_explored += 1;
-        trace!("search: budget={} cuts={}", budget, f2.cut_edges.count_ones(..));
 
-        reduce_common_cherries(&mut f1, &mut f2);
+        // 1. Reduce: grow cherries and prune roots across ALL forests
+        reduce_common_cherries_multi(&mut f1, &mut forests);
 
-        if f1.rt.len() <= 2 {
-            trace!("agreement forest found via |R_t|<=2");
-            return Some(f2);
+        // 2. Termination
+        if f1.rt.len() <= 2 || self.is_agreement_forest_multi(&f1, &forests) {
+            return Some(forests);
         }
 
-        if self.is_agreement_forest(&f1, &f2) {
-            trace!("agreement forest found (cuts={})", f2.cut_edges.count_ones(..));
-            return Some(f2);
-        }
-
-        if budget == 0 {
+        // 3. Budget check: can any forest still accept a cut?
+        let any_budget = forests
+            .iter()
+            .any(|fi| fi.cut_edges.count_ones(..) < max_cuts);
+        if !any_budget {
             return None;
         }
 
-        let key = f2.cut_edges.as_slice().to_vec();
-
+        // 4. Collect sibling pairs from F1
         let map_f1 = dot_leafset_map(&f1);
-        let map_f2 = dot_leafset_map(&f2);
         let sibling_pairs = collect_sibling_pairs(&f1, &map_f1);
+
         for (ka, kc) in sibling_pairs {
-            let Some(&na) = map_f2.get(&ka) else { continue };
-            let Some(&nc) = map_f2.get(&kc) else { continue };
+            // 5. Check each non-reference forest for agreement on this pair
+            let mut disagreements: Vec<(usize, DisagreementCase)> = Vec::new();
 
-            let na_dot = dot_rep(&f2, na);
-            let nc_dot = dot_rep(&f2, nc);
+            for (i, fi) in forests.iter().enumerate() {
+                let map_fi = dot_leafset_map(fi);
+                let Some(&na) = map_fi.get(&ka) else {
+                    continue;
+                };
+                let Some(&nc) = map_fi.get(&kc) else {
+                    continue;
+                };
 
-            if are_siblings_in_f2(&f2, na_dot, nc_dot) {
-                if grow_specific_cherry(&mut f1, &mut f2, &ka, &kc, &map_f1) {
-                    return self.search(f1, f2, budget);
+                let na_dot = dot_rep(fi, na);
+                let nc_dot = dot_rep(fi, nc);
+
+                if are_siblings_in_f2(fi, na_dot, nc_dot) {
+                    continue;
                 }
+
+                let case = classify_disagreement(fi, na_dot, nc_dot);
+                disagreements.push((i, case));
             }
 
-            trace!(
-                "branch on sibling pair: f1_labels=({},{}), f2_nodes=({},{}), budget={}",
-                ka.len(),
-                kc.len(),
-                na_dot,
-                nc_dot,
-                budget
-            );
+            // 6a. All forests agree: grow cherry in all forests, recurse
+            if disagreements.is_empty() {
+                if grow_specific_cherry_multi(&mut f1, &mut forests, &ka, &kc, &map_f1) {
+                    return self.search(f1, forests, max_cuts);
+                }
+                continue;
+            }
 
-            let same_component = f2.component_root(na_dot) == f2.component_root(nc_dot);
-            if !same_component
-                || is_ancestor_in_forest(&f2, na_dot, nc_dot)
-                || is_ancestor_in_forest(&f2, nc_dot, na_dot)
-            {
-                trace!("case 6.1 (ancestor or separate components)");
-                let mut branches = Vec::new();
-                if let Some(f) = try_cut(&f2, na_dot) {
-                    branches.push(f);
+            // 6b. Disagreement: branch on best case (first-found).
+            disagreements.sort_by_key(|(_, case)| disagreement_priority(case));
+
+            for (forest_idx, case) in &disagreements {
+                let forest_idx = *forest_idx;
+                let remaining = max_cuts - forests[forest_idx].cut_edges.count_ones(..);
+
+                if remaining == 0 {
+                    continue;
                 }
-                if let Some(f) = try_cut(&f2, nc_dot) {
-                    branches.push(f);
-                }
-                for branch in branches {
-                    if let Some(sol) = self.search(f1.clone(), branch, budget - 1) {
-                        return Some(sol);
+
+                trace!(
+                    "branch on forest {} (of {}), remaining={}",
+                    forest_idx,
+                    forests.len(),
+                    remaining
+                );
+
+                match case {
+                    DisagreementCase::Case62 { pendant } => {
+                        trace!("case 6.2 (one pendant): node={}", *pendant);
+                        if let Some(cut_forest) = try_cut(&forests[forest_idx], *pendant) {
+                            let mut next = forests.clone();
+                            next[forest_idx] = cut_forest;
+                            if let Some(sol) = self.search(f1.clone(), next, max_cuts) {
+                                return Some(sol);
+                            }
+                        }
                     }
-                }
-                return None;
-            }
-
-            let mut a_node = na_dot;
-            let mut c_node = nc_dot;
-            let da = effective_depth(&f2, a_node);
-            let dc = effective_depth(&f2, c_node);
-            if da < dc {
-                std::mem::swap(&mut a_node, &mut c_node);
-            }
-
-            let pendant_nodes = pendant_nodes_on_path(&f2, a_node, c_node);
-            if pendant_nodes.len() == 1 {
-                trace!("case 6.2 (one pendant): node={}", pendant_nodes[0]);
-                if let Some(next) = try_cut(&f2, pendant_nodes[0]) {
-                    if let Some(sol) = self.search(f1.clone(), next, budget - 1) {
-                        return Some(sol);
+                    DisagreementCase::Case61 { branches } => {
+                        trace!("case 6.1 ({} branches)", branches.len());
+                        for node in branches {
+                            if let Some(cut_forest) = try_cut(&forests[forest_idx], *node) {
+                                let mut next = forests.clone();
+                                next[forest_idx] = cut_forest;
+                                if let Some(sol) = self.search(f1.clone(), next, max_cuts) {
+                                    return Some(sol);
+                                }
+                            }
+                        }
                     }
-                }
-                return None;
-            }
-
-            if pendant_nodes.len() >= 2 {
-                trace!("case 6.3 ({} pendants)", pendant_nodes.len());
-                let mut branches = Vec::new();
-                if let Some(f) = try_cut(&f2, a_node) {
-                    branches.push((1usize, f));
-                }
-                if let Some(f) = try_cut(&f2, c_node) {
-                    branches.push((1usize, f));
-                }
-                if pendant_nodes.len() <= budget {
-                    if let Some(f) = try_cut_many(&f2, &pendant_nodes) {
-                        branches.push((pendant_nodes.len(), f));
-                    }
-                }
-                for (cost, branch) in branches {
-                    if cost <= budget {
-                        if let Some(sol) = self.search(f1.clone(), branch, budget - cost) {
-                            return Some(sol);
+                    DisagreementCase::Case63 {
+                        a_node,
+                        c_node,
+                        pendants,
+                    } => {
+                        trace!("case 6.3 ({} pendants)", pendants.len());
+                        let fi = &forests[forest_idx];
+                        let mut branch_cuts: Vec<(usize, FptForest)> = Vec::new();
+                        if self.pendants_first {
+                            if pendants.len() <= remaining {
+                                if let Some(f) = try_cut_many(fi, pendants) {
+                                    branch_cuts.push((pendants.len(), f));
+                                }
+                            }
+                            if let Some(f) = try_cut(fi, *a_node) {
+                                branch_cuts.push((1, f));
+                            }
+                            if let Some(f) = try_cut(fi, *c_node) {
+                                branch_cuts.push((1, f));
+                            }
+                        } else {
+                            if let Some(f) = try_cut(fi, *a_node) {
+                                branch_cuts.push((1, f));
+                            }
+                            if let Some(f) = try_cut(fi, *c_node) {
+                                branch_cuts.push((1, f));
+                            }
+                            if pendants.len() <= remaining {
+                                if let Some(f) = try_cut_many(fi, pendants) {
+                                    branch_cuts.push((pendants.len(), f));
+                                }
+                            }
+                        }
+                        for (cost, cut_forest) in branch_cuts {
+                            if cost <= remaining {
+                                let mut next = forests.clone();
+                                next[forest_idx] = cut_forest;
+                                if let Some(sol) =
+                                    self.search(f1.clone(), next, max_cuts)
+                                {
+                                    return Some(sol);
+                                }
+                            }
                         }
                     }
                 }
-                return None;
             }
+            return None;
         }
 
         self.stats.branches_pruned += 1;
-        let _ = key;
         None
     }
 
-    fn is_agreement_forest(&self, f1: &FptForest, f2: &FptForest) -> bool {
-        let components = component_leaf_sets(f2, f1.tree.num_leaves as usize);
-        let t1_clusters = build_cluster_keys_from_forest(f1);
-        let t2_clusters = build_cluster_keys_from_forest(f2);
+    fn is_agreement_forest_multi(&self, f1: &FptForest, forests: &[FptForest]) -> bool {
+        let label_space = f1.tree.num_leaves as usize;
 
-        components.iter().all(|set| {
+        // Compute per-forest component leaf sets and refine
+        let mut refined = component_leaf_sets(&forests[0], label_space);
+        for fi in &forests[1..] {
+            let partition = component_leaf_sets(fi, label_space);
+            refined = refine_partitions(&refined, &partition);
+        }
+
+        let t1_clusters = build_cluster_keys_from_forest(f1);
+        let all_fi_clusters: Vec<FxHashSet<Vec<usize>>> =
+            forests.iter().map(build_cluster_keys_from_forest).collect();
+
+        refined.iter().all(|set| {
+            if set.count_ones(..) <= 1 {
+                return true;
+            }
             let key = leafset_key(set);
-            if !t1_clusters.contains(&key) || !t2_clusters.contains(&key) {
+            if !t1_clusters.contains(&key) {
                 return false;
             }
+            for fi_clusters in &all_fi_clusters {
+                if !fi_clusters.contains(&key) {
+                    return false;
+                }
+            }
             let t1_sub = f1.tree.prune_to_leafset(set);
-            let t2_sub = f2.tree.prune_to_leafset(set);
-            canonical_form(&t1_sub) == canonical_form(&t2_sub)
+            let t1_canon = canonical_form(&t1_sub);
+            for fi in forests {
+                let ti_sub = fi.tree.prune_to_leafset(set);
+                if canonical_form(&ti_sub) != t1_canon {
+                    return false;
+                }
+            }
+            true
         })
     }
 
-    fn reconstruct_components(&self, t1: &Tree, forest: &FptForest) -> Vec<Tree> {
-        let components = component_leaf_sets(forest, t1.num_leaves as usize);
-        components
+    fn reconstruct_components_multi(
+        &self,
+        instance: &Instance,
+        forests: &[FptForest],
+    ) -> Vec<Tree> {
+        let label_space = instance.num_leaves as usize;
+        let t1 = &instance.trees[0];
+
+        let mut partitions: Vec<Vec<FixedBitSet>> = forests
             .iter()
+            .map(|fi| component_leaf_sets(fi, label_space))
+            .collect();
+
+        let mut refined = partitions.remove(0);
+        for partition in &partitions {
+            refined = refine_partitions(&refined, partition);
+        }
+
+        refined
+            .iter()
+            .filter(|set| set.count_ones(..) > 0)
             .map(|set| t1.prune_to_leafset(set))
             .collect()
     }
@@ -658,54 +780,7 @@ fn build_cluster_keys_from_forest(forest: &FptForest) -> FxHashSet<Vec<usize>> {
     set
 }
 
-fn signature_map(forest: &FptForest) -> FxHashMap<String, NodeId> {
-    let mut map = FxHashMap::default();
-    let mut cache = FxHashMap::default();
-    for node in 0..forest.tree.num_nodes() {
-        let node = node as NodeId;
-        if forest.live_leafsets[node as usize].count_ones(..) == 0 {
-            continue;
-        }
-        let sig = node_signature(forest, node, &mut cache);
-        if !sig.is_empty() {
-            map.insert(sig, node);
-        }
-    }
-    map
-}
 
-fn node_signature(
-    forest: &FptForest,
-    node: NodeId,
-    cache: &mut FxHashMap<NodeId, String>,
-) -> String {
-    if let Some(sig) = cache.get(&node) {
-        return sig.clone();
-    }
-    if forest.live_leafsets[node as usize].count_ones(..) == 0 {
-        return String::new();
-    }
-
-    let children = active_children(forest, node);
-    let sig = match children.len() {
-        0 => {
-            let key = leafset_key(&forest.live_leafsets[node as usize]);
-            format!("L{:?}", key)
-        }
-        1 => node_signature(forest, children[0], cache),
-        _ => {
-            let mut a = node_signature(forest, children[0], cache);
-            let mut b = node_signature(forest, children[1], cache);
-            if a > b {
-                std::mem::swap(&mut a, &mut b);
-            }
-            format!("({},{})", a, b)
-        }
-    };
-
-    cache.insert(node, sig.clone());
-    sig
-}
 
 fn active_children(forest: &FptForest, node: NodeId) -> Vec<NodeId> {
     let tree = &forest.tree;
@@ -727,57 +802,6 @@ fn active_children(forest: &FptForest, node: NodeId) -> Vec<NodeId> {
     out
 }
 
-fn contract_cherry_sets(
-    f1: &mut FptForest,
-    f2: &mut FptForest,
-    p1: NodeId,
-    p2: NodeId,
-    a_set: &FixedBitSet,
-    c_set: &FixedBitSet,
-) -> bool {
-    if p1 == NONE || p2 == NONE {
-        return false;
-    }
-
-    let mut union = a_set.clone();
-    union.union_with(c_set);
-
-    contract_parent(f1, p1, &union);
-    contract_parent(f2, p2, &union);
-    true
-}
-
-fn contract_parent(forest: &mut FptForest, parent: NodeId, set: &FixedBitSet) {
-    let mut stack = Vec::new();
-    if let Some((left, right)) = forest.tree.children(parent) {
-        if left != NONE {
-            stack.push(left);
-        }
-        if right != NONE {
-            stack.push(right);
-        }
-    }
-
-    forest.tree.left[parent as usize] = NONE;
-    forest.tree.right[parent as usize] = NONE;
-    forest.tree.label[parent as usize] = 0;
-    forest.base_leafsets[parent as usize] = set.clone();
-    forest.live_leafsets[parent as usize] = set.clone();
-
-    while let Some(node) = stack.pop() {
-        forest.base_leafsets[node as usize].clear();
-        forest.live_leafsets[node as usize].clear();
-        if let Some((left, right)) = forest.tree.children(node) {
-            if left != NONE {
-                stack.push(left);
-            }
-            if right != NONE {
-                stack.push(right);
-            }
-        }
-    }
-}
-
 fn trivial_forest(reference: &Tree, num_leaves: u32) -> Vec<Tree> {
     let mut components = Vec::new();
     for lbl in 1..=num_leaves {
@@ -797,104 +821,8 @@ fn trivial_forest(reference: &Tree, num_leaves: u32) -> Vec<Tree> {
     components
 }
 
-fn reduce_common_cherries(f1: &mut FptForest, f2: &mut FptForest) {
-    loop {
-        if prune_agreeing_roots(f1, f2) {
-            continue;
-        }
-        if grow_agreeing_cherries(f1, f2) {
-            continue;
-        }
-        break;
-    }
-}
-
 fn is_active_leaf(forest: &FptForest, node: NodeId) -> bool {
     forest.live_leafsets[node as usize].count_ones(..) > 0 && active_children(forest, node).is_empty()
-}
-
-fn in_main_component(forest: &FptForest, node: NodeId) -> bool {
-    forest.component_root(node) == forest.tree.root
-}
-
-fn prune_agreeing_roots(f1: &mut FptForest, f2: &mut FptForest) -> bool {
-    let map_f1 = dot_leafset_map(f1);
-    let map_f2 = dot_leafset_map(f2);
-    for set in f1.rt.iter() {
-        let key = leafset_key(set);
-        let Some(&node_f2) = map_f2.get(&key) else { continue };
-        let Some(&node_f1) = map_f1.get(&key) else { continue };
-        if dot_parent(f2, node_f2) == NONE {
-            trace!(
-                "prune agreeing root: leafset={:?}, f1_node={}, f2_node={}",
-                key,
-                node_f1,
-                node_f2
-            );
-            f1.done_leafsets.push(set.clone());
-            f2.done_leafsets.push(set.clone());
-            rt_remove(f1, &key);
-            rt_remove(f2, &key);
-            deactivate_subtree(f1, node_f1);
-            deactivate_subtree(f2, node_f2);
-            return true;
-        }
-    }
-    false
-}
-
-fn grow_agreeing_cherries(f1: &mut FptForest, f2: &mut FptForest) -> bool {
-    let map_f1 = dot_leafset_map(f1);
-    let map_f2 = dot_leafset_map(f2);
-    let nodes: Vec<NodeId> = f1.tree.pre_order().collect();
-    for node in nodes {
-        if !is_dot_node(f1, node) {
-            continue;
-        }
-        let children = dot_children(f1, node);
-        if children.len() != 2 {
-            continue;
-        }
-        let key_a = leafset_key(&f1.live_leafsets[children[0] as usize]);
-        let key_c = leafset_key(&f1.live_leafsets[children[1] as usize]);
-        if !f1.rt_keys.contains(&key_a) || !f1.rt_keys.contains(&key_c) {
-            continue;
-        }
-        let Some(&na) = map_f2.get(&key_a) else { continue };
-        let Some(&nc) = map_f2.get(&key_c) else { continue };
-        if !are_siblings_in_f2(f2, na, nc) {
-            continue;
-        }
-        if grow_specific_cherry(f1, f2, &key_a, &key_c, &map_f1) {
-            return true;
-        }
-    }
-    false
-}
-
-fn grow_specific_cherry(
-    f1: &mut FptForest,
-    f2: &mut FptForest,
-    ka: &Vec<usize>,
-    kc: &Vec<usize>,
-    map_f1: &FxHashMap<Vec<usize>, NodeId>,
-) -> bool {
-    let Some(&node_a) = map_f1.get(ka) else { return false };
-    let Some(&node_c) = map_f1.get(kc) else { return false };
-    let p1 = dot_parent(f1, node_a);
-    if p1 == NONE || dot_parent(f1, node_c) != p1 {
-        return false;
-    }
-    let mut union = f1.live_leafsets[node_a as usize].clone();
-    union.union_with(&f1.live_leafsets[node_c as usize]);
-    rt_remove(f1, ka);
-    rt_remove(f1, kc);
-    rt_remove(f2, ka);
-    rt_remove(f2, kc);
-    rt_add(f1, union.clone());
-    rt_add(f2, union);
-    trace!("grow agreeing cherry");
-    true
 }
 
 fn deactivate_subtree(forest: &mut FptForest, node: NodeId) {
@@ -957,7 +885,226 @@ fn effective_depth(forest: &FptForest, node: NodeId) -> usize {
     depth
 }
 
-// (removed label-based helpers)
+// --- Multi-tree generalization ---
+
+#[derive(Clone, Debug)]
+enum DisagreementCase {
+    /// Case 6.2: exactly one pendant on path. Deterministic cut (branching factor 1).
+    Case62 { pendant: NodeId },
+    /// Case 6.1: ancestor relationship or separate components. 2-way branch.
+    Case61 { branches: Vec<NodeId> },
+    /// Case 6.3: >= 2 pendants on path. Branch: cut a, cut c, or cut all pendants.
+    Case63 {
+        a_node: NodeId,
+        c_node: NodeId,
+        pendants: Vec<NodeId>,
+    },
+}
+
+fn classify_disagreement(fi: &FptForest, na_dot: NodeId, nc_dot: NodeId) -> DisagreementCase {
+    let same_component = fi.component_root(na_dot) == fi.component_root(nc_dot);
+
+    if !same_component
+        || is_ancestor_in_forest(fi, na_dot, nc_dot)
+        || is_ancestor_in_forest(fi, nc_dot, na_dot)
+    {
+        let mut branches = Vec::new();
+        if na_dot != fi.tree.root && !fi.is_cut(na_dot) {
+            branches.push(na_dot);
+        }
+        if nc_dot != fi.tree.root && !fi.is_cut(nc_dot) {
+            branches.push(nc_dot);
+        }
+        return DisagreementCase::Case61 { branches };
+    }
+
+    let mut a_node = na_dot;
+    let mut c_node = nc_dot;
+    let da = effective_depth(fi, a_node);
+    let dc = effective_depth(fi, c_node);
+    if da < dc {
+        std::mem::swap(&mut a_node, &mut c_node);
+    }
+
+    let pendants = pendant_nodes_on_path(fi, a_node, c_node);
+
+    if pendants.len() == 1 {
+        DisagreementCase::Case62 {
+            pendant: pendants[0],
+        }
+    } else {
+        DisagreementCase::Case63 {
+            a_node,
+            c_node,
+            pendants,
+        }
+    }
+}
+
+fn disagreement_priority(case: &DisagreementCase) -> (u8, usize) {
+    match case {
+        DisagreementCase::Case62 { .. } => (0, 0),
+        DisagreementCase::Case61 { branches } => (1, branches.len()),
+        DisagreementCase::Case63 { pendants, .. } => (2, pendants.len()),
+    }
+}
+
+fn refine_partitions(p1: &[FixedBitSet], p2: &[FixedBitSet]) -> Vec<FixedBitSet> {
+    let mut refined = Vec::new();
+    for set1 in p1 {
+        for set2 in p2 {
+            let mut intersection = set1.clone();
+            intersection.intersect_with(set2);
+            if intersection.count_ones(..) > 0 {
+                refined.push(intersection);
+            }
+        }
+    }
+    refined
+}
+
+fn reduce_common_cherries_multi(f1: &mut FptForest, forests: &mut [FptForest]) {
+    loop {
+        if prune_agreeing_roots_multi(f1, forests) {
+            continue;
+        }
+        if grow_agreeing_cherries_multi(f1, forests) {
+            continue;
+        }
+        break;
+    }
+}
+
+fn prune_agreeing_roots_multi(f1: &mut FptForest, forests: &mut [FptForest]) -> bool {
+    let map_f1 = dot_leafset_map(f1);
+    let maps: Vec<FxHashMap<Vec<usize>, NodeId>> = forests.iter().map(|fi| dot_leafset_map(fi)).collect();
+
+    // Collect R_t snapshot to avoid borrow conflict
+    let rt_snapshot: Vec<FixedBitSet> = f1.rt.clone();
+
+    for set in &rt_snapshot {
+        let key = leafset_key(set);
+        let Some(&node_f1) = map_f1.get(&key) else {
+            continue;
+        };
+
+        let mut all_are_roots = true;
+        let mut forest_nodes = Vec::with_capacity(forests.len());
+        for (i, fi) in forests.iter().enumerate() {
+            let Some(&node_fi) = maps[i].get(&key) else {
+                all_are_roots = false;
+                break;
+            };
+            if dot_parent(fi, node_fi) != NONE {
+                all_are_roots = false;
+                break;
+            }
+            forest_nodes.push(node_fi);
+        }
+
+        if !all_are_roots {
+            continue;
+        }
+
+        trace!("prune agreeing root (multi): leafset={:?}", key);
+        f1.done_leafsets.push(set.clone());
+        rt_remove(f1, &key);
+        deactivate_subtree(f1, node_f1);
+
+        for (i, fi) in forests.iter_mut().enumerate() {
+            fi.done_leafsets.push(set.clone());
+            rt_remove(fi, &key);
+            deactivate_subtree(fi, forest_nodes[i]);
+        }
+
+        return true;
+    }
+    false
+}
+
+fn grow_agreeing_cherries_multi(f1: &mut FptForest, forests: &mut [FptForest]) -> bool {
+    let map_f1 = dot_leafset_map(f1);
+    let maps: Vec<FxHashMap<Vec<usize>, NodeId>> =
+        forests.iter().map(|fi| dot_leafset_map(fi)).collect();
+
+    let nodes: Vec<NodeId> = f1.tree.pre_order().collect();
+    for node in nodes {
+        if !is_dot_node(f1, node) {
+            continue;
+        }
+        let children = dot_children(f1, node);
+        if children.len() != 2 {
+            continue;
+        }
+
+        let key_a = leafset_key(&f1.live_leafsets[children[0] as usize]);
+        let key_c = leafset_key(&f1.live_leafsets[children[1] as usize]);
+
+        if !f1.rt_keys.contains(&key_a) || !f1.rt_keys.contains(&key_c) {
+            continue;
+        }
+
+        let mut all_siblings = true;
+        for (i, fi) in forests.iter().enumerate() {
+            let Some(&na) = maps[i].get(&key_a) else {
+                all_siblings = false;
+                break;
+            };
+            let Some(&nc) = maps[i].get(&key_c) else {
+                all_siblings = false;
+                break;
+            };
+            if !are_siblings_in_f2(fi, na, nc) {
+                all_siblings = false;
+                break;
+            }
+        }
+
+        if !all_siblings {
+            continue;
+        }
+
+        if grow_specific_cherry_multi(f1, forests, &key_a, &key_c, &map_f1) {
+            return true;
+        }
+    }
+    false
+}
+
+fn grow_specific_cherry_multi(
+    f1: &mut FptForest,
+    forests: &mut [FptForest],
+    ka: &Vec<usize>,
+    kc: &Vec<usize>,
+    map_f1: &FxHashMap<Vec<usize>, NodeId>,
+) -> bool {
+    let Some(&node_a) = map_f1.get(ka) else {
+        return false;
+    };
+    let Some(&node_c) = map_f1.get(kc) else {
+        return false;
+    };
+    let p1 = dot_parent(f1, node_a);
+    if p1 == NONE || dot_parent(f1, node_c) != p1 {
+        return false;
+    }
+
+    let mut union = f1.live_leafsets[node_a as usize].clone();
+    union.union_with(&f1.live_leafsets[node_c as usize]);
+
+    rt_remove(f1, ka);
+    rt_remove(f1, kc);
+    rt_add(f1, union.clone());
+
+    for fi in forests.iter_mut() {
+        rt_remove(fi, ka);
+        rt_remove(fi, kc);
+        rt_add(fi, union.clone());
+    }
+
+    trace!("grow agreeing cherry (multi)");
+    true
+}
 
 #[cfg(test)]
 mod tests {
