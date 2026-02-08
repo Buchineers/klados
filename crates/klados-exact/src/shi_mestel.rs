@@ -645,17 +645,18 @@ fn forest_parent_leaf(forest: &XForest, node: NodeId) -> NodeId {
         return NONE;
     }
     loop {
-        if forest.is_cut(cur) {
-            return NONE;
-        }
         let active = active_children_xf(forest, cur);
         if active.len() >= 2 {
             return cur;
         }
+        // cur has < 2 active children; if it's a component root, no valid parent
+        if forest.is_cut(cur) {
+            return NONE;
+        }
         // Single-child: keep going up (forced contraction)
         let p = forest.tree.parent[cur as usize];
         if p == NONE {
-            return cur; // component root with 1 child
+            return cur; // tree root with 1 child
         }
         cur = p;
     }
