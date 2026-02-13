@@ -193,12 +193,7 @@ impl FptSolver {
             }
         }
 
-        best.or_else(|| {
-            Some(trivial_forest(
-                &instance.trees[0],
-                instance.num_leaves,
-            ))
-        })
+        best.or_else(|| Some(trivial_forest(&instance.trees[0], instance.num_leaves)))
     }
 
     fn search(
@@ -339,9 +334,7 @@ impl FptSolver {
                             if cost <= remaining {
                                 let mut next = forests.clone();
                                 next[forest_idx] = cut_forest;
-                                if let Some(sol) =
-                                    self.search(f1.clone(), next, max_cuts)
-                                {
+                                if let Some(sol) = self.search(f1.clone(), next, max_cuts) {
                                     return Some(sol);
                                 }
                             }
@@ -567,10 +560,16 @@ fn dot_children(forest: &FptForest, node: NodeId) -> Vec<NodeId> {
     let tree = &forest.tree;
     let mut out = Vec::with_capacity(2);
     if let Some((left, right)) = tree.children(node) {
-        if left != NONE && !forest.is_cut(left) && forest.live_leafsets[left as usize].count_ones(..) > 0 {
+        if left != NONE
+            && !forest.is_cut(left)
+            && forest.live_leafsets[left as usize].count_ones(..) > 0
+        {
             out.push(descend_to_dot(forest, left));
         }
-        if right != NONE && !forest.is_cut(right) && forest.live_leafsets[right as usize].count_ones(..) > 0 {
+        if right != NONE
+            && !forest.is_cut(right)
+            && forest.live_leafsets[right as usize].count_ones(..) > 0
+        {
             out.push(descend_to_dot(forest, right));
         }
     }
@@ -634,7 +633,6 @@ fn forest_lca(forest: &FptForest, a: NodeId, c: NodeId) -> NodeId {
     }
     NONE
 }
-
 
 fn try_cut(forest: &FptForest, node: NodeId) -> Option<FptForest> {
     if node == forest.tree.root || forest.is_cut(node) {
@@ -730,11 +728,7 @@ fn rt_remove(forest: &mut FptForest, key: &Vec<usize>) {
     if !forest.rt_keys.remove(key) {
         return;
     }
-    if let Some(pos) = forest
-        .rt
-        .iter()
-        .position(|set| leafset_key(set) == *key)
-    {
+    if let Some(pos) = forest.rt.iter().position(|set| leafset_key(set) == *key) {
         forest.rt.swap_remove(pos);
     }
 }
@@ -780,8 +774,6 @@ fn build_cluster_keys_from_forest(forest: &FptForest) -> FxHashSet<Vec<usize>> {
     set
 }
 
-
-
 fn active_children(forest: &FptForest, node: NodeId) -> Vec<NodeId> {
     let tree = &forest.tree;
     let mut out = Vec::with_capacity(2);
@@ -822,7 +814,8 @@ fn trivial_forest(reference: &Tree, num_leaves: u32) -> Vec<Tree> {
 }
 
 fn is_active_leaf(forest: &FptForest, node: NodeId) -> bool {
-    forest.live_leafsets[node as usize].count_ones(..) > 0 && active_children(forest, node).is_empty()
+    forest.live_leafsets[node as usize].count_ones(..) > 0
+        && active_children(forest, node).is_empty()
 }
 
 fn deactivate_subtree(forest: &mut FptForest, node: NodeId) {
@@ -977,7 +970,8 @@ fn reduce_common_cherries_multi(f1: &mut FptForest, forests: &mut [FptForest]) {
 
 fn prune_agreeing_roots_multi(f1: &mut FptForest, forests: &mut [FptForest]) -> bool {
     let map_f1 = dot_leafset_map(f1);
-    let maps: Vec<FxHashMap<Vec<usize>, NodeId>> = forests.iter().map(|fi| dot_leafset_map(fi)).collect();
+    let maps: Vec<FxHashMap<Vec<usize>, NodeId>> =
+        forests.iter().map(|fi| dot_leafset_map(fi)).collect();
 
     // Collect R_t snapshot to avoid borrow conflict
     let rt_snapshot: Vec<FixedBitSet> = f1.rt.clone();
