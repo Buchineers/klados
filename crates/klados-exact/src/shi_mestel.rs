@@ -9,18 +9,26 @@ use fixedbitset::FixedBitSet;
 use klados_core::{Instance, NodeId, SolverStats, Tree, NONE};
 
 fn trace_enabled() -> bool {
-    std::env::var("SHI_MESTEL_TRACE").ok().as_deref() == Some("1")
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var("SHI_MESTEL_TRACE").ok().as_deref() == Some("1"))
 }
 
 fn profile_enabled() -> bool {
-    std::env::var("SHI_MESTEL_PROFILE").ok().as_deref() == Some("1")
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var("SHI_MESTEL_PROFILE").ok().as_deref() == Some("1"))
 }
 
 fn split_tree_limit() -> usize {
-    std::env::var("SHI_MESTEL_SPLIT_TREES")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(usize::MAX)
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("SHI_MESTEL_SPLIT_TREES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(usize::MAX)
+    })
 }
 
 thread_local! {
@@ -57,7 +65,11 @@ fn dump_split_stats() {
     });
     eprintln!("{line}");
     if let Ok(path) = std::env::var("SHI_MESTEL_PROFILE_PATH") {
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
             use std::io::Write;
             let _ = writeln!(f, "{line}");
         }
@@ -227,9 +239,7 @@ impl SearchState {
     }
 
     fn cut_node(&mut self, forest_idx: usize, node: NodeId) {
-        if node != self.forests[forest_idx].tree.root
-            && !self.forests[forest_idx].is_cut(node)
-        {
+        if node != self.forests[forest_idx].tree.root && !self.forests[forest_idx].is_cut(node) {
             self.forests[forest_idx].cut(node);
             self.undo_log.push(UndoEntry::Cut { forest_idx, node });
         }
@@ -286,7 +296,14 @@ impl ShiMestelSolver {
 
         let mut state = SearchState::new(forests);
 
-        for target_s in 1..=instance.num_leaves as usize {
+        // Compute bounds on optimal component count via pairwise
+        // 3-approximation. The lower bound lets us skip early fruitless
+        // rounds; the upper bound (tight for 2-tree instances) lets us
+        // stop early.
+        let bounds = crate::lower_bound::maf_bounds(&instance.trees, instance.num_leaves);
+        trace!("maf_bounds: lower={}, upper={}", bounds.lower, bounds.upper);
+
+        for target_s in bounds.lower..=bounds.upper {
             self.stats = SolverStats::default();
             trace!("trying target_s={}", target_s);
 
@@ -330,12 +347,8 @@ impl super::ExactSolver for ShiMestelSolver {
 // Alg-Maf: Main recursive algorithm
 // ============================================================================
 
-fn max_order(forests: &[XForest], label_space: usize) -> usize {
-    forests
-        .iter()
-        .map(|f| component_leaf_sets_xf(f, label_space).len())
-        .max()
-        .unwrap_or(1)
+fn max_order_from_cached(comp_sets: &[Vec<FixedBitSet>]) -> usize {
+    comp_sets.iter().map(|cs| cs.len()).max().unwrap_or(1)
 }
 
 fn alg_maf(
@@ -348,57 +361,58 @@ fn alg_maf(
     stats.nodes_explored += 1;
     state.checkpoint();
 
-    // Apply Reduction Rule 1 exhaustively
-    apply_reduction_rules_state(state, label_space);
+    // Interleaved R1/R2 reduction to fixpoint
+    let comp_sets = loop {
+        // Apply Reduction Rule 1 exhaustively; returns fresh component sets
+        let comp_sets = apply_reduction_rules_state(state, label_space);
 
-    // Budget check
-    let cur_order = max_order(&state.forests, label_space);
-    if cur_order > target_s {
-        stats.branches_pruned += 1;
-        state.rollback();
-        return None;
-    }
+        // Budget check after R1
+        let cur_order = max_order_from_cached(&comp_sets);
+        if cur_order > target_s {
+            stats.branches_pruned += 1;
+            state.rollback();
+            return None;
+        }
 
-    // Step 2: If not LSI, use BR-LSI
-    if !all_pairs_lsi(&state.forests, label_space) {
-        let result = br_lsi_step(state, target_s, label_space, num_leaves, stats);
-        state.rollback();
-        return result;
-    }
+        // If not LSI, use BR-LSI (branch and recurse)
+        if !all_pairs_lsi_cached(&comp_sets) {
+            let result = br_lsi_step(state, target_s, label_space, num_leaves, stats, &comp_sets);
+            state.rollback();
+            return result;
+        }
 
-    // Step 3: LSI satisfied. Apply RR2 exhaustively
-    loop {
+        // LSI satisfied. Try one R2 collapse; if it fires, loop back to re-check R1
         if let Some((a, b)) = find_common_sibling_pair(&state.forests, label_space) {
             trace!("R2: collapsing common sibling-pair ({}, {})", a, b);
             state.add_collapse(a, b);
-        } else {
-            break;
+            continue; // R2 fired -> re-run R1 (may enable new cuts)
         }
-    }
+
+        break comp_sets; // No R1 or R2 applicable, fully reduced
+    };
 
     // Split-or-decompose: split overlapping components if any
+    // Use pre-computed components from forests[0] (after LSI, all forests share same partition)
+    let comps_f0 = &comp_sets[0];
     let (split_applied, split_result) =
-        apply_split_branching(state, target_s, label_space, num_leaves, stats);
+        apply_split_branching_cached(state, target_s, label_space, num_leaves, stats, comps_f0);
     if split_applied {
         state.rollback();
         return split_result;
     }
 
-    // Classify components
-    let (all_comps, non_iso_comps) = classify_components(&state.forests, label_space);
+    // Classify components using pre-computed component sets
+    let (all_comps, non_iso_comps) = classify_components_cached(&state.forests, comps_f0);
 
     if non_iso_comps.is_empty() {
-        let result = extract_maf_components(
-            &state.forests[0],
-            &state.collapses,
-            label_space,
-            num_leaves,
-        );
+        let result =
+            extract_maf_components(&state.forests[0], &state.collapses, label_space, num_leaves);
         state.rollback();
         return Some(result);
     }
 
-    let remaining = target_s - cur_order;
+    // Budget check with fresh component count (fixes stale cur_order bug)
+    let remaining = target_s.saturating_sub(all_comps.len());
     if remaining == 0 {
         stats.branches_pruned += 1;
         state.rollback();
@@ -458,18 +472,19 @@ fn br_lsi_step(
     label_space: usize,
     num_leaves: u32,
     stats: &mut SolverStats,
+    comp_sets: &[Vec<FixedBitSet>],
 ) -> Option<Vec<Tree>> {
-    let (i, j) = match find_violating_pair(&state.forests, label_space) {
+    let (i, j) = match find_violating_pair_cached(comp_sets) {
         Some(pair) => pair,
         None => return None,
     };
 
     let (target_idx, v1, v2) = if let Some((_v, v1, v2)) =
-        find_branching_vertex(&state.forests[i], &state.forests[j], label_space)
+        find_branching_vertex_cached(&state.forests[i], &state.forests[j], &comp_sets[j])
     {
         (i, v1, v2)
     } else if let Some((_v, v1, v2)) =
-        find_branching_vertex(&state.forests[j], &state.forests[i], label_space)
+        find_branching_vertex_cached(&state.forests[j], &state.forests[i], &comp_sets[i])
     {
         (j, v1, v2)
     } else {
@@ -510,29 +525,33 @@ fn br_lsi_step(
 // Reduction Rule 1 (Section 3.1)
 // ============================================================================
 
-fn apply_reduction_rules_state(state: &mut SearchState, label_space: usize) {
-    let mut changed = true;
-    while changed {
-        changed = false;
+/// Apply R1 exhaustively, returning the final component sets for all forests.
+fn apply_reduction_rules_state(
+    state: &mut SearchState,
+    label_space: usize,
+) -> Vec<Vec<FixedBitSet>> {
+    loop {
         let comp_sets: Vec<Vec<FixedBitSet>> = state
             .forests
             .iter()
             .map(|f| component_leaf_sets_xf(f, label_space))
             .collect();
+        let mut changed = false;
         'outer: for i in 0..state.forests.len() {
             for j in 0..state.forests.len() {
                 if i == j {
                     continue;
                 }
-                if let Some(node) =
-                    find_r1_cut(&state.forests[i], &comp_sets[j], label_space)
-                {
+                if let Some(node) = find_r1_cut(&state.forests[i], &comp_sets[j], label_space) {
                     trace!("R1: cut node {} in forest {}", node, i);
                     state.cut_node(i, node);
                     changed = true;
                     break 'outer;
                 }
             }
+        }
+        if !changed {
+            return comp_sets;
         }
     }
 }
@@ -586,15 +605,11 @@ fn find_r1_cut(
 // LSI checking (Section 2.2)
 // ============================================================================
 
-fn all_pairs_lsi(forests: &[XForest], label_space: usize) -> bool {
-    if forests.len() <= 1 {
+fn all_pairs_lsi_cached(comp_sets: &[Vec<FixedBitSet>]) -> bool {
+    if comp_sets.len() <= 1 {
         return true;
     }
-    let sets: Vec<Vec<FixedBitSet>> = forests
-        .iter()
-        .map(|f| component_leaf_sets_xf(f, label_space))
-        .collect();
-    let keys: Vec<Vec<Vec<usize>>> = sets
+    let keys: Vec<Vec<Vec<usize>>> = comp_sets
         .iter()
         .map(|components| {
             let mut ks: Vec<Vec<usize>> = components.iter().map(|s| leafset_key(s)).collect();
@@ -605,14 +620,10 @@ fn all_pairs_lsi(forests: &[XForest], label_space: usize) -> bool {
     keys.windows(2).all(|w| w[0] == w[1])
 }
 
-fn find_violating_pair(forests: &[XForest], label_space: usize) -> Option<(usize, usize)> {
-    let sets: Vec<Vec<FixedBitSet>> = forests
-        .iter()
-        .map(|f| component_leaf_sets_xf(f, label_space))
-        .collect();
-    for i in 0..forests.len() {
-        for j in (i + 1)..forests.len() {
-            if !lsi_pair(&sets[i], &sets[j]) {
+fn find_violating_pair_cached(comp_sets: &[Vec<FixedBitSet>]) -> Option<(usize, usize)> {
+    for i in 0..comp_sets.len() {
+        for j in (i + 1)..comp_sets.len() {
+            if !lsi_pair(&comp_sets[i], &comp_sets[j]) {
                 return Some((i, j));
             }
         }
@@ -632,13 +643,11 @@ fn lsi_pair(a: &[FixedBitSet], b: &[FixedBitSet]) -> bool {
 // Branching Rule 1: find branching vertex (Section 3.1, Case 1)
 // ============================================================================
 
-fn find_branching_vertex(
+fn find_branching_vertex_cached(
     fi: &XForest,
-    fj: &XForest,
-    label_space: usize,
+    _fj: &XForest,
+    fj_components: &[FixedBitSet],
 ) -> Option<(NodeId, NodeId, NodeId)> {
-    let fj_components = component_leaf_sets_xf(fj, label_space);
-
     for node in fi.tree.pre_order() {
         if fi.live_leafsets[node as usize].count_ones(..) == 0 {
             continue;
@@ -652,7 +661,7 @@ fn find_branching_vertex(
         let ls1 = &fi.live_leafsets[c1 as usize];
         let ls2 = &fi.live_leafsets[c2 as usize];
 
-        for comp in &fj_components {
+        for comp in fj_components {
             let c1_inter = has_intersection(ls1, comp);
             let c2_inter = has_intersection(ls2, comp);
 
@@ -760,8 +769,8 @@ fn forest_resolves_to(forest: &XForest, start: NodeId, target: NodeId) -> bool {
 // Forest navigation (with forced contraction)
 // ============================================================================
 
-fn forest_children(forest: &XForest, node: NodeId) -> Vec<NodeId> {
-    let mut out = Vec::with_capacity(2);
+fn forest_children(forest: &XForest, node: NodeId) -> Children {
+    let mut out = Children::new();
     if let Some((left, right)) = forest.tree.children(node) {
         if left != NONE
             && !forest.is_cut(left)
@@ -824,43 +833,52 @@ fn forest_parent_leaf(forest: &XForest, node: NodeId) -> NodeId {
     }
 }
 
-fn forest_lca(forest: &XForest, a: NodeId, b: NodeId) -> NodeId {
-    let mut ancestors = std::collections::HashSet::new();
-    let mut cur = a;
-    ancestors.insert(cur);
-    loop {
-        if forest.is_cut(cur) || forest.tree.parent[cur as usize] == NONE {
-            break;
+fn forest_lca(forest: &XForest, mut a: NodeId, mut b: NodeId) -> NodeId {
+    let depth = &forest.tree.depth;
+    // Walk deeper node up to same depth, respecting cut edges
+    while depth[a as usize] > depth[b as usize] {
+        if forest.is_cut(a) {
+            return NONE;
         }
-        cur = forest.tree.parent[cur as usize];
-        ancestors.insert(cur);
-    }
-    cur = b;
-    if ancestors.contains(&cur) {
-        return cur;
-    }
-    loop {
-        if forest.is_cut(cur) || forest.tree.parent[cur as usize] == NONE {
-            break;
-        }
-        cur = forest.tree.parent[cur as usize];
-        if ancestors.contains(&cur) {
-            return cur;
+        a = forest.tree.parent[a as usize];
+        if a == NONE {
+            return NONE;
         }
     }
-    NONE
+    while depth[b as usize] > depth[a as usize] {
+        if forest.is_cut(b) {
+            return NONE;
+        }
+        b = forest.tree.parent[b as usize];
+        if b == NONE {
+            return NONE;
+        }
+    }
+    // Walk both up until they meet
+    while a != b {
+        if forest.is_cut(a) || forest.is_cut(b) {
+            return NONE;
+        }
+        a = forest.tree.parent[a as usize];
+        b = forest.tree.parent[b as usize];
+        if a == NONE || b == NONE {
+            return NONE;
+        }
+    }
+    a
 }
 
 // ============================================================================
 // Split-or-decompose: SPLIT branching on overlapping components
 // ============================================================================
 
-fn apply_split_branching(
+fn apply_split_branching_cached(
     state: &mut SearchState,
     target_s: usize,
     label_space: usize,
     num_leaves: u32,
     stats: &mut SolverStats,
+    comps: &[FixedBitSet],
 ) -> (bool, Option<Vec<Tree>>) {
     let start = if profile_enabled() {
         Some(std::time::Instant::now())
@@ -870,13 +888,12 @@ fn apply_split_branching(
     if profile_enabled() {
         SPLIT_STATS.with(|s| s.borrow_mut().attempts += 1);
     }
-    let comps = component_leaf_sets_xf(&state.forests[0], label_space);
     if comps.len() <= 1 {
         return (false, None);
     }
 
     if let Some((forest_idx, comp_a, comp_b, edge_child)) =
-        find_overlap_any_tree(&state.forests, &comps, split_tree_limit())
+        find_overlap_any_tree(&state.forests, comps, split_tree_limit())
     {
         if profile_enabled() {
             SPLIT_STATS.with(|s| s.borrow_mut().triggered += 1);
@@ -1008,13 +1025,10 @@ fn find_overlap_any_tree(
     None
 }
 
-fn find_overlap_in_tree(
-    forest: &XForest,
-    comps: &[FixedBitSet],
-) -> Option<(usize, usize, NodeId)> {
+fn find_overlap_in_tree(forest: &XForest, comps: &[FixedBitSet]) -> Option<(usize, usize, NodeId)> {
     let num_nodes = forest.tree.num_nodes();
     let mut edge_owner: Vec<Option<usize>> = vec![None; num_nodes];
-    let mut comp_sizes: Vec<usize> = comps.iter().map(|c| c.count_ones(..)).collect();
+    let comp_sizes: Vec<usize> = comps.iter().map(|c| c.count_ones(..)).collect();
 
     for child in forest.tree.pre_order() {
         if child == forest.tree.root {
@@ -1078,7 +1092,7 @@ fn splitting_core(
         let mut has_mixed = false;
 
         for neighbor in neighbors(tree, v) {
-            let mut side = side_leafset(tree, full_leafsets, x, v, neighbor);
+            let side = side_leafset(tree, full_leafsets, x, v, neighbor);
             if side.count_ones(..) == 0 {
                 continue;
             }
@@ -1240,10 +1254,16 @@ fn score_sibling_pair(forests: &[XForest], a: u32, b: u32) -> i32 {
         } else if omega1.len() == 1 {
             1000
         } else {
-            let lca_sets: Vec<FixedBitSet> =
-                omega1.iter().map(|&i| lca_leafset(&forests[i], a, b)).collect();
+            let lca_sets: Vec<FixedBitSet> = omega1
+                .iter()
+                .map(|&i| lca_leafset(&forests[i], a, b))
+                .collect();
             let all_same_lca = lca_sets.windows(2).all(|w| w[0] == w[1]);
-            if all_same_lca { 1000 } else { 0 }
+            if all_same_lca {
+                1000
+            } else {
+                0
+            }
         }
     }
 }
@@ -1263,45 +1283,62 @@ fn compute_e_f(forest: &XForest, a: u32, b: u32) -> Vec<NodeId> {
         return Vec::new();
     }
 
-    let mut on_path = std::collections::HashSet::new();
-    on_path.insert(a_node);
-    on_path.insert(b_node);
-    on_path.insert(lca);
+    // Use a flat bool vector instead of HashSet for O(1) lookup without hashing.
+    let n = forest.tree.num_nodes();
+    let mut on_path = vec![false; n];
+    // Collect path nodes in a small stack-vec for iteration.
+    let mut path_nodes_buf = Vec::with_capacity(32);
+
+    on_path[a_node as usize] = true;
+    on_path[b_node as usize] = true;
+    on_path[lca as usize] = true;
+    path_nodes_buf.push(lca);
 
     let mut cur = a_node;
     while cur != lca {
-        if forest.is_cut(cur) { break; }
+        if forest.is_cut(cur) {
+            break;
+        }
         let p = forest.tree.parent[cur as usize];
-        if p == NONE { break; }
-        on_path.insert(p);
+        if p == NONE {
+            break;
+        }
+        if !on_path[p as usize] {
+            on_path[p as usize] = true;
+            path_nodes_buf.push(p);
+        }
         cur = p;
     }
     cur = b_node;
     while cur != lca {
-        if forest.is_cut(cur) { break; }
+        if forest.is_cut(cur) {
+            break;
+        }
         let p = forest.tree.parent[cur as usize];
-        if p == NONE { break; }
-        on_path.insert(p);
+        if p == NONE {
+            break;
+        }
+        if !on_path[p as usize] {
+            on_path[p as usize] = true;
+            path_nodes_buf.push(p);
+        }
         cur = p;
     }
 
     let mut e_f = Vec::new();
-    for &path_node in &on_path {
-        if path_node == a_node || path_node == b_node {
-            continue;
-        }
+    for &path_node in &path_nodes_buf {
         if let Some((left, right)) = forest.tree.children(path_node) {
             if left != NONE
                 && !forest.is_cut(left)
                 && forest.live_leafsets[left as usize].count_ones(..) > 0
-                && !on_path.contains(&left)
+                && !on_path[left as usize]
             {
                 e_f.push(left);
             }
             if right != NONE
                 && !forest.is_cut(right)
                 && forest.live_leafsets[right as usize].count_ones(..) > 0
-                && !on_path.contains(&right)
+                && !on_path[right as usize]
             {
                 e_f.push(right);
             }
@@ -1334,7 +1371,16 @@ fn apply_case_2_branching(
     let max_e = e_sets.iter().map(|e| e.len()).max().unwrap_or(0);
 
     if max_e >= 2 {
-        return apply_branching_rule_2_1(state, target_s, a, b, &e_sets, label_space, num_leaves, stats);
+        return apply_branching_rule_2_1(
+            state,
+            target_s,
+            a,
+            b,
+            &e_sets,
+            label_space,
+            num_leaves,
+            stats,
+        );
     }
 
     let omega1: Vec<usize> = e_sets
@@ -1348,16 +1394,35 @@ fn apply_case_2_branching(
         return None;
     }
 
-    let lca_sets: Vec<FixedBitSet> = omega1.iter().map(|&i| lca_leafset(&state.forests[i], a, b)).collect();
+    let lca_sets: Vec<FixedBitSet> = omega1
+        .iter()
+        .map(|&i| lca_leafset(&state.forests[i], a, b))
+        .collect();
     let all_same_lca = lca_sets.windows(2).all(|w| w[0] == w[1]);
 
     if all_same_lca {
         trace!("Case 2.2.1: reduction for ({}, {})", a, b);
-        return apply_reduction_rule_2_2_1(state, target_s, &e_sets, label_space, num_leaves, stats);
+        return apply_reduction_rule_2_2_1(
+            state,
+            target_s,
+            &e_sets,
+            label_space,
+            num_leaves,
+            stats,
+        );
     }
 
     trace!("Case 2.2.2: branching for ({}, {})", a, b);
-    apply_branching_rule_2_2_2(state, target_s, a, b, &e_sets, label_space, num_leaves, stats)
+    apply_branching_rule_2_2_2(
+        state,
+        target_s,
+        a,
+        b,
+        &e_sets,
+        label_space,
+        num_leaves,
+        stats,
+    )
 }
 
 /// BR 2.1: 3-way branch. [1] cut a, [2] cut b, [3] cut E_F
@@ -1552,11 +1617,11 @@ fn build_component_tree(expanded: &FixedBitSet, reference_tree: &Tree, num_leave
     }
 }
 
-fn classify_components(
+fn classify_components_cached(
     forests: &[XForest],
-    label_space: usize,
+    all_comps: &[FixedBitSet],
 ) -> (Vec<FixedBitSet>, Vec<FixedBitSet>) {
-    let all_comps = component_leaf_sets_xf(&forests[0], label_space);
+    let all_comps = all_comps.to_vec();
     let mut non_iso = Vec::new();
 
     for comp_ls in &all_comps {
@@ -1614,7 +1679,9 @@ fn solve_decomposed(
             .map(|f| XForest::from_tree(f.tree.prune_to_leafset(comp_ls)))
             .collect();
 
-        if let Some(result) = alg_maf_standalone(sub_forests.clone(), 2, label_space, num_leaves, stats) {
+        if let Some(result) =
+            alg_maf_standalone(sub_forests.clone(), 2, label_space, num_leaves, stats)
+        {
             shallow_results.push(Some(result));
             lower_bounds.push(1);
             total_lower_bound += 1;
@@ -1651,7 +1718,11 @@ fn solve_decomposed(
                     }
                 }
                 let expanded = expand_leafset(&sub_ls, &collapsed_into, num_leaves, label_space);
-                trees.push(build_component_tree(&expanded, &forests[0].tree, num_leaves));
+                trees.push(build_component_tree(
+                    &expanded,
+                    &forests[0].tree,
+                    num_leaves,
+                ));
             }
             component_results.push(trees);
         } else {
@@ -1686,8 +1757,13 @@ fn solve_decomposed(
                                 }
                             }
                         }
-                        let expanded = expand_leafset(&sub_ls, &collapsed_into, num_leaves, label_space);
-                        trees.push(build_component_tree(&expanded, &forests[0].tree, num_leaves));
+                        let expanded =
+                            expand_leafset(&sub_ls, &collapsed_into, num_leaves, label_space);
+                        trees.push(build_component_tree(
+                            &expanded,
+                            &forests[0].tree,
+                            num_leaves,
+                        ));
                     }
                     component_results.push(trees);
                     found = true;
@@ -1715,7 +1791,11 @@ fn solve_decomposed(
             continue;
         }
         let expanded = expand_leafset(comp_ls, &collapsed_into, num_leaves, label_space);
-        result_trees.push(build_component_tree(&expanded, &forests[0].tree, num_leaves));
+        result_trees.push(build_component_tree(
+            &expanded,
+            &forests[0].tree,
+            num_leaves,
+        ));
     }
 
     for trees in component_results {
@@ -1748,9 +1828,50 @@ fn extract_maf_components(
 // XForest navigation helpers
 // ============================================================================
 
-fn active_children_xf(forest: &XForest, node: NodeId) -> Vec<NodeId> {
+/// Stack-allocated list of 0-2 children (binary trees never have more).
+#[derive(Clone, Copy)]
+struct Children {
+    nodes: [NodeId; 2],
+    len: u8,
+}
+
+impl Children {
+    #[inline(always)]
+    fn new() -> Self {
+        Self {
+            nodes: [NONE, NONE],
+            len: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn push(&mut self, node: NodeId) {
+        self.nodes[self.len as usize] = node;
+        self.len += 1;
+    }
+
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    #[inline(always)]
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl std::ops::Index<usize> for Children {
+    type Output = NodeId;
+    #[inline(always)]
+    fn index(&self, idx: usize) -> &NodeId {
+        &self.nodes[idx]
+    }
+}
+
+fn active_children_xf(forest: &XForest, node: NodeId) -> Children {
     let tree = &forest.tree;
-    let mut out = Vec::with_capacity(2);
+    let mut out = Children::new();
     if let Some((left, right)) = tree.children(node) {
         if left != NONE
             && !forest.is_cut(left)
@@ -1792,9 +1913,7 @@ fn component_leaf_sets_xf(forest: &XForest, label_space: usize) -> Vec<FixedBitS
         let mut stack = vec![node];
         visited[node as usize] = true;
         while let Some(cur) = stack.pop() {
-            if forest.tree.is_leaf(cur)
-                && forest.live_leafsets[cur as usize].count_ones(..) > 0
-            {
+            if forest.tree.is_leaf(cur) && forest.live_leafsets[cur as usize].count_ones(..) > 0 {
                 set.union_with(&forest.live_leafsets[cur as usize]);
             }
             if let Some((left, right)) = forest.tree.children(cur) {
@@ -1918,14 +2037,29 @@ mod tests {
     fn make_simple_tree() -> Tree {
         // Tree: ((1,2),3)
         let mut tree = Tree::with_capacity(3);
-        tree.parent.push(3); tree.left.push(NONE); tree.right.push(NONE); tree.label.push(1);
+        tree.parent.push(3);
+        tree.left.push(NONE);
+        tree.right.push(NONE);
+        tree.label.push(1);
         tree.label_to_node[1] = 0;
-        tree.parent.push(3); tree.left.push(NONE); tree.right.push(NONE); tree.label.push(2);
+        tree.parent.push(3);
+        tree.left.push(NONE);
+        tree.right.push(NONE);
+        tree.label.push(2);
         tree.label_to_node[2] = 1;
-        tree.parent.push(4); tree.left.push(NONE); tree.right.push(NONE); tree.label.push(3);
+        tree.parent.push(4);
+        tree.left.push(NONE);
+        tree.right.push(NONE);
+        tree.label.push(3);
         tree.label_to_node[3] = 2;
-        tree.parent.push(4); tree.left.push(0); tree.right.push(1); tree.label.push(0);
-        tree.parent.push(NONE); tree.left.push(3); tree.right.push(2); tree.label.push(0);
+        tree.parent.push(4);
+        tree.left.push(0);
+        tree.right.push(1);
+        tree.label.push(0);
+        tree.parent.push(NONE);
+        tree.left.push(3);
+        tree.right.push(2);
+        tree.label.push(0);
         tree.root = 4;
         tree.compute_metadata();
         tree
@@ -1969,7 +2103,12 @@ mod tests {
         let t2 = make_simple_tree();
         let f1 = XForest::from_tree(t1);
         let f2 = XForest::from_tree(t2);
-        assert!(all_pairs_lsi(&[f1, f2], 3));
+        let forests = [f1, f2];
+        let comp_sets: Vec<Vec<FixedBitSet>> = forests
+            .iter()
+            .map(|f| component_leaf_sets_xf(f, 3))
+            .collect();
+        assert!(all_pairs_lsi_cached(&comp_sets));
     }
 
     #[test]
@@ -1984,10 +2123,13 @@ mod tests {
     fn test_has_intersection() {
         let mut a = FixedBitSet::with_capacity(4);
         let mut b = FixedBitSet::with_capacity(4);
-        a.insert(1); a.insert(2);
-        b.insert(2); b.insert(3);
+        a.insert(1);
+        a.insert(2);
+        b.insert(2);
+        b.insert(3);
         assert!(has_intersection(&a, &b));
-        b.clear(); b.insert(3);
+        b.clear();
+        b.insert(3);
         assert!(!has_intersection(&a, &b));
     }
 
@@ -1995,8 +2137,11 @@ mod tests {
     fn test_is_subset() {
         let mut a = FixedBitSet::with_capacity(4);
         let mut b = FixedBitSet::with_capacity(4);
-        a.insert(1); a.insert(2);
-        b.insert(1); b.insert(2); b.insert(3);
+        a.insert(1);
+        a.insert(2);
+        b.insert(1);
+        b.insert(2);
+        b.insert(3);
         assert!(is_subset(&a, &b));
         assert!(!is_subset(&b, &a));
     }
