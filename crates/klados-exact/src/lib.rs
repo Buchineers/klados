@@ -4,6 +4,7 @@
 
 mod fpt;
 pub mod lower_bound;
+mod maf_ilp;
 mod shi_mestel;
 
 use klados_core::{Instance, SolverStats, Tree};
@@ -23,6 +24,7 @@ pub fn available_solvers() -> Vec<Box<dyn ExactSolver>> {
     vec![
         Box::new(fpt::FptSolver::new()),
         Box::new(shi_mestel::ShiMestelSolver::new()),
+        Box::new(maf_ilp::MafIlpSolver::new()),
     ]
 }
 
@@ -34,6 +36,9 @@ pub fn solver_by_name(name: &str) -> Option<Box<dyn ExactSolver>> {
     }
     if name == "shi-mestel" || name == "shimestel" {
         return Some(Box::new(shi_mestel::ShiMestelSolver::new()));
+    }
+    if name == "maf-ilp" || name == "mafilp" || name == "ilp" {
+        return Some(Box::new(maf_ilp::MafIlpSolver::new()));
     }
     for solver in available_solvers() {
         if solver.name().eq_ignore_ascii_case(&name) {
@@ -56,6 +61,12 @@ mod tests {
     #[test]
     fn test_registry_has_shi_mestel() {
         let solver = solver_by_name("shi-mestel");
+        assert!(solver.is_some());
+    }
+
+    #[test]
+    fn test_registry_has_maf_ilp() {
+        let solver = solver_by_name("maf-ilp");
         assert!(solver.is_some());
     }
 }

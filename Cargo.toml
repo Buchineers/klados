@@ -22,6 +22,9 @@ fixedbitset = "0.5"
 smallvec = "1.13"
 fxhash = "0.2"
 
+# LP/ILP solver
+highs = "2.0"
+
 # Error handling
 thiserror = "2.0"
 
