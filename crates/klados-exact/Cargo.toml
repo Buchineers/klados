@@ -10,3 +10,4 @@ klados-core = { workspace = true }
 thiserror = { workspace = true }
 fixedbitset = { workspace = true }
 fxhash = { workspace = true }
+highs = { workspace = true }
