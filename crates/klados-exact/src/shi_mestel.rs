@@ -6,6 +6,7 @@
 //! Uses checkpoint/rollback on a SearchState to avoid cloning forests at each branch.
 
 use fixedbitset::FixedBitSet;
+use fxhash::FxHashMap;
 use klados_core::{Instance, NodeId, SolverStats, Tree, NONE};
 
 fn trace_enabled() -> bool {
@@ -265,6 +266,75 @@ impl SearchState {
 }
 
 // ============================================================================
+// Zobrist hashing for transposition table
+// ============================================================================
+
+/// Pre-computed random values for Zobrist hashing.
+/// We hash the component partition: for each label, XOR in a value
+/// derived from its component ID.  Two states with identical component
+/// partitions will hash identically regardless of operation order.
+struct ZobristTable {
+    /// label_keys[label] = random u64 for that label
+    label_keys: Vec<u64>,
+}
+
+impl ZobristTable {
+    fn new(num_labels: usize) -> Self {
+        // Simple deterministic PRNG (splitmix64) seeded with a fixed value.
+        // Determinism helps reproducibility; quality doesn't matter much.
+        let mut state: u64 = 0xdeadbeef12345678;
+        let mut label_keys = Vec::with_capacity(num_labels + 1);
+        for _ in 0..=num_labels {
+            state = state.wrapping_add(0x9e3779b97f4a7c15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+            z ^= z >> 31;
+            label_keys.push(z);
+        }
+        Self { label_keys }
+    }
+
+    /// Hash a component partition.  The partition is a set of FixedBitSets
+    /// where each label belongs to exactly one component.  We hash each
+    /// component by XOR of its label keys, then XOR all component hashes
+    /// together with a mixing step to distinguish different partitions that
+    /// happen to have the same XOR.
+    fn hash_partition(&self, components: &[FixedBitSet]) -> u64 {
+        let mut h: u64 = 0;
+        for comp in components {
+            let mut comp_h: u64 = 0;
+            for lbl in comp.ones() {
+                if lbl < self.label_keys.len() {
+                    comp_h ^= self.label_keys[lbl];
+                }
+            }
+            // Mix the per-component hash before combining, so that
+            // {A,B},{C} hashes differently from {A,C},{B}
+            comp_h = comp_h.wrapping_mul(0x517cc1b727220a95);
+            comp_h ^= comp_h >> 32;
+            h ^= comp_h;
+        }
+        // Final mix
+        h = h.wrapping_mul(0x2545f4914f6cdd1d);
+        h ^= h >> 32;
+        h
+    }
+}
+
+/// Transposition table entry: records the minimum target_s at which
+/// this state was proven infeasible.
+#[derive(Clone, Copy)]
+struct TTEntry {
+    /// The state was proven infeasible (returned None) with this target_s.
+    /// Any call with target_s <= this value can be pruned immediately.
+    infeasible_at: usize,
+}
+
+/// Maximum number of entries in the transposition table to bound memory.
+const TT_MAX_ENTRIES: usize = 1 << 22; // ~4M entries, ~48MB
+
+// ============================================================================
 // ShiMestelSolver
 // ============================================================================
 
@@ -303,9 +373,15 @@ impl ShiMestelSolver {
         let bounds = crate::lower_bound::maf_bounds(&instance.trees, instance.num_leaves);
         trace!("maf_bounds: lower={}, upper={}", bounds.lower, bounds.upper);
 
+        // Transposition table persists across iterative deepening rounds
+        let zobrist = ZobristTable::new(label_space);
+        let mut tt: FxHashMap<u64, TTEntry> = FxHashMap::default();
+
+        let solve_start = std::time::Instant::now();
+
         for target_s in bounds.lower..=bounds.upper {
             self.stats = SolverStats::default();
-            trace!("trying target_s={}", target_s);
+            let round_start = std::time::Instant::now();
 
             if let Some(result) = alg_maf(
                 &mut state,
@@ -313,15 +389,33 @@ impl ShiMestelSolver {
                 label_space,
                 instance.num_leaves,
                 &mut self.stats,
+                &zobrist,
+                &mut tt,
             ) {
+                let total_ms = solve_start.elapsed().as_millis();
+                let round_ms = round_start.elapsed().as_millis();
                 trace!(
-                    "solution found: target_s={}, components={}",
+                    "solution found: target_s={}, components={}, round={}ms, total={}ms, tt_size={}, nodes={}",
                     target_s,
-                    result.len()
+                    result.len(),
+                    round_ms,
+                    total_ms,
+                    tt.len(),
+                    self.stats.nodes_explored,
                 );
                 dump_split_stats();
                 return Some(result);
             }
+
+            let round_ms = round_start.elapsed().as_millis();
+            trace!(
+                "target_s={} failed: {}ms, nodes={}, pruned={}, tt_size={}",
+                target_s,
+                round_ms,
+                self.stats.nodes_explored,
+                self.stats.branches_pruned,
+                tt.len(),
+            );
         }
 
         dump_split_stats();
@@ -357,6 +451,8 @@ fn alg_maf(
     label_space: usize,
     num_leaves: u32,
     stats: &mut SolverStats,
+    zobrist: &ZobristTable,
+    tt: &mut FxHashMap<u64, TTEntry>,
 ) -> Option<Vec<Tree>> {
     stats.nodes_explored += 1;
     state.checkpoint();
@@ -376,7 +472,16 @@ fn alg_maf(
 
         // If not LSI, use BR-LSI (branch and recurse)
         if !all_pairs_lsi_cached(&comp_sets) {
-            let result = br_lsi_step(state, target_s, label_space, num_leaves, stats, &comp_sets);
+            let result = br_lsi_step(
+                state,
+                target_s,
+                label_space,
+                num_leaves,
+                stats,
+                &comp_sets,
+                zobrist,
+                tt,
+            );
             state.rollback();
             return result;
         }
@@ -391,12 +496,35 @@ fn alg_maf(
         break comp_sets; // No R1 or R2 applicable, fully reduced
     };
 
-    // Split-or-decompose: split overlapping components if any
-    // Use pre-computed components from forests[0] (after LSI, all forests share same partition)
+    // --- Transposition table probe ---
+    // After full reduction (R1 + LSI + R2 to fixpoint), the component
+    // partition is canonical.  Hash it and check whether we've already
+    // proven this state infeasible at this or higher target_s.
     let comps_f0 = &comp_sets[0];
-    let (split_applied, split_result) =
-        apply_split_branching_cached(state, target_s, label_space, num_leaves, stats, comps_f0);
+    let tt_hash = zobrist.hash_partition(comps_f0);
+    if let Some(entry) = tt.get(&tt_hash) {
+        if target_s <= entry.infeasible_at {
+            stats.branches_pruned += 1;
+            state.rollback();
+            return None;
+        }
+    }
+
+    // Split-or-decompose: split overlapping components if any
+    let (split_applied, split_result) = apply_split_branching_cached(
+        state,
+        target_s,
+        label_space,
+        num_leaves,
+        stats,
+        comps_f0,
+        zobrist,
+        tt,
+    );
     if split_applied {
+        if split_result.is_none() {
+            tt_insert(tt, tt_hash, target_s);
+        }
         state.rollback();
         return split_result;
     }
@@ -415,6 +543,7 @@ fn alg_maf(
     let remaining = target_s.saturating_sub(all_comps.len());
     if remaining == 0 {
         stats.branches_pruned += 1;
+        tt_insert(tt, tt_hash, target_s);
         state.rollback();
         return None;
     }
@@ -431,6 +560,9 @@ fn alg_maf(
             &all_comps,
             stats,
         );
+        if result.is_none() {
+            tt_insert(tt, tt_hash, target_s);
+        }
         state.rollback();
         return result;
     }
@@ -439,18 +571,51 @@ fn alg_maf(
     let (a, b) = match find_best_sibling_pair(&state.forests, label_space) {
         Some(pair) => pair,
         None => {
+            tt_insert(tt, tt_hash, target_s);
             state.rollback();
             return None;
         }
     };
 
     trace!("MSS pair: a={}, b={}, remaining={}", a, b, remaining);
-    let result = apply_case_2_branching(state, target_s, a, b, label_space, num_leaves, stats);
+    let result = apply_case_2_branching(
+        state,
+        target_s,
+        a,
+        b,
+        label_space,
+        num_leaves,
+        stats,
+        zobrist,
+        tt,
+    );
+    if result.is_none() {
+        tt_insert(tt, tt_hash, target_s);
+    }
     state.rollback();
     result
 }
 
-/// Standalone version for sub-instances (decomposition creates fresh SearchState)
+/// Insert or update a transposition table entry, respecting the size bound.
+fn tt_insert(tt: &mut FxHashMap<u64, TTEntry>, hash: u64, target_s: usize) {
+    if let Some(entry) = tt.get_mut(&hash) {
+        // Keep the higher infeasible_at (more information)
+        if target_s > entry.infeasible_at {
+            entry.infeasible_at = target_s;
+        }
+    } else if tt.len() < TT_MAX_ENTRIES {
+        tt.insert(
+            hash,
+            TTEntry {
+                infeasible_at: target_s,
+            },
+        );
+    }
+    // If table is full and entry doesn't exist, we just don't insert.
+    // A more sophisticated replacement policy could be added later.
+}
+
+/// Standalone version for sub-instances (decomposition creates fresh SearchState + TT)
 fn alg_maf_standalone(
     forests: Vec<XForest>,
     target_s: usize,
@@ -459,7 +624,17 @@ fn alg_maf_standalone(
     stats: &mut SolverStats,
 ) -> Option<Vec<Tree>> {
     let mut state = SearchState::new(forests);
-    alg_maf(&mut state, target_s, label_space, num_leaves, stats)
+    let zobrist = ZobristTable::new(label_space);
+    let mut tt: FxHashMap<u64, TTEntry> = FxHashMap::default();
+    alg_maf(
+        &mut state,
+        target_s,
+        label_space,
+        num_leaves,
+        stats,
+        &zobrist,
+        &mut tt,
+    )
 }
 
 // ============================================================================
@@ -473,6 +648,8 @@ fn br_lsi_step(
     num_leaves: u32,
     stats: &mut SolverStats,
     comp_sets: &[Vec<FixedBitSet>],
+    zobrist: &ZobristTable,
+    tt: &mut FxHashMap<u64, TTEntry>,
 ) -> Option<Vec<Tree>> {
     let (i, j) = match find_violating_pair_cached(comp_sets) {
         Some(pair) => pair,
@@ -499,7 +676,8 @@ fn br_lsi_step(
     if v1 != state.forests[target_idx].tree.root && !state.forests[target_idx].is_cut(v1) {
         state.checkpoint();
         state.cut_node(target_idx, v1);
-        if let Some(result) = alg_maf(state, target_s, label_space, num_leaves, stats) {
+        if let Some(result) = alg_maf(state, target_s, label_space, num_leaves, stats, zobrist, tt)
+        {
             state.rollback();
             return Some(result);
         }
@@ -510,7 +688,8 @@ fn br_lsi_step(
     if v2 != state.forests[target_idx].tree.root && !state.forests[target_idx].is_cut(v2) {
         state.checkpoint();
         state.cut_node(target_idx, v2);
-        if let Some(result) = alg_maf(state, target_s, label_space, num_leaves, stats) {
+        if let Some(result) = alg_maf(state, target_s, label_space, num_leaves, stats, zobrist, tt)
+        {
             state.rollback();
             return Some(result);
         }
@@ -879,6 +1058,8 @@ fn apply_split_branching_cached(
     num_leaves: u32,
     stats: &mut SolverStats,
     comps: &[FixedBitSet],
+    zobrist: &ZobristTable,
+    tt: &mut FxHashMap<u64, TTEntry>,
 ) -> (bool, Option<Vec<Tree>>) {
     let start = if profile_enabled() {
         Some(std::time::Instant::now())
@@ -916,6 +1097,8 @@ fn apply_split_branching_cached(
             forest_idx,
             &comps[comp_a],
             edge_child,
+            zobrist,
+            tt,
         ) {
             if let Some(t0) = start {
                 let dt = t0.elapsed().as_nanos();
@@ -934,6 +1117,8 @@ fn apply_split_branching_cached(
             forest_idx,
             &comps[comp_b],
             edge_child,
+            zobrist,
+            tt,
         ) {
             if let Some(t0) = start {
                 let dt = t0.elapsed().as_nanos();
@@ -966,6 +1151,8 @@ fn split_component_branch(
     forest_idx: usize,
     comp: &FixedBitSet,
     edge_child: NodeId,
+    zobrist: &ZobristTable,
+    tt: &mut FxHashMap<u64, TTEntry>,
 ) -> Option<Vec<Tree>> {
     let tree = &state.forests[forest_idx].tree;
     let full_leafsets = &state.forests[forest_idx].full_leafsets;
@@ -998,7 +1185,8 @@ fn split_component_branch(
         for child in cut {
             state.cut_node(forest_idx, child);
         }
-        if let Some(result) = alg_maf(state, target_s, label_space, num_leaves, stats) {
+        if let Some(result) = alg_maf(state, target_s, label_space, num_leaves, stats, zobrist, tt)
+        {
             state.rollback();
             return Some(result);
         }
@@ -1366,6 +1554,8 @@ fn apply_case_2_branching(
     label_space: usize,
     num_leaves: u32,
     stats: &mut SolverStats,
+    zobrist: &ZobristTable,
+    tt: &mut FxHashMap<u64, TTEntry>,
 ) -> Option<Vec<Tree>> {
     let e_sets: Vec<Vec<NodeId>> = state.forests.iter().map(|f| compute_e_f(f, a, b)).collect();
     let max_e = e_sets.iter().map(|e| e.len()).max().unwrap_or(0);
@@ -1380,6 +1570,8 @@ fn apply_case_2_branching(
             label_space,
             num_leaves,
             stats,
+            zobrist,
+            tt,
         );
     }
 
@@ -1409,6 +1601,8 @@ fn apply_case_2_branching(
             label_space,
             num_leaves,
             stats,
+            zobrist,
+            tt,
         );
     }
 
@@ -1422,6 +1616,8 @@ fn apply_case_2_branching(
         label_space,
         num_leaves,
         stats,
+        zobrist,
+        tt,
     )
 }
 
@@ -1435,6 +1631,8 @@ fn apply_branching_rule_2_1(
     label_space: usize,
     num_leaves: u32,
     stats: &mut SolverStats,
+    zobrist: &ZobristTable,
+    tt: &mut FxHashMap<u64, TTEntry>,
 ) -> Option<Vec<Tree>> {
     trace!("BR 2.1: a={}, b={}", a, b);
 
@@ -1445,7 +1643,8 @@ fn apply_branching_rule_2_1(
             let a_node = state.forests[idx].tree.label_to_node[a as usize];
             state.cut_node(idx, a_node);
         }
-        if let Some(result) = alg_maf(state, target_s, label_space, num_leaves, stats) {
+        if let Some(result) = alg_maf(state, target_s, label_space, num_leaves, stats, zobrist, tt)
+        {
             state.rollback();
             return Some(result);
         }
@@ -1459,7 +1658,8 @@ fn apply_branching_rule_2_1(
             let b_node = state.forests[idx].tree.label_to_node[b as usize];
             state.cut_node(idx, b_node);
         }
-        if let Some(result) = alg_maf(state, target_s, label_space, num_leaves, stats) {
+        if let Some(result) = alg_maf(state, target_s, label_space, num_leaves, stats, zobrist, tt)
+        {
             state.rollback();
             return Some(result);
         }
@@ -1479,7 +1679,9 @@ fn apply_branching_rule_2_1(
             }
         }
         if any_cut {
-            if let Some(result) = alg_maf(state, target_s, label_space, num_leaves, stats) {
+            if let Some(result) =
+                alg_maf(state, target_s, label_space, num_leaves, stats, zobrist, tt)
+            {
                 state.rollback();
                 return Some(result);
             }
@@ -1498,13 +1700,15 @@ fn apply_reduction_rule_2_2_1(
     label_space: usize,
     num_leaves: u32,
     stats: &mut SolverStats,
+    zobrist: &ZobristTable,
+    tt: &mut FxHashMap<u64, TTEntry>,
 ) -> Option<Vec<Tree>> {
     for (i, e_nodes) in e_sets.iter().enumerate() {
         for &node in e_nodes {
             state.cut_node(i, node);
         }
     }
-    alg_maf(state, target_s, label_space, num_leaves, stats)
+    alg_maf(state, target_s, label_space, num_leaves, stats, zobrist, tt)
 }
 
 /// Case 2.2.2: 3-way branch
@@ -1517,6 +1721,8 @@ fn apply_branching_rule_2_2_2(
     label_space: usize,
     num_leaves: u32,
     stats: &mut SolverStats,
+    zobrist: &ZobristTable,
+    tt: &mut FxHashMap<u64, TTEntry>,
 ) -> Option<Vec<Tree>> {
     trace!("BR 2.2.2: a={}, b={}", a, b);
 
@@ -1527,7 +1733,8 @@ fn apply_branching_rule_2_2_2(
             let a_node = state.forests[idx].tree.label_to_node[a as usize];
             state.cut_node(idx, a_node);
         }
-        if let Some(result) = alg_maf(state, target_s, label_space, num_leaves, stats) {
+        if let Some(result) = alg_maf(state, target_s, label_space, num_leaves, stats, zobrist, tt)
+        {
             state.rollback();
             return Some(result);
         }
@@ -1541,7 +1748,8 @@ fn apply_branching_rule_2_2_2(
             let b_node = state.forests[idx].tree.label_to_node[b as usize];
             state.cut_node(idx, b_node);
         }
-        if let Some(result) = alg_maf(state, target_s, label_space, num_leaves, stats) {
+        if let Some(result) = alg_maf(state, target_s, label_space, num_leaves, stats, zobrist, tt)
+        {
             state.rollback();
             return Some(result);
         }
@@ -1561,7 +1769,9 @@ fn apply_branching_rule_2_2_2(
             }
         }
         if any_cut {
-            if let Some(result) = alg_maf(state, target_s, label_space, num_leaves, stats) {
+            if let Some(result) =
+                alg_maf(state, target_s, label_space, num_leaves, stats, zobrist, tt)
+            {
                 state.rollback();
                 return Some(result);
             }
