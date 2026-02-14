@@ -121,17 +121,6 @@ impl FptSolver {
         }
     }
 
-    pub fn with_config(config: SolverConfig) -> Self {
-        Self {
-            config,
-            stats: SolverStats::default(),
-            memo: FxHashMap::default(),
-            num_leaves: 0,
-            multi_tree: false,
-            pendants_first: false,
-        }
-    }
-
     pub fn stats(&self) -> &SolverStats {
         &self.stats
     }

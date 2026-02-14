@@ -34,27 +34,31 @@ pub struct MafBounds {
 /// For each pair of trees, computes an approximate rSPR distance (3-approx).
 /// - Lower bound: `max over pairs of ceil(approx_cost / 3) + 1`
 /// - Upper bound: for 2-tree instances, `min over pairs of approx_cost + 1`;
-///   for multi-tree, `num_leaves` (trivial).
+///   for multi-tree, greedy multi-tree cherry reduction.
 pub fn maf_bounds(trees: &[Tree], num_leaves: u32) -> MafBounds {
     if trees.len() <= 1 {
         return MafBounds { lower: 1, upper: 1 };
     }
 
     let mut best_lb = 1usize;
-    let mut best_ub_pair = usize::MAX; // tightest pairwise upper bound
+    let mut best_ub_pair = usize::MAX;
 
-    for i in 0..trees.len() {
-        for j in (i + 1)..trees.len() {
+    // Pairwise distances (3-approx) for lower bound
+    let m = trees.len();
+    let mut pairwise = vec![vec![0usize; m]; m];
+    for i in 0..m {
+        for j in (i + 1)..m {
             let approx_cost = approx_rspr_distance(&trees[i], &trees[j]);
-            // 3-approximation: OPT_pairwise >= ceil(approx_cost / 3)
+            pairwise[i][j] = approx_cost;
+            pairwise[j][i] = approx_cost;
+
+            // Standard pairwise lower bound
             let lb_cost = (approx_cost + 2) / 3;
             let lb_components = lb_cost + 1;
             if lb_components > best_lb {
                 best_lb = lb_components;
             }
-            // The approx_cost is an upper bound on pairwise rSPR distance.
-            // For 2-tree instances, this is also an upper bound on multi-tree
-            // MAF cost. The approx solution has (approx_cost + 1) components.
+
             let ub_components = approx_cost + 1;
             if ub_components < best_ub_pair {
                 best_ub_pair = ub_components;
@@ -62,18 +66,118 @@ pub fn maf_bounds(trees: &[Tree], num_leaves: u32) -> MafBounds {
         }
     }
 
-    // For 2-tree instances, the pairwise upper bound is valid.
-    // For multi-tree, the pairwise approximation doesn't give a valid
-    // multi-tree upper bound, so fall back to num_leaves.
+    // Multi-tree additive lower bound: for each reference tree i,
+    // OPT_cuts >= sum_{j!=i}(d(i,j)) / (m-1) because each optimal cut
+    // resolves at most (m-1) pairwise disagreements.
+    // We have 3-approx of d(i,j), so: OPT_cuts >= sum / (3*(m-1)).
+    if m >= 3 {
+        for i in 0..m {
+            let sum_d: usize = pairwise[i].iter().sum();
+            // OPT_cuts >= ceil(sum_d / (3 * (m-1)))
+            let denom = 3 * (m - 1);
+            let lb_cuts = (sum_d + denom - 1) / denom;
+            let lb_components = lb_cuts + 1;
+            if lb_components > best_lb {
+                best_lb = lb_components;
+            }
+        }
+    }
+
+    // Upper bound
     let upper = if trees.len() == 2 {
         best_ub_pair.min(num_leaves as usize)
     } else {
-        num_leaves as usize
+        // Greedy multi-tree cherry reduction: try each tree as reference,
+        // take the best (lowest) upper bound.
+        let mut best_multi_ub = num_leaves as usize;
+        for ref_idx in 0..m {
+            let ub = greedy_multi_tree_ub(trees, ref_idx);
+            if ub < best_multi_ub {
+                best_multi_ub = ub;
+            }
+        }
+        best_multi_ub.min(num_leaves as usize)
     };
 
     MafBounds {
         lower: best_lb,
         upper,
+    }
+}
+
+/// Greedy upper bound for multi-tree MAF: use `ref_idx` as the reference tree,
+/// reduce cherries against ALL other trees simultaneously.
+/// Returns the number of components in the resulting forest.
+fn greedy_multi_tree_ub(trees: &[Tree], ref_idx: usize) -> usize {
+    let mut mtrees: Vec<MutableTree> = trees.iter().map(|t| MutableTree::from_tree(t)).collect();
+    let mut cuts = 0;
+
+    loop {
+        if mtrees[ref_idx].num_alive_leaves <= 1 {
+            break;
+        }
+
+        let cherries = mtrees[ref_idx].find_cherries();
+        if cherries.is_empty() {
+            break;
+        }
+
+        let (a, b) = cherries[0];
+
+        // Check if this cherry is common to ALL trees
+        let common = mtrees.iter().all(|t| t.is_cherry(a, b));
+
+        if common {
+            // Free reduction: contract in all trees
+            for t in &mut mtrees {
+                t.contract_cherry(a, b);
+            }
+        } else {
+            // Cut one leaf from ALL trees. Pick the leaf that causes the
+            // least damage: for each candidate {a, b}, count how many
+            // other trees have it as part of a cherry (cheaper to cut the
+            // one that's less "useful").
+            let cut_label = pick_multi_tree_cut(&mtrees, ref_idx, a, b);
+            for t in &mut mtrees {
+                t.cut_leaf(cut_label);
+            }
+            cuts += 1;
+        }
+    }
+
+    cuts + 1 // components = cuts + 1
+}
+
+/// Pick which of {a, b} to cut in multi-tree setting.
+/// Heuristic: cut the leaf that is deeper (more displaced) in the most
+/// trees, breaking ties by total depth.
+fn pick_multi_tree_cut(mtrees: &[MutableTree], ref_idx: usize, a: Label, b: Label) -> Label {
+    let mut a_deeper_count = 0i32;
+    let mut total_depth_diff: i32 = 0;
+
+    for (i, t) in mtrees.iter().enumerate() {
+        if i == ref_idx {
+            continue;
+        }
+        let na = t.label_to_node[a as usize];
+        let nb = t.label_to_node[b as usize];
+        if na == NONE || nb == NONE {
+            continue;
+        }
+        let da = depth_in_mtree(t, na) as i32;
+        let db = depth_in_mtree(t, nb) as i32;
+        total_depth_diff += da - db;
+        if da > db {
+            a_deeper_count += 1;
+        } else if db > da {
+            a_deeper_count -= 1;
+        }
+    }
+
+    if a_deeper_count > 0 || (a_deeper_count == 0 && total_depth_diff >= 0) {
+        a
+    } else {
+        b
     }
 }
 
@@ -85,6 +189,11 @@ pub fn lower_bound_components(trees: &[Tree]) -> usize {
         return 1;
     }
     maf_bounds(trees, trees[0].num_leaves).lower
+}
+
+/// Public wrapper for pairwise approximate rSPR distance.
+pub fn approx_rspr_distance_pub(t1: &Tree, t2: &Tree) -> usize {
+    approx_rspr_distance(t1, t2)
 }
 
 // ---------------------------------------------------------------------------

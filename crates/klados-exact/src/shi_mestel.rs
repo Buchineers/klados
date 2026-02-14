@@ -370,8 +370,33 @@ impl ShiMestelSolver {
         // 3-approximation. The lower bound lets us skip early fruitless
         // rounds; the upper bound (tight for 2-tree instances) lets us
         // stop early.
-        let bounds = crate::lower_bound::maf_bounds(&instance.trees, instance.num_leaves);
+        let mut bounds = crate::lower_bound::maf_bounds(&instance.trees, instance.num_leaves);
         trace!("maf_bounds: lower={}, upper={}", bounds.lower, bounds.upper);
+
+        // For multi-tree instances, compute exact pairwise distances to
+        // tighten the lower bound.  Each pair is a 2-tree sub-problem
+        // that we can solve quickly.  This avoids the 3x loss from the
+        // approximation factor and typically saves many iterative-deepening
+        // rounds on hard instances.
+        if instance.num_trees() >= 3 && instance.num_leaves <= 50 {
+            let exact_lb = exact_pairwise_lower_bound(
+                &instance.trees,
+                label_space,
+                instance.num_leaves,
+                bounds.lower,
+                bounds.upper,
+                &mut self.stats,
+            );
+            if exact_lb > bounds.lower {
+                trace!(
+                    "exact pairwise LB: {} -> {} (saved {} rounds)",
+                    bounds.lower,
+                    exact_lb,
+                    exact_lb - bounds.lower
+                );
+                bounds.lower = exact_lb;
+            }
+        }
 
         // Transposition table persists across iterative deepening rounds
         let zobrist = ZobristTable::new(label_space);
@@ -421,6 +446,170 @@ impl ShiMestelSolver {
         dump_split_stats();
         Some(trivial_forest(&instance.trees[0], instance.num_leaves))
     }
+}
+
+/// Compute a tight lower bound by solving each pair of trees exactly.
+///
+/// For each pair (Ti, Tj), we solve the 2-tree MAF problem exactly,
+/// giving the exact rSPR distance d(Ti, Tj).  The optimal multi-tree
+/// MAF cost is at least max over all pairs of d(Ti, Tj), so
+/// LB_components = max(d(Ti, Tj)) + 1.
+///
+/// We use a per-pair time budget: if any pair takes too long, we fall
+/// back to the approximation-based lower bound for that pair.
+fn exact_pairwise_lower_bound(
+    trees: &[Tree],
+    label_space: usize,
+    num_leaves: u32,
+    approx_lb: usize,
+    upper_bound: usize,
+    _stats: &mut SolverStats,
+) -> usize {
+    let m = trees.len();
+    let mut best_lb = approx_lb;
+
+    // Collect all pairs with their approximate costs, sorted by cost
+    // descending (most promising pairs first).
+    let mut pairs: Vec<(usize, usize, usize)> = Vec::new(); // (i, j, approx_cost)
+    for i in 0..m {
+        for j in (i + 1)..m {
+            let approx_cost = crate::lower_bound::approx_rspr_distance_pub(&trees[i], &trees[j]);
+            pairs.push((i, j, approx_cost));
+        }
+    }
+    // Sort by approx_cost descending: highest-distance pairs first
+    pairs.sort_by(|a, b| b.2.cmp(&a.2));
+
+    // Time budget: spend at most 3 seconds total
+    let total_budget = std::time::Duration::from_secs(3);
+    let start = std::time::Instant::now();
+    let per_pair_budget = total_budget / (pairs.len() as u32).max(1);
+
+    // Track exact distances for the additive bound (cuts = components - 1)
+    let mut exact_dist: Vec<Vec<Option<usize>>> = vec![vec![None; m]; m];
+
+    for &(i, j, approx_cost) in &pairs {
+        if start.elapsed() >= total_budget {
+            break;
+        }
+
+        // Skip pairs whose approximate UB (approx_cost + 1) can't improve best_lb
+        // AND whose approx distance can't help the additive bound.
+        // For the additive bound, we need exact distances, so we still want to
+        // compute them even if they don't individually beat best_lb.
+        // But skip if approx_cost is very small (won't contribute much).
+        if approx_cost + 1 <= best_lb && approx_cost < 3 {
+            exact_dist[i][j] = Some(approx_cost);
+            exact_dist[j][i] = Some(approx_cost);
+            continue;
+        }
+
+        // Create 2-tree sub-instance
+        let sub_forests: Vec<XForest> = vec![
+            XForest::from_tree(trees[i].clone()),
+            XForest::from_tree(trees[j].clone()),
+        ];
+        let zobrist = ZobristTable::new(label_space);
+        let mut tt: FxHashMap<u64, TTEntry> = FxHashMap::default();
+
+        // Start iterative deepening from the approximation-based LB for this pair.
+        let pair_lb_start = (approx_cost + 2) / 3;
+
+        let pair_start = std::time::Instant::now();
+        let mut pair_exact_components = pair_lb_start + 1; // fallback
+        let mut timed_out = false;
+
+        for target_s in (pair_lb_start + 1)..=(approx_cost + 1) {
+            if pair_start.elapsed() >= per_pair_budget {
+                timed_out = true;
+                break;
+            }
+
+            let mut sub_state = SearchState::new(sub_forests.iter().map(|f| f.clone()).collect());
+            let mut sub_stats = SolverStats::default();
+            if alg_maf(
+                &mut sub_state,
+                target_s,
+                label_space,
+                num_leaves,
+                &mut sub_stats,
+                &zobrist,
+                &mut tt,
+            )
+            .is_some()
+            {
+                pair_exact_components = target_s;
+                trace!(
+                    "exact pair ({},{}) = {} components",
+                    i,
+                    j,
+                    pair_exact_components
+                );
+                break;
+            }
+            pair_exact_components = target_s + 1;
+        }
+
+        // Store exact distance (cuts = components - 1)
+        let exact_cuts = pair_exact_components - 1;
+        if !timed_out {
+            exact_dist[i][j] = Some(exact_cuts);
+            exact_dist[j][i] = Some(exact_cuts);
+        } else {
+            // Timed out: use the last proven lower bound (may be incomplete)
+            exact_dist[i][j] = Some(exact_cuts);
+            exact_dist[j][i] = Some(exact_cuts);
+        }
+
+        if pair_exact_components > best_lb {
+            best_lb = pair_exact_components;
+        }
+
+        // Early termination: if we've matched the UB, no need to check more pairs
+        if best_lb >= upper_bound {
+            return best_lb;
+        }
+    }
+
+    // Additive multi-tree lower bound using exact pairwise distances:
+    // OPT_cuts >= sum_{j!=i} d(i,j) / (m-1) for any reference tree i.
+    // This is tighter than the approximation-based additive bound because
+    // we don't lose the factor-3 from the cherry approximation.
+    if m >= 3 {
+        for i in 0..m {
+            let mut sum_d = 0usize;
+            let mut all_known = true;
+            for j in 0..m {
+                if i == j {
+                    continue;
+                }
+                if let Some(d) = exact_dist[i][j] {
+                    sum_d += d;
+                } else {
+                    all_known = false;
+                    // Use approximation-based lower bound for unknown pairs
+                    let approx = crate::lower_bound::approx_rspr_distance_pub(&trees[i], &trees[j]);
+                    sum_d += (approx + 2) / 3; // ceil(approx/3) as conservative estimate
+                }
+            }
+            let denom = m - 1;
+            let lb_cuts = (sum_d + denom - 1) / denom;
+            let lb_components = lb_cuts + 1;
+            if lb_components > best_lb {
+                trace!(
+                    "additive exact LB from ref {}: {} (sum_d={}, m-1={}, all_known={})",
+                    i,
+                    lb_components,
+                    sum_d,
+                    denom,
+                    all_known
+                );
+                best_lb = lb_components;
+            }
+        }
+    }
+
+    best_lb
 }
 
 impl super::ExactSolver for ShiMestelSolver {
@@ -615,28 +804,6 @@ fn tt_insert(tt: &mut FxHashMap<u64, TTEntry>, hash: u64, target_s: usize) {
     // A more sophisticated replacement policy could be added later.
 }
 
-/// Standalone version for sub-instances (decomposition creates fresh SearchState + TT)
-fn alg_maf_standalone(
-    forests: Vec<XForest>,
-    target_s: usize,
-    label_space: usize,
-    num_leaves: u32,
-    stats: &mut SolverStats,
-) -> Option<Vec<Tree>> {
-    let mut state = SearchState::new(forests);
-    let zobrist = ZobristTable::new(label_space);
-    let mut tt: FxHashMap<u64, TTEntry> = FxHashMap::default();
-    alg_maf(
-        &mut state,
-        target_s,
-        label_space,
-        num_leaves,
-        stats,
-        &zobrist,
-        &mut tt,
-    )
-}
-
 // ============================================================================
 // BR-LSI step (Section 3): Find LSI violation and branch
 // ============================================================================
@@ -705,25 +872,37 @@ fn br_lsi_step(
 // ============================================================================
 
 /// Apply R1 exhaustively, returning the final component sets for all forests.
+///
+/// Optimized to only recompute the component sets for the forest that was
+/// modified on each iteration, rather than all forests.
 fn apply_reduction_rules_state(
     state: &mut SearchState,
     label_space: usize,
 ) -> Vec<Vec<FixedBitSet>> {
+    let mut scratch = FixedBitSet::with_capacity(label_space + 1);
+    let nf = state.forests.len();
+
+    // Initial computation of all component sets
+    let mut comp_sets: Vec<Vec<FixedBitSet>> = state
+        .forests
+        .iter()
+        .map(|f| component_leaf_sets_xf(f, label_space))
+        .collect();
+
     loop {
-        let comp_sets: Vec<Vec<FixedBitSet>> = state
-            .forests
-            .iter()
-            .map(|f| component_leaf_sets_xf(f, label_space))
-            .collect();
         let mut changed = false;
-        'outer: for i in 0..state.forests.len() {
-            for j in 0..state.forests.len() {
+        'outer: for i in 0..nf {
+            for j in 0..nf {
                 if i == j {
                     continue;
                 }
-                if let Some(node) = find_r1_cut(&state.forests[i], &comp_sets[j], label_space) {
+                if let Some(node) =
+                    find_r1_cut(&state.forests[i], &comp_sets[j], label_space, &mut scratch)
+                {
                     trace!("R1: cut node {} in forest {}", node, i);
                     state.cut_node(i, node);
+                    // Only recompute the modified forest's components
+                    comp_sets[i] = component_leaf_sets_xf(&state.forests[i], label_space);
                     changed = true;
                     break 'outer;
                 }
@@ -736,10 +915,16 @@ fn apply_reduction_rules_state(
 }
 
 /// Find a node in forest_i that should be cut according to R1 (relative to fj_components).
+///
+/// R1 says: cut above `node` if the set of labels below `node` equals the
+/// union of those fj-components whose intersection with the whole component
+/// is fully contained in `node_ls`.  We check this without allocating by
+/// doing two passes over fj_components with bitwise operations on slices.
 fn find_r1_cut(
     forest_i: &XForest,
     fj_components: &[FixedBitSet],
     label_space: usize,
+    scratch: &mut FixedBitSet,
 ) -> Option<NodeId> {
     for node in forest_i.tree.pre_order() {
         if forest_i.is_cut(node) || node == forest_i.tree.root {
@@ -754,27 +939,71 @@ fn find_r1_cut(
         }
 
         let node_ls = &forest_i.live_leafsets[node as usize];
+        let node_count = node_ls.count_ones(..);
         let comp_root = forest_i.component_root(node);
         let comp_ls = &forest_i.live_leafsets[comp_root as usize];
+        let comp_count = comp_ls.count_ones(..);
 
-        let mut union_matching = FixedBitSet::with_capacity(label_space + 1);
-        union_matching.grow(label_space + 1);
+        if node_count == 0 || node_count >= comp_count {
+            continue;
+        }
+
+        // Build union_matching in scratch without allocating
+        scratch.clear();
+        scratch.grow(label_space + 1);
+        let mut union_count = 0usize;
+
         for fj_comp in fj_components {
-            let mut inter = fj_comp.clone();
-            inter.intersect_with(comp_ls);
-            if inter.count_ones(..) == 0 {
-                continue;
+            // Check: does fj_comp ∩ comp_ls ≠ ∅ and fj_comp ∩ comp_ls ⊆ node_ls?
+            // We do this with raw slice ops to avoid allocating an intersection.
+            let fj_sl = fj_comp.as_slice();
+            let comp_sl = comp_ls.as_slice();
+            let node_sl = node_ls.as_slice();
+            let len = fj_sl.len().min(comp_sl.len());
+
+            let mut has_inter = false;
+            let mut subset_of_node = true;
+            for k in 0..len {
+                let inter_word = fj_sl[k] & comp_sl[k];
+                if inter_word != 0 {
+                    has_inter = true;
+                    let node_word = if k < node_sl.len() { node_sl[k] } else { 0 };
+                    if inter_word & !node_word != 0 {
+                        subset_of_node = false;
+                        break;
+                    }
+                }
             }
-            if is_subset(&inter, node_ls) {
-                union_matching.union_with(&inter);
+
+            if has_inter && subset_of_node {
+                // Union the intersection into scratch
+                let scratch_sl = scratch.as_mut_slice();
+                for k in 0..len {
+                    let inter_word = fj_sl[k] & comp_sl[k];
+                    if k < scratch_sl.len() {
+                        let old = scratch_sl[k];
+                        scratch_sl[k] |= inter_word;
+                        union_count += (scratch_sl[k].count_ones() - old.count_ones()) as usize;
+                    }
+                }
+                // Early exit: if union already exceeds node_ls, this node won't match
+                if union_count > node_count {
+                    break;
+                }
             }
         }
 
-        if union_matching == *node_ls
-            && union_matching.count_ones(..) > 0
-            && union_matching.count_ones(..) < comp_ls.count_ones(..)
-        {
-            return Some(node);
+        if union_count == node_count && union_count > 0 {
+            // Verify: scratch == node_ls (same bits set)
+            if scratch.as_slice() == node_ls.as_slice()
+                || (scratch.as_slice().len() >= node_ls.as_slice().len()
+                    && scratch.as_slice()[..node_ls.as_slice().len()] == *node_ls.as_slice()
+                    && scratch.as_slice()[node_ls.as_slice().len()..]
+                        .iter()
+                        .all(|&w| w == 0))
+            {
+                return Some(node);
+            }
         }
     }
     None
@@ -788,15 +1017,36 @@ fn all_pairs_lsi_cached(comp_sets: &[Vec<FixedBitSet>]) -> bool {
     if comp_sets.len() <= 1 {
         return true;
     }
-    let keys: Vec<Vec<Vec<usize>>> = comp_sets
-        .iter()
-        .map(|components| {
-            let mut ks: Vec<Vec<usize>> = components.iter().map(|s| leafset_key(s)).collect();
-            ks.sort();
-            ks
-        })
-        .collect();
-    keys.windows(2).all(|w| w[0] == w[1])
+    // Compare sorted component partitions.  Instead of allocating key vecs,
+    // we sort by the raw slice representation (which is deterministic for
+    // FixedBitSets of the same capacity).
+    let ref_sorted = sorted_partition_hashes(&comp_sets[0]);
+    for cs in &comp_sets[1..] {
+        if sorted_partition_hashes(cs) != ref_sorted {
+            return false;
+        }
+    }
+    true
+}
+
+/// Hash each component and return a sorted vec of hashes for comparison.
+/// Much cheaper than allocating Vec<Vec<usize>> keys.
+fn sorted_partition_hashes(components: &[FixedBitSet]) -> Vec<u64> {
+    let mut hashes: Vec<u64> = components.iter().map(|s| hash_bitset(s)).collect();
+    hashes.sort_unstable();
+    hashes
+}
+
+/// Fast hash of a FixedBitSet (for partition comparison, not for TT).
+fn hash_bitset(s: &FixedBitSet) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325; // FNV offset basis
+    for &word in s.as_slice() {
+        h ^= word as u64;
+        h = h.wrapping_mul(0x100000001b3); // FNV prime
+        h ^= (word >> 32) as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
 }
 
 fn find_violating_pair_cached(comp_sets: &[Vec<FixedBitSet>]) -> Option<(usize, usize)> {
@@ -811,11 +1061,10 @@ fn find_violating_pair_cached(comp_sets: &[Vec<FixedBitSet>]) -> Option<(usize, 
 }
 
 fn lsi_pair(a: &[FixedBitSet], b: &[FixedBitSet]) -> bool {
-    let mut a_keys: Vec<Vec<usize>> = a.iter().map(|s| leafset_key(s)).collect();
-    let mut b_keys: Vec<Vec<usize>> = b.iter().map(|s| leafset_key(s)).collect();
-    a_keys.sort();
-    b_keys.sort();
-    a_keys == b_keys
+    if a.len() != b.len() {
+        return false;
+    }
+    sorted_partition_hashes(a) == sorted_partition_hashes(b)
 }
 
 // ============================================================================
@@ -1876,12 +2125,17 @@ fn solve_decomposed(
     );
 
     let collapsed_into = build_collapsed_into(collapses, num_leaves);
+    let nc = non_iso_comps.len();
 
-    // Phase 1: Shallow probe (t=1)
-    let mut sub_forest_cache: Vec<Vec<XForest>> = Vec::with_capacity(non_iso_comps.len());
-    let mut shallow_results: Vec<Option<Vec<Tree>>> = Vec::with_capacity(non_iso_comps.len());
-    let mut lower_bounds: Vec<usize> = Vec::with_capacity(non_iso_comps.len());
+    // Phase 1: Shallow probe (t=1) for ALL components to establish lower bounds.
+    // Each component gets its own TT and Zobrist table that persist through
+    // the deep solve phase (Phase 2), giving cross-round TT reuse.
+    let mut sub_forest_cache: Vec<Vec<XForest>> = Vec::with_capacity(nc);
+    let mut shallow_results: Vec<Option<Vec<Tree>>> = Vec::with_capacity(nc);
+    let mut lower_bounds: Vec<usize> = Vec::with_capacity(nc);
     let mut total_lower_bound: usize = 0;
+    let mut comp_zobrist: Vec<ZobristTable> = Vec::with_capacity(nc);
+    let mut comp_tt: Vec<FxHashMap<u64, TTEntry>> = Vec::with_capacity(nc);
 
     for comp_ls in non_iso_comps {
         let sub_forests: Vec<XForest> = forests
@@ -1889,9 +2143,19 @@ fn solve_decomposed(
             .map(|f| XForest::from_tree(f.tree.prune_to_leafset(comp_ls)))
             .collect();
 
-        if let Some(result) =
-            alg_maf_standalone(sub_forests.clone(), 2, label_space, num_leaves, stats)
-        {
+        let zobrist = ZobristTable::new(label_space);
+        let mut tt: FxHashMap<u64, TTEntry> = FxHashMap::default();
+
+        let mut sub_state = SearchState::new(sub_forests.clone());
+        if let Some(result) = alg_maf(
+            &mut sub_state,
+            2,
+            label_space,
+            num_leaves,
+            stats,
+            &zobrist,
+            &mut tt,
+        ) {
             shallow_results.push(Some(result));
             lower_bounds.push(1);
             total_lower_bound += 1;
@@ -1901,6 +2165,8 @@ fn solve_decomposed(
             total_lower_bound += 2;
         }
         sub_forest_cache.push(sub_forests);
+        comp_zobrist.push(zobrist);
+        comp_tt.push(tt);
     }
 
     if total_lower_bound > remaining {
@@ -1908,9 +2174,13 @@ fn solve_decomposed(
         return None;
     }
 
-    // Phase 2: Deep solve
+    // Phase 2: Deep solve with progressive budget tightening.
+    // After solving each component, we replace its lower bound with the
+    // actual cost, which tightens budgets for subsequent components.
+    // TT from Phase 1 is reused so iterative deepening benefits from
+    // prior infeasibility proofs.
     let mut total_cost: usize = 0;
-    let mut component_results: Vec<Vec<Tree>> = Vec::with_capacity(non_iso_comps.len());
+    let mut component_results: Vec<Vec<Tree>> = Vec::with_capacity(nc);
 
     for (idx, _comp_ls) in non_iso_comps.iter().enumerate() {
         if let Some(ref result) = shallow_results[idx] {
@@ -1936,6 +2206,8 @@ fn solve_decomposed(
             }
             component_results.push(trees);
         } else {
+            // Compute budget using current (progressively tightened) lower bounds.
+            // For already-solved components, lower_bounds[i] == actual cost.
             let other_lb: usize = lower_bounds
                 .iter()
                 .enumerate()
@@ -1947,14 +2219,19 @@ fn solve_decomposed(
 
             let mut found = false;
             for cost in 2..=budget.min(comp_num_labels) {
-                if let Some(result) = alg_maf_standalone(
-                    sub_forest_cache[idx].clone(),
+                let mut sub_state = SearchState::new(sub_forest_cache[idx].clone());
+                if let Some(result) = alg_maf(
+                    &mut sub_state,
                     1 + cost,
                     label_space,
                     num_leaves,
                     stats,
+                    &comp_zobrist[idx],
+                    &mut comp_tt[idx],
                 ) {
                     total_cost += cost;
+                    // Progressive tightening: set this component's LB to actual cost
+                    lower_bounds[idx] = cost;
                     let mut trees = Vec::new();
                     for sub_tree in &result {
                         let mut sub_ls = FixedBitSet::with_capacity(label_space + 1);
@@ -1993,10 +2270,15 @@ fn solve_decomposed(
     // Assemble result
     let mut result_trees: Vec<Tree> = Vec::new();
 
+    // Pre-compute hashes of non-iso components for fast lookup
+    let non_iso_hashes: Vec<u64> = non_iso_comps.iter().map(|c| hash_bitset(c)).collect();
+
     for comp_ls in all_comps {
+        let h = hash_bitset(comp_ls);
         if non_iso_comps
             .iter()
-            .any(|c| leafset_key(c) == leafset_key(comp_ls))
+            .zip(non_iso_hashes.iter())
+            .any(|(c, &ch)| ch == h && c.as_slice() == comp_ls.as_slice())
         {
             continue;
         }
@@ -2099,46 +2381,23 @@ fn active_children_xf(forest: &XForest, node: NodeId) -> Children {
     out
 }
 
-fn component_leaf_sets_xf(forest: &XForest, label_space: usize) -> Vec<FixedBitSet> {
-    let mut visited = vec![false; forest.tree.num_nodes()];
+/// Get the leaf set for each component in the forest.
+///
+/// A component root is either a cut node or the tree root.
+/// Its `live_leafsets` already contains exactly the active labels in
+/// that component, so we just clone those -- no tree walk needed.
+fn component_leaf_sets_xf(forest: &XForest, _label_space: usize) -> Vec<FixedBitSet> {
     let mut components = Vec::new();
-    for node in forest.tree.pre_order() {
-        if forest.live_leafsets[node as usize].count_ones(..) == 0 {
-            continue;
-        }
-        let is_comp_root = if forest.is_cut(node) {
-            true
-        } else {
-            let parent = forest.tree.parent[node as usize];
-            parent == NONE
-        };
-        if !is_comp_root {
-            continue;
-        }
-        if visited[node as usize] {
-            continue;
-        }
-        let mut set = FixedBitSet::with_capacity(label_space + 1);
-        set.grow(label_space + 1);
-        let mut stack = vec![node];
-        visited[node as usize] = true;
-        while let Some(cur) = stack.pop() {
-            if forest.tree.is_leaf(cur) && forest.live_leafsets[cur as usize].count_ones(..) > 0 {
-                set.union_with(&forest.live_leafsets[cur as usize]);
-            }
-            if let Some((left, right)) = forest.tree.children(cur) {
-                if left != NONE && !forest.is_cut(left) && !visited[left as usize] {
-                    visited[left as usize] = true;
-                    stack.push(left);
-                }
-                if right != NONE && !forest.is_cut(right) && !visited[right as usize] {
-                    visited[right as usize] = true;
-                    stack.push(right);
-                }
-            }
-        }
-        if set.count_ones(..) > 0 {
-            components.push(set);
+    // The tree root is always a component root (if it has live labels)
+    let root_ls = &forest.live_leafsets[forest.tree.root as usize];
+    if root_ls.count_ones(..) > 0 {
+        components.push(root_ls.clone());
+    }
+    // Every cut node is a component root
+    for node in forest.cut_edges.ones() {
+        let ls = &forest.live_leafsets[node];
+        if ls.count_ones(..) > 0 {
+            components.push(ls.clone());
         }
     }
     components
@@ -2147,10 +2406,6 @@ fn component_leaf_sets_xf(forest: &XForest, label_space: usize) -> Vec<FixedBitS
 // ============================================================================
 // Pure utility functions
 // ============================================================================
-
-fn leafset_key(set: &FixedBitSet) -> Vec<usize> {
-    set.as_slice().to_vec()
-}
 
 /// Compute canonical form of a tree restricted to a label-set without building a pruned tree.
 fn tree_canonical_for_labels(tree: &Tree, labels: &FixedBitSet) -> String {
