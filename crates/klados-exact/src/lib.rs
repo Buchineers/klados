@@ -2,7 +2,6 @@
 //!
 //! Each approach is implemented as its own solver and registered here.
 
-mod fpt;
 pub mod lower_bound;
 mod maf_ilp;
 mod shi_mestel;
@@ -22,7 +21,6 @@ pub trait ExactSolver {
 /// Return all available exact solvers.
 pub fn available_solvers() -> Vec<Box<dyn ExactSolver>> {
     vec![
-        Box::new(fpt::FptSolver::new()),
         Box::new(shi_mestel::ShiMestelSolver::new()),
         Box::new(maf_ilp::MafIlpSolver::new()),
     ]
@@ -31,9 +29,6 @@ pub fn available_solvers() -> Vec<Box<dyn ExactSolver>> {
 /// Lookup solver by name (case-insensitive).
 pub fn solver_by_name(name: &str) -> Option<Box<dyn ExactSolver>> {
     let name = name.trim().to_ascii_lowercase();
-    if name == "fpt" {
-        return Some(Box::new(fpt::FptSolver::new()));
-    }
     if name == "shi-mestel" || name == "shimestel" {
         return Some(Box::new(shi_mestel::ShiMestelSolver::new()));
     }
@@ -51,12 +46,6 @@ pub fn solver_by_name(name: &str) -> Option<Box<dyn ExactSolver>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_registry_has_fpt() {
-        let solver = solver_by_name("whidden");
-        assert!(solver.is_some());
-    }
 
     #[test]
     fn test_registry_has_shi_mestel() {

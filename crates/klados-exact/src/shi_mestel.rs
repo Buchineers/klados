@@ -21,17 +21,6 @@ fn profile_enabled() -> bool {
     *CACHED.get_or_init(|| std::env::var("SHI_MESTEL_PROFILE").ok().as_deref() == Some("1"))
 }
 
-fn split_tree_limit() -> usize {
-    use std::sync::OnceLock;
-    static CACHED: OnceLock<usize> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        std::env::var("SHI_MESTEL_SPLIT_TREES")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(usize::MAX)
-    })
-}
-
 thread_local! {
     static SPLIT_STATS: std::cell::RefCell<SplitStats> = std::cell::RefCell::new(SplitStats::default());
 }
@@ -1322,8 +1311,7 @@ fn apply_split_branching_cached(
         return (false, None);
     }
 
-    if let Some((forest_idx, comp_a, comp_b, edge_child)) =
-        find_overlap_any_tree(&state.forests, comps, split_tree_limit())
+    if let Some((forest_idx, comp_a, comp_b, edge_child)) = find_best_overlap(&state.forests, comps)
     {
         if profile_enabled() {
             SPLIT_STATS.with(|s| s.borrow_mut().triggered += 1);
@@ -1445,21 +1433,67 @@ fn split_component_branch(
     None
 }
 
-fn find_overlap_any_tree(
+/// Scan all trees for overlapping components and select the overlap whose
+/// splitting core is smallest (fewest branches = best branching factor).
+fn find_best_overlap(
     forests: &[XForest],
     comps: &[FixedBitSet],
-    tree_limit: usize,
 ) -> Option<(usize, usize, usize, NodeId)> {
-    let limit = tree_limit.min(forests.len());
     if profile_enabled() {
-        SPLIT_STATS.with(|s| s.borrow_mut().trees_scanned += limit as u64);
+        SPLIT_STATS.with(|s| s.borrow_mut().trees_scanned += forests.len() as u64);
     }
-    for (forest_idx, forest) in forests.iter().enumerate().take(limit) {
+
+    let mut best: Option<(usize, usize, usize, NodeId)> = None;
+    let mut best_score = usize::MAX;
+
+    for (forest_idx, forest) in forests.iter().enumerate() {
         if let Some((a, b, edge_child)) = find_overlap_in_tree(forest, comps) {
-            return Some((forest_idx, a, b, edge_child));
+            // Evaluate splitting core quality for both components
+            let score = overlap_score(forest, comps, a, b, edge_child);
+            if score < best_score {
+                best_score = score;
+                best = Some((forest_idx, a, b, edge_child));
+                // A single-cut core is optimal; stop early
+                if best_score <= 1 {
+                    break;
+                }
+            }
         }
     }
-    None
+    best
+}
+
+/// Score an overlap by the minimum splitting core size across both components.
+/// Lower is better (fewer branches in the split).
+fn overlap_score(
+    forest: &XForest,
+    comps: &[FixedBitSet],
+    comp_a: usize,
+    comp_b: usize,
+    edge_child: NodeId,
+) -> usize {
+    let tree = &forest.tree;
+    let full_leafsets = &forest.full_leafsets;
+
+    let mut best = usize::MAX;
+    for &comp_idx in &[comp_a, comp_b] {
+        let comp = &comps[comp_idx];
+        let mut y = full_leafsets[edge_child as usize].clone();
+        y.intersect_with(comp);
+        if y.count_ones(..) == 0 {
+            continue;
+        }
+        let mut z = comp.clone();
+        z.difference_with(&y);
+        if z.count_ones(..) == 0 {
+            continue;
+        }
+        let core = splitting_core(tree, full_leafsets, comp, &y, &z);
+        if !core.is_empty() && core.len() < best {
+            best = core.len();
+        }
+    }
+    best
 }
 
 fn find_overlap_in_tree(forest: &XForest, comps: &[FixedBitSet]) -> Option<(usize, usize, NodeId)> {
@@ -1645,10 +1679,11 @@ fn count_intersection(a: &FixedBitSet, b: &FixedBitSet) -> usize {
 // ============================================================================
 
 fn find_best_sibling_pair(forests: &[XForest], label_space: usize) -> Option<(u32, u32)> {
+    let mut seen = fxhash::FxHashSet::default();
     let mut all_pairs: Vec<(u32, u32)> = Vec::new();
     for forest in forests {
         for pair in find_all_sibling_pairs(forest, label_space) {
-            if !all_pairs.contains(&pair) {
+            if seen.insert(pair) {
                 all_pairs.push(pair);
             }
         }
@@ -1672,37 +1707,52 @@ fn find_best_sibling_pair(forests: &[XForest], label_space: usize) -> Option<(u3
     Some(best_pair)
 }
 
+/// Score a sibling pair by the branching case it triggers.
+/// Higher score = better (lower branching factor).
+///
+/// Case 2.2.1 (deterministic cut, branching factor 1): score 10000
+/// BR 2.1 with |E_F| >= 3 (vector (1,1,>=3), factor ~2.21): score 5000 + |E_F|
+/// BR 2.1 with |E_F| == 2 (vector (1,1,2), factor ~2.41): score 3000
+/// BR 2.2.2 (vector (1,1,1), factor 3): score 0
+/// No useful branching: score -1000
 fn score_sibling_pair(forests: &[XForest], a: u32, b: u32) -> i32 {
     let e_sizes: Vec<usize> = forests.iter().map(|f| compute_e_f(f, a, b).len()).collect();
     let max_e = e_sizes.iter().copied().max().unwrap_or(0);
 
-    if max_e >= 2 {
-        100 + max_e as i32
-    } else {
-        let omega1: Vec<usize> = e_sizes
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| **e == 1)
-            .map(|(i, _)| i)
-            .collect();
+    let omega1: Vec<usize> = e_sizes
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| **e == 1)
+        .map(|(i, _)| i)
+        .collect();
 
-        if omega1.is_empty() {
-            -100
-        } else if omega1.len() == 1 {
-            1000
-        } else {
-            let lca_sets: Vec<FixedBitSet> = omega1
-                .iter()
-                .map(|&i| lca_leafset(&forests[i], a, b))
-                .collect();
-            let all_same_lca = lca_sets.windows(2).all(|w| w[0] == w[1]);
-            if all_same_lca {
-                1000
-            } else {
-                0
-            }
+    // Check for Case 2.2.1 (deterministic): all omega1 forests have same LCA leafset
+    if !omega1.is_empty() {
+        let lca_sets: Vec<FixedBitSet> = omega1
+            .iter()
+            .map(|&i| lca_leafset(&forests[i], a, b))
+            .collect();
+        let all_same_lca = lca_sets.windows(2).all(|w| w[0] == w[1]);
+        if all_same_lca {
+            return 10000; // Best: deterministic reduction, no branching
         }
     }
+
+    // BR 2.1: 3-way branch (1, 1, |E_F|)
+    if max_e >= 3 {
+        return 5000 + max_e as i32;
+    }
+    if max_e >= 2 {
+        return 3000;
+    }
+
+    // BR 2.2.2: 3-way branch (1, 1, 1) — worst branching factor
+    if !omega1.is_empty() {
+        return 0;
+    }
+
+    // No useful branching found
+    -1000
 }
 
 fn compute_e_f(forest: &XForest, a: u32, b: u32) -> Vec<NodeId> {
@@ -2100,7 +2150,78 @@ fn classify_components_cached(
         }
     }
 
+    // Sort non-iso components by size (smallest first).
+    // In decomposition, solving small components first yields tighter
+    // progressive budget bounds for the remaining larger components.
+    non_iso.sort_by_key(|c| c.count_ones(..));
+
     (all_comps, non_iso)
+}
+
+/// Check if a component is pendant in a tree: its embedding shares no edges
+/// with other components. Equivalent to: there exists a node v in the tree
+/// such that the full leafset of v, intersected with the union of all active
+/// labels, equals exactly the component's label set.
+#[allow(dead_code)]
+fn is_pendant_in_tree(
+    tree: &Tree,
+    full_leafsets: &[FixedBitSet],
+    comp: &FixedBitSet,
+    all_active: &FixedBitSet,
+) -> bool {
+    for node in tree.pre_order() {
+        if tree.is_leaf(node) {
+            continue;
+        }
+        let node_ls = &full_leafsets[node as usize];
+        // Check: node_ls ∩ all_active == comp
+        let node_sl = node_ls.as_slice();
+        let active_sl = all_active.as_slice();
+        let comp_sl = comp.as_slice();
+        let len = node_sl.len().min(active_sl.len()).min(comp_sl.len());
+
+        let mut matches = true;
+        for k in 0..len {
+            if (node_sl[k] & active_sl[k]) != comp_sl[k] {
+                matches = false;
+                break;
+            }
+        }
+        if matches {
+            // Check remaining words in comp_sl are zero
+            for k in len..comp_sl.len() {
+                if comp_sl[k] != 0 {
+                    matches = false;
+                    break;
+                }
+            }
+        }
+        if matches {
+            // Check remaining words in (node ∩ active) beyond comp are zero
+            for k in len..node_sl.len().min(active_sl.len()) {
+                if node_sl[k] & active_sl[k] != 0 {
+                    matches = false;
+                    break;
+                }
+            }
+        }
+        if matches {
+            return true;
+        }
+    }
+    false
+}
+
+/// Check if a component is pendant in ALL trees.
+#[allow(dead_code)]
+fn is_pendant_in_all_trees(
+    forests: &[XForest],
+    comp: &FixedBitSet,
+    all_active: &FixedBitSet,
+) -> bool {
+    forests
+        .iter()
+        .all(|f| is_pendant_in_tree(&f.tree, &f.full_leafsets, comp, all_active))
 }
 
 /// Solve independent component sub-problems (Recursion Rule with t=1 shallow probe)
@@ -2138,31 +2259,69 @@ fn solve_decomposed(
     let mut comp_tt: Vec<FxHashMap<u64, TTEntry>> = Vec::with_capacity(nc);
 
     for comp_ls in non_iso_comps {
-        let sub_forests: Vec<XForest> = forests
+        let sub_trees: Vec<Tree> = forests
             .iter()
-            .map(|f| XForest::from_tree(f.tree.prune_to_leafset(comp_ls)))
+            .map(|f| f.tree.prune_to_leafset(comp_ls))
+            .collect();
+        let sub_forests: Vec<XForest> = sub_trees
+            .iter()
+            .map(|t| XForest::from_tree(t.clone()))
             .collect();
 
         let zobrist = ZobristTable::new(label_space);
         let mut tt: FxHashMap<u64, TTEntry> = FxHashMap::default();
 
-        let mut sub_state = SearchState::new(sub_forests.clone());
-        if let Some(result) = alg_maf(
-            &mut sub_state,
-            2,
-            label_space,
-            num_leaves,
-            stats,
-            &zobrist,
-            &mut tt,
-        ) {
-            shallow_results.push(Some(result));
-            lower_bounds.push(1);
-            total_lower_bound += 1;
+        // Use pairwise approximation to get a tighter initial lower bound
+        // than the shallow probe alone (which only distinguishes 1 vs 2).
+        let approx_lb = crate::lower_bound::maf_bounds(&sub_trees, num_leaves).lower;
+
+        if approx_lb <= 1 {
+            // Approximation says 1 component suffices -- but we know it's
+            // non-isomorphic so it needs at least 2. Use shallow probe.
+            let mut sub_state = SearchState::new(sub_forests.clone());
+            if let Some(result) = alg_maf(
+                &mut sub_state,
+                2,
+                label_space,
+                num_leaves,
+                stats,
+                &zobrist,
+                &mut tt,
+            ) {
+                shallow_results.push(Some(result));
+                lower_bounds.push(1);
+                total_lower_bound += 1;
+            } else {
+                shallow_results.push(None);
+                lower_bounds.push(2);
+                total_lower_bound += 2;
+            }
+        } else if approx_lb == 2 {
+            // Try shallow probe at target_s=2
+            let mut sub_state = SearchState::new(sub_forests.clone());
+            if let Some(result) = alg_maf(
+                &mut sub_state,
+                2,
+                label_space,
+                num_leaves,
+                stats,
+                &zobrist,
+                &mut tt,
+            ) {
+                shallow_results.push(Some(result));
+                lower_bounds.push(1);
+                total_lower_bound += 1;
+            } else {
+                shallow_results.push(None);
+                lower_bounds.push(2);
+                total_lower_bound += 2;
+            }
         } else {
+            // approx_lb >= 3: skip shallow probe, use approximation bound
+            // The component needs at least approx_lb components = approx_lb - 1 cuts
             shallow_results.push(None);
-            lower_bounds.push(2);
-            total_lower_bound += 2;
+            lower_bounds.push(approx_lb - 1); // cuts, not components
+            total_lower_bound += approx_lb - 1;
         }
         sub_forest_cache.push(sub_forests);
         comp_zobrist.push(zobrist);
@@ -2218,7 +2377,8 @@ fn solve_decomposed(
             let comp_num_labels = non_iso_comps[idx].count_ones(..) as usize;
 
             let mut found = false;
-            for cost in 2..=budget.min(comp_num_labels) {
+            let start_cost = lower_bounds[idx].max(2);
+            for cost in start_cost..=budget.min(comp_num_labels) {
                 let mut sub_state = SearchState::new(sub_forest_cache[idx].clone());
                 if let Some(result) = alg_maf(
                     &mut sub_state,
@@ -2407,13 +2567,20 @@ fn component_leaf_sets_xf(forest: &XForest, _label_space: usize) -> Vec<FixedBit
 // Pure utility functions
 // ============================================================================
 
-/// Compute canonical form of a tree restricted to a label-set without building a pruned tree.
-fn tree_canonical_for_labels(tree: &Tree, labels: &FixedBitSet) -> String {
-    fn build(tree: &Tree, node: NodeId, labels: &FixedBitSet) -> Option<String> {
+/// Compute a canonical hash of a tree restricted to a label-set.
+/// Uses a Merkle-style bottom-up hash: leaves hash their label,
+/// internal nodes hash (min(left,right), max(left,right)) for
+/// order-independence. Zero-allocation alternative to string canonicalization.
+fn tree_canonical_for_labels(tree: &Tree, labels: &FixedBitSet) -> u64 {
+    fn build(tree: &Tree, node: NodeId, labels: &FixedBitSet) -> Option<u64> {
         if tree.is_leaf(node) {
             let lbl = tree.label[node as usize];
             if labels.contains(lbl as usize) {
-                return Some(lbl.to_string());
+                // Hash the label with a mixing constant to avoid trivial collisions
+                let mut h = lbl as u64;
+                h = h.wrapping_mul(0x9e3779b97f4a7c15);
+                h ^= h >> 30;
+                return Some(h);
             } else {
                 return None;
             }
@@ -2422,11 +2589,16 @@ fn tree_canonical_for_labels(tree: &Tree, labels: &FixedBitSet) -> String {
             let left = build(tree, l, labels);
             let right = build(tree, r, labels);
             match (left, right) {
-                (Some(mut a), Some(mut b)) => {
-                    if a > b {
-                        std::mem::swap(&mut a, &mut b);
-                    }
-                    Some(format!("({},{})", a, b))
+                (Some(a), Some(b)) => {
+                    // Order-independent: sort the two hashes
+                    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                    // Combine with a mixing step that distinguishes structure
+                    let mut h = lo;
+                    h = h.wrapping_mul(0xbf58476d1ce4e5b9);
+                    h ^= hi;
+                    h = h.wrapping_mul(0x94d049bb133111eb);
+                    h ^= h >> 31;
+                    Some(h)
                 }
                 (Some(a), None) => Some(a),
                 (None, Some(b)) => Some(b),
@@ -2437,9 +2609,9 @@ fn tree_canonical_for_labels(tree: &Tree, labels: &FixedBitSet) -> String {
         }
     }
     if tree.root == NONE {
-        String::new()
+        0
     } else {
-        build(tree, tree.root, labels).unwrap_or_default()
+        build(tree, tree.root, labels).unwrap_or(0)
     }
 }
 

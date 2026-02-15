@@ -26,8 +26,8 @@ struct Cli {
 enum Commands {
     /// Run exact solver (default)
     Exact {
-        /// Exact approach name (e.g., fpt)
-        #[arg(long, default_value = "whidden")]
+        /// Exact approach name (shi-mestel or ilp)
+        #[arg(long, default_value = "shi-mestel")]
         approach: String,
     },
     /// Show instance info
@@ -71,9 +71,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Run exact solver
             let mut solver = solver_by_name(&approach)
                 .unwrap_or_else(|| panic!("Unknown approach: {}", approach));
-            let components = solver
-                .solve(&instance)
-                .expect("Failed to find solution");
+            let components = solver.solve(&instance).expect("Failed to find solution");
 
             if cli.verbose {
                 eprintln!("Solution: {} components", components.len());
@@ -87,10 +85,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         None => {
-            let mut solver = solver_by_name("whidden").expect("Missing default solver");
-            let components = solver
-                .solve(&instance)
-                .expect("Failed to find solution");
+            let mut solver = solver_by_name("shi-mestel").expect("Missing default solver");
+            let components = solver.solve(&instance).expect("Failed to find solution");
 
             if cli.verbose {
                 eprintln!("Solution: {} components", components.len());
