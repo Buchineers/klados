@@ -3,8 +3,8 @@
 //! Trees are stored in a cache-efficient Structure-of-Arrays (SoA) layout.
 //! All nodes are indices into contiguous vectors, avoiding pointer chasing.
 
-use pace26io::binary_tree::{TopDownCursor, Label as PaceLabel};
 use fixedbitset::FixedBitSet;
+use pace26io::binary_tree::{Label as PaceLabel, TopDownCursor};
 
 /// Node identifier (index into arena vectors)
 pub type NodeId = u32;
@@ -84,7 +84,7 @@ impl Tree {
         if let Some((left_cursor, right_cursor)) = cursor.children() {
             // Internal node
             self.label.push(0);
-            
+
             // Add placeholder children (will be updated)
             self.left.push(NONE);
             self.right.push(NONE);
@@ -236,6 +236,71 @@ impl Tree {
         }
     }
 
+    /// Create a new tree with labels remapped according to the given mapping.
+    ///
+    /// `new_num_leaves` is the size of the new label space (labels will be 1..=new_num_leaves).
+    /// `label_map[old_label]` = new_label for each leaf label present in this tree.
+    /// Labels not in the map (value 0) are treated as absent — their leaves are pruned
+    /// and degree-1 internal nodes are suppressed.
+    pub fn relabel(&self, label_map: &[Label], new_num_leaves: u32) -> Self {
+        let mut out = Tree::with_capacity(new_num_leaves);
+
+        fn build(src: &Tree, label_map: &[Label], out: &mut Tree, node: NodeId) -> Option<NodeId> {
+            if src.is_leaf(node) {
+                let old_lbl = src.label[node as usize];
+                if old_lbl == 0 {
+                    return None;
+                }
+                let new_lbl = if (old_lbl as usize) < label_map.len() {
+                    label_map[old_lbl as usize]
+                } else {
+                    0
+                };
+                if new_lbl == 0 {
+                    return None;
+                }
+                let id = out.parent.len() as NodeId;
+                out.parent.push(NONE);
+                out.left.push(NONE);
+                out.right.push(NONE);
+                out.label.push(new_lbl);
+                out.label_to_node[new_lbl as usize] = id;
+                return Some(id);
+            }
+
+            let (left, right) = src.children(node).unwrap();
+            let l = build(src, label_map, out, left);
+            let r = build(src, label_map, out, right);
+
+            match (l, r) {
+                (None, None) => None,
+                (Some(child), None) | (None, Some(child)) => Some(child),
+                (Some(lc), Some(rc)) => {
+                    let id = out.parent.len() as NodeId;
+                    out.parent.push(NONE);
+                    out.left.push(lc);
+                    out.right.push(rc);
+                    out.label.push(0);
+                    out.parent[lc as usize] = id;
+                    out.parent[rc as usize] = id;
+                    Some(id)
+                }
+            }
+        }
+
+        if self.root != NONE {
+            if let Some(root) = build(self, label_map, &mut out, self.root) {
+                out.root = root;
+                out.parent[root as usize] = NONE;
+            } else {
+                out.root = NONE;
+            }
+        }
+
+        out.compute_metadata();
+        out
+    }
+
     /// Create a new tree that contains only leaves in `keep`.
     ///
     /// Suppresses degree-1 internal nodes to keep the tree binary.
@@ -243,12 +308,7 @@ impl Tree {
     pub fn prune_to_leafset(&self, keep: &FixedBitSet) -> Self {
         let mut out = Tree::with_capacity(self.num_leaves);
 
-        fn build(
-            src: &Tree,
-            keep: &FixedBitSet,
-            out: &mut Tree,
-            node: NodeId,
-        ) -> Option<NodeId> {
+        fn build(src: &Tree, keep: &FixedBitSet, out: &mut Tree, node: NodeId) -> Option<NodeId> {
             if src.is_leaf(node) {
                 let lbl = src.label[node as usize];
                 if lbl != 0 && keep.contains(lbl as usize) {
@@ -308,8 +368,14 @@ impl<'a> TopDownCursor for TreeCursor<'a> {
     fn children(&self) -> Option<(Self, Self)> {
         self.tree.children(self.node).map(|(l, r)| {
             (
-                TreeCursor { tree: self.tree, node: l },
-                TreeCursor { tree: self.tree, node: r },
+                TreeCursor {
+                    tree: self.tree,
+                    node: l,
+                },
+                TreeCursor {
+                    tree: self.tree,
+                    node: r,
+                },
             )
         })
     }
