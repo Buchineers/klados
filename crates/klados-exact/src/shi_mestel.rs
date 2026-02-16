@@ -487,39 +487,49 @@ fn exact_pairwise_lower_bound(
     let m = trees.len();
     let mut best_lb = approx_lb;
 
-    // Collect all pairs with their approximate costs, sorted by cost
-    // descending (most promising pairs first).
-    let mut pairs: Vec<(usize, usize, usize)> = Vec::new(); // (i, j, approx_cost)
+    // Collect all pairs with their upper-bound costs (cherry reduction),
+    // sorted descending (most promising pairs first).
+    let mut pairs: Vec<(usize, usize, usize, usize)> = Vec::new(); // (i, j, cherry_ub, two_approx)
     for i in 0..m {
         for j in (i + 1)..m {
-            let approx_cost = crate::lower_bound::approx_rspr_distance_pub(&trees[i], &trees[j]);
-            pairs.push((i, j, approx_cost));
+            let cherry_ub = crate::lower_bound::approx_rspr_distance_pub(&trees[i], &trees[j]);
+            let two_approx = crate::lower_bound::red_blue_approx_pub(&trees[i], &trees[j]);
+            pairs.push((i, j, cherry_ub, two_approx));
         }
     }
-    // Sort by approx_cost descending: highest-distance pairs first
     pairs.sort_by(|a, b| b.2.cmp(&a.2));
 
-    // Time budget: spend at most 3 seconds total
     let total_budget = std::time::Duration::from_secs(3);
     let start = std::time::Instant::now();
     let per_pair_budget = total_budget / (pairs.len() as u32).max(1);
 
-    // Track exact distances for the additive bound (cuts = components - 1)
+    // Track exact and lower-bound distances for the additive bound
+    // exact_dist[i][j] = Some(d) means we know the exact pairwise distance is d
+    // lb_dist[i][j] = proven lower bound on d(i,j) (from 2-approx)
     let mut exact_dist: Vec<Vec<Option<usize>>> = vec![vec![None; m]; m];
+    let mut lb_dist: Vec<Vec<usize>> = vec![vec![0; m]; m];
 
-    for &(i, j, approx_cost) in &pairs {
+    // Initialize lb_dist from the 2-approximation
+    for &(i, j, _, two_approx) in &pairs {
+        let lb = (two_approx + 1) / 2; // ceil(two_approx / 2)
+        lb_dist[i][j] = lb;
+        lb_dist[j][i] = lb;
+    }
+
+    for &(i, j, cherry_ub, two_approx) in &pairs {
         if start.elapsed() >= total_budget {
             break;
         }
 
-        // Skip pairs whose approximate UB (approx_cost + 1) can't improve best_lb
-        // AND whose approx distance can't help the additive bound.
-        // For the additive bound, we need exact distances, so we still want to
-        // compute them even if they don't individually beat best_lb.
-        // But skip if approx_cost is very small (won't contribute much).
-        if approx_cost + 1 <= best_lb && approx_cost < 3 {
-            exact_dist[i][j] = Some(approx_cost);
-            exact_dist[j][i] = Some(approx_cost);
+        // Use 2-approximation lower bound for this pair
+        let pair_lb = (two_approx + 1) / 2; // ceil(two_approx / 2)
+
+        // Skip if this pair can't possibly improve the best lower bound
+        // (neither individually nor via the additive bound)
+        if cherry_ub + 1 <= best_lb && pair_lb < 2 {
+            // For very small pairs, the 2-approx LB is reliable enough
+            exact_dist[i][j] = Some(pair_lb);
+            exact_dist[j][i] = Some(pair_lb);
             continue;
         }
 
@@ -531,16 +541,15 @@ fn exact_pairwise_lower_bound(
         let zobrist = ZobristTable::new(label_space);
         let mut tt: FxHashMap<u64, TTEntry> = FxHashMap::default();
 
-        // Start iterative deepening from the approximation-based LB for this pair.
-        let pair_lb_start = (approx_cost + 2) / 3;
+        // Start iterative deepening from the 2-approx lower bound
+        let pair_lb_components = pair_lb + 1;
 
         let pair_start = std::time::Instant::now();
-        let mut pair_exact_components = pair_lb_start + 1; // fallback
-        let mut timed_out = false;
+        let mut pair_exact_components = pair_lb_components; // conservative fallback
+        let mut proven = false;
 
-        for target_s in (pair_lb_start + 1)..=(approx_cost + 1) {
+        for target_s in pair_lb_components..=(cherry_ub + 1) {
             if pair_start.elapsed() >= per_pair_budget {
-                timed_out = true;
                 break;
             }
 
@@ -558,6 +567,7 @@ fn exact_pairwise_lower_bound(
             .is_some()
             {
                 pair_exact_components = target_s;
+                proven = true;
                 trace!(
                     "exact pair ({},{}) = {} components",
                     i,
@@ -566,49 +576,48 @@ fn exact_pairwise_lower_bound(
                 );
                 break;
             }
+            // target_s failed, so the true answer is > target_s
             pair_exact_components = target_s + 1;
         }
 
-        // Store exact distance (cuts = components - 1)
+        // Store distance
         let exact_cuts = pair_exact_components - 1;
-        if !timed_out {
-            exact_dist[i][j] = Some(exact_cuts);
-            exact_dist[j][i] = Some(exact_cuts);
-        } else {
-            // Timed out: use the last proven lower bound (may be incomplete)
+        if proven {
+            // We found the exact answer
             exact_dist[i][j] = Some(exact_cuts);
             exact_dist[j][i] = Some(exact_cuts);
         }
+        // else: timed out — we have a proven lower bound (pair_exact_components - 1)
+        // but NOT an exact value. Update lb_dist if we improved it.
+        if exact_cuts > lb_dist[i][j] {
+            lb_dist[i][j] = exact_cuts;
+            lb_dist[j][i] = exact_cuts;
+        }
 
+        // Only update best_lb with proven lower bounds
         if pair_exact_components > best_lb {
             best_lb = pair_exact_components;
         }
 
-        // Early termination: if we've matched the UB, no need to check more pairs
         if best_lb >= upper_bound {
             return best_lb;
         }
     }
 
-    // Additive multi-tree lower bound using exact pairwise distances:
+    // Additive multi-tree lower bound using exact/lb pairwise distances:
     // OPT_cuts >= sum_{j!=i} d(i,j) / (m-1) for any reference tree i.
-    // This is tighter than the approximation-based additive bound because
-    // we don't lose the factor-3 from the cherry approximation.
     if m >= 3 {
         for i in 0..m {
             let mut sum_d = 0usize;
-            let mut all_known = true;
             for j in 0..m {
                 if i == j {
                     continue;
                 }
+                // Use exact distance if available, otherwise proven lower bound
                 if let Some(d) = exact_dist[i][j] {
                     sum_d += d;
                 } else {
-                    all_known = false;
-                    // Use approximation-based lower bound for unknown pairs
-                    let approx = crate::lower_bound::approx_rspr_distance_pub(&trees[i], &trees[j]);
-                    sum_d += (approx + 2) / 3; // ceil(approx/3) as conservative estimate
+                    sum_d += lb_dist[i][j];
                 }
             }
             let denom = m - 1;
@@ -616,12 +625,11 @@ fn exact_pairwise_lower_bound(
             let lb_components = lb_cuts + 1;
             if lb_components > best_lb {
                 trace!(
-                    "additive exact LB from ref {}: {} (sum_d={}, m-1={}, all_known={})",
+                    "additive exact LB from ref {}: {} (sum_d={}, m-1={})",
                     i,
                     lb_components,
                     sum_d,
                     denom,
-                    all_known
                 );
                 best_lb = lb_components;
             }
