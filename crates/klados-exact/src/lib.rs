@@ -3,7 +3,7 @@
 //! Each approach is implemented as its own solver and registered here.
 
 pub mod lower_bound;
-mod maf_ilp;
+pub mod maf_ilp;
 mod shi_mestel;
 
 use klados_core::{Instance, SolverStats, Tree};
