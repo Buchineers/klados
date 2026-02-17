@@ -51,6 +51,15 @@ enum Commands {
         #[arg(value_name = "FILE")]
         list_file: PathBuf,
     },
+    /// Compare LP relaxation bounds vs Olver 2-approx bounds
+    CompareBounds {
+        /// Path to best_known_scores.json file
+        #[arg(value_name = "FILE")]
+        scores_file: PathBuf,
+        /// Max leaves to test with LP (LP is slower for large instances)
+        #[arg(long, default_value = "50")]
+        max_leaves: u32,
+    },
 }
 
 #[derive(serde::Deserialize)]
@@ -74,6 +83,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(Commands::CheckBounds { list_file }) => {
             run_check_bounds(&list_file)?;
+            return Ok(());
+        }
+        Some(Commands::CompareBounds {
+            scores_file,
+            max_leaves,
+        }) => {
+            run_compare_bounds(&scores_file, max_leaves)?;
             return Ok(());
         }
         _ => {
@@ -263,34 +279,31 @@ fn run_validate_bounds(scores_file: &PathBuf) -> Result<(), Box<dyn std::error::
 
         // Check for BOTH upper and lower bound violations
         let reference = entry.best_known.min(entry.our_score);
-        let mut gap = 0;
-        let mut violation_type = "";
 
+        let gap;
         if bounds.upper < reference {
             // Upper bound violation: our upper < optimal
             upper_violations += 1;
             gap = reference - bounds.upper;
-            violation_type = "UPPER";
             violation_list.push((
                 digest.clone(),
                 bounds.lower,
                 bounds.upper,
                 reference,
                 gap,
-                violation_type.to_string(),
+                "UPPER".to_string(),
             ));
         } else if bounds.lower > reference {
             // Lower bound violation: our lower > optimal
             lower_violations += 1;
             gap = bounds.lower - reference;
-            violation_type = "LOWER";
             violation_list.push((
                 digest.clone(),
                 bounds.lower,
                 bounds.upper,
                 reference,
                 gap,
-                violation_type.to_string(),
+                "LOWER".to_string(),
             ));
         } else {
             gap = bounds.upper - reference;
@@ -549,6 +562,157 @@ fn run_check_bounds(list_file: &PathBuf) -> Result<(), Box<dyn std::error::Error
 
     if errors == 0 && processed > 0 {
         println!("\n✓ All {} instances processed successfully", processed);
+    }
+
+    Ok(())
+}
+
+fn run_compare_bounds(
+    scores_file: &PathBuf,
+    max_leaves: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Read the scores file
+    let content = fs::read_to_string(scores_file)?;
+    let entries: HashMap<String, ScoreEntry> = serde_json::from_str(&content)?;
+
+    // Filter to multi-tree instances with <= max_leaves
+    let test_entries: Vec<_> = entries
+        .iter()
+        .filter(|(_, entry)| entry.trees >= 3 && entry.leaves <= max_leaves as usize)
+        .collect();
+
+    println!(
+        "Analyzing bounds gaps on {} multi-tree instances (<= {} leaves)...\n",
+        test_entries.len(),
+        max_leaves
+    );
+    println!(
+        "{:<40} {:>6} {:>6} {:>6} {:>10} {:>10} {:>10} {:>10}",
+        "Instance", "Leaves", "Trees", "Best", "Olver LB", "Gap", "Time(ms)", "Gap/Best%"
+    );
+    println!("{}", "-".repeat(100));
+
+    let mut total_time_ms = 0.0f64;
+    let mut processed = 0usize;
+    let mut errors = 0usize;
+    let mut total_gap = 0usize;
+    let mut gap_histogram: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::new();
+
+    for (digest, entry) in test_entries {
+        let path = &entry.path;
+
+        if !std::path::Path::new(path).exists() {
+            println!(
+                "{:<40} {:>6} {:>6} FILE NOT FOUND",
+                &digest[..20],
+                entry.leaves,
+                entry.trees
+            );
+            errors += 1;
+            continue;
+        }
+
+        // Read and parse instance
+        let file_content = match fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => {
+                println!(
+                    "{:<40} {:>6} {:>6} READ ERROR",
+                    &digest[..20],
+                    entry.leaves,
+                    entry.trees
+                );
+                errors += 1;
+                continue;
+            }
+        };
+
+        let reader = BufReader::new(file_content.as_bytes());
+        let mut builder = IndexedBinTreeBuilder::default();
+        let pace = match PaceInstance::try_read(reader, &mut builder) {
+            Ok(p) => p,
+            Err(_) => {
+                println!(
+                    "{:<40} {:>6} {:>6} PARSE ERROR",
+                    &digest[..20],
+                    entry.leaves,
+                    entry.trees
+                );
+                errors += 1;
+                continue;
+            }
+        };
+
+        let num_leaves = pace.num_leaves as u32;
+        let trees: Vec<Tree> = pace
+            .trees
+            .iter()
+            .map(|t| Tree::from_cursor(t.top_down(), num_leaves))
+            .collect();
+        let instance = Instance::new(trees, num_leaves);
+
+        // Time bounds computation
+        let start = Instant::now();
+        let bounds = maf_bounds(&instance.trees, instance.num_leaves);
+        let elapsed_ms = start.elapsed().as_micros() as f64 / 1000.0;
+        total_time_ms += elapsed_ms;
+
+        let best = entry.best_known;
+        let olver_lb = bounds.lower;
+        let gap = best.saturating_sub(olver_lb);
+        total_gap += gap;
+        *gap_histogram.entry(gap).or_insert(0) += 1;
+
+        let gap_pct = if best > 0 {
+            (gap as f64 / best as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        let name = if entry.name.is_empty() {
+            digest[..20].to_string()
+        } else {
+            format!(
+                "{} ({})",
+                &entry.name[..entry.name.len().min(15)],
+                &digest[..8]
+            )
+        };
+
+        println!(
+            "{:<40} {:>6} {:>6} {:>6} {:>10} {:>10} {:>10.2} {:>9.1}%",
+            name, entry.leaves, entry.trees, best, olver_lb, gap, elapsed_ms, gap_pct
+        );
+
+        processed += 1;
+    }
+
+    println!("{}", "-".repeat(100));
+    println!("\n=== GAP ANALYSIS SUMMARY ===");
+    println!("Instances tested:    {}", processed);
+    println!("Errors:              {}", errors);
+    println!("Total gap:           {}", total_gap);
+    println!(
+        "Mean gap:            {:.2}",
+        if processed > 0 {
+            total_gap as f64 / processed as f64
+        } else {
+            0.0
+        }
+    );
+    println!(
+        "Mean time:           {:.2} ms",
+        total_time_ms / processed as f64
+    );
+
+    // Show gap distribution
+    println!("\nGap distribution:");
+    let mut gaps: Vec<_> = gap_histogram.iter().collect();
+    gaps.sort_by_key(|(g, _)| **g);
+    for (gap, count) in gaps.iter().take(15) {
+        let bar = "█".repeat(*count / processed.max(1) * 50 + 1);
+        println!("  gap={:>2}: {:>4} instances {}", gap, count, bar);
     }
 
     Ok(())

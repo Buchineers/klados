@@ -56,29 +56,6 @@ pub fn maf_bounds(trees: &[Tree], num_leaves: u32) -> MafBounds {
         }
     }
 
-    // Multi-tree additive lower bound using 2-approx pairwise distances
-    // DISABLED: This bound can be incorrect for some multi-tree instances
-    // For now, we use only pairwise bounds which are proven correct for 2-tree instances
-    if false && m >= 3 {
-        let mut pairwise = vec![vec![0usize; m]; m];
-        for i in 0..m {
-            for j in (i + 1)..m {
-                let a = red_blue_approx(&trees[i], &trees[j]);
-                pairwise[i][j] = a;
-                pairwise[j][i] = a;
-            }
-        }
-        for i in 0..m {
-            let sum_d: usize = pairwise[i].iter().sum();
-            let denom = 2 * (m - 1);
-            let lb_cuts = (sum_d + denom - 1) / denom;
-            let lb_components = lb_cuts + 1;
-            if lb_components > best_lb {
-                best_lb = lb_components;
-            }
-        }
-    }
-
     let upper = if trees.len() == 2 {
         best_ub_pair.min(num_leaves as usize)
     } else {
@@ -273,12 +250,6 @@ impl TreeData {
             }
         }
         result
-    }
-
-    /// Check if u is an ancestor of v (or equal) using depth + LCA.
-    #[inline]
-    fn is_ancestor_or_eq(&self, u: NodeId, v: NodeId) -> bool {
-        self.lca(u, v) == u
     }
 }
 
