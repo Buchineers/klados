@@ -492,6 +492,8 @@ dependencies = [
  "klados-core",
  "klados-exact",
  "pace26io",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

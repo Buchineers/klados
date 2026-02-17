@@ -36,6 +36,8 @@ klados-core = { workspace = true }
 klados-exact = { workspace = true }
 pace26io = { workspace = true }
 clap = { workspace = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 
 [profile.release]
 lto = "fat"
