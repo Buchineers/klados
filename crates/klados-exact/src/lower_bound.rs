@@ -422,19 +422,49 @@ fn is_triple_compatible(td1: &TreeData, td2: &TreeData, x1: Label, x2: Label, x3
     let n2 = td1.tree.label_to_node[x2 as usize];
     let n3 = td1.tree.label_to_node[x3 as usize];
 
-    let lca12_1 = td1.lca(n1, n2);
-    let lca123_1 = td1.lca(lca12_1, n3);
-    let strict1 = lca12_1 != lca123_1;
-
     let m1 = td2.tree.label_to_node[x1 as usize];
     let m2 = td2.tree.label_to_node[x2 as usize];
     let m3 = td2.tree.label_to_node[x3 as usize];
 
+    // Check all three pairings: (x1,x2), (x1,x3), (x2,x3)
+    // For each, check if lca(pair) < lca(all three) matches between trees
+
+    // Pair (x1, x2)
+    let lca12_1 = td1.lca(n1, n2);
+    let lca123_1 = td1.lca(lca12_1, n3);
+    let strict12_1 = lca12_1 != lca123_1;
+
     let lca12_2 = td2.lca(m1, m2);
     let lca123_2 = td2.lca(lca12_2, m3);
-    let strict2 = lca12_2 != lca123_2;
+    let strict12_2 = lca12_2 != lca123_2;
 
-    strict1 == strict2
+    if strict12_1 != strict12_2 {
+        return false;
+    }
+
+    // Pair (x1, x3)
+    let lca13_1 = td1.lca(n1, n3);
+    let lca123_1b = td1.lca(lca13_1, n2);
+    let strict13_1 = lca13_1 != lca123_1b;
+
+    let lca13_2 = td2.lca(m1, m3);
+    let lca123_2b = td2.lca(lca13_2, m2);
+    let strict13_2 = lca13_2 != lca123_2b;
+
+    if strict13_1 != strict13_2 {
+        return false;
+    }
+
+    // Pair (x2, x3)
+    let lca23_1 = td1.lca(n2, n3);
+    let lca123_1c = td1.lca(lca23_1, n1);
+    let strict23_1 = lca23_1 != lca123_1c;
+
+    let lca23_2 = td2.lca(m2, m3);
+    let lca123_2c = td2.lca(lca23_2, m1);
+    let strict23_2 = lca23_2 != lca123_2c;
+
+    strict23_1 == strict23_2
 }
 
 /// Check if a set of labels (given as a bitset) is compatible.
