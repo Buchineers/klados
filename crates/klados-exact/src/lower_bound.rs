@@ -57,7 +57,9 @@ pub fn maf_bounds(trees: &[Tree], num_leaves: u32) -> MafBounds {
     }
 
     // Multi-tree additive lower bound using 2-approx pairwise distances
-    if m >= 3 {
+    // DISABLED: This bound can be incorrect for some multi-tree instances
+    // For now, we use only pairwise bounds which are proven correct for 2-tree instances
+    if false && m >= 3 {
         let mut pairwise = vec![vec![0usize; m]; m];
         for i in 0..m {
             for j in (i + 1)..m {
@@ -111,7 +113,13 @@ pub fn approx_rspr_distance_pub(t1: &Tree, t2: &Tree) -> usize {
 
 /// Public wrapper for the 2-approximation.
 pub fn red_blue_approx_pub(t1: &Tree, t2: &Tree) -> usize {
-    red_blue_approx(t1, t2)
+    let result = red_blue_approx(t1, t2);
+    eprintln!(
+        "Red-Blue approx for 2 trees: {} (MAF size = {})",
+        result,
+        result + 1
+    );
+    result
 }
 
 // ============================================================================
@@ -356,17 +364,41 @@ fn red_blue_approx(t1: &Tree, t2: &Tree) -> usize {
         return 0;
     }
 
+    let trace = std::env::var("RED_BLUE_TRACE").is_ok();
+
     let td1 = TreeData::build(t1);
     let td2 = TreeData::build(t2);
     let mut partition = Partition::new_single(n);
     let mut pairslist: Vec<(Label, Label)> = Vec::new();
 
+    if trace {
+        eprintln!("[RB] Starting red_blue_approx with {} leaves", n);
+        eprintln!("[RB] T1 root={}, T2 root={}", t1.root, t2.root);
+    }
+
     let max_iterations = 4 * n as usize; // each iteration creates ≥1 new component, max O(n)
-    for _ in 0..max_iterations {
+    for iter in 0..max_iterations {
+        if trace {
+            eprintln!("[RB] === Iteration {} ===", iter);
+            eprintln!(
+                "[RB] Partition has {} components",
+                partition.count_components()
+            );
+            for cid in partition.active_component_ids() {
+                let members: Vec<usize> = partition.members[cid as usize].ones().collect();
+                eprintln!("[RB]   comp {}: {:?}", cid, members);
+            }
+        }
+
         // Find lowest root-of-infeasibility
         let u = match find_lowest_roi(&td1, &td2, &partition) {
             Some(u) => u,
-            None => break,
+            None => {
+                if trace {
+                    eprintln!("[RB] No ROI found — partition is feasible");
+                }
+                break;
+            }
         };
 
         let (u_l, u_r) = t1.children(u).unwrap();
@@ -382,32 +414,94 @@ fn red_blue_approx(t1: &Tree, t2: &Tree) -> usize {
             }
         }
 
+        if trace {
+            let reds: Vec<usize> = red.ones().collect();
+            let blues: Vec<usize> = blue.ones().collect();
+            let whites: Vec<usize> = white.ones().collect();
+            eprintln!("[RB] ROI: u={} (u_l={}, u_r={})", u, u_l, u_r);
+            eprintln!("[RB] Red (L(u_r)): {:?}", reds);
+            eprintln!("[RB] Blue (L(u_l)): {:?}", blues);
+            eprintln!("[RB] White: {:?}", whites);
+        }
+
         // Save original partition for Find-Merge-Pair
         let original_comp = partition.comp.clone();
 
         // Step 1: Make-R∪B-compatible
-        make_rub_compatible(&td2, &mut partition, red, blue);
+        make_rub_compatible(&td1, &td2, &mut partition, red, blue);
+        if trace {
+            eprintln!(
+                "[RB] After Make-RUB-compatible: {} components",
+                partition.count_components()
+            );
+            for cid in partition.active_component_ids() {
+                let members: Vec<usize> = partition.members[cid as usize].ones().collect();
+                eprintln!("[RB]   comp {}: {:?}", cid, members);
+            }
+        }
 
         // Step 2: Make-Splittable
         make_splittable(&td2, &mut partition, red, blue, &white);
+        if trace {
+            eprintln!(
+                "[RB] After Make-Splittable: {} components",
+                partition.count_components()
+            );
+            for cid in partition.active_component_ids() {
+                let members: Vec<usize> = partition.members[cid as usize].ones().collect();
+                eprintln!("[RB]   comp {}: {:?}", cid, members);
+            }
+        }
 
         // Step 3: Split
         split_procedure(&td1, &td2, &mut partition, red, blue, &white);
+        if trace {
+            eprintln!(
+                "[RB] After Split: {} components",
+                partition.count_components()
+            );
+            for cid in partition.active_component_ids() {
+                let members: Vec<usize> = partition.members[cid as usize].ones().collect();
+                eprintln!("[RB]   comp {}: {:?}", cid, members);
+            }
+        }
 
-        // Step 4: Find-Merge-Pair
-        if let Some(pair) = find_merge_pair(&td2, &partition, red, blue, &original_comp) {
+        // Step 4: Find-Merge-Pair with proper R∪B-feasibility checking
+        if let Some(pair) = find_merge_pair(&td1, &td2, &partition, red, blue, &original_comp) {
+            if trace {
+                eprintln!("[RB] Find-Merge-Pair found: ({}, {})", pair.0, pair.1);
+            }
             pairslist.push(pair);
+        } else if trace {
+            eprintln!("[RB] Find-Merge-Pair: no pair found");
         }
     }
 
     // Merge-Components
-    for &(x1, x2) in &pairslist {
+    if trace {
+        eprintln!("[RB] === Merge-Components: {} pairs ===", pairslist.len());
+    }
+    for &(x1, x2) in pairslist.iter() {
         let c1 = partition.component_of(x1);
         let c2 = partition.component_of(x2);
+        if trace {
+            eprintln!("[RB] Merge: x1={}, x2={}, c1={}, c2={}", x1, x2, c1, c2);
+        }
         partition.merge(c1, c2);
     }
 
     let nc = partition.count_components();
+    if trace {
+        eprintln!(
+            "[RB] Final: {} components (cost={})",
+            nc,
+            nc.saturating_sub(1)
+        );
+        for cid in partition.active_component_ids() {
+            let members: Vec<usize> = partition.members[cid as usize].ones().collect();
+            eprintln!("[RB]   comp {}: {:?}", cid, members);
+        }
+    }
     if nc == 0 {
         0
     } else {
@@ -416,66 +510,47 @@ fn red_blue_approx(t1: &Tree, t2: &Tree) -> usize {
 }
 
 /// Check if a triple (x1,x2,x3) is compatible across two trees.
+/// Per Definition 2: check if lca(x1, x2) ≺ lca(x1, x2, x3) matches between trees.
+/// Note: We check the specific ordering (x1, x2) vs (x1, x2, x3), not all permutations.
 #[inline]
 fn is_triple_compatible(td1: &TreeData, td2: &TreeData, x1: Label, x2: Label, x3: Label) -> bool {
     let n1 = td1.tree.label_to_node[x1 as usize];
     let n2 = td1.tree.label_to_node[x2 as usize];
     let n3 = td1.tree.label_to_node[x3 as usize];
 
+    let lca12_1 = td1.lca(n1, n2);
+    let lca123_1 = td1.lca(lca12_1, n3);
+    let strict1 = lca12_1 != lca123_1;
+
     let m1 = td2.tree.label_to_node[x1 as usize];
     let m2 = td2.tree.label_to_node[x2 as usize];
     let m3 = td2.tree.label_to_node[x3 as usize];
 
-    // Check all three pairings: (x1,x2), (x1,x3), (x2,x3)
-    // For each, check if lca(pair) < lca(all three) matches between trees
-
-    // Pair (x1, x2)
-    let lca12_1 = td1.lca(n1, n2);
-    let lca123_1 = td1.lca(lca12_1, n3);
-    let strict12_1 = lca12_1 != lca123_1;
-
     let lca12_2 = td2.lca(m1, m2);
     let lca123_2 = td2.lca(lca12_2, m3);
-    let strict12_2 = lca12_2 != lca123_2;
+    let strict2 = lca12_2 != lca123_2;
 
-    if strict12_1 != strict12_2 {
-        return false;
-    }
-
-    // Pair (x1, x3)
-    let lca13_1 = td1.lca(n1, n3);
-    let lca123_1b = td1.lca(lca13_1, n2);
-    let strict13_1 = lca13_1 != lca123_1b;
-
-    let lca13_2 = td2.lca(m1, m3);
-    let lca123_2b = td2.lca(lca13_2, m2);
-    let strict13_2 = lca13_2 != lca123_2b;
-
-    if strict13_1 != strict13_2 {
-        return false;
-    }
-
-    // Pair (x2, x3)
-    let lca23_1 = td1.lca(n2, n3);
-    let lca123_1c = td1.lca(lca23_1, n1);
-    let strict23_1 = lca23_1 != lca123_1c;
-
-    let lca23_2 = td2.lca(m2, m3);
-    let lca123_2c = td2.lca(lca23_2, m1);
-    let strict23_2 = lca23_2 != lca123_2c;
-
-    strict23_1 == strict23_2
+    strict1 == strict2
 }
 
 /// Check if a set of labels (given as a bitset) is compatible.
+/// Per Definition 2: check ALL ordered triples (x1, x2, x3).
 fn is_set_compatible(td1: &TreeData, td2: &TreeData, labels: &FixedBitSet) -> bool {
     let lbls: Vec<usize> = labels.ones().collect();
     if lbls.len() <= 2 {
         return true;
     }
+
+    // Check ALL ordered triples - not just one ordering per combination
     for i in 0..lbls.len() {
-        for j in (i + 1)..lbls.len() {
-            for k in (j + 1)..lbls.len() {
+        for j in 0..lbls.len() {
+            if i == j {
+                continue;
+            }
+            for k in 0..lbls.len() {
+                if k == i || k == j {
+                    continue;
+                }
                 if !is_triple_compatible(
                     td1,
                     td2,
@@ -574,6 +649,109 @@ fn partition_overlaps_in_v2(td2: &TreeData, partition: &Partition) -> bool {
     false
 }
 
+/// Check if partition is R∪B-feasible per Definition 7 in the paper.
+/// A partition P is K-feasible if:
+/// 1. For all w ∈ L, P is K ∪ {w}-compatible (Def 3: each comp A_i ∩ (K∪{w}) is compatible)
+/// 2. No two components in P overlap in V₂ ∪ V₁[K]
+fn is_rub_feasible_impl(
+    td1: &TreeData,
+    td2: &TreeData,
+    partition: &Partition,
+    red: &FixedBitSet,
+    blue: &FixedBitSet,
+    trace: bool,
+) -> bool {
+    let n = partition.n as usize;
+    let rub = {
+        let mut s = red.clone();
+        s.union_with(blue);
+        s
+    };
+
+    // Check 1: For all w ∈ L, P is K∪{w}-compatible
+    // Definition 3: P is K-compatible if for every component A_i, A_i ∩ K is compatible.
+    // So "P is (K∪{w})-compatible" means: for every A_i, A_i ∩ (K∪{w}) is compatible.
+    // This is: A_i ∩ (R∪B∪{w}) is compatible — only includes w if w ∈ A_i.
+    for w in 1..=n {
+        for cid in partition.active_component_ids() {
+            let comp = &partition.members[cid as usize];
+            // Compute comp ∩ (R∪B ∪ {w})
+            let mut test_set = comp.clone();
+            let mut kw = rub.clone();
+            kw.insert(w);
+            test_set.intersect_with(&kw);
+            if test_set.count_ones(..) >= 3 && !is_set_compatible(td1, td2, &test_set) {
+                if trace {
+                    let set_members: Vec<usize> = test_set.ones().collect();
+                    let comp_members: Vec<usize> = comp.ones().collect();
+                    eprintln!(
+                        "[RB-FEA]     FAIL: comp {:?} with w={}: set {:?} not compatible",
+                        comp_members, w, set_members
+                    );
+                }
+                return false;
+            }
+        }
+    }
+
+    // Check 2: No overlap in V₂
+    if partition_overlaps_in_v2(td2, partition) {
+        if trace {
+            eprintln!("[RB-FEA]     FAIL: partition overlaps in V2");
+        }
+        return false;
+    }
+
+    // Check 3: No overlap in V₁[R∪B]
+    let num_nodes = td1.tree.num_nodes();
+    let mut cover: Vec<u32> = vec![u32::MAX; num_nodes];
+
+    for cid in partition.active_component_ids() {
+        let labels = &partition.members[cid as usize];
+        let mut inside = labels.clone();
+        inside.intersect_with(&rub);
+
+        if inside.count_ones(..) < 2 {
+            continue;
+        }
+
+        let lca_node = td1.lca_of_labels(&inside);
+        if lca_node == NONE {
+            continue;
+        }
+
+        for lbl in inside.ones() {
+            let mut cur = td1.tree.label_to_node[lbl];
+            if cur == NONE {
+                continue;
+            }
+            loop {
+                if cover[cur as usize] == cid {
+                    break;
+                }
+                if cover[cur as usize] != u32::MAX && cover[cur as usize] != cid {
+                    if trace {
+                        eprintln!("[RB-FEA]     FAIL: overlap in V1[RUB] at node {} (comp {} and comp {})",
+                            cur, cover[cur as usize], cid);
+                    }
+                    return false;
+                }
+                cover[cur as usize] = cid;
+                if cur == lca_node {
+                    break;
+                }
+                let p = td1.tree.parent[cur as usize];
+                if p == NONE {
+                    break;
+                }
+                cur = p;
+            }
+        }
+    }
+
+    true
+}
+
 /// Check Definition 4: is u a root-of-infeasibility?
 fn is_roi(td1: &TreeData, td2: &TreeData, partition: &Partition, u: NodeId) -> bool {
     if td1.tree.is_leaf(u) {
@@ -587,7 +765,8 @@ fn is_roi(td1: &TreeData, td2: &TreeData, partition: &Partition, u: NodeId) -> b
         // Intersection with u_leaves
         let mut intersection = labels.clone();
         intersection.intersect_with(u_leaves);
-        if intersection.count_ones(..) >= 3 && !is_set_compatible(td1, td2, &intersection) {
+        let count = intersection.count_ones(..);
+        if count >= 3 && !is_set_compatible(td1, td2, &intersection) {
             return true;
         }
     }
@@ -689,7 +868,10 @@ fn find_lowest_roi(td1: &TreeData, td2: &TreeData, partition: &Partition) -> Opt
 }
 
 /// Make-R∪B-compatible
+/// Per the paper: while ∃ A ∈ P that is not R∪B-compatible do
+///   find lowest û in V₂[A] where A∩L(û) intersects both R and B, then split.
 fn make_rub_compatible(
+    td1: &TreeData,
     td2: &TreeData,
     partition: &mut Partition,
     red: &FixedBitSet,
@@ -708,11 +890,13 @@ fn make_rub_compatible(
                 continue;
             }
 
-            // Check R∪B-compatible: is a_rub compatible?
-            // Actually, we need to check if the R∪B intersection of this component is compatible
-            // But this is expensive for large sets. We can just check: is there any
-            // internal node in T2 where A∩L(û) intersects both R and B?
-            // The procedure says: find lowest û in V2[A] where A∩L(û) intersects both R and B
+            // Check if the R∪B intersection of this component is actually compatible.
+            // Only split if it's NOT R∪B-compatible (Definition 3).
+            if is_set_compatible(td1, td2, &a_rub) {
+                continue;
+            }
+
+            // Not R∪B-compatible: find lowest û in V₂[A] where A∩L(û) intersects both R and B
             if let Some(u_hat) = find_rub_split_node(td2, labels, red, blue) {
                 let u_hat_leaves = &td2.leaf_set[u_hat as usize];
                 let mut inside = labels.clone();
@@ -1039,17 +1223,26 @@ fn special_split(
     }
 }
 
-/// Find-Merge-Pair
+/// Find-Merge-Pair with proper R∪B-feasibility checking per Definition 7
 fn find_merge_pair(
+    td1: &TreeData,
     td2: &TreeData,
     partition: &Partition,
     red: &FixedBitSet,
     blue: &FixedBitSet,
     original_comp: &[u32],
 ) -> Option<(Label, Label)> {
+    let trace = std::env::var("RED_BLUE_TRACE").is_ok();
     let mut rub = red.clone();
     rub.union_with(blue);
     let rub_labels: Vec<usize> = rub.ones().collect();
+
+    if trace {
+        eprintln!(
+            "[RB-FMP] Searching for merge pair among R∪B labels: {:?}",
+            rub_labels
+        );
+    }
 
     for i in 0..rub_labels.len() {
         for j in (i + 1)..rub_labels.len() {
@@ -1057,21 +1250,34 @@ fn find_merge_pair(
             let x2 = rub_labels[j] as Label;
 
             if original_comp[x1 as usize] != original_comp[x2 as usize] {
+                if trace {
+                    eprintln!(
+                        "[RB-FMP]   ({},{}) skipped: different original component",
+                        x1, x2
+                    );
+                }
                 continue;
             }
 
             let c1 = partition.component_of(x1);
             let c2 = partition.component_of(x2);
             if c1 == c2 {
+                if trace {
+                    eprintln!("[RB-FMP]   ({},{}) skipped: same component now", x1, x2);
+                }
                 continue;
             }
 
-            // Check if merging would keep no overlap in V2
-            // Quick check: merged component is compatible
-            let mut merged = partition.members[c1 as usize].clone();
-            merged.union_with(&partition.members[c2 as usize]);
+            if trace {
+                let m1: Vec<usize> = partition.members[c1 as usize].ones().collect();
+                let m2: Vec<usize> = partition.members[c2 as usize].ones().collect();
+                eprintln!(
+                    "[RB-FMP]   Checking ({},{}) : comps {:?} and {:?}",
+                    x1, x2, m1, m2
+                );
+            }
 
-            // Build test partition
+            // Build test partition with merged components
             let mut test = Partition {
                 comp: partition.comp.clone(),
                 members: partition.members.clone(),
@@ -1079,8 +1285,18 @@ fn find_merge_pair(
             };
             test.merge(c1, c2);
 
-            if !partition_overlaps_in_v2(td2, &test) {
+            // Check R∪B-feasibility per Definition 7
+            let feasible = is_rub_feasible_impl(td1, td2, &test, red, blue, trace);
+            if feasible {
+                if trace {
+                    eprintln!(
+                        "[RB-FMP]   ({},{}) is R∪B-feasible! Returning pair.",
+                        x1, x2
+                    );
+                }
                 return Some((x1, x2));
+            } else if trace {
+                eprintln!("[RB-FMP]   ({},{}) is NOT R∪B-feasible", x1, x2);
             }
         }
     }
