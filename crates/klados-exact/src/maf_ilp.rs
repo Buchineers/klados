@@ -270,7 +270,7 @@ fn solve_ilp(instance: &Instance) -> Option<(Vec<Tree>, SolverStats)> {
                 let (s_col, _) = same_vars[pidx];
                 for &v in &tree_paths[pidx] {
                     if let Some((c_col, _)) = cut_vars[tree_idx][v as usize] {
-                        pb.add_row(..=1.0, &[(c_col, 1.0), (s_col, 1.0)]);
+                        pb.add_row(..=1.0, [(c_col, 1.0), (s_col, 1.0)]);
                     }
                 }
             }
@@ -303,13 +303,13 @@ fn solve_ilp(instance: &Instance) -> Option<(Vec<Tree>, SolverStats)> {
         let (sxy, _) = same_vars[pair_index(x, y)];
         let (sxz, _) = same_vars[pair_index(x, z)];
         let (syz, _) = same_vars[pair_index(y, z)];
-        pb.add_row(..=2.0, &[(sxy, 1.0), (sxz, 1.0), (syz, 1.0)]);
+        pb.add_row(..=2.0, [(sxy, 1.0), (sxz, 1.0), (syz, 1.0)]);
     }
 
     // --- Configure and solve ---
     let mut model = pb.optimise(Sense::Minimise);
     model.make_quiet();
-    model.set_option("threads", 1 as i32); // single-threaded for PACE
+    model.set_option("threads", 1_i32); // single-threaded for PACE
     model.set_option("presolve", "on");
 
     let solved = model.solve();
@@ -390,6 +390,12 @@ pub struct MafIlpSolver {
     /// Maximum number of leaves the ILP solver will attempt.
     /// Beyond this, the constraint count becomes too large.
     max_leaves: u32,
+}
+
+impl Default for MafIlpSolver {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MafIlpSolver {

@@ -17,9 +17,6 @@ mod utils;
 
 use klados_core::{Instance, SolverStats, Tree};
 
-pub use search_state::{Collapses, SearchState};
-pub use transposition::{TTEntry, ZobristTable};
-
 fn trace_enabled() -> bool {
     use std::sync::OnceLock;
     static CACHED: OnceLock<bool> = OnceLock::new();
@@ -44,6 +41,12 @@ pub(crate) use trace;
 
 pub struct ShiMestelSolver {
     stats: SolverStats,
+}
+
+impl Default for ShiMestelSolver {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ShiMestelSolver {

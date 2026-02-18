@@ -39,8 +39,8 @@ pub fn find_common_subtrees(trees: &[Tree], num_leaves: u32) -> Vec<(u32, Vec<u3
     let n = num_leaves as usize;
     let mut ref_sibling = vec![0u32; n + 1];
     for node in ref_tree.post_order() {
-        if let Some((l, r)) = ref_tree.children(node) {
-            if ref_tree.is_leaf(l) && ref_tree.is_leaf(r) {
+        if let Some((l, r)) = ref_tree.children(node)
+            && ref_tree.is_leaf(l) && ref_tree.is_leaf(r) {
                 let ll = ref_tree.label[l as usize];
                 let rl = ref_tree.label[r as usize];
                 if ll != 0 && rl != 0 {
@@ -48,7 +48,6 @@ pub fn find_common_subtrees(trees: &[Tree], num_leaves: u32) -> Vec<(u32, Vec<u3
                     ref_sibling[rl as usize] = ll;
                 }
             }
-        }
     }
 
     let has_any_pair = ref_sibling[1..].iter().any(|&s| s != 0);
@@ -59,8 +58,8 @@ pub fn find_common_subtrees(trees: &[Tree], num_leaves: u32) -> Vec<(u32, Vec<u3
     for other in &trees[1..] {
         let mut other_sibling = vec![0u32; n + 1];
         for node in other.post_order() {
-            if let Some((l, r)) = other.children(node) {
-                if other.is_leaf(l) && other.is_leaf(r) {
+            if let Some((l, r)) = other.children(node)
+                && other.is_leaf(l) && other.is_leaf(r) {
                     let ll = other.label[l as usize];
                     let rl = other.label[r as usize];
                     if ll != 0 && rl != 0 {
@@ -68,7 +67,6 @@ pub fn find_common_subtrees(trees: &[Tree], num_leaves: u32) -> Vec<(u32, Vec<u3
                         other_sibling[rl as usize] = ll;
                     }
                 }
-            }
         }
 
         let mut any_survives = false;
@@ -84,7 +82,7 @@ pub fn find_common_subtrees(trees: &[Tree], num_leaves: u32) -> Vec<(u32, Vec<u3
         }
     }
 
-    let all_hashes: Vec<Vec<u64>> = trees.iter().map(|t| subtree_hashes(t)).collect();
+    let all_hashes: Vec<Vec<u64>> = trees.iter().map(subtree_hashes).collect();
 
     let other_hash_sets: Vec<FxHashSet<(u64, u32)>> = trees[1..]
         .iter()

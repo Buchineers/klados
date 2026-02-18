@@ -21,10 +21,7 @@ pub fn br_lsi_step(
     zobrist: &ZobristTable,
     tt: &mut FxHashMap<u64, TTEntry>,
 ) -> Option<Vec<klados_core::Tree>> {
-    let (i, j) = match find_violating_pair_cached(comp_sets) {
-        Some(pair) => pair,
-        None => return None,
-    };
+    let (i, j) = find_violating_pair_cached(comp_sets)?;
 
     let (target_idx, v1, v2) = if let Some((_v, v1, v2)) =
         find_branching_vertex_cached(&state.forests[i], &state.forests[j], &comp_sets[j])
@@ -386,8 +383,8 @@ fn apply_branching_rule_2_1(
                 }
             }
         }
-        if any_cut {
-            if let Some(result) = super::algorithm::alg_maf(
+        if any_cut
+            && let Some(result) = super::algorithm::alg_maf(
                 state,
                 target_s,
                 label_space,
@@ -399,7 +396,6 @@ fn apply_branching_rule_2_1(
                 state.rollback();
                 return Some(result);
             }
-        }
         state.rollback();
     }
 
@@ -479,8 +475,8 @@ fn apply_branching_rule_2_2_2(
                 }
             }
         }
-        if any_cut {
-            if let Some(result) = super::algorithm::alg_maf(
+        if any_cut
+            && let Some(result) = super::algorithm::alg_maf(
                 state,
                 target_s,
                 label_space,
@@ -492,7 +488,6 @@ fn apply_branching_rule_2_2_2(
                 state.rollback();
                 return Some(result);
             }
-        }
         state.rollback();
     }
 

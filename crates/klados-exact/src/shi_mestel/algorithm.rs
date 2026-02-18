@@ -71,13 +71,12 @@ pub fn alg_maf(
 
     let comps_f0 = &comp_sets[0];
     let tt_hash = zobrist.hash_partition(comps_f0);
-    if let Some(entry) = tt.get(&tt_hash) {
-        if target_s <= entry.infeasible_at {
+    if let Some(entry) = tt.get(&tt_hash)
+        && target_s <= entry.infeasible_at {
             stats.branches_pruned += 1;
             state.rollback();
             return None;
         }
-    }
 
     let profile_enabled = super::profile_enabled();
     let split_result = SPLIT_STATS.with(|s| {
@@ -120,6 +119,7 @@ pub fn alg_maf(
         return None;
     }
 
+    #[allow(clippy::overly_complex_bool_expr)]
     if false && non_iso_comps.len() >= 2 {
         let result = super::decomposition::solve_decomposed(
             &state.forests,
@@ -195,7 +195,7 @@ pub fn exact_pairwise_lower_bound(
     let mut lb_dist: Vec<Vec<usize>> = vec![vec![0; m]; m];
 
     for &(i, j, _, two_approx) in &pairs {
-        let lb = (two_approx + 1) / 2;
+        let lb = two_approx.div_ceil(2);
         lb_dist[i][j] = lb;
         lb_dist[j][i] = lb;
     }
@@ -205,9 +205,9 @@ pub fn exact_pairwise_lower_bound(
             break;
         }
 
-        let pair_lb = (two_approx + 1) / 2;
+        let pair_lb = two_approx.div_ceil(2);
 
-        if cherry_ub + 1 <= best_lb && pair_lb < 2 {
+        if cherry_ub < best_lb && pair_lb < 2 {
             exact_dist[i][j] = Some(pair_lb);
             exact_dist[j][i] = Some(pair_lb);
             continue;
@@ -231,7 +231,7 @@ pub fn exact_pairwise_lower_bound(
                 break;
             }
 
-            let mut sub_state = SearchState::new(sub_forests.iter().map(|f| f.clone()).collect());
+            let mut sub_state = SearchState::new(sub_forests.to_vec());
             let mut sub_stats = SolverStats::default();
             if alg_maf(
                 &mut sub_state,
@@ -290,7 +290,7 @@ pub fn exact_pairwise_lower_bound(
                 }
             }
             let denom = m - 1;
-            let lb_cuts = (sum_d + denom - 1) / denom;
+            let lb_cuts = sum_d.div_ceil(denom);
             let lb_components = lb_cuts + 1;
             if lb_components > best_lb {
                 super::trace!(
@@ -400,8 +400,8 @@ fn dump_split_stats() {
         )
     });
     eprintln!("{line}");
-    if let Ok(path) = std::env::var("SHI_MESTEL_PROFILE_PATH") {
-        if let Ok(mut f) = std::fs::OpenOptions::new()
+    if let Ok(path) = std::env::var("SHI_MESTEL_PROFILE_PATH")
+        && let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)
@@ -409,5 +409,4 @@ fn dump_split_stats() {
             use std::io::Write;
             let _ = writeln!(f, "{line}");
         }
-    }
 }
