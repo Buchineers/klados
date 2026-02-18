@@ -4,7 +4,7 @@
 
 pub mod lower_bound;
 pub mod maf_ilp;
-mod shi_mestel;
+pub mod shi_mestel;
 
 use klados_core::{Instance, SolverStats, Tree};
 

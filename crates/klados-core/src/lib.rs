@@ -3,13 +3,13 @@
 //! Provides arena-based tree representation for cache-efficient traversal
 //! during the FPT search.
 
-pub mod tree;
-pub mod forest;
 pub mod instance;
+pub mod tree;
+pub mod xforest;
 
-pub use tree::{Tree, NodeId, Label, NONE};
-pub use forest::Forest;
 pub use instance::Instance;
+pub use tree::{Label, NodeId, Tree, NONE};
+pub use xforest::XForest;
 
 /// Solver configuration
 #[derive(Clone, Debug)]
