@@ -46,14 +46,13 @@ impl TreeData {
             if first_occ[node as usize] == u32::MAX {
                 first_occ[node as usize] = pos;
             }
-            if !returning {
-                if let Some((left, right)) = tree.children(node) {
+            if !returning
+                && let Some((left, right)) = tree.children(node) {
                     stack.push((node, true));
                     stack.push((right, false));
                     stack.push((node, true));
                     stack.push((left, false));
                 }
-            }
         }
 
         let len = euler.len();

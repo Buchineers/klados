@@ -429,12 +429,11 @@ impl<'a> Iterator for PostOrderIter<'a> {
 
         // If this node has a parent on the stack, and this node is the left
         // child of that parent, we need to process the right subtree first.
-        if let Some(&parent) = self.stack.last() {
-            if self.tree.left[parent as usize] == node {
+        if let Some(&parent) = self.stack.last()
+            && self.tree.left[parent as usize] == node {
                 // We just finished the left subtree; descend into right
                 self.push_leftmost(self.tree.right[parent as usize]);
             }
-        }
 
         Some(node)
     }

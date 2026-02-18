@@ -3,7 +3,6 @@
 use fixedbitset::FixedBitSet;
 use fxhash::FxHashMap;
 
-
 pub const TT_MAX_ENTRIES: usize = 1 << 22;
 
 #[derive(Clone, Copy)]

@@ -11,24 +11,6 @@ pub use instance::Instance;
 pub use tree::{Label, NodeId, Tree, NONE};
 pub use xforest::XForest;
 
-/// Solver configuration
-#[derive(Clone, Debug)]
-pub struct SolverConfig {
-    /// Maximum search depth (None = unlimited)
-    pub max_depth: Option<usize>,
-    /// Verbosity level
-    pub verbose: bool,
-}
-
-impl Default for SolverConfig {
-    fn default() -> Self {
-        Self {
-            max_depth: None,
-            verbose: false,
-        }
-    }
-}
-
 /// Statistics collected during solving
 #[derive(Clone, Debug, Default)]
 pub struct SolverStats {

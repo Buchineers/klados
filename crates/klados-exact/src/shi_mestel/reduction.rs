@@ -4,8 +4,7 @@ use fixedbitset::FixedBitSet;
 use klados_core::{NodeId, XForest, NONE};
 
 use super::forest_nav::{
-    component_leaf_sets_xf, forest_children, forest_is_leaf,
-    forest_parent_leaf, forest_resolves_to,
+    component_leaf_sets_xf, forest_children, forest_is_leaf, forest_parent_leaf, forest_resolves_to,
 };
 use super::search_state::SearchState;
 
@@ -114,17 +113,16 @@ pub fn find_r1_cut(
             }
         }
 
-        if union_count == node_count && union_count > 0 {
-            if scratch.as_slice() == node_ls.as_slice()
+        if union_count == node_count && union_count > 0
+            && (scratch.as_slice() == node_ls.as_slice()
                 || (scratch.as_slice().len() >= node_ls.as_slice().len()
                     && scratch.as_slice()[..node_ls.as_slice().len()] == *node_ls.as_slice()
                     && scratch.as_slice()[node_ls.as_slice().len()..]
                         .iter()
-                        .all(|&w| w == 0))
+                        .all(|&w| w == 0)))
             {
                 return Some(node);
             }
-        }
     }
     None
 }

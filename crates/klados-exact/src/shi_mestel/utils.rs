@@ -50,7 +50,7 @@ pub fn hash_bitset(s: &FixedBitSet) -> u64 {
 }
 
 pub fn sorted_partition_hashes(components: &[FixedBitSet]) -> Vec<u64> {
-    let mut hashes: Vec<u64> = components.iter().map(|s| hash_bitset(s)).collect();
+    let mut hashes: Vec<u64> = components.iter().map(hash_bitset).collect();
     hashes.sort_unstable();
     hashes
 }

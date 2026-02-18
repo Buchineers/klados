@@ -2,7 +2,6 @@
 
 use klados_core::tree::{Label, NodeId, Tree, NONE};
 
-
 pub fn cherry_reduce_ub(t1: &Tree, t2: &Tree) -> usize {
     let c1 = cherry_reduce(t1, t2);
     let c2 = cherry_reduce(t2, t1);
@@ -187,7 +186,7 @@ fn depth_in_mtree(t: &MutableTree, mut node: NodeId) -> u32 {
 }
 
 pub fn greedy_multi_tree_ub(trees: &[Tree], ref_idx: usize) -> usize {
-    let mut mtrees: Vec<MutableTree> = trees.iter().map(|t| MutableTree::from_tree(t)).collect();
+    let mut mtrees: Vec<MutableTree> = trees.iter().map(MutableTree::from_tree).collect();
     let mut cuts = 0;
     loop {
         if mtrees[ref_idx].num_alive_leaves <= 1 {

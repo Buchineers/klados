@@ -290,12 +290,10 @@ pub fn splitting_core(
             }
         }
 
-        if pure_y_edge.is_some() && pure_z_edge.is_some() && has_mixed {
-            let e1 = pure_y_edge.unwrap();
-            let e2 = pure_z_edge.unwrap();
-            let side_y = pure_y_side.unwrap();
-            let side_z = pure_z_side.unwrap();
-
+        if let (Some(e1), Some(e2), Some(side_y), Some(side_z)) =
+            (pure_y_edge, pure_z_edge, pure_y_side, pure_z_side)
+            && has_mixed
+        {
             let mut x1 = x.clone();
             x1.difference_with(&side_y);
             let mut y1 = y.clone();

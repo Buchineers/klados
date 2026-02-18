@@ -29,18 +29,9 @@ pub fn available_solvers() -> Vec<Box<dyn ExactSolver>> {
 /// Lookup solver by name (case-insensitive).
 pub fn solver_by_name(name: &str) -> Option<Box<dyn ExactSolver>> {
     let name = name.trim().to_ascii_lowercase();
-    if name == "shi-mestel" || name == "shimestel" {
-        return Some(Box::new(shi_mestel::ShiMestelSolver::new()));
-    }
-    if name == "maf-ilp" || name == "mafilp" || name == "ilp" {
-        return Some(Box::new(maf_ilp::MafIlpSolver::new()));
-    }
-    for solver in available_solvers() {
-        if solver.name().eq_ignore_ascii_case(&name) {
-            return Some(solver);
-        }
-    }
-    None
+    available_solvers()
+        .into_iter()
+        .find(|solver| solver.name().eq_ignore_ascii_case(&name))
 }
 
 #[cfg(test)]

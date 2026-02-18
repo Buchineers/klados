@@ -33,7 +33,7 @@ pub fn maf_bounds(trees: &[Tree], num_leaves: u32) -> MafBounds {
     for i in 0..m {
         for j in (i + 1)..m {
             let approx_2 = red_blue_approx(&trees[i], &trees[j]);
-            let lb_cost = (approx_2 + 1) / 2;
+            let lb_cost = approx_2.div_ceil(2);
             let lb_components = lb_cost + 1;
             if lb_components > best_lb {
                 best_lb = lb_components;
@@ -68,13 +68,6 @@ pub fn maf_bounds(trees: &[Tree], num_leaves: u32) -> MafBounds {
         lower: best_lb.min(upper),
         upper,
     }
-}
-
-pub fn lower_bound_components(trees: &[Tree]) -> usize {
-    if trees.len() <= 1 {
-        return 1;
-    }
-    maf_bounds(trees, trees[0].num_leaves).lower
 }
 
 pub fn approx_rspr_distance_pub(t1: &Tree, t2: &Tree) -> usize {

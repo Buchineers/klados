@@ -4,9 +4,7 @@ use fixedbitset::FixedBitSet;
 use fxhash::FxHashMap;
 use klados_core::{Tree, XForest};
 
-use super::extraction::{
-    build_collapsed_into, build_component_tree, expand_leafset,
-};
+use super::extraction::{build_collapsed_into, build_component_tree, expand_leafset};
 use super::search_state::SearchState;
 use super::transposition::{TTEntry, ZobristTable};
 use super::utils::hash_bitset;
@@ -57,26 +55,7 @@ pub fn solve_decomposed(
 
         let approx_lb = crate::lower_bound::maf_bounds(&sub_trees, num_leaves).lower;
 
-        if approx_lb <= 1 {
-            let mut sub_state = SearchState::new(sub_forests.clone());
-            if let Some(result) = super::algorithm::alg_maf(
-                &mut sub_state,
-                2,
-                label_space,
-                num_leaves,
-                stats,
-                &zobrist,
-                &mut tt,
-            ) {
-                shallow_results.push(Some(result));
-                lower_bounds.push(1);
-                total_lower_bound += 1;
-            } else {
-                shallow_results.push(None);
-                lower_bounds.push(2);
-                total_lower_bound += 2;
-            }
-        } else if approx_lb == 2 {
+        if approx_lb <= 2 {
             let mut sub_state = SearchState::new(sub_forests.clone());
             if let Some(result) = super::algorithm::alg_maf(
                 &mut sub_state,
@@ -144,7 +123,7 @@ pub fn solve_decomposed(
                 .map(|(_, &lb)| lb)
                 .sum();
             let budget = remaining.saturating_sub(other_lb);
-            let comp_num_labels = non_iso_comps[idx].count_ones(..) as usize;
+            let comp_num_labels = non_iso_comps[idx].count_ones(..);
 
             let mut found = false;
             let start_cost = lower_bounds[idx].max(2);
@@ -197,7 +176,7 @@ pub fn solve_decomposed(
     }
 
     let mut result_trees: Vec<Tree> = Vec::new();
-    let non_iso_hashes: Vec<u64> = non_iso_comps.iter().map(|c| hash_bitset(c)).collect();
+    let non_iso_hashes: Vec<u64> = non_iso_comps.iter().map(hash_bitset).collect();
 
     for comp_ls in all_comps {
         let h = hash_bitset(comp_ls);

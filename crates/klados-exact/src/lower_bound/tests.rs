@@ -3,7 +3,7 @@
 use klados_core::tree::{Tree, NONE};
 
 use super::tree_data::TreeData;
-use super::{cherry_reduce_ub, lower_bound_components, red_blue_approx};
+use super::{cherry_reduce_ub, maf_bounds, red_blue_approx};
 
 fn make_tree_2leaves() -> (Tree, Tree) {
     let mut t1 = Tree::with_capacity(2);
@@ -167,7 +167,7 @@ fn test_identical_trees() {
 #[test]
 fn test_lower_bound_identical() {
     let (t1, t2) = make_tree_2leaves();
-    assert_eq!(lower_bound_components(&[t1, t2]), 1);
+    assert_eq!(maf_bounds(&[t1, t2], 2).lower, 1);
 }
 
 #[test]
@@ -193,14 +193,14 @@ fn test_red_blue_4leaf() {
 #[test]
 fn test_lower_bound_3leaf() {
     let (t1, t2) = make_3leaf_trees();
-    let lb = lower_bound_components(&[t1, t2]);
+    let lb = maf_bounds(&[t1, t2], 3).lower;
     assert!(lb >= 1 && lb <= 2, "lb={}", lb);
 }
 
 #[test]
 fn test_single_tree() {
     let (t1, _) = make_3leaf_trees();
-    assert_eq!(lower_bound_components(&[t1]), 1);
+    assert_eq!(maf_bounds(&[t1], 3).lower, 1);
 }
 
 #[test]

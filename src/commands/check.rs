@@ -38,11 +38,7 @@ pub fn run(list_file: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        let digest = if line.starts_with("s:") {
-            &line[2..]
-        } else {
-            line
-        };
+        let digest = line.strip_prefix("s:").unwrap_or(line);
 
         let path = base_dir.join(format!(
             "stride-downloads/{}/{}/{}",

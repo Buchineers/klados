@@ -4,8 +4,7 @@ use fixedbitset::FixedBitSet;
 use klados_core::tree::{Label, NodeId, Tree, NONE};
 
 use super::feasibility::{
-    find_lowest_roi, is_rub_feasible_impl, is_set_compatible, is_triple_compatible,
-    mark_v_set,
+    find_lowest_roi, is_rub_feasible_impl, is_set_compatible, is_triple_compatible, mark_v_set,
 };
 use super::partition::Partition;
 use super::tree_data::TreeData;
