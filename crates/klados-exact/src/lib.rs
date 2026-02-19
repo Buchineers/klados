@@ -4,6 +4,7 @@
 
 pub mod lower_bound;
 pub mod maf_ilp;
+pub mod maf_sat;
 pub mod shi_mestel;
 
 use klados_core::{Instance, SolverStats, Tree};
@@ -23,6 +24,7 @@ pub fn available_solvers() -> Vec<Box<dyn ExactSolver>> {
     vec![
         Box::new(shi_mestel::ShiMestelSolver::new()),
         Box::new(maf_ilp::MafIlpSolver::new()),
+        Box::new(maf_sat::MafSatSolver::new()),
     ]
 }
 
@@ -47,6 +49,12 @@ mod tests {
     #[test]
     fn test_registry_has_maf_ilp() {
         let solver = solver_by_name("maf-ilp");
+        assert!(solver.is_some());
+    }
+
+    #[test]
+    fn test_registry_has_maf_sat() {
+        let solver = solver_by_name("maf-sat");
         assert!(solver.is_some());
     }
 }
