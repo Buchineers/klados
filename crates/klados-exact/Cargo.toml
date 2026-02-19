@@ -11,3 +11,5 @@ thiserror = { workspace = true }
 fixedbitset = { workspace = true }
 fxhash = { workspace = true }
 highs = { workspace = true }
+rustsat = { workspace = true }
+rustsat-cadical = { workspace = true }

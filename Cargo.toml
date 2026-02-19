@@ -26,6 +26,10 @@ fxhash = "0.2"
 # LP/ILP solver
 highs = "2.0"
 
+# SAT solver
+rustsat = "0.7"
+rustsat-cadical = "0.7"
+
 # Error handling
 thiserror = "2.0"
 
