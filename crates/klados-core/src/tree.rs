@@ -164,6 +164,30 @@ impl Tree {
         }
     }
 
+
+    pub fn nearest_common_ancestor(&self, mut node_a: NodeId, mut node_b: NodeId) -> NodeId {
+        // Bring both nodes to the same depth
+        let mut da = self.depth[node_a as usize];
+        let mut db = self.depth[node_b as usize];
+
+        while da > db {
+            node_a = self.parent[node_a as usize];
+            da -= 1;
+        }
+        while db > da {
+            node_b = self.parent[node_b as usize];
+            db -= 1;
+        }
+
+        // Walk up together until they meet
+        while node_a != node_b {
+            node_a = self.parent[node_a as usize];
+            node_b = self.parent[node_b as usize];
+        }
+
+        node_a
+    }
+
     /// Number of nodes in the tree
     #[inline]
     pub fn num_nodes(&self) -> usize {
@@ -574,4 +598,19 @@ mod tests {
         assert_eq!(tree.depth[0], 2); // leaf 1
         assert_eq!(tree.depth[1], 2); // leaf 2
     }
+
+    #[test]
+    fn test_nearest_common_ancestor() {
+        let tree = make_simple_tree();
+
+        // LCA of leaves 1 and 2 is their parent (node 3)
+        assert_eq!(tree.nearest_common_ancestor(0, 1), 3);
+        // LCA of leaves 1 and 3 is the root (node 4)
+        assert_eq!(tree.nearest_common_ancestor(0, 2), 4);
+        // LCA of a node with itself is itself
+        assert_eq!(tree.nearest_common_ancestor(2, 2), 2);
+        // LCA of leaf 2 and internal node 3 is node 3
+        assert_eq!(tree.nearest_common_ancestor(1, 3), 3);
+    }
+
 }

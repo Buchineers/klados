@@ -4,6 +4,8 @@ pub mod max_sat;
 
 use klados_core::{Instance, SolverStats, Tree};
 
+use crate::max_sat::MaxSatSolver;
+
 /// Trait for heuristic solver approaches.
 pub trait HeuristicSolver {
     /// Short name used for CLI selection.
@@ -18,7 +20,7 @@ pub trait HeuristicSolver {
 
 /// Run all available heuristc solvers.
 pub fn available_solvers() -> Vec<Box<dyn HeuristicSolver>> {
-    vec![]
+    vec![Box::new(MaxSatSolver::new())]
 }
 
 pub fn solver_by_name(name: &str) -> Option<Box<dyn HeuristicSolver>> {
