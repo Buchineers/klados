@@ -1,0 +1,15 @@
+[package]
+name = "klados-heuristic"
+version = "0.1.0"
+edition = "2024"
+description = "Heuristic FPT solver for klados MAF solver"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+klados-core = { workspace = true }
+pace26io = { workspace = true }
+thiserror = { workspace = true }
+fixedbitset = { workspace = true }
+fxhash = { workspace = true }
+highs = { workspace = true }
+libc = "0.2"

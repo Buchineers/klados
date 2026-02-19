@@ -27,6 +27,10 @@ enum Commands {
         #[arg(long, default_value = "shi-mestel")]
         approach: String,
     },
+    Heuristic {
+        #[arg(long)]
+        solver: String,
+    },
     Info,
     Bounds,
     ValidateBounds {
@@ -99,6 +103,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Some(Commands::Exact { approach }) => {
                     commands::exact::run(&instance, &approach, cli.verbose)?;
+                }
+                Some(Commands::Heuristic { solver }) => {
+                    commands::heuristic::run(&instance, &solver, cli.verbose)?;
                 }
                 None => {
                     commands::exact::run(&instance, "shi-mestel", cli.verbose)?;
