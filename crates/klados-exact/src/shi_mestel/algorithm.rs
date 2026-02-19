@@ -119,7 +119,6 @@ pub fn alg_maf(
         return None;
     }
 
-    #[allow(clippy::overly_complex_bool_expr)]
     if false && non_iso_comps.len() >= 2 {
         let result = super::decomposition::solve_decomposed(
             &state.forests,
@@ -321,25 +320,7 @@ pub fn solve_inner(instance: &Instance, stats: &mut SolverStats) -> Option<Vec<T
     let mut bounds = maf_bounds(&instance.trees, instance.num_leaves);
     super::trace!("maf_bounds: lower={}, upper={}", bounds.lower, bounds.upper);
 
-    if instance.num_trees() >= 3 && instance.num_leaves <= 50 {
-        let exact_lb = exact_pairwise_lower_bound(
-            &instance.trees,
-            label_space,
-            instance.num_leaves,
-            bounds.lower,
-            bounds.upper,
-            stats,
-        );
-        if exact_lb > bounds.lower {
-            super::trace!(
-                "exact pairwise LB: {} -> {} (saved {} rounds)",
-                bounds.lower,
-                exact_lb,
-                exact_lb - bounds.lower
-            );
-            bounds.lower = exact_lb;
-        }
-    }
+
 
     let zobrist = ZobristTable::new(label_space);
     let mut tt: FxHashMap<u64, TTEntry> = FxHashMap::default();
