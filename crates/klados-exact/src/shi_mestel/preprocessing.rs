@@ -241,3 +241,111 @@ pub fn expand_solution(
     }
     result
 }
+
+/// Find common chains across all trees and return collapses.
+/// A chain is a sequence of leaves appearing in identical caterpillar order.
+/// Chains longer than 3 are compressed to length 3.
+pub fn find_common_chains(trees: &[Tree], num_leaves: u32) -> Vec<(u32, Vec<u32>)> {
+    let n = num_leaves as usize;
+    if n < 5 || trees.len() < 2 {
+        return Vec::new();
+    }
+
+    // Extract chains from each tree
+    let all_chains: Vec<Vec<Vec<u32>>> = trees
+        .iter()
+        .map(|t| extract_chains(t, n))
+        .collect();
+
+    // Find chains common to ALL trees
+    let mut collapses = Vec::new();
+    'outer: for chain in &all_chains[0] {
+        if chain.len() <= 3 {
+            continue;
+        }
+
+        // Check if this chain appears in all other trees
+        for other_chains in &all_chains[1..] {
+            let found = other_chains.iter().any(|oc| oc == chain);
+            if !found {
+                continue 'outer;
+            }
+        }
+
+        // Common chain found - keep first 3, remove the rest
+        let representative = chain[0];
+        let removed: Vec<u32> = chain[3..].to_vec();
+        if !removed.is_empty() {
+            collapses.push((representative, removed));
+        }
+    }
+
+    collapses
+}
+
+/// Extract all maximal chains from a tree.
+/// A chain is a path where each internal node has exactly one leaf child.
+fn extract_chains(tree: &Tree, n: usize) -> Vec<Vec<u32>> {
+    let mut chains = Vec::new();
+    let mut visited = vec![false; tree.num_nodes()];
+
+    for start_node in tree.pre_order() {
+        if tree.is_leaf(start_node) || visited[start_node as usize] {
+            continue;
+        }
+
+        // Try to extend a chain from this node
+        let mut chain = Vec::new();
+        let mut cur = start_node;
+
+        loop {
+            if tree.is_leaf(cur) {
+                break;
+            }
+
+            let (left, right) = match tree.children(cur) {
+                Some(lr) => lr,
+                None => break,
+            };
+
+            // Check if this is a chain node (one leaf, one internal)
+            let (leaf_child, next_node) = if tree.is_leaf(left) && !tree.is_leaf(right) {
+                (left, right)
+            } else if tree.is_leaf(right) && !tree.is_leaf(left) {
+                (right, left)
+            } else {
+                // Not a chain node
+                break;
+            };
+
+            let lbl = tree.label[leaf_child as usize];
+            if lbl > 0 && (lbl as usize) <= n {
+                chain.push(lbl);
+                visited[leaf_child as usize] = true;
+            }
+            cur = next_node;
+        }
+
+        // Add any remaining leaves at the end of the chain
+        if !tree.is_leaf(cur) {
+            if let Some((left, right)) = tree.children(cur) {
+                if tree.is_leaf(left) && tree.is_leaf(right) {
+                    let ll = tree.label[left as usize];
+                    let rl = tree.label[right as usize];
+                    if ll > 0 {
+                        chain.push(ll);
+                    }
+                    if rl > 0 {
+                        chain.push(rl);
+                    }
+                }
+            }
+        }
+
+        if chain.len() >= 4 {
+            chains.push(chain);
+        }
+    }
+
+    chains
+}
