@@ -51,7 +51,7 @@ enum Commands {
     AnalyzeRun {
         #[arg(value_name = "FILE")]
         summary_file: std::path::PathBuf,
-        #[arg(long, default_value = "100")]
+        #[arg(long, default_value = "10")]
         top_n: usize,
     },
 }

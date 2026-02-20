@@ -11,13 +11,13 @@ struct SummaryEntry {
     s_num_trees: u32,
     s_num_leaves: u32,
     s_prev_best: Option<u32>,
-    s_heuristic_score: f64,
+    s_heuristic_score: Option<f64>,
     s_result: String,
-    s_score: u32,
-    s_wtime: f64,
+    s_score: Option<u32>,
+    s_wtime: Option<f64>,
     s_utime: Option<f64>,
-    s_stime: f64,
-    s_maxrss: u64,
+    s_stime: Option<f64>,
+    s_maxrss: Option<u64>,
 }
 
 pub fn run(summary_file: &PathBuf, top_n: usize) -> Result<(), Box<dyn std::error::Error>> {
@@ -74,7 +74,7 @@ pub fn run(summary_file: &PathBuf, top_n: usize) -> Result<(), Box<dyn std::erro
         println!("\n--- Valid Instances ---");
 
         // Score statistics
-        let scores: Vec<u32> = valid.iter().map(|e| e.s_score).collect();
+        let scores: Vec<u32> = valid.iter().filter_map(|e| e.s_score).collect();
         let total_score: u32 = scores.iter().sum();
         let mean_score = total_score as f64 / valid.len() as f64;
         let max_score = *scores.iter().max().unwrap_or(&0);
@@ -87,15 +87,15 @@ pub fn run(summary_file: &PathBuf, top_n: usize) -> Result<(), Box<dyn std::erro
         // Optimality check
         let optimal: Vec<_> = valid
             .iter()
-            .filter(|e| e.s_prev_best.map_or(false, |best| e.s_score == best))
+            .filter(|e| e.s_prev_best.map_or(false, |best| e.s_score == Some(best)))
             .collect();
         let suboptimal: Vec<_> = valid
             .iter()
-            .filter(|e| e.s_prev_best.map_or(false, |best| e.s_score > best))
+            .filter(|e| e.s_prev_best.map_or(false, |best| e.s_score > Some(best)))
             .collect();
         let new_best: Vec<_> = valid
             .iter()
-            .filter(|e| e.s_prev_best.map_or(false, |best| e.s_score < best))
+            .filter(|e| e.s_prev_best.map_or(false, |best| e.s_score < Some(best)))
             .collect();
         let no_ref: Vec<_> = valid.iter().filter(|e| e.s_prev_best.is_none()).collect();
 
@@ -124,7 +124,7 @@ pub fn run(summary_file: &PathBuf, top_n: usize) -> Result<(), Box<dyn std::erro
         // Time statistics
         let times: Vec<f64> = valid
             .iter()
-            .map(|e| e.s_utime.unwrap_or(e.s_wtime))
+            .filter_map(|e| e.s_utime.or(e.s_wtime))
             .collect();
         let total_time: f64 = times.iter().sum();
         let mean_time = total_time / valid.len() as f64;
@@ -177,7 +177,7 @@ pub fn run(summary_file: &PathBuf, top_n: usize) -> Result<(), Box<dyn std::erro
         // Top N slowest instances
         let mut with_time: Vec<_> = valid
             .iter()
-            .map(|e| (e, e.s_utime.unwrap_or(e.s_wtime)))
+            .filter_map(|e| Some((e, e.s_utime.or(e.s_wtime)?)))
             .collect();
         with_time.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -190,7 +190,11 @@ pub fn run(summary_file: &PathBuf, top_n: usize) -> Result<(), Box<dyn std::erro
         for (entry, time) in with_time.iter().take(top_n) {
             println!(
                 "{:32} {:>6} {:>6} {:>8} {:>8.3}",
-                entry.s_idigest, entry.s_num_trees, entry.s_num_leaves, entry.s_score, time
+                entry.s_idigest,
+                entry.s_num_trees,
+                entry.s_num_leaves,
+                entry.s_score.unwrap_or(0),
+                time
             );
         }
     }
