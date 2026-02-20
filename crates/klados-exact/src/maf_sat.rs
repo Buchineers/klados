@@ -15,7 +15,9 @@ use rustsat::types::{Clause, Lit, TernaryVal, Var};
 use rustsat_cadical::CaDiCaL;
 
 use crate::lower_bound::{cherry_reduce_ub, greedy_multi_tree_ub, red_blue_approx};
-use crate::shi_mestel::preprocessing::{expand_solution, find_common_subtrees, reduce_instance};
+use crate::shi_mestel::preprocessing::{
+    expand_solution, find_common_chains, find_common_subtrees, reduce_instance,
+};
 use crate::ExactSolver;
 
 // ═══════════════════════════════════════════════════════════════
@@ -135,6 +137,7 @@ fn find_tree_clusters(tree: &Tree, num_leaves: usize) -> Vec<Cluster> {
 }
 
 /// Find clusters that appear in ALL trees (regardless of internal topology)
+/// Uses exact leaf-set comparison (no hash collisions)
 fn find_common_clusters(trees: &[Tree], num_leaves: u32) -> Vec<Cluster> {
     if trees.len() < 2 || num_leaves < 6 {
         return Vec::new();
@@ -142,42 +145,35 @@ fn find_common_clusters(trees: &[Tree], num_leaves: u32) -> Vec<Cluster> {
 
     let n = num_leaves as usize;
 
-    // Get clusters for each tree
-    let tree_clusters: Vec<Vec<Cluster>> = trees.iter().map(|t| find_tree_clusters(t, n)).collect();
+    // Build clusters from reference tree
+    let ref_clusters = find_tree_clusters(&trees[0], n);
 
-    // Build a map from leaf set fingerprint to count
-    let mut cluster_counts: std::collections::HashMap<u64, (Cluster, usize)> =
-        std::collections::HashMap::new();
-
-    for clusters in &tree_clusters {
-        for cluster in clusters {
-            // Use a simple hash of the leaf set
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            use std::hash::{Hash, Hasher};
-            for leaf in cluster.leaves.ones() {
-                leaf.hash(&mut hasher);
-            }
-            let fingerprint = hasher.finish();
-
-            cluster_counts
-                .entry(fingerprint)
-                .and_modify(|(_, count)| *count += 1)
-                .or_insert_with(|| (cluster.clone(), 1));
-        }
-    }
-
-    // Keep only clusters present in ALL trees
-    let mut common: Vec<Cluster> = cluster_counts
-        .into_values()
-        .filter(|(_, count)| *count == trees.len())
-        .map(|(cluster, _)| cluster)
+    // Build lookup sets for other trees using exact leaf-set keys
+    let other_sets: Vec<fxhash::FxHashSet<Vec<usize>>> = trees[1..]
+        .iter()
+        .map(|tree| {
+            let clusters = find_tree_clusters(tree, n);
+            clusters
+                .into_iter()
+                .map(|c| c.leaves.ones().collect::<Vec<usize>>())
+                .collect()
+        })
         .collect();
 
-    // Sort by size descending for better splitting
-    common.sort_by(|a, b| {
-        let size_a = a.leaves.count_ones(..);
-        let size_b = b.leaves.count_ones(..);
-        size_b.cmp(&size_a)
+    // Keep only ref clusters present in ALL other trees
+    let mut common: Vec<Cluster> = ref_clusters
+        .into_iter()
+        .filter(|c| {
+            let key: Vec<usize> = c.leaves.ones().collect();
+            other_sets.iter().all(|s| s.contains(&key))
+        })
+        .collect();
+
+    // Sort by distance from n/2 (best splits first)
+    let target = n / 2;
+    common.sort_by_key(|c| {
+        let sz = c.leaves.count_ones(..);
+        (sz as isize - target as isize).unsigned_abs()
     });
 
     common
@@ -970,6 +966,26 @@ fn solve_sat(instance: &Instance, stats: &mut SolverStats) -> Option<Vec<Tree>> 
         );
     }
 
+    // Phase 1b: Chain reduction (compress long chains)
+    let chain_collapses = find_common_chains(&reduced.trees, reduced.num_leaves);
+    let n_before_chain = reduced.num_leaves;
+    let (reduced, chain_reverse_map) = if chain_collapses.is_empty() {
+        let rev_map: Vec<u32> = (0..=n_before_chain).collect();
+        (reduced, rev_map)
+    } else {
+        let (r, rev) = reduce_instance(&reduced, &chain_collapses);
+        let new_leaves = r.num_leaves;
+        eprintln!(
+            "[sat] Chain reduced: {} → {} leaves ({} chains compressed)",
+            n_before_chain,
+            new_leaves,
+            chain_collapses.len()
+        );
+        (r, rev)
+    };
+
+    let n_reduced = reduced.num_leaves as usize;
+
     if n_reduced <= 1 {
         stats.lower_bound = 1;
         stats.upper_bound = Some(1);
@@ -1010,6 +1026,19 @@ fn solve_sat(instance: &Instance, stats: &mut SolverStats) -> Option<Vec<Tree>> 
     stats.upper_bound = Some(ub_components);
 
     let components = sat_solve_maf(&reduced, ub_components, lb_components, &mut profile)?;
+
+    // Expand solution: first chain collapses, then subtree collapses
+    let components = if chain_collapses.is_empty() {
+        components
+    } else {
+        expand_solution(
+            components,
+            &chain_collapses,
+            &chain_reverse_map,
+            &instance.trees[0],
+            instance.num_leaves,
+        )
+    };
 
     if collapses.is_empty() {
         Some(components)
