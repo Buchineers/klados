@@ -1,5 +1,6 @@
 //! CLI command handlers.
 
+pub mod analyze;
 pub mod bounds;
 pub mod check;
 pub mod compare;
