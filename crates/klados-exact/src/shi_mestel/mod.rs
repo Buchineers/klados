@@ -8,7 +8,7 @@ mod branching;
 mod decomposition;
 mod extraction;
 mod forest_nav;
-mod preprocessing;
+pub(crate) mod preprocessing;
 mod reduction;
 mod search_state;
 mod split;

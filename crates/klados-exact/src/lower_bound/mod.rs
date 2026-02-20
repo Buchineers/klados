@@ -13,7 +13,7 @@ mod tree_data;
 
 use klados_core::tree::Tree;
 
-pub use cherry::cherry_reduce_ub;
+pub use cherry::{cherry_reduce_ub, greedy_multi_tree_ub};
 pub use red_blue::red_blue_approx;
 
 pub struct MafBounds {
