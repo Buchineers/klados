@@ -3,9 +3,14 @@
 use klados_core::tree::{Label, NodeId, Tree, NONE};
 
 pub fn cherry_reduce_ub(t1: &Tree, t2: &Tree) -> usize {
-    let c1 = cherry_reduce(t1, t2);
-    let c2 = cherry_reduce(t2, t1);
-    c1.min(c2)
+    let mut best = cherry_reduce(t1, t2).min(cherry_reduce(t2, t1));
+
+    // Try multiple seeded runs for better upper bound
+    for seed in 1..=5 {
+        best = best.min(cherry_reduce_seeded(t1, t2, seed));
+        best = best.min(cherry_reduce_seeded(t2, t1, seed));
+    }
+    best
 }
 
 struct MutableTree {
@@ -133,9 +138,14 @@ impl MutableTree {
 }
 
 fn cherry_reduce(ref_tree: &Tree, other_tree: &Tree) -> usize {
+    cherry_reduce_seeded(ref_tree, other_tree, 0)
+}
+
+fn cherry_reduce_seeded(ref_tree: &Tree, other_tree: &Tree, seed: u64) -> usize {
     let mut m_ref = MutableTree::from_tree(ref_tree);
     let mut m_other = MutableTree::from_tree(other_tree);
     let mut cuts = 0;
+    let mut step = 0u64;
     loop {
         if m_ref.num_alive_leaves <= 1 {
             break;
@@ -144,7 +154,18 @@ fn cherry_reduce(ref_tree: &Tree, other_tree: &Tree) -> usize {
         if cherries.is_empty() {
             break;
         }
-        let (a, b) = cherries[0];
+        // Deterministic permutation based on seed + step
+        let idx = if cherries.len() > 1 && seed != 0 {
+            let h = seed
+                .wrapping_mul(0x9e3779b97f4a7c15)
+                .wrapping_add(step.wrapping_mul(0x517cc1b727220a95));
+            (h as usize) % cherries.len()
+        } else {
+            0
+        };
+        step += 1;
+
+        let (a, b) = cherries[idx];
         if m_other.is_cherry(a, b) {
             m_ref.contract_cherry(a, b);
             m_other.contract_cherry(a, b);
@@ -186,8 +207,13 @@ fn depth_in_mtree(t: &MutableTree, mut node: NodeId) -> u32 {
 }
 
 pub fn greedy_multi_tree_ub(trees: &[Tree], ref_idx: usize) -> usize {
+    greedy_multi_tree_ub_seeded(trees, ref_idx, 0)
+}
+
+pub fn greedy_multi_tree_ub_seeded(trees: &[Tree], ref_idx: usize, seed: u64) -> usize {
     let mut mtrees: Vec<MutableTree> = trees.iter().map(MutableTree::from_tree).collect();
     let mut cuts = 0;
+    let mut step = 0u64;
     loop {
         if mtrees[ref_idx].num_alive_leaves <= 1 {
             break;
@@ -196,7 +222,18 @@ pub fn greedy_multi_tree_ub(trees: &[Tree], ref_idx: usize) -> usize {
         if cherries.is_empty() {
             break;
         }
-        let (a, b) = cherries[0];
+        // Deterministic permutation based on seed + step
+        let idx = if cherries.len() > 1 && seed != 0 {
+            let h = seed
+                .wrapping_mul(0x9e3779b97f4a7c15)
+                .wrapping_add(step.wrapping_mul(0x517cc1b727220a95));
+            (h as usize) % cherries.len()
+        } else {
+            0
+        };
+        step += 1;
+
+        let (a, b) = cherries[idx];
         if mtrees.iter().all(|t| t.is_cherry(a, b)) {
             for t in &mut mtrees {
                 t.contract_cherry(a, b);
