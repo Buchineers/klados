@@ -22,9 +22,64 @@ struct ScoreEntry {
     path: String,
 }
 
+// STRIDE summary.json format
+#[derive(serde::Deserialize, Debug)]
+struct SummaryEntry {
+    #[serde(rename = "s_key")]
+    key: String,
+    #[serde(rename = "s_idigest")]
+    idigest: String,
+    #[serde(rename = "s_num_trees")]
+    num_trees: u32,
+    #[serde(rename = "s_num_leaves")]
+    num_leaves: u32,
+    #[serde(rename = "s_prev_best")]
+    prev_best: Option<u32>,
+    #[serde(rename = "s_score")]
+    score: u32,
+    #[serde(rename = "s_path")]
+    path: String,
+}
+
 pub fn run(scores_file: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let content = fs::read_to_string(scores_file)?;
-    let entries: HashMap<String, ScoreEntry> = serde_json::from_str(&content)?;
+
+    // Detect file format
+    let first_line = content.lines().next().unwrap_or("");
+    let is_summary_format = first_line.contains("s_key") || first_line.contains("s_prev_best");
+
+    let entries: HashMap<String, ScoreEntry> = if is_summary_format {
+        // Parse summary.json format
+        let mut entries = HashMap::new();
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(summary) = serde_json::from_str::<SummaryEntry>(line) {
+                // Use the best of: our solver's result (guaranteed optimal) or database best
+                let optimal = if let Some(db_best) = summary.prev_best {
+                    (summary.score as usize).min(db_best as usize)
+                } else {
+                    summary.score as usize
+                };
+                entries.insert(
+                    summary.idigest.clone(),
+                    ScoreEntry {
+                        best_known: optimal,
+                        our_score: optimal,
+                        leaves: summary.num_leaves as usize,
+                        trees: summary.num_trees as usize,
+                        name: String::new(),
+                        path: summary.path,
+                    },
+                );
+            }
+        }
+        entries
+    } else {
+        // Original best_known_scores.json format
+        serde_json::from_str(&content)?
+    };
     let base_dir = scores_file.parent().unwrap_or(std::path::Path::new("."));
 
     let mut sorted_entries: Vec<_> = entries.iter().collect();

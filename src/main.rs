@@ -33,6 +33,7 @@ enum Commands {
     },
     Info,
     Bounds,
+    RedBlueUB,
     ValidateBounds {
         #[arg(value_name = "FILE")]
         scores_file: std::path::PathBuf,
@@ -46,6 +47,12 @@ enum Commands {
         scores_file: std::path::PathBuf,
         #[arg(long, default_value = "50")]
         max_leaves: u32,
+    },
+    AnalyzeRun {
+        #[arg(value_name = "FILE")]
+        summary_file: std::path::PathBuf,
+        #[arg(long, default_value = "100")]
+        top_n: usize,
     },
 }
 
@@ -66,6 +73,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_leaves,
         }) => {
             commands::compare::run(&scores_file, max_leaves)?;
+            return Ok(());
+        }
+        Some(Commands::AnalyzeRun {
+            summary_file,
+            top_n,
+        }) => {
+            commands::analyze::run(&summary_file, top_n)?;
             return Ok(());
         }
         _ => {
