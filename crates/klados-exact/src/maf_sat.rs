@@ -10,12 +10,13 @@ use klados_core::tree::{Label, NodeId, Tree, NONE};
 use klados_core::{Instance, SolverStats};
 use rustsat::encodings::card::{BoundUpper, Totalizer};
 use rustsat::instances::{BasicVarManager, ManageVars};
-use rustsat::solvers::{Solve, SolveIncremental, SolverResult};
+use rustsat::solvers::{PhaseLit, Solve, SolveIncremental, SolverResult};
 use rustsat::types::{Clause, Lit, TernaryVal, Var};
 use rustsat_cadical::CaDiCaL;
 
 use crate::lower_bound::{
-    cherry_reduce_ub, greedy_multi_tree_ub, greedy_multi_tree_ub_seeded, red_blue_approx,
+    cherry_reduce_ub, greedy_multi_tree_partition, greedy_multi_tree_ub,
+    greedy_multi_tree_ub_seeded, red_blue_approx,
 };
 use crate::shi_mestel::preprocessing::{
     expand_solution, find_common_chains, find_common_subtrees, reduce_instance,
@@ -490,64 +491,6 @@ impl NcaData {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Path Data - precomputed paths for H3
-// ═══════════════════════════════════════════════════════════════
-
-/// Precomputed path data for H3: for each pair (ja, jb), the list
-/// of internal node indices on the path between them.
-struct PathData {
-    /// paths[pair_idx] = Vec of internal node indices
-    paths: Vec<Vec<usize>>,
-}
-
-impl PathData {
-    fn build(tree: &Tree, pc: &TreePrecomp, n: usize) -> Self {
-        let num_pairs = n * (n - 1) / 2;
-        let mut paths = Vec::with_capacity(num_pairs);
-
-        for ja in 0..n {
-            let node_a = tree.node_by_label((ja + 1) as Label);
-            for jb in (ja + 1)..n {
-                let node_b = tree.node_by_label((jb + 1) as Label);
-                let nca = tree.nearest_common_ancestor(node_a, node_b);
-
-                let mut path = Vec::with_capacity(16);
-
-                let mut cur = node_a;
-                while cur != nca {
-                    if !tree.is_leaf(cur) {
-                        path.push(pc.idx(cur));
-                    }
-                    cur = tree.parent[cur as usize];
-                }
-
-                cur = node_b;
-                while cur != nca {
-                    if !tree.is_leaf(cur) {
-                        path.push(pc.idx(cur));
-                    }
-                    cur = tree.parent[cur as usize];
-                }
-
-                if !tree.is_leaf(nca) {
-                    path.push(pc.idx(nca));
-                }
-
-                paths.push(path);
-            }
-        }
-
-        Self { paths }
-    }
-
-    fn get(&self, ja: usize, jb: usize, n: usize) -> &[usize] {
-        // Index into flat array matching the nested loop order
-        let offset = ja * n - ja * (ja + 1) / 2 + (jb - ja - 1);
-        &self.paths[offset]
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════
 // Encoding with w variables for H3, but no H2/t (not needed)
 // ═══════════════════════════════════════════════════════════════
 
@@ -688,35 +631,6 @@ impl TreeNav {
         }
     }
 
-    /// Get d-literal for a node: leaf → l[i][j], internal → d[ii]
-    #[inline]
-    fn d_lit(
-        &self,
-        node: NodeId,
-        l: &[Vec<Var>],
-        d: &[Var],
-        i: usize,
-        _pc: &TreePrecomp,
-        positive: bool,
-    ) -> Lit {
-        if self.is_leaf[node as usize] {
-            let j = self.leaf_idx[node as usize].unwrap_or(0);
-            if positive {
-                l[i][j].pos_lit()
-            } else {
-                l[i][j].neg_lit()
-            }
-        } else {
-            let _ii = self.leaf_idx.len() - self.is_leaf.len() + node as usize; // This is wrong, need proper mapping
-                                                                                // Actually we need to use pc.idx, but we don't have pc here
-                                                                                // For now, assume caller provides correct d slice
-            if positive {
-                d[node as usize].pos_lit()
-            } else {
-                d[node as usize].neg_lit()
-            }
-        }
-    }
 }
 
 fn add_clause(solver: &mut CaDiCaL, lits: &[Lit]) {
@@ -1146,6 +1060,27 @@ fn sat_solve_maf(
 
     profile.encode_ms = t_enc.elapsed().as_secs_f64() * 1000.0 + nav_ms + var_ms;
     profile.num_vars = vm.n_used() as usize;
+
+    // Phase hints: bias the solver toward the greedy upper-bound partition.
+    // CaDiCaL will override these via VSIDS if they are wrong, so the downside
+    // is negligible while the upside is faster SAT proofs at the UB bound.
+    {
+        let (greedy_n_comps, greedy_partition) =
+            greedy_multi_tree_partition(&instance.trees, 0, 0);
+        if greedy_n_comps <= k {
+            for j in 0..n {
+                let comp_idx = greedy_partition[j];
+                for i in 0..k {
+                    let lit = if i == comp_idx {
+                        enc.l[i][j].pos_lit()
+                    } else {
+                        enc.l[i][j].neg_lit()
+                    };
+                    let _ = solver.phase_lit(lit);
+                }
+            }
+        }
+    }
 
     let u_lits: Vec<Lit> = enc.u.iter().map(|v| v.pos_lit()).collect();
     let mut totalizer = Totalizer::default();

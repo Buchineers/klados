@@ -249,6 +249,88 @@ pub fn greedy_multi_tree_ub_seeded(trees: &[Tree], ref_idx: usize, seed: u64) ->
     cuts + 1
 }
 
+/// Run the greedy multi-tree cherry reduction and return the leaf partition.
+///
+/// Returns `(num_components, partition)` where `partition[j]` is the 0-based
+/// component index for the leaf with label `j+1`. Component 0 contains all
+/// leaves that were never cut (the "surviving" group); components 1.. each
+/// hold a set of leaves that were cut together as one group.
+///
+/// The number of components equals the number of cuts + 1, matching
+/// `greedy_multi_tree_ub_seeded`.
+pub fn greedy_multi_tree_partition(
+    trees: &[Tree],
+    ref_idx: usize,
+    seed: u64,
+) -> (usize, Vec<usize>) {
+    let n = trees[ref_idx].num_leaves as usize;
+    let mut mtrees: Vec<MutableTree> = trees.iter().map(MutableTree::from_tree).collect();
+
+    // Union-find over labels 1..=n (index 0 unused).
+    let mut uf: Vec<usize> = (0..=n).collect();
+    // Component assignment: 0 = surviving (default); 1.. = cut groups.
+    let mut label_comp: Vec<usize> = vec![0; n + 1];
+    let mut next_comp: usize = 1;
+
+    let mut step = 0u64;
+    loop {
+        if mtrees[ref_idx].num_alive_leaves <= 1 {
+            break;
+        }
+        let cherries = mtrees[ref_idx].find_cherries();
+        if cherries.is_empty() {
+            break;
+        }
+        let idx = if cherries.len() > 1 && seed != 0 {
+            let h = seed
+                .wrapping_mul(0x9e3779b97f4a7c15)
+                .wrapping_add(step.wrapping_mul(0x517cc1b727220a95));
+            (h as usize) % cherries.len()
+        } else {
+            0
+        };
+        step += 1;
+
+        let (a, b) = cherries[idx];
+        if mtrees.iter().all(|t| t.is_cherry(a, b)) {
+            for t in &mut mtrees {
+                t.contract_cherry(a, b);
+            }
+            // b merges into a: union their groups (a stays as representative).
+            let ra = uf_find(&uf, a as usize);
+            let rb = uf_find(&uf, b as usize);
+            if ra != rb {
+                uf[rb] = ra;
+            }
+        } else {
+            let cut = pick_multi_tree_cut(&mtrees, ref_idx, a, b);
+            for t in &mut mtrees {
+                t.cut_leaf(cut);
+            }
+            // All leaves in cut's UF group get a new component ID.
+            let r_cut = uf_find(&uf, cut as usize);
+            let comp_idx = next_comp;
+            next_comp += 1;
+            for lbl in 1..=n {
+                if uf_find(&uf, lbl) == r_cut {
+                    label_comp[lbl] = comp_idx;
+                }
+            }
+        }
+    }
+
+    // Map label 1..=n → component (0-indexed by leaf = label-1).
+    let partition: Vec<usize> = (1..=n).map(|lbl| label_comp[lbl]).collect();
+    (next_comp, partition)
+}
+
+fn uf_find(uf: &[usize], mut x: usize) -> usize {
+    while uf[x] != x {
+        x = uf[x];
+    }
+    x
+}
+
 fn pick_multi_tree_cut(mtrees: &[MutableTree], ref_idx: usize, a: Label, b: Label) -> Label {
     let mut a_deeper = 0i32;
     let mut total_diff: i32 = 0;
