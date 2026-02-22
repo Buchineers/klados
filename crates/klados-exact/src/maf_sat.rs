@@ -41,6 +41,7 @@ struct SolveProfile {
     h5_clauses: usize,
     sym_clauses: usize,
     sibling_clauses: usize,
+    singleton_clauses: usize,
     encode_ms: f64,
     solve_ms: f64,
     cegar_ms: f64,
@@ -59,12 +60,13 @@ impl SolveProfile {
             + self.h5_clauses
             + self.sym_clauses
             + self.sibling_clauses
+            + self.singleton_clauses
     }
 
     fn report(&self) {
         eprintln!(
             "[profile] n={} n'={} k={} m={} splits={} vars={} clauses={} \
-             (H1={} H2={} H3={} H4={} H5={} sym={} sib={}) \
+             (H1={} H2={} H3={} H4={} H5={} sym={} sib={} sing={}) \
              encode={:.1}ms solve={:.1}ms cegar={:.1}ms \
              sat_calls={} violations={} bounds=[{},{}] opt={}",
             self.n,
@@ -81,6 +83,7 @@ impl SolveProfile {
             self.h5_clauses,
             self.sym_clauses,
             self.sibling_clauses,
+            self.singleton_clauses,
             self.encode_ms,
             self.solve_ms,
             self.cegar_ms,
@@ -244,11 +247,25 @@ fn collapse_cluster(
     restrict_instance(instance, &keep)
 }
 
-/// Combine two solutions: expand the collapsed representative with the cluster solution
+/// Combine cluster and rest solutions.
+///
+/// Cluster decomposition theorem: MAF(T1..Tm) = cluster_MAF + rest_MAF - 1.
+///
+/// In the rest_MAF, rep (the ghost leaf standing for the whole cluster) will
+/// typically be a singleton component {rep}.  If it is, we substitute the
+/// cluster_solution for that singleton.
+///
+/// If rep is grouped with other leaves {rep, X1, …, Xm} in the rest solution:
+///   • cluster_solution has exactly 1 component → we can merge: replace the
+///     component with {cluster_leaves ∪ X1 … Xm}.
+///   • cluster_solution has > 1 component → cannot merge consistently; return
+///     None so the caller can fall back to monolithic solving.  The theorem
+///     guarantees that at the true optimum this case never arises, so returning
+///     None is only a safety valve against a solver returning a sub-optimal
+///     (or equal-cost but wrong-structure) solution.
 fn combine_solutions(
     cluster_solution: &[Tree],
     rest_solution: &[Tree],
-    _cluster: &FixedBitSet,
     rep: u32,
     cluster_reverse: &[u32],
     rest_reverse: &[u32],
@@ -258,51 +275,79 @@ fn combine_solutions(
     let n = num_leaves as usize;
     let mut combined = Vec::new();
 
-    // Find what subproblem label the rep has in rest solution
+    // Find rep's label in the rest sub-instance label space.
     let rep_subproblem_label: u32 = (1..rest_reverse.len() as u32)
         .find(|&i| rest_reverse[i as usize] == rep)
-        .unwrap_or(1);
+        .expect("rep must be present in rest instance");
+
+    let mut found_rep = false;
 
     for tree in rest_solution {
         let leaves: Vec<Label> = tree.leaves().collect();
-        let contains_rep = leaves.contains(&rep_subproblem_label);
-
-        if contains_rep && leaves.len() > 1 {
-            // The rep is grouped with other leaves - this breaks cluster decomposition
-            // because the cluster leaves would need to merge with non-cluster leaves,
-            // potentially creating invalid subtrees
-            return None;
-        }
-
-        if contains_rep {
-            // Rep is singleton - replace with cluster components
-            for ct in cluster_solution {
-                let orig_labels: Vec<Label> = ct
-                    .leaves()
-                    .map(|l| cluster_reverse[l as usize])
-                    .filter(|&l| l > 0 && (l as usize) <= n)
-                    .collect();
+        if leaves.contains(&rep_subproblem_label) {
+            found_rep = true;
+            if leaves.len() == 1 {
+                // Singleton {rep} — substitute with all cluster components.
+                for ct in cluster_solution {
+                    let mut ls = FixedBitSet::with_capacity(n + 1);
+                    for l in ct.leaves() {
+                        let orig = cluster_reverse[l as usize];
+                        if orig > 0 && (orig as usize) <= n {
+                            ls.insert(orig as usize);
+                        }
+                    }
+                    if ls.count_ones(..) > 0 {
+                        combined.push(ref_tree.prune_to_leafset(&ls));
+                    }
+                }
+            } else {
+                // Rep is grouped with other rest leaves {rep, X1, …, Xm}.
+                // Only valid when cluster has exactly 1 component (merge everything).
+                if cluster_solution.len() != 1 {
+                    return None;
+                }
                 let mut ls = FixedBitSet::with_capacity(n + 1);
-                for &l in &orig_labels {
-                    ls.insert(l as usize);
+                // Add cluster leaves.
+                for ct in cluster_solution {
+                    for l in ct.leaves() {
+                        let orig = cluster_reverse[l as usize];
+                        if orig > 0 && (orig as usize) <= n {
+                            ls.insert(orig as usize);
+                        }
+                    }
+                }
+                // Add rest leaves (excluding rep).
+                for &l in &leaves {
+                    if l == rep_subproblem_label {
+                        continue;
+                    }
+                    let orig = rest_reverse[l as usize];
+                    if orig > 0 && (orig as usize) <= n {
+                        ls.insert(orig as usize);
+                    }
                 }
                 if ls.count_ones(..) > 0 {
                     combined.push(ref_tree.prune_to_leafset(&ls));
                 }
             }
         } else {
-            // Component doesn't contain rep - just remap labels
+            // Component doesn't contain rep — remap labels directly.
             let mut ls = FixedBitSet::with_capacity(n + 1);
             for &l in &leaves {
-                let orig_l = rest_reverse[l as usize];
-                if orig_l > 0 && (orig_l as usize) <= n {
-                    ls.insert(orig_l as usize);
+                let orig = rest_reverse[l as usize];
+                if orig > 0 && (orig as usize) <= n {
+                    ls.insert(orig as usize);
                 }
             }
             if ls.count_ones(..) > 0 {
                 combined.push(ref_tree.prune_to_leafset(&ls));
             }
         }
+    }
+
+    if !found_rep {
+        // Rep not found in rest solution — shouldn't happen with a valid MAF.
+        return None;
     }
 
     Some(combined)
@@ -662,9 +707,9 @@ impl TreeNav {
                 l[i][j].neg_lit()
             }
         } else {
-            let ii = self.leaf_idx.len() - self.is_leaf.len() + node as usize; // This is wrong, need proper mapping
-                                                                               // Actually we need to use pc.idx, but we don't have pc here
-                                                                               // For now, assume caller provides correct d slice
+            let _ii = self.leaf_idx.len() - self.is_leaf.len() + node as usize; // This is wrong, need proper mapping
+                                                                                // Actually we need to use pc.idx, but we don't have pc here
+                                                                                // For now, assume caller provides correct d slice
             if positive {
                 d[node as usize].pos_lit()
             } else {
@@ -910,6 +955,7 @@ fn seed_sibling_constraints(
     instance: &Instance,
     enc: &MafEncoding,
     profile: &mut SolveProfile,
+    ghost_leaves: &[usize],
 ) {
     let ref_tree = &instance.trees[0];
     let k = enc.k;
@@ -924,6 +970,18 @@ fn seed_sibling_constraints(
                     continue;
                 }
 
+                let ja = (la - 1) as usize;
+                let jb = (lb - 1) as usize;
+
+                // Skip sibling constraints involving ghost leaves (cluster representatives).
+                // A ghost leaf is an artificial stand-in for a whole cluster sub-instance;
+                // it has no genuine cherry relationship in the original instance trees, so
+                // forcing it to be co-component with its structural cherry partner is wrong
+                // and will make the singleton assumption UNSAT.
+                if ghost_leaves.contains(&ja) || ghost_leaves.contains(&jb) {
+                    continue;
+                }
+
                 let is_common = instance.trees[1..].iter().all(|t| {
                     let na = t.node_by_label(la);
                     let nb = t.node_by_label(lb);
@@ -933,8 +991,6 @@ fn seed_sibling_constraints(
                 });
 
                 if is_common {
-                    let ja = (la - 1) as usize;
-                    let jb = (lb - 1) as usize;
                     for i in 0..k {
                         add_clause(solver, &[enc.l[i][ja].neg_lit(), enc.l[i][jb].pos_lit()]);
                         add_clause(solver, &[enc.l[i][jb].neg_lit(), enc.l[i][ja].pos_lit()]);
@@ -950,12 +1006,15 @@ fn seed_sibling_constraints(
 // ═══════════════════════════════════════════════════════════════
 // CEGAR for H4 (incompatible triples)
 // ═══════════════════════════════════════════════════════════════
+// CEGAR for H4 (incompatible triples)
+// ═══════════════════════════════════════════════════════════════
 
 fn add_violated_triples(
     solver: &mut CaDiCaL,
     enc: &MafEncoding,
     components: &[Vec<usize>],
     nca_data: &NcaData,
+    added_triples: &mut fxhash::FxHashSet<(usize, usize, usize)>,
 ) -> usize {
     let k = enc.k;
     let mut violations = 0;
@@ -973,6 +1032,12 @@ fn add_violated_triples(
                     let c = comp[kk];
 
                     if nca_data.is_incompatible(a, b, c) {
+                        let key = (a, b, c);
+                        if added_triples.contains(&key) {
+                            continue; // Already added, skip duplicate
+                        }
+                        added_triples.insert(key);
+
                         for i in 0..k {
                             add_clause(
                                 solver,
@@ -1002,6 +1067,7 @@ fn sat_solve_maf(
     k_max: usize,
     lb_components: usize,
     profile: &mut SolveProfile,
+    preferred_singletons: &[usize],
 ) -> Option<Vec<Tree>> {
     let n = instance.num_leaves as usize;
     let k = k_max;
@@ -1016,21 +1082,6 @@ fn sat_solve_maf(
         .iter()
         .map(|t| TreePrecomp::build(t))
         .collect();
-
-    // Phase 1: Always use local propagation H3 encoding
-    // This reduces H3 clauses from O(m × k × n² × path_len) to O(m × k × n × 12)
-    let use_local_h3 = true;
-    let avg_path_len = 10usize;
-    let estimated_h3_path = m * k * (n * (n - 1) / 2) * avg_path_len;
-    let avg_internal_nodes: usize =
-        precomps.iter().map(|p| p.num_internal).sum::<usize>() / m.max(1);
-    let estimated_h3_local = m * k * avg_internal_nodes * 12;
-    eprintln!(
-        "[sat] H3: local-prop encoding (path_est={} clauses, local_est={} clauses, {:.1}% reduction)",
-        estimated_h3_path,
-        estimated_h3_local,
-        100.0 * (estimated_h3_path - estimated_h3_local) as f64 / estimated_h3_path.max(1) as f64
-    );
 
     // Build TreeNav data for local propagation
     let t_nav = std::time::Instant::now();
@@ -1069,7 +1120,30 @@ fn sat_solve_maf(
 
     let t_enc = std::time::Instant::now();
     add_structural_clauses(&mut solver, &enc, profile, instance, &precomps, &navs);
-    seed_sibling_constraints(&mut solver, instance, &enc, profile);
+    seed_sibling_constraints(&mut solver, instance, &enc, profile, preferred_singletons);
+
+    // Hard singleton constraints for ghost leaves (cluster representatives).
+    // For every ghost p: ~l[i][p] \/ ~l[i][j] for all i, all j != p.
+    // This is a hard structural fact: a ghost leaf must be completely alone in its
+    // component so that combine_solutions can substitute the cluster sub-solution.
+    // Hard binary clauses (rather than a soft indicator variable + retry) ensure:
+    //   (a) The solver finds the TRUE optimal k under the isolation requirement
+    //       instead of a spuriously low k that groups the ghost with other leaves.
+    //   (b) No O2 collision: the ghost is free to land in any component index,
+    //       while O2 still pins leaf-index-0 to component 0.
+    let mut singleton_clauses = 0usize;
+    for &p in preferred_singletons {
+        for i in 0..k {
+            for q in 0..n {
+                if q != p {
+                    add_clause(&mut solver, &[enc.l[i][p].neg_lit(), enc.l[i][q].neg_lit()]);
+                    singleton_clauses += 1;
+                }
+            }
+        }
+    }
+    profile.singleton_clauses = singleton_clauses;
+
     profile.encode_ms = t_enc.elapsed().as_secs_f64() * 1000.0 + nav_ms + var_ms;
     profile.num_vars = vm.n_used() as usize;
 
@@ -1081,17 +1155,21 @@ fn sat_solve_maf(
 
     let mut best_components: Option<Vec<Vec<usize>>> = None;
 
+    // Pre-encode the full range once so enforce_ub can assume any bound in [lb_components, k].
+    totalizer
+        .encode_ub(lb_components..=k, &mut solver, &mut vm)
+        .unwrap();
+
+    // Track added H4 triples to avoid re-adding duplicates across CEGAR iterations.
+    let mut added_triples: fxhash::FxHashSet<(usize, usize, usize)> = fxhash::FxHashSet::default();
+
+    // Linear descent from k down to lb_components.  CEGAR triples learned at higher bounds
+    // remain in the solver and help prune lower bounds — so descending linearly is better than
+    // binary search when CEGAR dominates the cost.
     for bound in (lb_components..=k).rev() {
-        totalizer
-            .encode_ub(bound..=bound, &mut solver, &mut vm)
-            .unwrap();
         let assumps_vec = totalizer.enforce_ub(bound).unwrap();
 
-        let t_bound = std::time::Instant::now();
-        let mut cegar_iters = 0;
-
         loop {
-            cegar_iters += 1;
             profile.sat_calls += 1;
 
             let t_solve = std::time::Instant::now();
@@ -1102,7 +1180,13 @@ fn sat_solve_maf(
                 SolverResult::Sat => {
                     let t_cegar = std::time::Instant::now();
                     let comps = extract_components(&solver, &enc, n, k);
-                    let v = add_violated_triples(&mut solver, &enc, &comps, &nca_data);
+                    let v = add_violated_triples(
+                        &mut solver,
+                        &enc,
+                        &comps,
+                        &nca_data,
+                        &mut added_triples,
+                    );
                     profile.cegar_ms += t_cegar.elapsed().as_secs_f64() * 1000.0;
                     profile.cegar_violations += v;
                     profile.h4_clauses += v * k;
@@ -1171,12 +1255,33 @@ fn components_to_trees(components: &[Vec<usize>], ref_tree: &Tree, num_leaves: u
 // ═══════════════════════════════════════════════════════════════
 
 fn solve_sat(instance: &Instance, stats: &mut SolverStats) -> Option<Vec<Tree>> {
+    solve_sat_inner(instance, stats, vec![])
+}
+
+fn solve_sat_inner(
+    instance: &Instance,
+    stats: &mut SolverStats,
+    preferred_singleton_labels: Vec<u32>,
+) -> Option<Vec<Tree>> {
+    solve_sat_inner_impl(instance, stats, preferred_singleton_labels, false)
+}
+
+fn solve_sat_inner_impl(
+    instance: &Instance,
+    stats: &mut SolverStats,
+    preferred_singleton_labels: Vec<u32>,
+    skip_cluster_decomp: bool,
+) -> Option<Vec<Tree>> {
     let n = instance.num_leaves as usize;
     let mut profile = SolveProfile::default();
     profile.n = n;
 
-    // Phase 0: Try cluster decomposition FIRST
-    let clusters = find_common_clusters(&instance.trees, instance.num_leaves);
+    // Phase 0: Try cluster decomposition FIRST (unless suppressed for monolithic fallback)
+    let clusters = if skip_cluster_decomp {
+        vec![]
+    } else {
+        find_common_clusters(&instance.trees, instance.num_leaves)
+    };
     if let Some(split_cluster) = find_best_split_cluster(&clusters, n) {
         let cluster_size = split_cluster.leaves.count_ones(..);
         let rest_size = n - cluster_size + 1;
@@ -1187,24 +1292,38 @@ fn solve_sat(instance: &Instance, stats: &mut SolverStats) -> Option<Vec<Tree>> 
             n, cluster_size, rest_size
         );
 
-        // Solve the cluster sub-instance
+        // Solve the cluster sub-instance.
+        // Map each preferred singleton label into the cluster's label space (if it lives there).
         let (cluster_inst, cluster_rev) = restrict_instance(instance, &split_cluster.leaves);
+        // Do NOT propagate inherited ghost constraints into the cluster sub-problem.
+        // Each decomposition level's ghost requirement only applies to its own rest-instance.
+        // Inherited ghosts are plain leaves in the cluster and rest sub-problems; forcing them
+        // as singletons inside nested sub-problems can inflate the optimal k beyond the true
+        // optimum (the cluster-decomposition theorem does not require this).
         let mut cluster_stats = SolverStats::default();
-        let cluster_result = solve_sat(&cluster_inst, &mut cluster_stats)?;
+        let cluster_result = solve_sat_inner(&cluster_inst, &mut cluster_stats, vec![])?;
 
-        // Pick representative (first label in cluster)
+        // Pick representative (smallest label in cluster).
         let rep = split_cluster.leaves.ones().next().unwrap() as u32;
 
-        // Solve the rest (cluster collapsed to representative)
+        // Build the rest instance (cluster collapsed to ghost rep).
         let (rest_inst, rest_rev) = collapse_cluster(instance, &split_cluster.leaves, rep);
-        let mut rest_stats = SolverStats::default();
-        let rest_result = solve_sat(&rest_inst, &mut rest_stats)?;
 
-        // Combine solutions
+        // Solve the rest instance WITHOUT any ghost singleton constraint.
+        // The cluster-decomposition theorem (Bordewich & Semple) proves that for the
+        // UNCONSTRAINED optimal rest-MAF, rep is always a singleton component.
+        // Enforcing the constraint inflates the rest optimum (the unconstrained optimum
+        // can be smaller), making the formula |MAF(full)| = |MAF(cluster)| + |MAF(rest)| - 1
+        // return the wrong (larger) answer.
+        let mut rest_stats = SolverStats::default();
+        let rest_result = solve_sat_inner(&rest_inst, &mut rest_stats, vec![])?;
+
+        // Combine solutions.  By the theorem, rep is a singleton in the optimal rest-MAF,
+        // so combine_solutions should always succeed.  The fallback to monolithic is only
+        // a safety net in case the SAT solver returns a non-optimal solution.
         if let Some(combined) = combine_solutions(
             &cluster_result,
             &rest_result,
-            &split_cluster.leaves,
             rep,
             &cluster_rev,
             &rest_rev,
@@ -1218,12 +1337,40 @@ fn solve_sat(instance: &Instance, stats: &mut SolverStats) -> Option<Vec<Tree>> 
             };
             return Some(combined);
         }
-        // If combine fails (rep was grouped), fall through to normal solving
-        eprintln!("[sat] Cluster decomposition failed (rep grouped), falling back");
+        // Fall through to monolithic solving.
+        eprintln!("[sat] Cluster combine failed (non-singleton rep with >1 cluster comp), falling back to monolithic");
+        // Solve monolithically WITHOUT any ghost constraint.
+        // The ghost constraint was only needed for combine_solutions to work. Since combine
+        // failed, we solve the current instance directly — the rep is just a plain leaf.
+        // Keeping the ghost would inflate the solution by forcing an extra singleton component
+        // that may not exist in the true optimum (the ghost is only special in rest-instances
+        // where the theorem guarantees singleton exists, not in the original instance).
+        return solve_sat_inner_impl(instance, stats, vec![], true);
     }
 
     // Phase 1: Kernelize (subtree reduction)
-    let collapses = find_common_subtrees(&instance.trees, instance.num_leaves);
+    let mut collapses = find_common_subtrees(&instance.trees, instance.num_leaves);
+
+    // If the preferred singleton leaf would be collapsed away (it's in a "removed" set),
+    // swap it with the representative so it survives kernelization.
+    // Correctness: all leaves in a common subtree must be in the same MAF component,
+    // so requiring singleton on the rep vs. any other member is equivalent.
+    for &pref_lbl in &preferred_singleton_labels {
+        for (rep, removed) in &mut collapses {
+            if let Some(pos) = removed.iter().position(|&l| l == pref_lbl) {
+                let old_rep = *rep;
+                *rep = pref_lbl;
+                removed[pos] = old_rep;
+                removed.sort_unstable();
+                eprintln!(
+                    "[sat] Promoted preferred_singleton_label={} to collapse rep (was {})",
+                    pref_lbl, old_rep
+                );
+                break;
+            }
+        }
+    }
+
     let (reduced, reverse_map) = if collapses.is_empty() {
         (instance.clone(), (0..=instance.num_leaves).collect())
     } else {
@@ -1241,7 +1388,31 @@ fn solve_sat(instance: &Instance, stats: &mut SolverStats) -> Option<Vec<Tree>> 
     }
 
     // Phase 1b: Chain reduction (compress long chains)
-    let chain_collapses = find_common_chains(&reduced.trees, reduced.num_leaves);
+    let mut chain_collapses = find_common_chains(&reduced.trees, reduced.num_leaves);
+
+    // Again protect preferred_singleton_labels from being collapsed away by chain reduction.
+    // Here we need each label in the post-subtree-reduction space.
+    for &pref_lbl in &preferred_singleton_labels {
+        // Translate pref_lbl from original space to reduced (post-subtree) space via reverse_map.
+        let pref_in_reduced =
+            (1..=reduced.num_leaves).find(|&nl| reverse_map[nl as usize] == pref_lbl);
+        if let Some(pref_red_lbl) = pref_in_reduced {
+            for (rep, removed) in &mut chain_collapses {
+                if let Some(pos) = removed.iter().position(|&l| l == pref_red_lbl) {
+                    let old_rep = *rep;
+                    *rep = pref_red_lbl;
+                    removed[pos] = old_rep;
+                    removed.sort_unstable();
+                    eprintln!(
+                        "[sat] Promoted preferred_singleton_label={} (reduced={}) to chain collapse rep (was {})",
+                        pref_lbl, pref_red_lbl, old_rep
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
     let n_before_chain = reduced.num_leaves;
     let (reduced, chain_reverse_map) = if chain_collapses.is_empty() {
         let rev_map: Vec<u32> = (0..=n_before_chain).collect();
@@ -1300,11 +1471,60 @@ fn solve_sat(instance: &Instance, stats: &mut SolverStats) -> Option<Vec<Tree>> 
         lb_components, ub_components, n_reduced
     );
 
+    // Translate all preferred singleton labels through chain_reverse_map ∘ reverse_map
+    // into 0-based indices in the fully-reduced instance.
+    let preferred_singletons_reduced: Vec<usize> = preferred_singleton_labels
+        .iter()
+        .filter_map(|&orig_lbl| {
+            let found = (1..=reduced.num_leaves)
+                .find(|&chain_lbl| {
+                    let subtree_lbl = chain_reverse_map[chain_lbl as usize];
+                    subtree_lbl < reverse_map.len() as u32
+                        && reverse_map[subtree_lbl as usize] == orig_lbl
+                })
+                .map(|chain_lbl| (chain_lbl - 1) as usize);
+            if found.is_none() {
+                eprintln!(
+                    "[sat] preferred_singleton_label={} not found after kernelization",
+                    orig_lbl
+                );
+            }
+            found
+        })
+        .collect();
+
+    // Each ghost leaf must occupy its own component.  Ensure bounds are high enough
+    // that there is room for g isolated ghost components plus at least one component
+    // for the remaining non-ghost leaves (if any exist).
+    // - lb: must be at least (g + 1) since g singletons + ≥1 component for non-ghosts.
+    // - ub: greedy was computed on the instance including ghosts as ordinary leaves, so
+    //   it may under-count. The safe upper bound is ub + g (each ghost may need one extra
+    //   cut beyond what greedy found). We cap at n_reduced (trivial bound: all singletons).
+    let g = preferred_singletons_reduced.len();
+    let (lb_components, ub_components) = if g > 0 {
+        let min_k_for_ghosts = if n_reduced > g { g + 1 } else { g };
+        let lb = lb_components.max(min_k_for_ghosts);
+        let ub = (ub_components + g).min(n_reduced);
+        eprintln!(
+            "[sat] Ghost adjustment: g={} min_k={} lb={} ub={}",
+            g, min_k_for_ghosts, lb, ub
+        );
+        (lb, ub)
+    } else {
+        (lb_components, ub_components)
+    };
+
     profile.bounds_computed = (lb_components, ub_components);
     stats.lower_bound = lb_components;
     stats.upper_bound = Some(ub_components);
 
-    let components = sat_solve_maf(&reduced, ub_components, lb_components, &mut profile)?;
+    let components = sat_solve_maf(
+        &reduced,
+        ub_components,
+        lb_components,
+        &mut profile,
+        &preferred_singletons_reduced,
+    )?;
 
     // Expand solution: first chain collapses, then subtree collapses
     let components = if chain_collapses.is_empty() {
