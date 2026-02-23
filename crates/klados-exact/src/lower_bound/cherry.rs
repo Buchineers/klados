@@ -5,8 +5,10 @@ use klados_core::tree::{Label, NodeId, Tree, NONE};
 pub fn cherry_reduce_ub(t1: &Tree, t2: &Tree) -> usize {
     let mut best = cherry_reduce(t1, t2).min(cherry_reduce(t2, t1));
 
-    // Try multiple seeded runs for better upper bound
-    for seed in 1..=5 {
+    // Try multiple seeded runs for better upper bound.
+    // Each run is O(n^2) and takes <1 ms for n≤50, so increasing seeds is cheap.
+    // More seeds give a better chance of finding the cherry ordering that minimizes cuts.
+    for seed in 1..=20 {
         best = best.min(cherry_reduce_seeded(t1, t2, seed));
         best = best.min(cherry_reduce_seeded(t2, t1, seed));
     }
