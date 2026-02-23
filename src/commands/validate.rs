@@ -41,7 +41,7 @@ struct SummaryEntry {
     path: String,
 }
 
-pub fn run(scores_file: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run(scores_file: &PathBuf, top_n: usize) -> Result<(), Box<dyn std::error::Error>> {
     let content = fs::read_to_string(scores_file)?;
 
     // Detect file format
@@ -85,7 +85,14 @@ pub fn run(scores_file: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let mut sorted_entries: Vec<_> = entries.iter().collect();
     sorted_entries.sort_by(|a, b| (a.1.leaves, a.1.trees).cmp(&(b.1.leaves, b.1.trees)));
 
-    println!("Validating bounds against {} instances...\n", entries.len());
+    if top_n > 0 {
+        sorted_entries.truncate(top_n);
+    }
+
+    println!(
+        "Validating bounds against {} instances...\n",
+        sorted_entries.len()
+    );
     println!(
         "{:<40} {:>6} {:>6} {:>6} {:>6} {:>6} {:>5} {:>7} {:>8}",
         "Instance", "Leaves", "Trees", "Best", "LB", "UB", "Gap", "Tight%", "Time(ms)"

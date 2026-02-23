@@ -37,6 +37,8 @@ enum Commands {
     ValidateBounds {
         #[arg(value_name = "FILE")]
         scores_file: std::path::PathBuf,
+        #[arg(long, default_value = "0")]
+        top_n: usize,
     },
     CheckBounds {
         #[arg(value_name = "FILE")]
@@ -60,8 +62,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Commands::ValidateBounds { scores_file }) => {
-            commands::validate::run(&scores_file)?;
+        Some(Commands::ValidateBounds { scores_file, top_n }) => {
+            commands::validate::run(&scores_file, top_n)?;
             return Ok(());
         }
         Some(Commands::CheckBounds { list_file }) => {
