@@ -1098,9 +1098,37 @@ fn sat_solve_maf(
     // Track added H4 triples to avoid re-adding duplicates across CEGAR iterations.
     let mut added_triples: fxhash::FxHashSet<(usize, usize, usize)> = fxhash::FxHashSet::default();
 
+    // Upfront H4: for small n add all incompatible triples before the CEGAR loop.
+    // This gives the SAT solver full H4 propagation from the first call, and reduces
+    // bound levels to exactly 1 SAT call each (no inner CEGAR iterations).
+    // For larger n the clause count becomes prohibitive and lazy CEGAR is better.
+    const UPFRONT_TRIPLE_THRESHOLD: usize = 40;
+    if n <= UPFRONT_TRIPLE_THRESHOLD {
+        for a in 0..n {
+            for b in (a + 1)..n {
+                for c in (b + 1)..n {
+                    if nca_data.is_incompatible(a, b, c) {
+                        added_triples.insert((a, b, c));
+                        for i in 0..k {
+                            add_clause(
+                                &mut solver,
+                                &[
+                                    enc.l[i][a].neg_lit(),
+                                    enc.l[i][b].neg_lit(),
+                                    enc.l[i][c].neg_lit(),
+                                ],
+                            );
+                        }
+                        profile.h4_clauses += k;
+                    }
+                }
+            }
+        }
+    }
+
     // Linear descent from k down to lb_components.  CEGAR triples learned at higher bounds
-    // remain in the solver and help prune lower bounds — so descending linearly is better than
-    // binary search when CEGAR dominates the cost.
+    // remain in the solver and help prune lower bounds — accumulated violations make the
+    // UNSAT proof at the infeasibility boundary significantly cheaper.
     for bound in (lb_components..=k).rev() {
         let assumps_vec = totalizer.enforce_ub(bound).unwrap();
 
@@ -1372,8 +1400,18 @@ fn solve_sat_inner_impl(
         return Some(vec![instance.trees[0].clone()]);
     }
 
-    let ub_components = if reduced.num_trees() == 2 {
-        cherry_reduce_ub(&reduced.trees[0], &reduced.trees[1]) + 1
+    // For m=2: compute red_blue once and derive both LB and UB from it,
+    // then tighten UB with cherry_reduce.
+    let two_tree_rb_dist = if reduced.num_trees() == 2 {
+        Some(red_blue_approx(&reduced.trees[0], &reduced.trees[1]))
+    } else {
+        None
+    };
+
+    let ub_components = if let Some(rb_dist) = two_tree_rb_dist {
+        // Both cherry_reduce and red_blue_approx are valid upper bounds; take the tighter one.
+        let cherry_ub = cherry_reduce_ub(&reduced.trees[0], &reduced.trees[1]) + 1;
+        cherry_ub.min(rb_dist + 1)
     } else {
         let mut best = usize::MAX;
         // Try each tree as reference with seeded variations
@@ -1387,8 +1425,8 @@ fn solve_sat_inner_impl(
         best
     };
 
-    let lb_components = if reduced.num_trees() == 2 {
-        (red_blue_approx(&reduced.trees[0], &reduced.trees[1]).div_ceil(2)) + 1
+    let lb_components = if let Some(rb_dist) = two_tree_rb_dist {
+        rb_dist.div_ceil(2) + 1
     } else {
         let mut best_lb = 0;
         for i in 0..reduced.trees.len() {
