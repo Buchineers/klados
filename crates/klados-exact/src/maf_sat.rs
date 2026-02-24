@@ -785,22 +785,27 @@ fn add_structural_clauses(
     let k = enc.k;
     let m = enc.m;
 
-    // H1a: every leaf in at least one component
+    // H1a: every leaf in at least one component.
+    // By O2+O3+H1, l[i][j]=FALSE for i>j (induction), so only components 0..=j
+    // can hold leaf j. The clause need only span those components.
     for j in 0..n {
-        let clause: Vec<Lit> = (0..k).map(|i| enc.l[i][j].pos_lit()).collect();
+        let hi = j.min(k - 1);
+        let clause: Vec<Lit> = (0..=hi).map(|i| enc.l[i][j].pos_lit()).collect();
         add_clause(solver, &clause);
     }
     profile.h1_clauses += n;
 
-    // H1b: at most one component per leaf (ladder)
+    // H1b: at most one component per leaf (ladder).
+    // Same observation: ladder only needs to run up to component min(j, k-1).
     for j in 0..n {
-        for i in 0..k - 1 {
+        let jk = j.min(k - 1); // max component that can hold leaf j
+        for i in 0..jk {
             add_clause(solver, &[enc.l[i][j].neg_lit(), enc.s[i][j].pos_lit()]);
         }
-        for i in 1..k - 1 {
+        for i in 1..jk {
             add_clause(solver, &[enc.s[i - 1][j].neg_lit(), enc.s[i][j].pos_lit()]);
         }
-        for i in 1..k {
+        for i in 1..=jk {
             add_clause(solver, &[enc.s[i - 1][j].neg_lit(), enc.l[i][j].neg_lit()]);
         }
     }
@@ -835,13 +840,16 @@ fn add_structural_clauses(
     // H3: local propagation encoding (fewer clauses than path-based)
     add_h3_local(solver, instance, precomps, navs, enc, profile);
 
-    // H5: usage tracking
+    // H5: usage tracking.
+    // l[i][j]=FALSE for j<i (O2+O3+H1), so only need j>=i.
+    let mut h5_count = 0;
     for i in 0..k {
-        for j in 0..n {
+        for j in i..n {
             add_clause(solver, &[enc.l[i][j].neg_lit(), enc.u[i].pos_lit()]);
+            h5_count += 1;
         }
     }
-    profile.h5_clauses = n * k;
+    profile.h5_clauses = h5_count;
 
     // O1: ordered usage
     for i in 0..k - 1 {
@@ -905,7 +913,9 @@ fn seed_sibling_constraints(
                 });
 
                 if is_common {
-                    for i in 0..k {
+                    // l[i][j]=FALSE for i>j, so only need i<=min(ja,jb).
+                    let hi = ja.min(jb).min(k - 1);
+                    for i in 0..=hi {
                         add_clause(solver, &[enc.l[i][ja].neg_lit(), enc.l[i][jb].pos_lit()]);
                         add_clause(solver, &[enc.l[i][jb].neg_lit(), enc.l[i][ja].pos_lit()]);
                         count += 2;
@@ -929,9 +939,10 @@ fn add_violated_triples(
     components: &[Vec<usize>],
     nca_data: &NcaData,
     added_triples: &mut fxhash::FxHashSet<(usize, usize, usize)>,
-) -> usize {
+) -> (usize, usize) {
     let k = enc.k;
     let mut violations = 0;
+    let mut clauses = 0;
 
     for comp in components {
         if comp.len() < 3 {
@@ -952,7 +963,11 @@ fn add_violated_triples(
                         }
                         added_triples.insert(key);
 
-                        for i in 0..k {
+                        // l[i][x]=FALSE for i>x, so clause is trivially satisfied
+                        // for i > min(a,b,c). Only add for i<=min(a,b,c).
+                        let min_leaf = a.min(b).min(c);
+                        let hi = min_leaf.min(k - 1);
+                        for i in 0..=hi {
                             add_clause(
                                 solver,
                                 &[
@@ -963,13 +978,14 @@ fn add_violated_triples(
                             );
                         }
                         violations += 1;
+                        clauses += hi + 1;
                     }
                 }
             }
         }
     }
 
-    violations
+    (violations, clauses)
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1109,7 +1125,10 @@ fn sat_solve_maf(
                 for c in (b + 1)..n {
                     if nca_data.is_incompatible(a, b, c) {
                         added_triples.insert((a, b, c));
-                        for i in 0..k {
+                        // a<b<c so a is min; l[i][a]=FALSE for i>a, making the
+                        // clause trivially satisfied. Only add for i<=a.
+                        let hi = a.min(k - 1);
+                        for i in 0..=hi {
                             add_clause(
                                 &mut solver,
                                 &[
@@ -1119,16 +1138,15 @@ fn sat_solve_maf(
                                 ],
                             );
                         }
-                        profile.h4_clauses += k;
+                        profile.h4_clauses += hi + 1;
                     }
                 }
             }
         }
     }
 
-    // Linear descent from k down to lb_components.  CEGAR triples learned at higher bounds
-    // remain in the solver and help prune lower bounds — accumulated violations make the
-    // UNSAT proof at the infeasibility boundary significantly cheaper.
+    // Linear descent from k down to lb_components. Learned clauses from SAT calls at
+    // higher bounds accumulate and make the UNSAT proof at opt-1 significantly cheaper.
     for bound in (lb_components..=k).rev() {
         let assumps_vec = totalizer.enforce_ub(bound).unwrap();
 
@@ -1143,7 +1161,7 @@ fn sat_solve_maf(
                 SolverResult::Sat => {
                     let t_cegar = std::time::Instant::now();
                     let comps = extract_components(&solver, &enc, n, k);
-                    let v = add_violated_triples(
+                    let (v, h4_new) = add_violated_triples(
                         &mut solver,
                         &enc,
                         &comps,
@@ -1152,7 +1170,7 @@ fn sat_solve_maf(
                     );
                     profile.cegar_ms += t_cegar.elapsed().as_secs_f64() * 1000.0;
                     profile.cegar_violations += v;
-                    profile.h4_clauses += v * k;
+                    profile.h4_clauses += h4_new;
 
                     if v == 0 {
                         profile.optimal_k = bound;
