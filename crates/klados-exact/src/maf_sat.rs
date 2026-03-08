@@ -1259,6 +1259,7 @@ fn solve_sat_inner_impl(
         subtree: true,
         chain: true,
         chain32: true,
+        chain32_multi: true,
         protected_labels: preferred_singleton_labels.clone(),
     };
     let kern = kernelize::kernelize(instance, &kern_config);
@@ -1290,8 +1291,7 @@ fn solve_sat_inner_impl(
     }
 
     // Try cluster decomposition
-    // Skip cluster decomp if 3-2 reductions fired (label spaces are complex to compose)
-    let clusters = if skip_cluster_decomp || param_reduction_32 > 0 {
+    let clusters = if skip_cluster_decomp {
         vec![]
     } else {
         find_common_clusters(&reduced.trees, reduced.num_leaves)

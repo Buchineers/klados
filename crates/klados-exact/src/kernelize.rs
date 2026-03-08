@@ -21,6 +21,9 @@ pub struct KernelizeConfig {
     pub subtree: bool,
     pub chain: bool,
     pub chain32: bool,
+    /// Experimental: enable 3-2 chain reduction for multi-tree instances (t ≥ 3).
+    /// UNPROVEN — only for empirical testing. Default: false.
+    pub chain32_multi: bool,
     /// Labels that must survive kernelization unchanged (used by cluster decomposition
     /// to protect ghost representative labels). If a protected label would be collapsed
     /// away, it is swapped to the representative position.
@@ -33,6 +36,7 @@ impl Default for KernelizeConfig {
             subtree: true,
             chain: true,
             chain32: true,
+            chain32_multi: false,
             protected_labels: Vec::new(),
         }
     }
@@ -149,11 +153,19 @@ pub fn kernelize(instance: &Instance, config: &KernelizeConfig) -> KernelizeResu
             }
         }
 
-        // 3-2 chain reduction (2-tree only)
-        if config.chain32 && reduced.num_trees() == 2 && reduced.num_leaves >= 3 {
-            if let Some(victim) =
+        // 3-2 chain reduction
+        if reduced.num_leaves >= 3 {
+            let victim = if config.chain32 && reduced.num_trees() == 2 {
+                // Proven safe for 2-tree instances
                 find_32_chain_candidate(&reduced.trees[0], &reduced.trees[1], reduced.num_leaves)
-            {
+            } else if config.chain32_multi && reduced.num_trees() >= 3 {
+                // Experimental: unproven for multi-tree, empirical testing only
+                find_32_chain_candidate_multi(&reduced.trees, reduced.num_leaves)
+            } else {
+                None
+            };
+
+            if let Some(victim) = victim {
                 let orig_label = composite_rev[victim as usize];
                 chain32_deleted_labels.push(orig_label);
                 chain32_removed += 1;
@@ -621,6 +633,108 @@ fn find_32_chain_candidate(t1: &Tree, t2: &Tree, num_leaves: u32) -> Option<u32>
 }
 
 // ═══════════════════════════════════════════════════════════════
+// 3-2 chain reduction (multi-tree, EXPERIMENTAL)
+// ═══════════════════════════════════════════════════════════════
+
+/// Find a single 3-2 chain reduction candidate across multiple trees.
+///
+/// **UNPROVEN** — the 3-2 chain reduction is only proven correct for 2 trees.
+/// This generalization is for empirical testing only.
+///
+/// Condition: find a triplet (p, q, r) such that in every tree T:
+/// - Either {p, q} is a cherry in T (cherry state), OR
+/// - {p, r} is a cherry in T AND parent(q in T) == grandparent(r in T) (interceptor state)
+/// The interceptor state must occur in at least one tree.
+/// If found, delete r (or q in the symmetric case).
+fn find_32_chain_candidate_multi(trees: &[Tree], num_leaves: u32) -> Option<u32> {
+    for p in 1..=num_leaves {
+        // p must be in a cherry in every tree
+        let mut siblings: Vec<u32> = Vec::with_capacity(trees.len());
+        let mut all_cherry = true;
+        for tree in trees {
+            let node_p = tree.node_by_label(p);
+            if node_p == NONE {
+                all_cherry = false;
+                break;
+            }
+            match tree.sibling(node_p) {
+                Some(s) if tree.is_leaf(s) => {
+                    siblings.push(tree.label[s as usize]);
+                }
+                _ => {
+                    all_cherry = false;
+                    break;
+                }
+            }
+        }
+        if !all_cherry || siblings.len() != trees.len() {
+            continue;
+        }
+
+        // Collect distinct sibling labels
+        let mut unique_sibs: Vec<u32> = siblings.clone();
+        unique_sibs.sort_unstable();
+        unique_sibs.dedup();
+
+        // Need exactly 2 distinct siblings (if 1: common cherry handled elsewhere)
+        if unique_sibs.len() != 2 {
+            continue;
+        }
+
+        let q = unique_sibs[0];
+        let r = unique_sibs[1];
+
+        // Try deleting r: in every tree, either {p,q} is cherry or r intercepts
+        if try_32_delete(trees, &siblings, p, q, r) {
+            return Some(r);
+        }
+        // Symmetric: try deleting q
+        if try_32_delete(trees, &siblings, p, r, q) {
+            return Some(q);
+        }
+    }
+    None
+}
+
+/// Check if `victim` can be deleted in a multi-tree 3-2 reduction.
+///
+/// For each tree: if sibling of p == keeper, the cherry state is satisfied.
+/// If sibling of p == victim, check the interceptor condition:
+/// parent(keeper in tree) == grandparent(victim in tree).
+fn try_32_delete(trees: &[Tree], siblings: &[u32], _p: u32, keeper: u32, victim: u32) -> bool {
+    let mut interceptor_exists = false;
+
+    for (t_idx, tree) in trees.iter().enumerate() {
+        if siblings[t_idx] == keeper {
+            // Cherry state: {p, keeper} is cherry in this tree — OK
+            continue;
+        }
+        if siblings[t_idx] != victim {
+            return false; // unexpected sibling
+        }
+
+        // Interceptor state: {p, victim} is cherry. Check parent(keeper) == grandparent(victim).
+        let node_keeper = tree.node_by_label(keeper);
+        let node_victim = tree.node_by_label(victim);
+        if node_keeper == NONE || node_victim == NONE {
+            return false;
+        }
+        let parent_victim = tree.parent[node_victim as usize];
+        if parent_victim == NONE {
+            return false;
+        }
+        let gp_victim = tree.parent[parent_victim as usize];
+        let parent_keeper = tree.parent[node_keeper as usize];
+        if gp_victim == NONE || parent_keeper == NONE || parent_keeper != gp_victim {
+            return false;
+        }
+        interceptor_exists = true;
+    }
+
+    interceptor_exists
+}
+
+// ═══════════════════════════════════════════════════════════════
 // Chain reduction (multi-tree)
 // ═══════════════════════════════════════════════════════════════
 
@@ -639,19 +753,30 @@ fn find_common_chains(trees: &[Tree], num_leaves: u32, truncate_to: usize) -> Ve
 
     let mut collapses = Vec::new();
     'outer: for chain in &all_chains[0] {
-        if chain.len() <= truncate_to {
-            continue;
-        }
+        // Find the common chain length: minimum prefix match across all trees.
+        // A chain from tree[0] may be a prefix of a longer chain in another tree, or vice versa.
+        let mut common_len = chain.len();
 
         for other_chains in &all_chains[1..] {
-            let found = other_chains.iter().any(|oc| oc == chain);
-            if !found {
-                continue 'outer;
+            let best_match = other_chains.iter().filter_map(|oc| {
+                if oc.starts_with(chain.as_slice()) || chain.starts_with(oc.as_slice()) {
+                    Some(chain.len().min(oc.len()))
+                } else {
+                    None
+                }
+            }).max();
+            match best_match {
+                Some(len) => common_len = common_len.min(len),
+                None => continue 'outer,
             }
         }
 
+        if common_len <= truncate_to {
+            continue;
+        }
+
         let representative = chain[0];
-        let removed: Vec<u32> = chain[truncate_to..].to_vec();
+        let removed: Vec<u32> = chain[truncate_to..common_len].to_vec();
         if !removed.is_empty() {
             collapses.push((representative, removed));
         }
