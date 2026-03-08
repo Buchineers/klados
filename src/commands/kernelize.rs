@@ -10,12 +10,14 @@ pub fn run(
     subtree: bool,
     chain: bool,
     chain32: bool,
+    chain32_multi: bool,
     verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = KernelizeConfig {
         subtree,
         chain,
         chain32,
+        chain32_multi,
         protected_labels: Vec::new(),
     };
 

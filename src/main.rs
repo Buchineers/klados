@@ -42,6 +42,9 @@ enum Commands {
         /// Enable 3-2 chain reduction (2-tree only)
         #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
         chain32: bool,
+        /// Experimental: enable 3-2 chain reduction for multi-tree (unproven)
+        #[arg(long, default_value = "false", action = clap::ArgAction::Set)]
+        chain32_multi: bool,
     },
     Info,
     Bounds,
@@ -136,8 +139,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     subtree,
                     chain,
                     chain32,
+                    chain32_multi,
                 }) => {
-                    commands::kernelize::run(&instance, subtree, chain, chain32, cli.verbose)?;
+                    commands::kernelize::run(&instance, subtree, chain, chain32, chain32_multi, cli.verbose)?;
                 }
                 Some(Commands::Heuristic { solver }) => {
                     commands::heuristic::run(&instance, &solver, cli.verbose)?;
