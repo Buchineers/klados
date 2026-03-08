@@ -31,6 +31,18 @@ enum Commands {
         #[arg(long)]
         solver: String,
     },
+    /// Apply kernelization rules and report reduction statistics.
+    Kernelize {
+        /// Enable subtree reduction (default: all enabled)
+        #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
+        subtree: bool,
+        /// Enable chain reduction
+        #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
+        chain: bool,
+        /// Enable 3-2 chain reduction (2-tree only)
+        #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
+        chain32: bool,
+    },
     Info,
     Bounds,
     RedBlueUB,
@@ -119,6 +131,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Some(Commands::Exact { approach }) => {
                     commands::exact::run(&instance, &approach, cli.verbose)?;
+                }
+                Some(Commands::Kernelize {
+                    subtree,
+                    chain,
+                    chain32,
+                }) => {
+                    commands::kernelize::run(&instance, subtree, chain, chain32, cli.verbose)?;
                 }
                 Some(Commands::Heuristic { solver }) => {
                     commands::heuristic::run(&instance, &solver, cli.verbose)?;

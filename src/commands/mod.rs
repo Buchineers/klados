@@ -6,4 +6,5 @@ pub mod check;
 pub mod compare;
 pub mod exact;
 pub mod heuristic;
+pub mod kernelize;
 pub mod validate;

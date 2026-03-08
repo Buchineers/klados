@@ -6,16 +6,17 @@
 mod algorithm;
 mod branching;
 mod decomposition;
-mod extraction;
+pub(crate) mod extraction;
 mod forest_nav;
-pub(crate) mod preprocessing;
 mod reduction;
 mod search_state;
 mod split;
 mod transposition;
-mod utils;
+pub(crate) mod utils;
 
 use klados_core::{Instance, SolverStats, Tree};
+
+use crate::kernelize::{self, KernelizeConfig};
 
 fn trace_enabled() -> bool {
     use std::sync::OnceLock;
@@ -64,25 +65,25 @@ impl ShiMestelSolver {
             return Some(instance.trees.clone());
         }
 
-        let subtree_collapses =
-            preprocessing::find_common_subtrees(&instance.trees, instance.num_leaves);
-        if !subtree_collapses.is_empty() {
-            let removed_count: usize = subtree_collapses.iter().map(|(_, r)| r.len()).sum();
+        let config = KernelizeConfig::default();
+        let kern = kernelize::kernelize(instance, &config);
+
+        if kern.stats.reduced_leaves < instance.num_leaves {
+            let total = kern.stats.subtree_removed + kern.stats.chain_removed + kern.stats.chain32_removed;
             trace!(
-                "subtree reduction: {} maximal common subtrees, removing {} labels ({} -> {} effective leaves)",
-                subtree_collapses.len(),
-                removed_count,
+                "kernelized: {} → {} leaves ({} removed: {} subtree, {} chain, {} 3-2)",
                 instance.num_leaves,
-                instance.num_leaves as usize - removed_count,
+                kern.stats.reduced_leaves,
+                total,
+                kern.stats.subtree_removed,
+                kern.stats.chain_removed,
+                kern.stats.chain32_removed,
             );
-            let (reduced, reverse_map) =
-                preprocessing::reduce_instance(instance, &subtree_collapses);
-            let reduced_result = self.solve_inner(&reduced);
+            let reduced_result = self.solve_inner(&kern.instance);
             return reduced_result.map(|components| {
-                preprocessing::expand_solution(
+                kernelize::expand_solution(
                     components,
-                    &subtree_collapses,
-                    &reverse_map,
+                    &kern,
                     &instance.trees[0],
                     instance.num_leaves,
                 )

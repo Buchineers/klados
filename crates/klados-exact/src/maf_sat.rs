@@ -14,12 +14,10 @@ use rustsat::solvers::{PhaseLit, Solve, SolveIncremental, SolverResult};
 use rustsat::types::{Clause, Lit, TernaryVal, Var};
 use rustsat_cadical::CaDiCaL;
 
+use crate::kernelize::{self, KernelizeConfig};
 use crate::lower_bound::{
     cherry_reduce_ub, greedy_multi_tree_partition, greedy_multi_tree_ub,
     greedy_multi_tree_ub_seeded, red_blue_approx,
-};
-use crate::shi_mestel::preprocessing::{
-    expand_solution, find_common_chains, find_common_subtrees, reduce_instance,
 };
 use crate::ExactSolver;
 
@@ -1257,30 +1255,59 @@ fn solve_sat_inner_impl(
     let mut profile = SolveProfile::default();
     profile.n = n;
 
-    // Phase 0: Try cluster decomposition FIRST (unless suppressed for monolithic fallback)
-    let clusters = if skip_cluster_decomp {
+    let kern_config = KernelizeConfig {
+        subtree: true,
+        chain: true,
+        chain32: true,
+        protected_labels: preferred_singleton_labels.clone(),
+    };
+    let kern = kernelize::kernelize(instance, &kern_config);
+    let reduced = &kern.instance;
+    let param_reduction_32 = kern.param_reduction;
+
+    let n_reduced = reduced.num_leaves as usize;
+    if kern.stats.reduced_leaves < instance.num_leaves {
+        let total = kern.stats.subtree_removed + kern.stats.chain_removed + kern.stats.chain32_removed;
+        eprintln!(
+            "[sat] Kernelized: {} → {} leaves ({} removed: {} subtree, {} chain, {} 3-2)",
+            n, n_reduced, total,
+            kern.stats.subtree_removed, kern.stats.chain_removed, kern.stats.chain32_removed,
+        );
+    }
+
+    if n_reduced <= 1 {
+        stats.lower_bound = 1 + param_reduction_32;
+        stats.upper_bound = Some(1 + param_reduction_32);
+        // The single surviving leaf is one component; expand back to original space.
+        let trivial = vec![reduced.trees[0].clone()];
+        let components = kernelize::expand_solution(
+            trivial,
+            &kern,
+            &instance.trees[0],
+            instance.num_leaves,
+        );
+        return Some(components);
+    }
+
+    // Try cluster decomposition
+    // Skip cluster decomp if 3-2 reductions fired (label spaces are complex to compose)
+    let clusters = if skip_cluster_decomp || param_reduction_32 > 0 {
         vec![]
     } else {
-        find_common_clusters(&instance.trees, instance.num_leaves)
+        find_common_clusters(&reduced.trees, reduced.num_leaves)
     };
-    if let Some(split_cluster) = find_best_split_cluster(&clusters, n) {
+    if let Some(split_cluster) = find_best_split_cluster(&clusters, n_reduced) {
         let cluster_size = split_cluster.leaves.count_ones(..);
-        let rest_size = n - cluster_size + 1;
+        let rest_size = n_reduced - cluster_size + 1;
 
         profile.cluster_splits += 1;
         eprintln!(
             "[sat] Cluster decomposition: {} = {} + {}",
-            n, cluster_size, rest_size
+            n_reduced, cluster_size, rest_size
         );
 
         // Solve the cluster sub-instance.
-        // Map each preferred singleton label into the cluster's label space (if it lives there).
-        let (cluster_inst, cluster_rev) = restrict_instance(instance, &split_cluster.leaves);
-        // Do NOT propagate inherited ghost constraints into the cluster sub-problem.
-        // Each decomposition level's ghost requirement only applies to its own rest-instance.
-        // Inherited ghosts are plain leaves in the cluster and rest sub-problems; forcing them
-        // as singletons inside nested sub-problems can inflate the optimal k beyond the true
-        // optimum (the cluster-decomposition theorem does not require this).
+        let (cluster_inst, cluster_rev) = restrict_instance(reduced, &split_cluster.leaves);
         let mut cluster_stats = SolverStats::default();
         let cluster_result = solve_sat_inner(&cluster_inst, &mut cluster_stats, vec![])?;
 
@@ -1288,134 +1315,37 @@ fn solve_sat_inner_impl(
         let rep = split_cluster.leaves.ones().next().unwrap() as u32;
 
         // Build the rest instance (cluster collapsed to ghost rep).
-        let (rest_inst, rest_rev) = collapse_cluster(instance, &split_cluster.leaves, rep);
+        let (rest_inst, rest_rev) = collapse_cluster(reduced, &split_cluster.leaves, rep);
 
-        // Solve the rest instance WITHOUT any ghost singleton constraint.
-        // The cluster-decomposition theorem (Bordewich & Semple) proves that for the
-        // UNCONSTRAINED optimal rest-MAF, rep is always a singleton component.
-        // Enforcing the constraint inflates the rest optimum (the unconstrained optimum
-        // can be smaller), making the formula |MAF(full)| = |MAF(cluster)| + |MAF(rest)| - 1
-        // return the wrong (larger) answer.
         let mut rest_stats = SolverStats::default();
         let rest_result = solve_sat_inner(&rest_inst, &mut rest_stats, vec![])?;
 
-        // Combine solutions.  By the theorem, rep is a singleton in the optimal rest-MAF,
-        // so combine_solutions should always succeed.  The fallback to monolithic is only
-        // a safety net in case the SAT solver returns a non-optimal solution.
         if let Some(combined) = combine_solutions(
             &cluster_result,
             &rest_result,
             rep,
             &cluster_rev,
             &rest_rev,
-            &instance.trees[0],
-            instance.num_leaves,
+            &reduced.trees[0],
+            reduced.num_leaves,
         ) {
-            stats.lower_bound = cluster_stats.lower_bound + rest_stats.lower_bound - 1;
+            let cluster_k =
+                cluster_stats.lower_bound + rest_stats.lower_bound - 1 + param_reduction_32;
+            stats.lower_bound = cluster_k;
             stats.upper_bound = match (cluster_stats.upper_bound, rest_stats.upper_bound) {
-                (Some(a), Some(b)) => Some(a + b - 1),
+                (Some(a), Some(b)) => Some(a + b - 1 + param_reduction_32),
                 _ => None,
             };
+            let combined = kernelize::expand_solution(
+                combined,
+                &kern,
+                &instance.trees[0],
+                instance.num_leaves,
+            );
             return Some(combined);
         }
-        // Fall through to monolithic solving.
-        eprintln!("[sat] Cluster combine failed (non-singleton rep with >1 cluster comp), falling back to monolithic");
-        // Solve monolithically WITHOUT any ghost constraint.
-        // The ghost constraint was only needed for combine_solutions to work. Since combine
-        // failed, we solve the current instance directly — the rep is just a plain leaf.
-        // Keeping the ghost would inflate the solution by forcing an extra singleton component
-        // that may not exist in the true optimum (the ghost is only special in rest-instances
-        // where the theorem guarantees singleton exists, not in the original instance).
-        return solve_sat_inner_impl(instance, stats, vec![], true);
-    }
-
-    // Phase 1: Kernelize (subtree reduction)
-    let mut collapses = find_common_subtrees(&instance.trees, instance.num_leaves);
-
-    // If the preferred singleton leaf would be collapsed away (it's in a "removed" set),
-    // swap it with the representative so it survives kernelization.
-    // Correctness: all leaves in a common subtree must be in the same MAF component,
-    // so requiring singleton on the rep vs. any other member is equivalent.
-    for &pref_lbl in &preferred_singleton_labels {
-        for (rep, removed) in &mut collapses {
-            if let Some(pos) = removed.iter().position(|&l| l == pref_lbl) {
-                let old_rep = *rep;
-                *rep = pref_lbl;
-                removed[pos] = old_rep;
-                removed.sort_unstable();
-                eprintln!(
-                    "[sat] Promoted preferred_singleton_label={} to collapse rep (was {})",
-                    pref_lbl, old_rep
-                );
-                break;
-            }
-        }
-    }
-
-    let (reduced, reverse_map) = if collapses.is_empty() {
-        (instance.clone(), (0..=instance.num_leaves).collect())
-    } else {
-        reduce_instance(instance, &collapses)
-    };
-
-    let n_reduced = reduced.num_leaves as usize;
-    if !collapses.is_empty() {
-        eprintln!(
-            "[sat] Kernelized: {} → {} leaves ({} subtrees collapsed)",
-            n,
-            n_reduced,
-            collapses.len()
-        );
-    }
-
-    // Phase 1b: Chain reduction (compress long chains)
-    let mut chain_collapses = find_common_chains(&reduced.trees, reduced.num_leaves);
-
-    // Again protect preferred_singleton_labels from being collapsed away by chain reduction.
-    // Here we need each label in the post-subtree-reduction space.
-    for &pref_lbl in &preferred_singleton_labels {
-        // Translate pref_lbl from original space to reduced (post-subtree) space via reverse_map.
-        let pref_in_reduced =
-            (1..=reduced.num_leaves).find(|&nl| reverse_map[nl as usize] == pref_lbl);
-        if let Some(pref_red_lbl) = pref_in_reduced {
-            for (rep, removed) in &mut chain_collapses {
-                if let Some(pos) = removed.iter().position(|&l| l == pref_red_lbl) {
-                    let old_rep = *rep;
-                    *rep = pref_red_lbl;
-                    removed[pos] = old_rep;
-                    removed.sort_unstable();
-                    eprintln!(
-                        "[sat] Promoted preferred_singleton_label={} (reduced={}) to chain collapse rep (was {})",
-                        pref_lbl, pref_red_lbl, old_rep
-                    );
-                    break;
-                }
-            }
-        }
-    }
-
-    let n_before_chain = reduced.num_leaves;
-    let (reduced, chain_reverse_map) = if chain_collapses.is_empty() {
-        let rev_map: Vec<u32> = (0..=n_before_chain).collect();
-        (reduced, rev_map)
-    } else {
-        let (r, rev) = reduce_instance(&reduced, &chain_collapses);
-        let new_leaves = r.num_leaves;
-        eprintln!(
-            "[sat] Chain reduced: {} → {} leaves ({} chains compressed)",
-            n_before_chain,
-            new_leaves,
-            chain_collapses.len()
-        );
-        (r, rev)
-    };
-
-    let n_reduced = reduced.num_leaves as usize;
-
-    if n_reduced <= 1 {
-        stats.lower_bound = 1;
-        stats.upper_bound = Some(1);
-        return Some(vec![instance.trees[0].clone()]);
+        // Fall through to monolithic solving on the reduced instance.
+        eprintln!("[sat] Cluster combine failed, falling back to monolithic");
     }
 
     // For m=2: compute red_blue once and derive both LB and UB from it,
@@ -1427,15 +1357,12 @@ fn solve_sat_inner_impl(
     };
 
     let ub_components = if let Some(rb_dist) = two_tree_rb_dist {
-        // Both cherry_reduce and red_blue_approx are valid upper bounds; take the tighter one.
         let cherry_ub = cherry_reduce_ub(&reduced.trees[0], &reduced.trees[1]) + 1;
         cherry_ub.min(rb_dist + 1)
     } else {
         let mut best = usize::MAX;
-        // Try each tree as reference with seeded variations
         for ref_idx in 0..reduced.trees.len() {
             best = best.min(greedy_multi_tree_ub(&reduced.trees, ref_idx));
-            // Phase 2: Try seeded variations for better upper bound
             for seed in 1..=3 {
                 best = best.min(greedy_multi_tree_ub_seeded(&reduced.trees, ref_idx, seed));
             }
@@ -1462,18 +1389,13 @@ fn solve_sat_inner_impl(
         lb_components, ub_components, n_reduced
     );
 
-    // Translate all preferred singleton labels through chain_reverse_map ∘ reverse_map
-    // into 0-based indices in the fully-reduced instance.
+    // Translate all preferred singleton labels into 0-based indices in the fully-reduced instance.
     let preferred_singletons_reduced: Vec<usize> = preferred_singleton_labels
         .iter()
         .filter_map(|&orig_lbl| {
             let found = (1..=reduced.num_leaves)
-                .find(|&chain_lbl| {
-                    let subtree_lbl = chain_reverse_map[chain_lbl as usize];
-                    subtree_lbl < reverse_map.len() as u32
-                        && reverse_map[subtree_lbl as usize] == orig_lbl
-                })
-                .map(|chain_lbl| (chain_lbl - 1) as usize);
+                .find(|&lbl| kern.reverse_map[lbl as usize] == orig_lbl)
+                .map(|lbl| (lbl - 1) as usize);
             if found.is_none() {
                 eprintln!(
                     "[sat] preferred_singleton_label={} not found after kernelization",
@@ -1484,13 +1406,7 @@ fn solve_sat_inner_impl(
         })
         .collect();
 
-    // Each ghost leaf must occupy its own component.  Ensure bounds are high enough
-    // that there is room for g isolated ghost components plus at least one component
-    // for the remaining non-ghost leaves (if any exist).
-    // - lb: must be at least (g + 1) since g singletons + ≥1 component for non-ghosts.
-    // - ub: greedy was computed on the instance including ghosts as ordinary leaves, so
-    //   it may under-count. The safe upper bound is ub + g (each ghost may need one extra
-    //   cut beyond what greedy found). We cap at n_reduced (trivial bound: all singletons).
+    // Ghost leaf bounds adjustment.
     let g = preferred_singletons_reduced.len();
     let (lb_components, ub_components) = if g > 0 {
         let min_k_for_ghosts = if n_reduced > g { g + 1 } else { g };
@@ -1506,41 +1422,26 @@ fn solve_sat_inner_impl(
     };
 
     profile.bounds_computed = (lb_components, ub_components);
-    stats.lower_bound = lb_components;
-    stats.upper_bound = Some(ub_components);
+    stats.lower_bound = lb_components + param_reduction_32;
+    stats.upper_bound = Some(ub_components + param_reduction_32);
 
     let components = sat_solve_maf(
-        &reduced,
+        reduced,
         ub_components,
         lb_components,
         &mut profile,
         &preferred_singletons_reduced,
     )?;
 
-    // Expand solution: first chain collapses, then subtree collapses
-    let components = if chain_collapses.is_empty() {
-        components
-    } else {
-        expand_solution(
-            components,
-            &chain_collapses,
-            &chain_reverse_map,
-            &instance.trees[0],
-            instance.num_leaves,
-        )
-    };
+    // Expand solution back to original label space.
+    let components = kernelize::expand_solution(
+        components,
+        &kern,
+        &instance.trees[0],
+        instance.num_leaves,
+    );
 
-    if collapses.is_empty() {
-        Some(components)
-    } else {
-        Some(expand_solution(
-            components,
-            &collapses,
-            &reverse_map,
-            &instance.trees[0],
-            instance.num_leaves,
-        ))
-    }
+    Some(components)
 }
 
 #[cfg(test)]

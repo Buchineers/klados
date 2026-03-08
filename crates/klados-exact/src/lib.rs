@@ -2,6 +2,7 @@
 //!
 //! Each approach is implemented as its own solver and registered here.
 
+pub mod kernelize;
 pub mod lower_bound;
 pub mod maf_ilp;
 pub mod maf_sat;
