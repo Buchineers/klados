@@ -1,7 +1,7 @@
 //! Precomputed tree data for efficient LCA queries.
 
 use fixedbitset::FixedBitSet;
-use klados_core::tree::{NodeId, Tree, NONE};
+use klados_core::tree::{NONE, NodeId, Tree};
 
 pub struct TreeData {
     pub tree: Tree,
@@ -46,13 +46,12 @@ impl TreeData {
             if first_occ[node as usize] == u32::MAX {
                 first_occ[node as usize] = pos;
             }
-            if !returning
-                && let Some((left, right)) = tree.children(node) {
-                    stack.push((node, true));
-                    stack.push((right, false));
-                    stack.push((node, true));
-                    stack.push((left, false));
-                }
+            if !returning && let Some((left, right)) = tree.children(node) {
+                stack.push((node, true));
+                stack.push((right, false));
+                stack.push((node, true));
+                stack.push((left, false));
+            }
         }
 
         let len = euler.len();

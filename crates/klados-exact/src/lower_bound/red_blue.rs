@@ -1,7 +1,7 @@
 //! Red-Blue 2-approximation algorithm for MAF lower bounds.
 
 use fixedbitset::FixedBitSet;
-use klados_core::tree::{Label, NodeId, Tree, NONE};
+use klados_core::tree::{Label, NONE, NodeId, Tree};
 
 use super::feasibility::{
     find_lowest_roi, is_rub_feasible_impl, is_set_compatible, is_triple_compatible, mark_v_set,
@@ -144,11 +144,7 @@ pub fn red_blue_approx(t1: &Tree, t2: &Tree) -> usize {
             eprintln!("[RB]   comp {}: {:?}", cid, members);
         }
     }
-    if nc == 0 {
-        0
-    } else {
-        nc - 1
-    }
+    if nc == 0 { 0 } else { nc - 1 }
 }
 
 fn make_rub_compatible(

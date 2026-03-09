@@ -3,7 +3,7 @@
 //! XForest extends the basic Forest with precomputed leafsets, enabling
 //! efficient component analysis and reduction rule applications.
 
-use crate::tree::{NodeId, Tree, NONE};
+use crate::tree::{NONE, NodeId, Tree};
 use fixedbitset::FixedBitSet;
 
 /// A forest representation with precomputed leafsets for efficient component analysis.

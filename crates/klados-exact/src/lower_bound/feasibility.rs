@@ -211,8 +211,10 @@ pub fn is_rub_feasible_impl(
                 }
                 if cover[cur as usize] != u32::MAX && cover[cur as usize] != cid {
                     if trace {
-                        eprintln!("[RB-FEA]     FAIL: overlap in V1[RUB] at node {} (comp {} and comp {})",
-                            cur, cover[cur as usize], cid);
+                        eprintln!(
+                            "[RB-FEA]     FAIL: overlap in V1[RUB] at node {} (comp {} and comp {})",
+                            cur, cover[cur as usize], cid
+                        );
                     }
                     return false;
                 }

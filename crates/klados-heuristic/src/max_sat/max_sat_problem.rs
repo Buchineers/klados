@@ -39,6 +39,7 @@ impl VarId {
     }
 }
 
+#[allow(dead_code)]
 impl Lit {
     pub fn positive(var: VarId) -> Self {
         var.pos()
@@ -80,6 +81,7 @@ impl MaxSatProblem {
         }
     }
 
+    #[allow(dead_code)]
     pub fn with_capacity(_num_vars: usize, num_clauses: usize) -> Self {
         Self {
             num_vars: 0,
@@ -93,6 +95,7 @@ impl MaxSatProblem {
         id
     }
 
+    #[allow(dead_code)]
     pub fn add_vars(&mut self, n: usize) -> Range<VarId> {
         let start = self.num_vars;
         self.num_vars += n;
@@ -106,10 +109,12 @@ impl MaxSatProblem {
         });
     }
 
+    #[allow(dead_code)]
     pub fn num_vars(&self) -> usize {
         self.num_vars
     }
 
+    #[allow(dead_code)]
     pub fn num_clauses(&self) -> usize {
         self.clauses.len()
     }

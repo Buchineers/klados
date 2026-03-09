@@ -136,11 +136,7 @@ impl Tree {
     #[inline]
     pub fn leaf_label(&self, node: NodeId) -> Option<Label> {
         let lbl = self.label[node as usize];
-        if lbl == 0 {
-            None
-        } else {
-            Some(lbl)
-        }
+        if lbl == 0 { None } else { Some(lbl) }
     }
 
     /// Get node by leaf label
@@ -163,7 +159,6 @@ impl Tree {
             Some(left)
         }
     }
-
 
     pub fn nearest_common_ancestor(&self, mut node_a: NodeId, mut node_b: NodeId) -> NodeId {
         // Bring both nodes to the same depth
@@ -454,10 +449,11 @@ impl<'a> Iterator for PostOrderIter<'a> {
         // If this node has a parent on the stack, and this node is the left
         // child of that parent, we need to process the right subtree first.
         if let Some(&parent) = self.stack.last()
-            && self.tree.left[parent as usize] == node {
-                // We just finished the left subtree; descend into right
-                self.push_leftmost(self.tree.right[parent as usize]);
-            }
+            && self.tree.left[parent as usize] == node
+        {
+            // We just finished the left subtree; descend into right
+            self.push_leftmost(self.tree.right[parent as usize]);
+        }
 
         Some(node)
     }
@@ -612,5 +608,4 @@ mod tests {
         // LCA of leaf 2 and internal node 3 is node 3
         assert_eq!(tree.nearest_common_ancestor(1, 3), 3);
     }
-
 }
