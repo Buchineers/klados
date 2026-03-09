@@ -7,23 +7,22 @@ use std::fs;
 fn load_instance(path: &str) -> (Tree, IndexedBinTree, u32) {
     let content = fs::read_to_string(path).unwrap();
     let mut lines = content.lines();
-    
-    let header_line = lines
-        .find(|l| l.starts_with("#p"))
-        .expect("No #p header");
-    
+
+    let header_line = lines.find(|l| l.starts_with("#p")).expect("No #p header");
+
     let parts: Vec<_> = header_line.split_whitespace().collect();
     let num_leaves = parts[2].parse::<u32>().unwrap();
-    
-    let tree_line = lines.find(|l| !l.trim().is_empty() && !l.starts_with('#'))
+
+    let tree_line = lines
+        .find(|l| !l.trim().is_empty() && !l.starts_with('#'))
         .expect("No tree found");
-    
+
     let pace_tree = IndexedBinTreeBuilder::default()
         .parse_newick_from_str(tree_line.trim(), Default::default())
         .unwrap();
-    
+
     let arena_tree = Tree::from_cursor(pace_tree.top_down(), num_leaves);
-    
+
     (arena_tree, pace_tree, num_leaves)
 }
 
@@ -144,5 +143,7 @@ library_benchmark_group!(
 );
 
 main!(
-    library_benchmark_groups = clone_benches, traversal_benches, access_benches
+    library_benchmark_groups = clone_benches,
+    traversal_benches,
+    access_benches
 );

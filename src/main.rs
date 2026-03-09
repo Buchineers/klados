@@ -141,7 +141,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     chain32,
                     chain32_multi,
                 }) => {
-                    commands::kernelize::run(&instance, subtree, chain, chain32, chain32_multi, cli.verbose)?;
+                    commands::kernelize::run(
+                        &instance,
+                        subtree,
+                        chain,
+                        chain32,
+                        chain32_multi,
+                        cli.verbose,
+                    )?;
                 }
                 Some(Commands::Heuristic { solver }) => {
                     commands::heuristic::run(&instance, &solver, cli.verbose)?;

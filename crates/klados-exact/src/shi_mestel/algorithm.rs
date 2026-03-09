@@ -10,8 +10,8 @@ use super::reduction::{
     all_pairs_lsi_cached, apply_reduction_rules_state, find_common_sibling_pair,
 };
 use super::search_state::SearchState;
-use super::split::{apply_split_branching_cached, SplitStats};
-use super::transposition::{tt_insert, TTEntry, ZobristTable};
+use super::split::{SplitStats, apply_split_branching_cached};
+use super::transposition::{TTEntry, ZobristTable, tt_insert};
 use super::utils::trivial_forest;
 use crate::lower_bound::maf_bounds;
 
@@ -72,11 +72,12 @@ pub fn alg_maf(
     let comps_f0 = &comp_sets[0];
     let tt_hash = zobrist.hash_partition(comps_f0);
     if let Some(entry) = tt.get(&tt_hash)
-        && target_s <= entry.infeasible_at {
-            stats.branches_pruned += 1;
-            state.rollback();
-            return None;
-        }
+        && target_s <= entry.infeasible_at
+    {
+        stats.branches_pruned += 1;
+        state.rollback();
+        return None;
+    }
 
     let profile_enabled = super::profile_enabled();
     let split_result = SPLIT_STATS.with(|s| {
@@ -165,6 +166,7 @@ pub fn alg_maf(
     result
 }
 
+#[allow(dead_code)]
 pub fn exact_pairwise_lower_bound(
     trees: &[Tree],
     label_space: usize,
@@ -317,10 +319,8 @@ pub fn solve_inner(instance: &Instance, stats: &mut SolverStats) -> Option<Vec<T
 
     let mut state = SearchState::new(forests);
 
-    let mut bounds = maf_bounds(&instance.trees, instance.num_leaves);
+    let bounds = maf_bounds(&instance.trees, instance.num_leaves);
     super::trace!("maf_bounds: lower={}, upper={}", bounds.lower, bounds.upper);
-
-
 
     let zobrist = ZobristTable::new(label_space);
     let mut tt: FxHashMap<u64, TTEntry> = FxHashMap::default();
@@ -344,7 +344,12 @@ pub fn solve_inner(instance: &Instance, stats: &mut SolverStats) -> Option<Vec<T
             let round_ms = round_start.elapsed().as_millis();
             super::trace!(
                 "solution found: target_s={}, components={}, round={}ms, total={}ms, tt_size={}, nodes={}",
-                target_s, result.len(), round_ms, total_ms, tt.len(), stats.nodes_explored,
+                target_s,
+                result.len(),
+                round_ms,
+                total_ms,
+                tt.len(),
+                stats.nodes_explored,
             );
             dump_split_stats();
             return Some(result);
@@ -386,8 +391,8 @@ fn dump_split_stats() {
             .create(true)
             .append(true)
             .open(path)
-        {
-            use std::io::Write;
-            let _ = writeln!(f, "{line}");
-        }
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "{line}");
+    }
 }

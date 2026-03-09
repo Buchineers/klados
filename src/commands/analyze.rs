@@ -5,6 +5,7 @@ use std::fs;
 use std::path::PathBuf;
 
 #[derive(serde::Deserialize, Debug)]
+#[allow(dead_code)]
 struct SummaryEntry {
     s_key: String,
     s_idigest: String,

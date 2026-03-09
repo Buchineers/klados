@@ -2,6 +2,7 @@
 //!
 //! Each approach is implemented as its own solver and registered here.
 
+pub mod cluster_reduction;
 pub mod kernelize;
 pub mod lower_bound;
 pub mod maf_ilp;

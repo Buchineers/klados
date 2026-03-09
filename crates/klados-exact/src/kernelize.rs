@@ -10,7 +10,7 @@
 
 use fixedbitset::FixedBitSet;
 use fxhash::FxHashMap;
-use klados_core::{Instance, Tree, NONE};
+use klados_core::{Instance, NONE, Tree};
 
 use crate::shi_mestel::extraction::build_component_tree;
 use crate::shi_mestel::utils::make_singleton_tree;
@@ -125,8 +125,7 @@ pub fn kernelize(instance: &Instance, config: &KernelizeConfig) -> KernelizeResu
             } else {
                 // For multi-tree: use sequence-based chain detection
                 let truncate_to = reduced.trees.len() + 1;
-                let collapses =
-                    find_common_chains(&reduced.trees, reduced.num_leaves, truncate_to);
+                let collapses = find_common_chains(&reduced.trees, reduced.num_leaves, truncate_to);
                 // Return the first victim and chain representative
                 collapses.into_iter().next().and_then(|(rep, removed)| {
                     removed.into_iter().next().map(|victim| (victim, rep))
@@ -148,7 +147,6 @@ pub fn kernelize(instance: &Instance, config: &KernelizeConfig) -> KernelizeResu
                 let (r, rev) = restrict_instance_simple(&reduced, &keep);
                 composite_rev = compose_reverse_maps(&composite_rev, &rev, r.num_leaves);
                 reduced = r;
-                progress = true;
                 continue; // chain may enable new cherries
             }
         }
@@ -178,7 +176,6 @@ pub fn kernelize(instance: &Instance, config: &KernelizeConfig) -> KernelizeResu
                 let (r, rev) = restrict_instance_simple(&reduced, &keep);
                 composite_rev = compose_reverse_maps(&composite_rev, &rev, r.num_leaves);
                 reduced = r;
-                progress = true;
                 continue; // 3-2 may enable new cherries/chains
             }
         }
@@ -189,7 +186,12 @@ pub fn kernelize(instance: &Instance, config: &KernelizeConfig) -> KernelizeResu
     }
 
     // Build surviving taxa info
-    let surviving_taxa = build_surviving_taxa(&composite_rev, &all_collapses_original, reduced.num_leaves, original_leaves);
+    let surviving_taxa = build_surviving_taxa(
+        &composite_rev,
+        &all_collapses_original,
+        reduced.num_leaves,
+        original_leaves,
+    );
 
     let stats = KernelizeStats {
         original_leaves,
@@ -238,7 +240,12 @@ pub fn expand_solution(
     let reverse_map = &result.reverse_map;
 
     let mut components = if collapses.is_empty() {
-        expand_with_reverse_map(reduced_components, reverse_map, original_ref_tree, original_num_leaves)
+        expand_with_reverse_map(
+            reduced_components,
+            reverse_map,
+            original_ref_tree,
+            original_num_leaves,
+        )
     } else {
         expand_with_collapses(
             reduced_components,
@@ -259,7 +266,11 @@ pub fn expand_solution(
             for &l in all_labels {
                 ls.insert(l as usize);
             }
-            components.push(build_component_tree(&ls, original_ref_tree, original_num_leaves));
+            components.push(build_component_tree(
+                &ls,
+                original_ref_tree,
+                original_num_leaves,
+            ));
         } else {
             components.push(make_singleton_tree(orig_label, original_num_leaves));
         }
@@ -746,10 +757,7 @@ fn find_common_chains(trees: &[Tree], num_leaves: u32, truncate_to: usize) -> Ve
         return Vec::new();
     }
 
-    let all_chains: Vec<Vec<Vec<u32>>> = trees
-        .iter()
-        .map(|t| extract_chains(t, n))
-        .collect();
+    let all_chains: Vec<Vec<Vec<u32>>> = trees.iter().map(|t| extract_chains(t, n)).collect();
 
     let mut collapses = Vec::new();
     'outer: for chain in &all_chains[0] {
@@ -758,13 +766,16 @@ fn find_common_chains(trees: &[Tree], num_leaves: u32, truncate_to: usize) -> Ve
         let mut common_len = chain.len();
 
         for other_chains in &all_chains[1..] {
-            let best_match = other_chains.iter().filter_map(|oc| {
-                if oc.starts_with(chain.as_slice()) || chain.starts_with(oc.as_slice()) {
-                    Some(chain.len().min(oc.len()))
-                } else {
-                    None
-                }
-            }).max();
+            let best_match = other_chains
+                .iter()
+                .filter_map(|oc| {
+                    if oc.starts_with(chain.as_slice()) || chain.starts_with(oc.as_slice()) {
+                        Some(chain.len().min(oc.len()))
+                    } else {
+                        None
+                    }
+                })
+                .max();
             match best_match {
                 Some(len) => common_len = common_len.min(len),
                 None => continue 'outer,
@@ -989,8 +1000,7 @@ fn build_surviving_taxa(
 
 /// Print kernelization results in a format comparable to Kelk's RMAFKernel output.
 pub fn print_stats(stats: &KernelizeStats) {
-    let total_removed =
-        stats.subtree_removed + stats.chain_removed + stats.chain32_removed;
+    let total_removed = stats.subtree_removed + stats.chain_removed + stats.chain32_removed;
     eprintln!("// --- Kernelization is finished.");
     eprintln!("// Leaves in original instance: {}", stats.original_leaves);
     eprintln!("// Leaves in reduced instance: {}", stats.reduced_leaves);
@@ -1018,9 +1028,6 @@ pub fn print_taxa_detail(stats: &KernelizeStats) {
         );
     }
     for &del in &stats.chain32_deleted_labels {
-        eprintln!(
-            "// 3-2 chain reduction deleted taxon {}",
-            del
-        );
+        eprintln!("// 3-2 chain reduction deleted taxon {}", del);
     }
 }

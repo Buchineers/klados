@@ -6,7 +6,7 @@
 //! - H3 path consistency with fast index access
 
 use fixedbitset::FixedBitSet;
-use klados_core::tree::{Label, NodeId, Tree, NONE};
+use klados_core::tree::{Label, NONE, NodeId, Tree};
 use klados_core::{Instance, SolverStats};
 use rustsat::encodings::card::{BoundUpper, Totalizer};
 use rustsat::instances::{BasicVarManager, ManageVars};
@@ -14,12 +14,13 @@ use rustsat::solvers::{PhaseLit, Solve, SolveIncremental, SolverResult};
 use rustsat::types::{Clause, Lit, TernaryVal, Var};
 use rustsat_cadical::CaDiCaL;
 
+use crate::ExactSolver;
+use crate::cluster_reduction::{self, ClusterReductionResult};
 use crate::kernelize::{self, KernelizeConfig};
 use crate::lower_bound::{
     cherry_reduce_ub, greedy_multi_tree_partition, greedy_multi_tree_ub,
     greedy_multi_tree_ub_seeded, red_blue_approx,
 };
-use crate::ExactSolver;
 
 // ═══════════════════════════════════════════════════════════════
 // Timing / profiling
@@ -93,263 +94,6 @@ impl SolveProfile {
             self.optimal_k,
         );
     }
-}
-
-// ═══════════════════════════════════════════════════════════════
-// Cluster Decomposition — split problem on common clusters
-// ═══════════════════════════════════════════════════════════════
-
-/// A cluster is a set of leaf labels that form a clade in a tree
-#[derive(Clone, Debug)]
-struct Cluster {
-    leaves: FixedBitSet,
-}
-
-/// Find all non-trivial clusters (leaf sets below internal nodes) in a tree
-fn find_tree_clusters(tree: &Tree, num_leaves: usize) -> Vec<Cluster> {
-    let mut leaf_sets = vec![FixedBitSet::with_capacity(num_leaves + 1); tree.num_nodes()];
-    let mut clusters = Vec::new();
-
-    // Compute leaf sets bottom-up
-    for node in tree.post_order() {
-        if tree.is_leaf(node) {
-            let lbl = tree.label[node as usize];
-            if lbl > 0 && (lbl as usize) <= num_leaves {
-                leaf_sets[node as usize].insert(lbl as usize);
-            }
-        } else if let Some((left, right)) = tree.children(node) {
-            let mut set = leaf_sets[left as usize].clone();
-            set.union_with(&leaf_sets[right as usize]);
-            leaf_sets[node as usize] = set;
-        }
-    }
-
-    // Extract non-trivial clusters (size >= 2 and < n)
-    for node in 0..tree.num_nodes() as NodeId {
-        if tree.is_leaf(node) {
-            continue;
-        }
-        let leaf_count = leaf_sets[node as usize].count_ones(..);
-        if leaf_count >= 2 && leaf_count < num_leaves {
-            clusters.push(Cluster {
-                leaves: leaf_sets[node as usize].clone(),
-            });
-        }
-    }
-
-    clusters
-}
-
-/// Find clusters that appear in ALL trees (regardless of internal topology)
-/// Uses exact leaf-set comparison (no hash collisions)
-fn find_common_clusters(trees: &[Tree], num_leaves: u32) -> Vec<Cluster> {
-    if trees.len() < 2 || num_leaves < 6 {
-        return Vec::new();
-    }
-
-    let n = num_leaves as usize;
-
-    // Build clusters from reference tree
-    let ref_clusters = find_tree_clusters(&trees[0], n);
-
-    // Build lookup sets for other trees using exact leaf-set keys
-    let other_sets: Vec<fxhash::FxHashSet<Vec<usize>>> = trees[1..]
-        .iter()
-        .map(|tree| {
-            let clusters = find_tree_clusters(tree, n);
-            clusters
-                .into_iter()
-                .map(|c| c.leaves.ones().collect::<Vec<usize>>())
-                .collect()
-        })
-        .collect();
-
-    // Keep only ref clusters present in ALL other trees
-    let mut common: Vec<Cluster> = ref_clusters
-        .into_iter()
-        .filter(|c| {
-            let key: Vec<usize> = c.leaves.ones().collect();
-            other_sets.iter().all(|s| s.contains(&key))
-        })
-        .collect();
-
-    // Sort by distance from n/2 (best splits first)
-    let target = n / 2;
-    common.sort_by_key(|c| {
-        let sz = c.leaves.count_ones(..);
-        (sz as isize - target as isize).unsigned_abs()
-    });
-
-    common
-}
-
-/// Find the best cluster to split on (closest to n/2 in size)
-fn find_best_split_cluster(clusters: &[Cluster], num_leaves: usize) -> Option<&Cluster> {
-    let target = num_leaves / 2;
-
-    clusters
-        .iter()
-        .filter(|c| {
-            let sz = c.leaves.count_ones(..);
-            // Must leave at least 3 leaves on each side
-            sz >= 3 && (num_leaves - sz) >= 3
-        })
-        .min_by_key(|c| {
-            let sz = c.leaves.count_ones(..);
-            (sz as isize - target as isize).abs() as usize
-        })
-}
-
-/// Restrict an instance to only the leaves in the given set
-fn restrict_instance(instance: &Instance, keep: &FixedBitSet) -> (Instance, Vec<u32>) {
-    let kept_labels: Vec<u32> = keep.ones().map(|i| i as u32).collect();
-    let new_n = kept_labels.len() as u32;
-
-    // Build label mapping: old_label -> new_label
-    let mut label_map = vec![0u32; instance.num_leaves as usize + 1];
-    let mut reverse_map = vec![0u32; new_n as usize + 1];
-    for (new_idx, &old_lbl) in kept_labels.iter().enumerate() {
-        let new_lbl = (new_idx + 1) as u32;
-        label_map[old_lbl as usize] = new_lbl;
-        reverse_map[new_lbl as usize] = old_lbl;
-    }
-
-    // Create restricted trees
-    let trees: Vec<Tree> = instance
-        .trees
-        .iter()
-        .map(|t| {
-            let pruned = t.prune_to_leafset(keep);
-            pruned.relabel(&label_map, new_n)
-        })
-        .collect();
-
-    (Instance::new(trees, new_n), reverse_map)
-}
-
-/// Collapse a cluster into a single representative leaf
-fn collapse_cluster(
-    instance: &Instance,
-    cluster: &FixedBitSet,
-    representative: u32,
-) -> (Instance, Vec<u32>) {
-    let n = instance.num_leaves as usize;
-
-    // Keep all leaves NOT in cluster, plus the representative
-    let mut keep = FixedBitSet::with_capacity(n + 1);
-    for lbl in 1..=n as u32 {
-        if !cluster.contains(lbl as usize) || lbl == representative {
-            keep.insert(lbl as usize);
-        }
-    }
-
-    restrict_instance(instance, &keep)
-}
-
-/// Combine cluster and rest solutions.
-///
-/// Cluster decomposition theorem: MAF(T1..Tm) = cluster_MAF + rest_MAF - 1.
-///
-/// In the rest_MAF, rep (the ghost leaf standing for the whole cluster) will
-/// typically be a singleton component {rep}.  If it is, we substitute the
-/// cluster_solution for that singleton.
-///
-/// If rep is grouped with other leaves {rep, X1, …, Xm} in the rest solution:
-///   • cluster_solution has exactly 1 component → we can merge: replace the
-///     component with {cluster_leaves ∪ X1 … Xm}.
-///   • cluster_solution has > 1 component → cannot merge consistently; return
-///     None so the caller can fall back to monolithic solving.  The theorem
-///     guarantees that at the true optimum this case never arises, so returning
-///     None is only a safety valve against a solver returning a sub-optimal
-///     (or equal-cost but wrong-structure) solution.
-fn combine_solutions(
-    cluster_solution: &[Tree],
-    rest_solution: &[Tree],
-    rep: u32,
-    cluster_reverse: &[u32],
-    rest_reverse: &[u32],
-    ref_tree: &Tree,
-    num_leaves: u32,
-) -> Option<Vec<Tree>> {
-    let n = num_leaves as usize;
-    let mut combined = Vec::new();
-
-    // Find rep's label in the rest sub-instance label space.
-    let rep_subproblem_label: u32 = (1..rest_reverse.len() as u32)
-        .find(|&i| rest_reverse[i as usize] == rep)
-        .expect("rep must be present in rest instance");
-
-    let mut found_rep = false;
-
-    for tree in rest_solution {
-        let leaves: Vec<Label> = tree.leaves().collect();
-        if leaves.contains(&rep_subproblem_label) {
-            found_rep = true;
-            if leaves.len() == 1 {
-                // Singleton {rep} — substitute with all cluster components.
-                for ct in cluster_solution {
-                    let mut ls = FixedBitSet::with_capacity(n + 1);
-                    for l in ct.leaves() {
-                        let orig = cluster_reverse[l as usize];
-                        if orig > 0 && (orig as usize) <= n {
-                            ls.insert(orig as usize);
-                        }
-                    }
-                    if ls.count_ones(..) > 0 {
-                        combined.push(ref_tree.prune_to_leafset(&ls));
-                    }
-                }
-            } else {
-                // Rep is grouped with other rest leaves {rep, X1, …, Xm}.
-                // Only valid when cluster has exactly 1 component (merge everything).
-                if cluster_solution.len() != 1 {
-                    return None;
-                }
-                let mut ls = FixedBitSet::with_capacity(n + 1);
-                // Add cluster leaves.
-                for ct in cluster_solution {
-                    for l in ct.leaves() {
-                        let orig = cluster_reverse[l as usize];
-                        if orig > 0 && (orig as usize) <= n {
-                            ls.insert(orig as usize);
-                        }
-                    }
-                }
-                // Add rest leaves (excluding rep).
-                for &l in &leaves {
-                    if l == rep_subproblem_label {
-                        continue;
-                    }
-                    let orig = rest_reverse[l as usize];
-                    if orig > 0 && (orig as usize) <= n {
-                        ls.insert(orig as usize);
-                    }
-                }
-                if ls.count_ones(..) > 0 {
-                    combined.push(ref_tree.prune_to_leafset(&ls));
-                }
-            }
-        } else {
-            // Component doesn't contain rep — remap labels directly.
-            let mut ls = FixedBitSet::with_capacity(n + 1);
-            for &l in &leaves {
-                let orig = rest_reverse[l as usize];
-                if orig > 0 && (orig as usize) <= n {
-                    ls.insert(orig as usize);
-                }
-            }
-            if ls.count_ones(..) > 0 {
-                combined.push(ref_tree.prune_to_leafset(&ls));
-            }
-        }
-    }
-
-    if !found_rep {
-        // Rep not found in rest solution — shouldn't happen with a valid MAF.
-        return None;
-    }
-
-    Some(combined)
 }
 
 pub struct MafSatSolver {
@@ -628,7 +372,6 @@ impl TreeNav {
             is_leaf,
         }
     }
-
 }
 
 fn add_clause(solver: &mut CaDiCaL, lits: &[Lit]) {
@@ -640,13 +383,12 @@ fn add_clause(solver: &mut CaDiCaL, lits: &[Lit]) {
 /// Requires d and e variables to be allocated in enc.
 fn add_h3_local(
     solver: &mut CaDiCaL,
-    instance: &Instance,
+    _instance: &Instance,
     precomps: &[TreePrecomp],
     navs: &[TreeNav],
     enc: &MafEncoding,
     profile: &mut SolveProfile,
 ) {
-    let n = enc.n;
     let k = enc.k;
     let m = enc.m;
     let mut count = 0usize;
@@ -656,7 +398,6 @@ fn add_h3_local(
     let e_vars = enc.e.as_ref().expect("e variables not allocated");
 
     for q in 0..m {
-        let tree = &instance.trees[q];
         let pc = &precomps[q];
         let nav = &navs[q];
 
@@ -1079,8 +820,7 @@ fn sat_solve_maf(
     // CaDiCaL will override these via VSIDS if they are wrong, so the downside
     // is negligible while the upside is faster SAT proofs at the UB bound.
     {
-        let (greedy_n_comps, greedy_partition) =
-            greedy_multi_tree_partition(&instance.trees, 0, 0);
+        let (greedy_n_comps, greedy_partition) = greedy_multi_tree_partition(&instance.trees, 0, 0);
         if greedy_n_comps <= k {
             for j in 0..n {
                 let comp_idx = greedy_partition[j];
@@ -1268,11 +1008,16 @@ fn solve_sat_inner_impl(
 
     let n_reduced = reduced.num_leaves as usize;
     if kern.stats.reduced_leaves < instance.num_leaves {
-        let total = kern.stats.subtree_removed + kern.stats.chain_removed + kern.stats.chain32_removed;
+        let total =
+            kern.stats.subtree_removed + kern.stats.chain_removed + kern.stats.chain32_removed;
         eprintln!(
             "[sat] Kernelized: {} → {} leaves ({} removed: {} subtree, {} chain, {} 3-2)",
-            n, n_reduced, total,
-            kern.stats.subtree_removed, kern.stats.chain_removed, kern.stats.chain32_removed,
+            n,
+            n_reduced,
+            total,
+            kern.stats.subtree_removed,
+            kern.stats.chain_removed,
+            kern.stats.chain32_removed,
         );
     }
 
@@ -1281,71 +1026,38 @@ fn solve_sat_inner_impl(
         stats.upper_bound = Some(1 + param_reduction_32);
         // The single surviving leaf is one component; expand back to original space.
         let trivial = vec![reduced.trees[0].clone()];
-        let components = kernelize::expand_solution(
-            trivial,
-            &kern,
-            &instance.trees[0],
-            instance.num_leaves,
-        );
+        let components =
+            kernelize::expand_solution(trivial, &kern, &instance.trees[0], instance.num_leaves);
         return Some(components);
     }
 
-    // Try cluster decomposition
-    let clusters = if skip_cluster_decomp {
-        vec![]
-    } else {
-        find_common_clusters(&reduced.trees, reduced.num_leaves)
-    };
-    if let Some(split_cluster) = find_best_split_cluster(&clusters, n_reduced) {
-        let cluster_size = split_cluster.leaves.count_ones(..);
-        let rest_size = n_reduced - cluster_size + 1;
-
-        profile.cluster_splits += 1;
-        eprintln!(
-            "[sat] Cluster decomposition: {} = {} + {}",
-            n_reduced, cluster_size, rest_size
-        );
-
-        // Solve the cluster sub-instance.
-        let (cluster_inst, cluster_rev) = restrict_instance(reduced, &split_cluster.leaves);
-        let mut cluster_stats = SolverStats::default();
-        let cluster_result = solve_sat_inner(&cluster_inst, &mut cluster_stats, vec![])?;
-
-        // Pick representative (smallest label in cluster).
-        let rep = split_cluster.leaves.ones().next().unwrap() as u32;
-
-        // Build the rest instance (cluster collapsed to ghost rep).
-        let (rest_inst, rest_rev) = collapse_cluster(reduced, &split_cluster.leaves, rep);
-
-        let mut rest_stats = SolverStats::default();
-        let rest_result = solve_sat_inner(&rest_inst, &mut rest_stats, vec![])?;
-
-        if let Some(combined) = combine_solutions(
-            &cluster_result,
-            &rest_result,
-            rep,
-            &cluster_rev,
-            &rest_rev,
-            &reduced.trees[0],
-            reduced.num_leaves,
-        ) {
-            let cluster_k =
-                cluster_stats.lower_bound + rest_stats.lower_bound - 1 + param_reduction_32;
-            stats.lower_bound = cluster_k;
-            stats.upper_bound = match (cluster_stats.upper_bound, rest_stats.upper_bound) {
-                (Some(a), Some(b)) => Some(a + b - 1 + param_reduction_32),
-                _ => None,
-            };
-            let combined = kernelize::expand_solution(
-                combined,
-                &kern,
-                &instance.trees[0],
-                instance.num_leaves,
-            );
-            return Some(combined);
+    if !skip_cluster_decomp {
+        match cluster_reduction::try_cluster_reduction(reduced, &mut |subinstance| {
+            let mut sub_stats = SolverStats::default();
+            solve_sat_inner(subinstance, &mut sub_stats, vec![])
+        })? {
+            ClusterReductionResult::NotApplicable => {}
+            ClusterReductionResult::Solved(solution) => {
+                profile.cluster_splits += 1;
+                eprintln!(
+                    "[sat] Cluster decomposition: {} = {} + {}",
+                    n_reduced, solution.cluster_size, solution.rest_size
+                );
+                let exact_k = solution.components.len() + param_reduction_32;
+                profile.bounds_computed = (exact_k, exact_k);
+                profile.optimal_k = exact_k;
+                profile.report();
+                stats.lower_bound = exact_k;
+                stats.upper_bound = Some(exact_k);
+                let components = kernelize::expand_solution(
+                    solution.components,
+                    &kern,
+                    &instance.trees[0],
+                    instance.num_leaves,
+                );
+                return Some(components);
+            }
         }
-        // Fall through to monolithic solving on the reduced instance.
-        eprintln!("[sat] Cluster combine failed, falling back to monolithic");
     }
 
     // For m=2: compute red_blue once and derive both LB and UB from it,
@@ -1434,12 +1146,8 @@ fn solve_sat_inner_impl(
     )?;
 
     // Expand solution back to original label space.
-    let components = kernelize::expand_solution(
-        components,
-        &kern,
-        &instance.trees[0],
-        instance.num_leaves,
-    );
+    let components =
+        kernelize::expand_solution(components, &kern, &instance.trees[0], instance.num_leaves);
 
     Some(components)
 }

@@ -1,7 +1,7 @@
 //! Utility functions for bitset operations and hashing.
 
 use fixedbitset::FixedBitSet;
-use klados_core::{NodeId, Tree, NONE};
+use klados_core::{NONE, NodeId, Tree};
 
 pub fn has_intersection(a: &FixedBitSet, b: &FixedBitSet) -> bool {
     let a_sl = a.as_slice();

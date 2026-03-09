@@ -19,7 +19,7 @@
 
 use fixedbitset::FixedBitSet;
 use highs::{Col, HighsModelStatus, RowProblem, Sense};
-use klados_core::tree::{Label, NodeId, Tree, NONE};
+use klados_core::tree::{Label, NONE, NodeId, Tree};
 use klados_core::{Instance, SolverStats};
 
 // ---------------------------------------------------------------------------

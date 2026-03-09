@@ -1,6 +1,6 @@
 //! Unit tests for lower bound computation.
 
-use klados_core::tree::{Tree, NONE};
+use klados_core::tree::{NONE, Tree};
 
 use super::tree_data::TreeData;
 use super::{cherry_reduce_ub, maf_bounds, red_blue_approx};

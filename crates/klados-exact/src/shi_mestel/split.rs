@@ -1,7 +1,7 @@
 //! Split-or-decompose: Overlapping component detection and splitting core computation.
 
 use fixedbitset::FixedBitSet;
-use klados_core::{NodeId, Tree, XForest, NONE};
+use klados_core::{NONE, NodeId, Tree, XForest};
 
 use super::search_state::SearchState;
 use super::transposition::{TTEntry, ZobristTable};

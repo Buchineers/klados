@@ -2,7 +2,7 @@
 
 use fixedbitset::FixedBitSet;
 use fxhash::FxHashMap;
-use klados_core::{NodeId, XForest, NONE};
+use klados_core::{NONE, NodeId, XForest};
 
 use super::forest_nav::{active_children_xf, forest_lca};
 use super::reduction::{find_all_sibling_pairs, find_violating_pair_cached};
@@ -392,10 +392,11 @@ fn apply_branching_rule_2_1(
                 stats,
                 zobrist,
                 tt,
-            ) {
-                state.rollback();
-                return Some(result);
-            }
+            )
+        {
+            state.rollback();
+            return Some(result);
+        }
         state.rollback();
     }
 
@@ -484,10 +485,11 @@ fn apply_branching_rule_2_2_2(
                 stats,
                 zobrist,
                 tt,
-            ) {
-                state.rollback();
-                return Some(result);
-            }
+            )
+        {
+            state.rollback();
+            return Some(result);
+        }
         state.rollback();
     }
 

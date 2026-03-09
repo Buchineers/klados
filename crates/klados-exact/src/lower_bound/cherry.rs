@@ -1,6 +1,6 @@
 //! Cherry-based heuristic for upper bounds.
 
-use klados_core::tree::{Label, NodeId, Tree, NONE};
+use klados_core::tree::{Label, NONE, NodeId, Tree};
 
 pub fn cherry_reduce_ub(t1: &Tree, t2: &Tree) -> usize {
     let mut best = cherry_reduce(t1, t2).min(cherry_reduce(t2, t1));
@@ -49,11 +49,7 @@ impl MutableTree {
     fn sibling(&self, node: NodeId) -> NodeId {
         let p = self.parent[node as usize];
         let l = self.left[p as usize];
-        if l == node {
-            self.right[p as usize]
-        } else {
-            l
-        }
+        if l == node { self.right[p as usize] } else { l }
     }
 
     fn is_cherry(&self, a: Label, b: Label) -> bool {
@@ -192,11 +188,7 @@ fn pick_leaf_to_cut(t2: &MutableTree, a: Label, b: Label) -> Label {
     }
     let da = depth_in_mtree(t2, na);
     let db = depth_in_mtree(t2, nb);
-    if da >= db {
-        a
-    } else {
-        b
-    }
+    if da >= db { a } else { b }
 }
 
 fn depth_in_mtree(t: &MutableTree, mut node: NodeId) -> u32 {

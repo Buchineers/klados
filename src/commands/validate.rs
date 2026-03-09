@@ -24,6 +24,7 @@ struct ScoreEntry {
 
 // STRIDE summary.json format
 #[derive(serde::Deserialize, Debug)]
+#[allow(dead_code)]
 struct SummaryEntry {
     #[serde(rename = "s_key")]
     key: String,

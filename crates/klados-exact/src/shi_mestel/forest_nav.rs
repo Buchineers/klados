@@ -1,7 +1,7 @@
 //! Forest navigation helpers for traversing forests with cut edges.
 
 use fixedbitset::FixedBitSet;
-use klados_core::{NodeId, XForest, NONE};
+use klados_core::{NONE, NodeId, XForest};
 
 #[derive(Clone, Copy)]
 pub struct Children {

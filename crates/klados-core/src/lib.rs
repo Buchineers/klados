@@ -8,7 +8,7 @@ pub mod tree;
 pub mod xforest;
 
 pub use instance::Instance;
-pub use tree::{Label, NodeId, Tree, NONE};
+pub use tree::{Label, NONE, NodeId, Tree};
 pub use xforest::XForest;
 
 /// Statistics collected during solving

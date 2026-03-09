@@ -1,14 +1,14 @@
 //! Unit tests for the Shi-Mestel solver.
 
 use fixedbitset::FixedBitSet;
-use klados_core::{Instance, Tree, XForest, NONE};
+use klados_core::{Instance, NONE, Tree, XForest};
 
+use super::ShiMestelSolver;
 use super::branching::compute_e_f;
 use super::forest_nav::component_leaf_sets_xf;
 use super::reduction::{all_pairs_lsi_cached, find_all_sibling_pairs};
 use super::search_state::SearchState;
 use super::utils::{has_intersection, is_subset};
-use super::ShiMestelSolver;
 
 fn make_simple_tree() -> Tree {
     let mut tree = Tree::with_capacity(3);
