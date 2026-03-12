@@ -1,10 +1,10 @@
-//! Reusable cluster reduction for rooted two-tree MAF.
+//! Cluster reduction for rooted multi-tree MAF.
 //!
-//! This follows Kelk's four-subinstance reduction:
-//! - `TP1`: cluster subtree with a marker leaf at the cluster root
-//! - `TP2`: cluster subtree without the marker
-//! - `TP3`: top part with a placeholder leaf for the cluster
-//! - `TP4`: top part without the placeholder
+//! This follows Kelk's four-subinstance reduction, generalized to m trees:
+//! - `TP1`: cluster subtree with a marker leaf at the cluster root (all trees)
+//! - `TP2`: cluster subtree without the marker (all trees)
+//! - `TP3`: top part with a placeholder leaf for the cluster (all trees)
+//! - `TP4`: top part without the placeholder (all trees)
 //!
 //! If `OPT(TP1) = OPT(TP2)` and `OPT(TP3) = OPT(TP4)`, then the original
 //! instance has optimum `OPT(TP2) + OPT(TP4) - 1`; otherwise it is
@@ -18,7 +18,7 @@ use klados_core::tree::{Label, NONE, NodeId, Tree};
 #[derive(Clone, Debug)]
 pub struct CommonCluster {
     pub leaves: FixedBitSet,
-    nodes: [NodeId; 2],
+    nodes: Vec<NodeId>,
 }
 
 #[derive(Clone, Debug)]
@@ -63,44 +63,68 @@ struct DecodedForest {
 }
 
 pub fn find_best_common_cluster(instance: &Instance) -> Option<CommonCluster> {
-    if instance.num_trees() != 2 || instance.num_leaves < 5 {
+    let m = instance.num_trees();
+    if m < 2 || instance.num_leaves < 5 {
         return None;
     }
 
     let n = instance.num_leaves as usize;
-    let clusters_t1 = tree_clusters_with_nodes(&instance.trees[0], n);
-    let clusters_t2 = tree_clusters_with_nodes(&instance.trees[1], n);
 
-    let lookup_t2: FxHashMap<Vec<usize>, NodeId> = clusters_t2
-        .into_iter()
-        .map(|(leaves, node)| (leafset_key(&leaves), node))
+    // Build per-tree lookup: leafset-key → NodeId
+    let per_tree: Vec<FxHashMap<Vec<usize>, NodeId>> = instance
+        .trees
+        .iter()
+        .map(|tree| {
+            tree_clusters_with_nodes(tree, n)
+                .into_iter()
+                .map(|(leaves, node)| (leafset_key(&leaves), node))
+                .collect()
+        })
         .collect();
 
+    // Use tree 0 as base, intersect with all others
     let target = n / 2;
     let mut best: Option<(CommonCluster, usize)> = None;
 
-    for (leaves, node_t1) in clusters_t1 {
-        let key = leafset_key(&leaves);
-        let Some(&node_t2) = lookup_t2.get(&key) else {
+    for (key, &node0) in &per_tree[0] {
+        // Check all other trees have this cluster
+        let mut nodes = vec![node0];
+        let mut all_present = true;
+        for lookup in &per_tree[1..] {
+            if let Some(&node_i) = lookup.get(key) {
+                nodes.push(node_i);
+            } else {
+                all_present = false;
+                break;
+            }
+        }
+        if !all_present {
             continue;
-        };
+        }
 
+        // Reconstruct leaf bitset from key
+        let mut leaves = FixedBitSet::with_capacity(n + 1);
+        for &lbl in key {
+            leaves.insert(lbl);
+        }
         let size = leaves.count_ones(..);
         if size <= 2 || size >= n - 1 {
             continue;
         }
 
         let dist = (size as isize - target as isize).unsigned_abs();
-        let candidate = CommonCluster {
-            leaves,
-            nodes: [node_t1, node_t2],
-        };
+        let candidate = CommonCluster { leaves, nodes };
 
         match &best {
             None => best = Some((candidate, dist)),
             Some((current, current_dist)) => {
                 let current_size = current.leaves.count_ones(..);
-                if dist < *current_dist || (dist == *current_dist && size > current_size) {
+                let better = dist < *current_dist
+                    || (dist == *current_dist && size > current_size)
+                    || (dist == *current_dist
+                        && size == current_size
+                        && key < &leafset_key(&current.leaves));
+                if better {
                     best = Some((candidate, dist));
                 }
             }
@@ -228,42 +252,32 @@ fn build_cluster_subproblems(instance: &Instance, cluster: &CommonCluster) -> Cl
         .filter(|&lbl| !cluster.leaves.contains(lbl as usize))
         .collect();
 
-    let tp1_trees = vec![
-        attach_marker_to_cluster_root(
-            &instance.trees[0],
-            cluster.nodes[0],
-            marker_down,
-            total_label_space,
-        ),
-        attach_marker_to_cluster_root(
-            &instance.trees[1],
-            cluster.nodes[1],
-            marker_down,
-            total_label_space,
-        ),
-    ];
-    let tp2_trees = vec![
-        instance.trees[0].prune_to_leafset(&cluster.leaves),
-        instance.trees[1].prune_to_leafset(&cluster.leaves),
-    ];
-    let tp3_trees = vec![
-        replace_cluster_with_marker(
-            &instance.trees[0],
-            cluster.nodes[0],
-            marker_up,
-            total_label_space,
-        ),
-        replace_cluster_with_marker(
-            &instance.trees[1],
-            cluster.nodes[1],
-            marker_up,
-            total_label_space,
-        ),
-    ];
-    let tp4_trees = vec![
-        prune_complement(&instance.trees[0], &cluster.leaves),
-        prune_complement(&instance.trees[1], &cluster.leaves),
-    ];
+    let tp1_trees: Vec<Tree> = instance
+        .trees
+        .iter()
+        .zip(&cluster.nodes)
+        .map(|(tree, &node)| {
+            attach_marker_to_cluster_root(tree, node, marker_down, total_label_space)
+        })
+        .collect();
+    let tp2_trees: Vec<Tree> = instance
+        .trees
+        .iter()
+        .map(|tree| tree.prune_to_leafset(&cluster.leaves))
+        .collect();
+    let tp3_trees: Vec<Tree> = instance
+        .trees
+        .iter()
+        .zip(&cluster.nodes)
+        .map(|(tree, &node)| {
+            replace_cluster_with_marker(tree, node, marker_up, total_label_space)
+        })
+        .collect();
+    let tp4_trees: Vec<Tree> = instance
+        .trees
+        .iter()
+        .map(|tree| prune_complement(tree, &cluster.leaves))
+        .collect();
 
     let tp1_labels = cluster_labels
         .iter()
