@@ -970,6 +970,595 @@ fn components_to_trees(components: &[Vec<usize>], ref_tree: &Tree, num_leaves: u
 }
 
 // ═══════════════════════════════════════════════════════════════
+// Compact encoding: active components only (for high-k instances)
+// When k ≈ n, most components are singletons. Instead of k slots,
+// encode only p = n - lb active (non-singleton) slots plus a[j]
+// singleton indicators. Reduces variables by factor k/p.
+// ═══════════════════════════════════════════════════════════════
+
+struct CompactEncoding {
+    a: Vec<Var>,               // a[j]: leaf j is singleton
+    l: Vec<Vec<Var>>,          // l[i][j]: leaf j in active component i (i in 0..p)
+    u: Vec<Var>,               // u[i]: active component i used
+    w: Vec<Vec<Vec<Var>>>,     // w[q][i][idx]
+    s: Vec<Vec<Var>>,          // s[i][j]: ladder aux for H1b AMO
+    t: Vec<Vec<Vec<Var>>>,     // t[q][i][idx]: ladder aux for H2
+    d: Vec<Vec<Vec<Var>>>,     // d[q][i][idx]
+    e: Vec<Vec<Vec<Var>>>,     // e[q][i][idx]
+    n: usize,
+    p: usize,
+    m: usize,
+}
+
+fn create_compact_variables(
+    vm: &mut BasicVarManager,
+    n: usize,
+    p: usize,
+    m: usize,
+    precomps: &[TreePrecomp],
+) -> CompactEncoding {
+    let alloc = |vm: &mut BasicVarManager, count: usize| -> Vec<Var> {
+        (0..count).map(|_| vm.new_var()).collect()
+    };
+
+    let a: Vec<Var> = alloc(vm, n);
+    let l: Vec<Vec<Var>> = (0..p).map(|_| alloc(vm, n)).collect();
+    let u: Vec<Var> = alloc(vm, p);
+    let s: Vec<Vec<Var>> = (0..p).map(|_| alloc(vm, n)).collect();
+
+    let w: Vec<Vec<Vec<Var>>> = (0..m)
+        .map(|q| {
+            let ni = precomps[q].num_internal;
+            (0..p).map(|_| alloc(vm, ni)).collect()
+        })
+        .collect();
+    let t: Vec<Vec<Vec<Var>>> = (0..m)
+        .map(|q| {
+            let ni = precomps[q].num_internal;
+            (0..p).map(|_| alloc(vm, ni)).collect()
+        })
+        .collect();
+    let d: Vec<Vec<Vec<Var>>> = (0..m)
+        .map(|q| {
+            let ni = precomps[q].num_internal;
+            (0..p).map(|_| alloc(vm, ni)).collect()
+        })
+        .collect();
+    let e: Vec<Vec<Vec<Var>>> = (0..m)
+        .map(|q| {
+            let ni = precomps[q].num_internal;
+            (0..p).map(|_| alloc(vm, ni)).collect()
+        })
+        .collect();
+
+    CompactEncoding {
+        a, l, u, w, s, t, d, e, n, p, m,
+    }
+}
+
+fn add_h3_local_compact(
+    solver: &mut CaDiCaL,
+    precomps: &[TreePrecomp],
+    navs: &[TreeNav],
+    enc: &CompactEncoding,
+    profile: &mut SolveProfile,
+) {
+    let p = enc.p;
+    let m = enc.m;
+    let mut count = 0usize;
+
+    for q in 0..m {
+        let pc = &precomps[q];
+        let nav = &navs[q];
+
+        for i in 0..p {
+            for &ii in &nav.post_order {
+                let (c1, c2) = nav.children[ii];
+                let d_ii = enc.d[q][i][ii];
+
+                let dc1 = if nav.is_leaf[c1 as usize] {
+                    enc.l[i][nav.leaf_idx[c1 as usize].unwrap_or(0)]
+                } else {
+                    enc.d[q][i][pc.idx(c1)]
+                };
+                let dc2 = if nav.is_leaf[c2 as usize] {
+                    enc.l[i][nav.leaf_idx[c2 as usize].unwrap_or(0)]
+                } else {
+                    enc.d[q][i][pc.idx(c2)]
+                };
+
+                add_clause(solver, &[dc1.neg_lit(), d_ii.pos_lit()]);
+                add_clause(solver, &[dc2.neg_lit(), d_ii.pos_lit()]);
+                add_clause(solver, &[d_ii.neg_lit(), dc1.pos_lit(), dc2.pos_lit()]);
+                count += 3;
+            }
+
+            for &ii in &nav.pre_order {
+                let e_ii = enc.e[q][i][ii];
+
+                if ii == nav.root_idx {
+                    add_clause(solver, &[e_ii.neg_lit()]);
+                    count += 1;
+                } else {
+                    let p_node = nav.parent[ii];
+                    let sib = nav.sibling[ii];
+                    let p_ii = pc.idx(p_node);
+                    let e_p = enc.e[q][i][p_ii];
+
+                    let d_sib = if nav.is_leaf[sib as usize] {
+                        enc.l[i][nav.leaf_idx[sib as usize].unwrap_or(0)]
+                    } else {
+                        enc.d[q][i][pc.idx(sib)]
+                    };
+
+                    add_clause(solver, &[e_p.neg_lit(), e_ii.pos_lit()]);
+                    add_clause(solver, &[d_sib.neg_lit(), e_ii.pos_lit()]);
+                    add_clause(solver, &[e_ii.neg_lit(), e_p.pos_lit(), d_sib.pos_lit()]);
+                    count += 3;
+                }
+            }
+
+            for &ii in &nav.post_order {
+                let (c1, c2) = nav.children[ii];
+                let w_ii = enc.w[q][i][ii];
+                let e_ii = enc.e[q][i][ii];
+
+                let dc1 = if nav.is_leaf[c1 as usize] {
+                    enc.l[i][nav.leaf_idx[c1 as usize].unwrap_or(0)]
+                } else {
+                    enc.d[q][i][pc.idx(c1)]
+                };
+                let dc2 = if nav.is_leaf[c2 as usize] {
+                    enc.l[i][nav.leaf_idx[c2 as usize].unwrap_or(0)]
+                } else {
+                    enc.d[q][i][pc.idx(c2)]
+                };
+
+                add_clause(solver, &[dc1.neg_lit(), dc2.neg_lit(), w_ii.pos_lit()]);
+                add_clause(solver, &[dc1.neg_lit(), e_ii.neg_lit(), w_ii.pos_lit()]);
+                add_clause(solver, &[dc2.neg_lit(), e_ii.neg_lit(), w_ii.pos_lit()]);
+                add_clause(solver, &[w_ii.neg_lit(), dc1.pos_lit(), dc2.pos_lit()]);
+                add_clause(solver, &[w_ii.neg_lit(), dc1.pos_lit(), e_ii.pos_lit()]);
+                add_clause(solver, &[w_ii.neg_lit(), dc2.pos_lit(), e_ii.pos_lit()]);
+                count += 6;
+            }
+        }
+    }
+    profile.h3_clauses = count;
+}
+
+fn add_structural_clauses_compact(
+    solver: &mut CaDiCaL,
+    enc: &CompactEncoding,
+    profile: &mut SolveProfile,
+    _instance: &Instance,
+    precomps: &[TreePrecomp],
+    navs: &[TreeNav],
+) {
+    let n = enc.n;
+    let p = enc.p;
+    let m = enc.m;
+
+    // H1a: every leaf is singleton or in at least one active component.
+    // By O2+O3+H1 induction, l[i][j]=FALSE for i>j, so only 0..=min(j,p-1).
+    for j in 0..n {
+        let jp = j.min(p - 1);
+        let mut clause = vec![enc.a[j].pos_lit()];
+        for i in 0..=jp {
+            clause.push(enc.l[i][j].pos_lit());
+        }
+        add_clause(solver, &clause);
+    }
+    profile.h1_clauses += n;
+
+    // H1b: AMO ladder over (a[j], l[0][j], ..., l[jp][j])
+    // Variables: x_0=a[j], x_1=l[0][j], ..., x_{jp+1}=l[jp][j]
+    // Auxiliary:  r_0=s[0][j], ..., r_{jp}=s[jp][j]
+    for j in 0..n {
+        let jp = j.min(p - 1);
+        // x_i → r_i
+        add_clause(solver, &[enc.a[j].neg_lit(), enc.s[0][j].pos_lit()]);
+        for i in 1..=jp {
+            add_clause(solver, &[enc.l[i - 1][j].neg_lit(), enc.s[i][j].pos_lit()]);
+        }
+        // r_{i-1} → r_i (chain)
+        for i in 1..=jp {
+            add_clause(solver, &[enc.s[i - 1][j].neg_lit(), enc.s[i][j].pos_lit()]);
+        }
+        // r_k → ¬l[k][j] (conflict)
+        for k in 0..=jp {
+            add_clause(solver, &[enc.s[k][j].neg_lit(), enc.l[k][j].neg_lit()]);
+        }
+    }
+    profile.h1_clauses += n * (3 * p);
+
+    // H2: AMO active component per internal node (ladder), only when p >= 2
+    if p >= 2 {
+        for q in 0..m {
+            let ni = enc.w[q][0].len();
+            for idx in 0..ni {
+                for i in 0..p - 1 {
+                    add_clause(
+                        solver,
+                        &[enc.w[q][i][idx].neg_lit(), enc.t[q][i][idx].pos_lit()],
+                    );
+                }
+                for i in 1..p - 1 {
+                    add_clause(
+                        solver,
+                        &[enc.t[q][i - 1][idx].neg_lit(), enc.t[q][i][idx].pos_lit()],
+                    );
+                }
+                for i in 1..p {
+                    add_clause(
+                        solver,
+                        &[enc.t[q][i - 1][idx].neg_lit(), enc.w[q][i][idx].neg_lit()],
+                    );
+                }
+            }
+            profile.h2_clauses += ni * (3 * p - 2);
+        }
+    }
+
+    // H3: local propagation (d/e/w)
+    add_h3_local_compact(solver, precomps, navs, enc, profile);
+
+    // H5: usage tracking — l[i][j] → u[i], only j >= i (O2+O3 forced-false)
+    let mut h5_count = 0;
+    for i in 0..p {
+        for j in i..n {
+            add_clause(solver, &[enc.l[i][j].neg_lit(), enc.u[i].pos_lit()]);
+            h5_count += 1;
+        }
+    }
+    profile.h5_clauses = h5_count;
+
+    // O1: ordered active component usage
+    let mut sym = 0;
+    if p >= 2 {
+        for i in 0..p - 1 {
+            add_clause(solver, &[enc.u[i + 1].neg_lit(), enc.u[i].pos_lit()]);
+            sym += 1;
+        }
+    }
+
+    // O2: leaf 0 is singleton or in active component 0
+    add_clause(solver, &[enc.a[0].pos_lit(), enc.l[0][0].pos_lit()]);
+    sym += 1;
+
+    // O3: lex ordering on active components
+    if p >= 2 {
+        for i in 0..p - 1 {
+            for j in 0..n {
+                let mut lits = vec![enc.l[i + 1][j].neg_lit()];
+                for jp in 0..j {
+                    lits.push(enc.l[i][jp].pos_lit());
+                }
+                add_clause(solver, &lits);
+                sym += 1;
+            }
+        }
+    }
+    profile.sym_clauses = sym;
+}
+
+fn seed_sibling_constraints_compact(
+    solver: &mut CaDiCaL,
+    instance: &Instance,
+    enc: &CompactEncoding,
+    profile: &mut SolveProfile,
+    ghost_leaves: &[usize],
+) {
+    let ref_tree = &instance.trees[0];
+    let p = enc.p;
+    let mut count = 0;
+
+    for node in ref_tree.post_order() {
+        if let Some((left, right)) = ref_tree.children(node) {
+            if ref_tree.is_leaf(left) && ref_tree.is_leaf(right) {
+                let la = ref_tree.label[left as usize];
+                let lb = ref_tree.label[right as usize];
+                if la == 0 || lb == 0 {
+                    continue;
+                }
+                let ja = (la - 1) as usize;
+                let jb = (lb - 1) as usize;
+                if ghost_leaves.contains(&ja) || ghost_leaves.contains(&jb) {
+                    continue;
+                }
+                let is_common = instance.trees[1..].iter().all(|t| {
+                    let na = t.node_by_label(la);
+                    let nb = t.node_by_label(lb);
+                    let pa = t.parent[na as usize];
+                    let pb = t.parent[nb as usize];
+                    pa != NONE && pa == pb
+                });
+                if is_common {
+                    add_clause(solver, &[enc.a[ja].neg_lit()]);
+                    add_clause(solver, &[enc.a[jb].neg_lit()]);
+                    count += 2;
+                    let hi = ja.min(jb).min(p - 1);
+                    for i in 0..=hi {
+                        add_clause(solver, &[enc.l[i][ja].neg_lit(), enc.l[i][jb].pos_lit()]);
+                        add_clause(solver, &[enc.l[i][jb].neg_lit(), enc.l[i][ja].pos_lit()]);
+                        count += 2;
+                    }
+                }
+            }
+        }
+    }
+    profile.sibling_clauses = count;
+}
+
+fn add_violated_triples_compact(
+    solver: &mut CaDiCaL,
+    enc: &CompactEncoding,
+    components: &[Vec<usize>],
+    nca_data: &NcaData,
+    added_triples: &mut fxhash::FxHashSet<(usize, usize, usize)>,
+) -> (usize, usize) {
+    let p = enc.p;
+    let mut violations = 0;
+    let mut clauses = 0;
+
+    for comp in components {
+        if comp.len() < 3 {
+            continue;
+        }
+        for ii in 0..comp.len() {
+            for jj in (ii + 1)..comp.len() {
+                for kk in (jj + 1)..comp.len() {
+                    let a = comp[ii];
+                    let b = comp[jj];
+                    let c = comp[kk];
+                    if nca_data.is_incompatible(a, b, c) {
+                        let key = (a, b, c);
+                        if added_triples.contains(&key) {
+                            continue;
+                        }
+                        added_triples.insert(key);
+                        let min_leaf = a.min(b).min(c);
+                        let hi = min_leaf.min(p - 1);
+                        for i in 0..=hi {
+                            add_clause(
+                                solver,
+                                &[
+                                    enc.l[i][a].neg_lit(),
+                                    enc.l[i][b].neg_lit(),
+                                    enc.l[i][c].neg_lit(),
+                                ],
+                            );
+                        }
+                        violations += 1;
+                        clauses += hi + 1;
+                    }
+                }
+            }
+        }
+    }
+    (violations, clauses)
+}
+
+fn extract_components_compact(
+    solver: &CaDiCaL,
+    enc: &CompactEncoding,
+    n: usize,
+    p: usize,
+) -> Vec<Vec<usize>> {
+    let mut components = Vec::new();
+    for i in 0..p {
+        let mut comp = Vec::new();
+        for j in 0..n {
+            if solver.var_val(enc.l[i][j]).unwrap() == TernaryVal::True {
+                comp.push(j);
+            }
+        }
+        if !comp.is_empty() {
+            components.push(comp);
+        }
+    }
+    for j in 0..n {
+        if solver.var_val(enc.a[j]).unwrap() == TernaryVal::True {
+            components.push(vec![j]);
+        }
+    }
+    components
+}
+
+fn sat_solve_maf_compact(
+    instance: &Instance,
+    k_max: usize,
+    lb_components: usize,
+    profile: &mut SolveProfile,
+    preferred_singletons: &[usize],
+) -> Option<Vec<Tree>> {
+    let n = instance.num_leaves as usize;
+    let p = n.saturating_sub(lb_components);
+    let m = instance.num_trees();
+
+    if p == 0 {
+        let components: Vec<Vec<usize>> = (0..n).map(|j| vec![j]).collect();
+        profile.optimal_k = n;
+        profile.report();
+        return Some(components_to_trees(&components, &instance.trees[0], instance.num_leaves));
+    }
+
+    profile.n_reduced = n;
+    profile.k = k_max;
+    profile.m = m;
+
+    let precomps: Vec<TreePrecomp> = instance
+        .trees
+        .iter()
+        .map(|t| TreePrecomp::build(t))
+        .collect();
+
+    let t_nav = std::time::Instant::now();
+    let navs: Vec<TreeNav> = (0..m)
+        .map(|q| TreeNav::build(&instance.trees[q], &precomps[q], n))
+        .collect();
+    let nav_ms = t_nav.elapsed().as_secs_f64() * 1000.0;
+
+    let nca_data = NcaData::build(instance, n);
+
+    let mut solver = CaDiCaL::default();
+    let mut vm = BasicVarManager::default();
+
+    let t_enc = std::time::Instant::now();
+    let enc = create_compact_variables(&mut vm, n, p, m, &precomps);
+
+    add_structural_clauses_compact(&mut solver, &enc, profile, instance, &precomps, &navs);
+    seed_sibling_constraints_compact(&mut solver, instance, &enc, profile, preferred_singletons);
+
+    // Ghost leaves: force singleton (1 unit clause each, vs k*n binary clauses in standard)
+    let mut singleton_clauses = 0usize;
+    for &ghost in preferred_singletons {
+        add_clause(&mut solver, &[enc.a[ghost].pos_lit()]);
+        singleton_clauses += 1;
+    }
+    profile.singleton_clauses = singleton_clauses;
+
+    profile.encode_ms = t_enc.elapsed().as_secs_f64() * 1000.0 + nav_ms;
+    profile.num_vars = vm.n_used() as usize;
+
+    eprintln!(
+        "[sat] Compact encoding: p={} n={} m={} vars={} clauses={}",
+        p, n, m, profile.num_vars, profile.total_clauses()
+    );
+
+    // Phase hints from greedy partition
+    {
+        let (greedy_n_comps, greedy_partition) = greedy_multi_tree_partition(&instance.trees, 0, 0);
+        if greedy_n_comps <= k_max {
+            let mut comp_members: Vec<Vec<usize>> = vec![Vec::new(); greedy_n_comps];
+            for j in 0..n {
+                comp_members[greedy_partition[j]].push(j);
+            }
+            let mut active_idx = 0usize;
+            for members in &comp_members {
+                if members.len() == 1 {
+                    let j = members[0];
+                    let _ = solver.phase_lit(enc.a[j].pos_lit());
+                    for i in 0..p {
+                        let _ = solver.phase_lit(enc.l[i][j].neg_lit());
+                    }
+                } else if active_idx < p {
+                    for &j in members {
+                        let _ = solver.phase_lit(enc.a[j].neg_lit());
+                        for i in 0..p {
+                            let lit = if i == active_idx {
+                                enc.l[i][j].pos_lit()
+                            } else {
+                                enc.l[i][j].neg_lit()
+                            };
+                            let _ = solver.phase_lit(lit);
+                        }
+                    }
+                    active_idx += 1;
+                }
+            }
+        }
+    }
+
+    // Totalizer over a[0..n] + u[0..p]: sum = #singletons + #active_used = #components
+    let mut totalizer = Totalizer::default();
+    for j in 0..n {
+        totalizer.extend([enc.a[j].pos_lit()]);
+    }
+    for i in 0..p {
+        totalizer.extend([enc.u[i].pos_lit()]);
+    }
+    totalizer
+        .encode_ub(lb_components..=k_max, &mut solver, &mut vm)
+        .unwrap();
+
+    let mut added_triples: fxhash::FxHashSet<(usize, usize, usize)> = fxhash::FxHashSet::default();
+
+    // Upfront H4 for small n
+    const UPFRONT_TRIPLE_THRESHOLD: usize = 40;
+    if n <= UPFRONT_TRIPLE_THRESHOLD {
+        for a in 0..n {
+            for b in (a + 1)..n {
+                for c in (b + 1)..n {
+                    if nca_data.is_incompatible(a, b, c) {
+                        added_triples.insert((a, b, c));
+                        let hi = a.min(p - 1);
+                        for i in 0..=hi {
+                            add_clause(
+                                &mut solver,
+                                &[
+                                    enc.l[i][a].neg_lit(),
+                                    enc.l[i][b].neg_lit(),
+                                    enc.l[i][c].neg_lit(),
+                                ],
+                            );
+                        }
+                        profile.h4_clauses += hi + 1;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut best_components: Option<Vec<Vec<usize>>> = None;
+
+    // Linear descent from k_max down to lb_components
+    for bound in (lb_components..=k_max).rev() {
+        let assumps_vec = totalizer.enforce_ub(bound).unwrap();
+
+        loop {
+            profile.sat_calls += 1;
+
+            let t_solve = std::time::Instant::now();
+            let result = solver.solve_assumps(&assumps_vec).unwrap();
+            profile.solve_ms += t_solve.elapsed().as_secs_f64() * 1000.0;
+
+            match result {
+                SolverResult::Sat => {
+                    let t_cegar = std::time::Instant::now();
+                    let comps = extract_components_compact(&solver, &enc, n, p);
+                    let (v, h4_new) = add_violated_triples_compact(
+                        &mut solver,
+                        &enc,
+                        &comps,
+                        &nca_data,
+                        &mut added_triples,
+                    );
+                    profile.cegar_ms += t_cegar.elapsed().as_secs_f64() * 1000.0;
+                    profile.cegar_violations += v;
+                    profile.h4_clauses += h4_new;
+
+                    if v == 0 {
+                        profile.optimal_k = bound;
+                        best_components = Some(comps);
+                        break;
+                    }
+                }
+                SolverResult::Unsat => {
+                    if best_components.is_some() {
+                        profile.optimal_k =
+                            best_components.as_ref().map(|c| c.len()).unwrap_or(k_max);
+                    }
+                    profile.report();
+                    return best_components
+                        .map(|c| components_to_trees(&c, &instance.trees[0], instance.num_leaves));
+                }
+                SolverResult::Interrupted => {
+                    profile.report();
+                    return best_components
+                        .map(|c| components_to_trees(&c, &instance.trees[0], instance.num_leaves));
+                }
+            }
+        }
+    }
+
+    profile.optimal_k = best_components.as_ref().map(|c| c.len()).unwrap_or(k_max);
+    profile.report();
+
+    best_components.map(|c| components_to_trees(&c, &instance.trees[0], instance.num_leaves))
+}
+
+// ═══════════════════════════════════════════════════════════════
 // Outer pipeline
 // ═══════════════════════════════════════════════════════════════
 
@@ -1137,13 +1726,27 @@ fn solve_sat_inner_impl(
     stats.lower_bound = lb_components + param_reduction_32;
     stats.upper_bound = Some(ub_components + param_reduction_32);
 
-    let components = sat_solve_maf(
-        reduced,
-        ub_components,
-        lb_components,
-        &mut profile,
-        &preferred_singletons_reduced,
-    )?;
+    let p = n_reduced.saturating_sub(lb_components);
+    let use_compact = p > 0 && p < ub_components / 2;
+
+    let components = if use_compact {
+        eprintln!("[sat] Using compact encoding: p={} (vs k={})", p, ub_components);
+        sat_solve_maf_compact(
+            reduced,
+            ub_components,
+            lb_components,
+            &mut profile,
+            &preferred_singletons_reduced,
+        )
+    } else {
+        sat_solve_maf(
+            reduced,
+            ub_components,
+            lb_components,
+            &mut profile,
+            &preferred_singletons_reduced,
+        )
+    }?;
 
     // Expand solution back to original label space.
     let components =
