@@ -13,7 +13,8 @@ use super::search_state::SearchState;
 use super::split::{SplitStats, apply_split_branching_cached};
 use super::transposition::{TTEntry, ZobristTable, tt_insert};
 use super::utils::trivial_forest;
-use crate::lower_bound::maf_bounds;
+use crate::lower_bound::{cherry_reduce_ub, maf_bounds, red_blue_approx};
+use crate::kernelize::{self, KernelizeConfig};
 
 thread_local! {
     static SPLIT_STATS: std::cell::RefCell<SplitStats> = std::cell::RefCell::new(SplitStats::default());
@@ -166,32 +167,44 @@ pub fn alg_maf(
     result
 }
 
-#[allow(dead_code)]
+/// Compute a tight lower bound on the multi-tree MAF using exact pairwise distances.
+///
+/// For each pair (Ti, Tj), runs the FPT solver with a time budget to prove the exact
+/// pairwise MAF distance. For m ≥ 3, applies the additive formula:
+///   MAF_size ≥ ceil(sum_{j≠i} d(Ti,Tj) / (m-1)) + 1  for any reference tree Ti
+///
+/// Each pair is kernelized before the FPT search to reduce the search space.
+/// Returns a lower bound ≥ `approx_lb`.
 pub fn exact_pairwise_lower_bound(
     trees: &[Tree],
-    label_space: usize,
     num_leaves: u32,
     approx_lb: usize,
     upper_bound: usize,
-    _stats: &mut SolverStats,
 ) -> usize {
     let m = trees.len();
+    if m < 3 {
+        return approx_lb;
+    }
+
     let mut best_lb = approx_lb;
 
-    let mut pairs: Vec<(usize, usize, usize, usize)> = Vec::new();
+    // Compute pairwise cherry_ub and red_blue_approx.
+    // Sort by two_approx descending so the pairs with the highest known LB are tried first.
+    let mut pairs: Vec<(usize, usize, usize, usize)> = Vec::new(); // (i, j, cherry_ub, two_approx)
     for i in 0..m {
         for j in (i + 1)..m {
-            let cherry_ub = crate::lower_bound::approx_rspr_distance_pub(&trees[i], &trees[j]);
-            let two_approx = crate::lower_bound::red_blue_approx_pub(&trees[i], &trees[j]);
+            let cherry_ub = cherry_reduce_ub(&trees[i], &trees[j]);
+            let two_approx = red_blue_approx(&trees[i], &trees[j]);
             pairs.push((i, j, cherry_ub, two_approx));
         }
     }
-    pairs.sort_by(|a, b| b.2.cmp(&a.2));
+    pairs.sort_by(|a, b| b.3.cmp(&a.3));
 
     let total_budget = std::time::Duration::from_secs(3);
     let start = std::time::Instant::now();
     let per_pair_budget = total_budget / (pairs.len() as u32).max(1);
 
+    // exact_dist[i][j] = proven exact pairwise cuts; lb_dist[i][j] = best known LB on cuts.
     let mut exact_dist: Vec<Vec<Option<usize>>> = vec![vec![None; m]; m];
     let mut lb_dist: Vec<Vec<usize>> = vec![vec![0; m]; m];
 
@@ -206,59 +219,96 @@ pub fn exact_pairwise_lower_bound(
             break;
         }
 
-        let pair_lb = two_approx.div_ceil(2);
+        let pair_lb = two_approx.div_ceil(2); // LB on cuts in original pair space
 
-        if cherry_ub < best_lb && pair_lb < 2 {
-            exact_dist[i][j] = Some(pair_lb);
-            exact_dist[j][i] = Some(pair_lb);
+        // Kernelize the pair to shrink the search space.
+        let pair_instance = Instance::new(vec![trees[i].clone(), trees[j].clone()], num_leaves);
+        let kern_cfg = KernelizeConfig { chain32_multi: false, ..KernelizeConfig::default() };
+        let kern = kernelize::kernelize(&pair_instance, &kern_cfg);
+        let pair_reduction = kern.param_reduction;
+        let n_pair = kern.instance.num_leaves;
+
+        // Trivial: pair fully reduced to a single leaf or empty.
+        if n_pair <= 1 {
+            let exact_cuts = pair_reduction;
+            let exact_comps = exact_cuts + 1;
+            exact_dist[i][j] = Some(exact_cuts);
+            exact_dist[j][i] = Some(exact_cuts);
+            if exact_cuts > lb_dist[i][j] {
+                lb_dist[i][j] = exact_cuts;
+                lb_dist[j][i] = exact_cuts;
+            }
+            if exact_comps > best_lb {
+                best_lb = exact_comps;
+            }
+            if best_lb >= upper_bound {
+                return best_lb;
+            }
             continue;
         }
 
-        let sub_forests: Vec<XForest> = vec![
-            XForest::from_tree(trees[i].clone()),
-            XForest::from_tree(trees[j].clone()),
-        ];
-        let zobrist = ZobristTable::new(label_space);
+        // Translate bounds into reduced-pair space.
+        // comps_original = comps_reduced + pair_reduction
+        let pair_lb_comps = pair_lb + 1;
+        let reduced_lb_comps = pair_lb_comps.saturating_sub(pair_reduction).max(1);
+        let reduced_ub_comps = (cherry_ub + 1).saturating_sub(pair_reduction).max(1);
+
+        // FPT branching is O(3^k). Only attempt exact search when the gap
+        // (= extra levels to search) is small enough to complete within budget.
+        // For gap ≤ 12 and n_pair ≤ 50 leaves, the search is typically <100ms.
+        const MAX_FPT_GAP: usize = 12;
+        if reduced_ub_comps.saturating_sub(reduced_lb_comps) > MAX_FPT_GAP {
+            // Gap too large for FPT; just use approx LB (already in lb_dist).
+            continue;
+        }
+
+        let pair_label_space = n_pair as usize;
+        let sub_forests: Vec<XForest> = kern
+            .instance
+            .trees
+            .iter()
+            .map(|t| XForest::from_tree(t.clone()))
+            .collect();
+        let zobrist = ZobristTable::new(pair_label_space);
         let mut tt: FxHashMap<u64, TTEntry> = FxHashMap::default();
 
-        let pair_lb_components = pair_lb + 1;
-
         let pair_start = std::time::Instant::now();
-        let mut pair_exact_components = pair_lb_components;
+        // Tightest known LB on components in original pair space (updated as we prove infeasibility).
+        let mut pair_exact_comps_orig = pair_lb_comps;
         let mut proven = false;
 
-        for target_s in pair_lb_components..=(cherry_ub + 1) {
+        for target_s in reduced_lb_comps..=reduced_ub_comps {
             if pair_start.elapsed() >= per_pair_budget {
                 break;
             }
 
-            let mut sub_state = SearchState::new(sub_forests.to_vec());
+            let mut sub_state = SearchState::new(sub_forests.clone());
             let mut sub_stats = SolverStats::default();
             if alg_maf(
                 &mut sub_state,
                 target_s,
-                label_space,
-                num_leaves,
+                pair_label_space,
+                n_pair,
                 &mut sub_stats,
                 &zobrist,
                 &mut tt,
             )
             .is_some()
             {
-                pair_exact_components = target_s;
+                // target_s components in reduced → target_s + pair_reduction in original
+                pair_exact_comps_orig = target_s + pair_reduction;
                 proven = true;
                 super::trace!(
-                    "exact pair ({},{}) = {} components",
-                    i,
-                    j,
-                    pair_exact_components
+                    "exact pair ({},{}) = {} comps (reduced={}, reduction={})",
+                    i, j, pair_exact_comps_orig, target_s, pair_reduction
                 );
                 break;
             }
-            pair_exact_components = target_s + 1;
+            // target_s infeasible in reduced → original needs ≥ target_s + 1 + pair_reduction
+            pair_exact_comps_orig = target_s + 1 + pair_reduction;
         }
 
-        let exact_cuts = pair_exact_components - 1;
+        let exact_cuts = pair_exact_comps_orig - 1;
         if proven {
             exact_dist[i][j] = Some(exact_cuts);
             exact_dist[j][i] = Some(exact_cuts);
@@ -267,42 +317,33 @@ pub fn exact_pairwise_lower_bound(
             lb_dist[i][j] = exact_cuts;
             lb_dist[j][i] = exact_cuts;
         }
-
-        if pair_exact_components > best_lb {
-            best_lb = pair_exact_components;
+        if pair_exact_comps_orig > best_lb {
+            best_lb = pair_exact_comps_orig;
         }
-
         if best_lb >= upper_bound {
             return best_lb;
         }
     }
 
-    if m >= 3 {
-        for i in 0..m {
-            let mut sum_d = 0usize;
-            for j in 0..m {
-                if i == j {
-                    continue;
-                }
-                if let Some(d) = exact_dist[i][j] {
-                    sum_d += d;
-                } else {
-                    sum_d += lb_dist[i][j];
-                }
+    // Additive multi-tree LB: for each reference Ti,
+    //   MAF_size ≥ ceil(sum_{j≠i} d(Ti,Tj) / (m-1)) + 1
+    for i in 0..m {
+        let mut sum_d = 0usize;
+        for j in 0..m {
+            if i == j {
+                continue;
             }
-            let denom = m - 1;
-            let lb_cuts = sum_d.div_ceil(denom);
-            let lb_components = lb_cuts + 1;
-            if lb_components > best_lb {
-                super::trace!(
-                    "additive exact LB from ref {}: {} (sum_d={}, m-1={})",
-                    i,
-                    lb_components,
-                    sum_d,
-                    denom,
-                );
-                best_lb = lb_components;
-            }
+            sum_d += exact_dist[i][j].unwrap_or(lb_dist[i][j]);
+        }
+        let denom = m - 1;
+        let lb_cuts = sum_d.div_ceil(denom);
+        let lb_comps = lb_cuts + 1;
+        if lb_comps > best_lb {
+            super::trace!(
+                "additive LB from ref {}: {} comps (sum_d={}, m-1={})",
+                i, lb_comps, sum_d, denom
+            );
+            best_lb = lb_comps;
         }
     }
 
@@ -322,12 +363,28 @@ pub fn solve_inner(instance: &Instance, stats: &mut SolverStats) -> Option<Vec<T
     let bounds = maf_bounds(&instance.trees, instance.num_leaves);
     super::trace!("maf_bounds: lower={}, upper={}", bounds.lower, bounds.upper);
 
+    // For multi-tree instances, try to tighten LB via exact pairwise distances + additive formula.
+    let start_lb = if instance.trees.len() >= 3 && bounds.upper > bounds.lower {
+        let exact_lb = exact_pairwise_lower_bound(
+            &instance.trees,
+            instance.num_leaves,
+            bounds.lower,
+            bounds.upper,
+        );
+        if exact_lb > bounds.lower {
+            super::trace!("exact_pairwise_lb tightened: {} → {}", bounds.lower, exact_lb);
+        }
+        exact_lb
+    } else {
+        bounds.lower
+    };
+
     let zobrist = ZobristTable::new(label_space);
     let mut tt: FxHashMap<u64, TTEntry> = FxHashMap::default();
 
     let solve_start = std::time::Instant::now();
 
-    for target_s in bounds.lower..=bounds.upper {
+    for target_s in start_lb..=bounds.upper {
         *stats = SolverStats::default();
         let round_start = std::time::Instant::now();
 

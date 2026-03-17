@@ -1,7 +1,7 @@
 //! Red-Blue 2-approximation algorithm for MAF lower bounds.
 
 use fixedbitset::FixedBitSet;
-use klados_core::tree::{Label, NONE, NodeId, Tree};
+use crate::tree::{Label, NONE, NodeId, Tree};
 
 use super::feasibility::{
     find_lowest_roi, is_rub_feasible_impl, is_set_compatible, is_triple_compatible, mark_v_set,

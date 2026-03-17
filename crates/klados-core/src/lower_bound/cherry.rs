@@ -1,6 +1,6 @@
 //! Cherry-based heuristic for upper bounds.
 
-use klados_core::tree::{Label, NONE, NodeId, Tree};
+use crate::tree::{Label, NONE, NodeId, Tree};
 
 pub fn cherry_reduce_ub(t1: &Tree, t2: &Tree) -> usize {
     let mut best = cherry_reduce(t1, t2).min(cherry_reduce(t2, t1));

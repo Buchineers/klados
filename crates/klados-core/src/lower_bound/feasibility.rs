@@ -1,7 +1,7 @@
 //! Feasibility checking and root-of-infeasibility detection.
 
 use fixedbitset::FixedBitSet;
-use klados_core::tree::{Label, NodeId};
+use crate::tree::{Label, NodeId};
 
 use super::partition::Partition;
 use super::tree_data::TreeData;
@@ -65,7 +65,7 @@ pub fn is_set_compatible(td1: &TreeData, td2: &TreeData, labels: &FixedBitSet) -
 pub fn mark_v_set(td: &TreeData, labels: &FixedBitSet, lca_node: NodeId) -> FixedBitSet {
     let num_nodes = td.tree.num_nodes();
     let mut marked = FixedBitSet::with_capacity(num_nodes);
-    if lca_node == klados_core::NONE {
+    if lca_node == crate::NONE {
         return marked;
     }
     for lbl in labels.ones() {
@@ -73,7 +73,7 @@ pub fn mark_v_set(td: &TreeData, labels: &FixedBitSet, lca_node: NodeId) -> Fixe
             continue;
         }
         let mut cur = td.tree.label_to_node[lbl];
-        if cur == klados_core::NONE {
+        if cur == crate::NONE {
             continue;
         }
         loop {
@@ -85,13 +85,13 @@ pub fn mark_v_set(td: &TreeData, labels: &FixedBitSet, lca_node: NodeId) -> Fixe
                 break;
             }
             let p = td.tree.parent[cur as usize];
-            if p == klados_core::NONE {
+            if p == crate::NONE {
                 break;
             }
             cur = p;
         }
     }
-    if lca_node != klados_core::NONE {
+    if lca_node != crate::NONE {
         marked.insert(lca_node as usize);
     }
     marked
@@ -107,7 +107,7 @@ pub fn partition_overlaps_in_v2(td2: &TreeData, partition: &Partition) -> bool {
             continue;
         }
         let lca_node = td2.lca_of_labels(labels);
-        if lca_node == klados_core::NONE {
+        if lca_node == crate::NONE {
             continue;
         }
         for lbl in labels.ones() {
@@ -115,7 +115,7 @@ pub fn partition_overlaps_in_v2(td2: &TreeData, partition: &Partition) -> bool {
                 continue;
             }
             let mut cur = td2.tree.label_to_node[lbl];
-            if cur == klados_core::NONE {
+            if cur == crate::NONE {
                 continue;
             }
             loop {
@@ -130,7 +130,7 @@ pub fn partition_overlaps_in_v2(td2: &TreeData, partition: &Partition) -> bool {
                     break;
                 }
                 let p = td2.tree.parent[cur as usize];
-                if p == klados_core::NONE {
+                if p == crate::NONE {
                     break;
                 }
                 cur = p;
@@ -196,13 +196,13 @@ pub fn is_rub_feasible_impl(
         }
 
         let lca_node = td1.lca_of_labels(&inside);
-        if lca_node == klados_core::NONE {
+        if lca_node == crate::NONE {
             continue;
         }
 
         for lbl in inside.ones() {
             let mut cur = td1.tree.label_to_node[lbl];
-            if cur == klados_core::NONE {
+            if cur == crate::NONE {
                 continue;
             }
             loop {
@@ -223,7 +223,7 @@ pub fn is_rub_feasible_impl(
                     break;
                 }
                 let p = td1.tree.parent[cur as usize];
-                if p == klados_core::NONE {
+                if p == crate::NONE {
                     break;
                 }
                 cur = p;
@@ -261,7 +261,7 @@ pub fn is_roi(td1: &TreeData, td2: &TreeData, partition: &Partition, u: NodeId) 
                 continue;
             }
             let lca_node = td1.lca_of_labels(&inside);
-            if lca_node == klados_core::NONE {
+            if lca_node == crate::NONE {
                 continue;
             }
             for lbl in inside.ones() {
@@ -269,7 +269,7 @@ pub fn is_roi(td1: &TreeData, td2: &TreeData, partition: &Partition, u: NodeId) 
                     continue;
                 }
                 let mut cur = td1.tree.label_to_node[lbl];
-                if cur == klados_core::NONE {
+                if cur == crate::NONE {
                     continue;
                 }
                 loop {
@@ -284,7 +284,7 @@ pub fn is_roi(td1: &TreeData, td2: &TreeData, partition: &Partition, u: NodeId) 
                         break;
                     }
                     let p = td1.tree.parent[cur as usize];
-                    if p == klados_core::NONE {
+                    if p == crate::NONE {
                         break;
                     }
                     cur = p;

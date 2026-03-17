@@ -62,12 +62,7 @@ pub fn build_component_tree(
     reference_tree: &Tree,
     num_leaves: u32,
 ) -> Tree {
-    if expanded.count_ones(..) == 1 {
-        let lbl = expanded.ones().next().unwrap() as u32;
-        super::utils::make_singleton_tree(lbl, num_leaves)
-    } else {
-        reference_tree.prune_to_leafset(expanded)
-    }
+    Tree::component_from_leafset(expanded, reference_tree, num_leaves)
 }
 
 pub fn classify_components_cached(

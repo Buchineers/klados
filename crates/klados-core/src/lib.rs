@@ -4,6 +4,8 @@
 //! during the FPT search.
 
 pub mod instance;
+pub mod kernelize;
+pub mod lower_bound;
 pub mod tree;
 pub mod xforest;
 

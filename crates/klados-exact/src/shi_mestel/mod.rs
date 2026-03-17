@@ -3,7 +3,7 @@
 //! Implements Alg-Maf from "A parameterized algorithm for the Maximum Agreement
 //! Forest problem on multiple rooted multifurcating trees" (JCSS 97, 2018).
 
-mod algorithm;
+pub(crate) mod algorithm;
 mod branching;
 mod decomposition;
 pub(crate) mod extraction;

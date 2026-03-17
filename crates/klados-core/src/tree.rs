@@ -374,6 +374,38 @@ impl Tree {
         out.compute_metadata();
         out
     }
+
+    /// Create a singleton tree containing exactly one leaf with the given label.
+    ///
+    /// Ported from `shi_mestel::utils::make_singleton_tree`. The label space
+    /// (`num_leaves`) is preserved so the tree is compatible with others on the
+    /// same instance.
+    pub fn singleton(label: Label, num_leaves: u32) -> Self {
+        let mut t = Tree::with_capacity(num_leaves);
+        t.parent.push(NONE);
+        t.left.push(NONE);
+        t.right.push(NONE);
+        t.label.push(label);
+        t.label_to_node[label as usize] = 0;
+        t.root = 0;
+        t.compute_metadata();
+        t
+    }
+
+    /// Build a component tree from a leafset by pruning the reference tree.
+    ///
+    /// If the leafset contains exactly one leaf, returns a singleton tree.
+    /// Otherwise prunes `reference` to only the leaves in `leafset`.
+    ///
+    /// Ported from `shi_mestel::extraction::build_component_tree`.
+    pub fn component_from_leafset(leafset: &FixedBitSet, reference: &Tree, num_leaves: u32) -> Self {
+        if leafset.count_ones(..) == 1 {
+            let lbl = leafset.ones().next().unwrap() as Label;
+            Tree::singleton(lbl, num_leaves)
+        } else {
+            reference.prune_to_leafset(leafset)
+        }
+    }
 }
 
 /// Cursor for navigating our arena tree via pace26io's TopDownCursor trait

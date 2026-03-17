@@ -530,27 +530,7 @@ fn build_components_from_leafsets(
 }
 
 fn build_component_tree(reference_tree: &Tree, num_leaves: u32, leafset: &FixedBitSet) -> Tree {
-    if leafset.count_ones(..) == 1 {
-        let label = leafset
-            .ones()
-            .next()
-            .expect("singleton must contain a label") as u32;
-        make_singleton_tree(label, num_leaves)
-    } else {
-        reference_tree.prune_to_leafset(leafset)
-    }
-}
-
-fn make_singleton_tree(label: u32, num_leaves: u32) -> Tree {
-    let mut tree = Tree::with_capacity(num_leaves);
-    tree.parent.push(NONE);
-    tree.left.push(NONE);
-    tree.right.push(NONE);
-    tree.label.push(label);
-    tree.label_to_node[label as usize] = 0;
-    tree.root = 0;
-    tree.compute_metadata();
-    tree
+    Tree::component_from_leafset(leafset, reference_tree, num_leaves)
 }
 
 #[cfg(test)]
@@ -654,7 +634,7 @@ mod tests {
                     keep.insert(lbl as usize);
                 }
                 if group.len() == 1 {
-                    make_singleton_tree(group[0], instance.num_leaves)
+                    Tree::singleton(group[0], instance.num_leaves)
                 } else {
                     instance.trees[0].prune_to_leafset(&keep)
                 }
