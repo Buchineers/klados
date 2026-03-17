@@ -817,6 +817,25 @@ fn sat_solve_maf(
     profile.encode_ms = t_enc.elapsed().as_secs_f64() * 1000.0 + nav_ms + var_ms;
     profile.num_vars = vm.n_used() as usize;
 
+    let ni_avg = precomps.iter().map(|p| p.num_internal).sum::<usize>() as f64 / m as f64;
+    let struct_clauses = profile.h1_clauses + profile.h2_clauses + profile.h3_clauses
+        + profile.h5_clauses + profile.sym_clauses + profile.sibling_clauses
+        + profile.singleton_clauses;
+    eprintln!(
+        "[sat] Encoding (pre-H4): {} vars, {} clauses in {:.1}ms",
+        profile.num_vars, struct_clauses, profile.encode_ms
+    );
+    eprintln!(
+        "[sat]   H1={} H2={} H3={} H5={} sym={} sib={} sing={}",
+        profile.h1_clauses, profile.h2_clauses, profile.h3_clauses,
+        profile.h5_clauses, profile.sym_clauses, profile.sibling_clauses,
+        profile.singleton_clauses
+    );
+    eprintln!(
+        "[sat]   n={} k={} m={} ni_avg={:.0} encode={:.1}ms",
+        n, k, m, ni_avg, profile.encode_ms
+    );
+
     // Phase hints: bias the solver toward the greedy upper-bound partition.
     // CaDiCaL will override these via VSIDS if they are wrong, so the downside
     // is negligible while the upside is faster SAT proofs at the UB bound.
@@ -862,87 +881,118 @@ fn sat_solve_maf(
         .encode_ub(lb_components..=k, &mut solver, &mut vm)
         .unwrap();
 
-    // Track added H4 triples to avoid re-adding duplicates across CEGAR iterations.
+    // H4 via "same-component" auxiliary variables.
+    // For each leaf pair (a,b) in some incompatible triple, create same[a][b].
+    // Forward: l[i][a] ∧ l[i][b] → same[a][b]  (ternary, shared across triples)
+    // H4:      ¬same[a][b] ∨ ¬same[a][c]        (binary, one per triple — strong propagation)
+    // No backward direction needed: over-approximation is sound.
     let mut added_triples: fxhash::FxHashSet<(usize, usize, usize)> = fxhash::FxHashSet::default();
+    {
+        let t_h4 = std::time::Instant::now();
 
-    // Upfront H4: for moderate n add all incompatible triples before the CEGAR loop.
-    // This gives the SAT solver full H4 propagation from the first call, and reduces
-    // bound levels to exactly 1 SAT call each (no inner CEGAR iterations).
-    // CEGAR for n > threshold can get stuck (too many iterations to converge),
-    // so we prefer upfront for n up to ~100. For very large n (> 100), CEGAR is used.
-    const UPFRONT_TRIPLE_THRESHOLD: usize = 100;
-    if n <= UPFRONT_TRIPLE_THRESHOLD {
+        // 1. Enumerate all incompatible triples and collect unique pairs.
+        let mut incompat: Vec<(usize, usize, usize)> = Vec::new();
+        let mut pair_set: fxhash::FxHashSet<(usize, usize)> = fxhash::FxHashSet::default();
         for a in 0..n {
             for b in (a + 1)..n {
                 for c in (b + 1)..n {
                     if nca_data.is_incompatible(a, b, c) {
-                        added_triples.insert((a, b, c));
-                        // a<b<c so a is min; l[i][a]=FALSE for i>a, making the
-                        // clause trivially satisfied. Only add for i<=a.
-                        let hi = a.min(k - 1);
-                        for i in 0..=hi {
-                            add_clause(
-                                &mut solver,
-                                &[
-                                    enc.l[i][a].neg_lit(),
-                                    enc.l[i][b].neg_lit(),
-                                    enc.l[i][c].neg_lit(),
-                                ],
-                            );
-                        }
-                        profile.h4_clauses += hi + 1;
+                        incompat.push((a, b, c));
+                        pair_set.insert((a, b));
+                        pair_set.insert((a, c));
+                        // (b,c) not needed — we use pairs involving the smallest leaf
                     }
                 }
             }
         }
+
+        // 2. Create same[a][b] variable for each unique pair.
+        let mut same_var: fxhash::FxHashMap<(usize, usize), Var> = fxhash::FxHashMap::default();
+        for &(a, b) in &pair_set {
+            same_var.insert((a, b), vm.new_var());
+        }
+
+        // 3. Forward clauses: ¬l[i][a] ∨ ¬l[i][b] ∨ same[a][b]
+        let mut fwd_clauses = 0usize;
+        for (&(a, b), &sv) in &same_var {
+            let hi = a.min(k - 1); // O3 pruning: l[i][a]=false for i>a
+            for i in 0..=hi {
+                add_clause(
+                    &mut solver,
+                    &[enc.l[i][a].neg_lit(), enc.l[i][b].neg_lit(), sv.pos_lit()],
+                );
+                fwd_clauses += 1;
+            }
+        }
+
+        // 4. H4 binary clauses: ¬same[a][b] ∨ ¬same[a][c]
+        for &(a, b, c) in &incompat {
+            added_triples.insert((a, b, c));
+            let sv_ab = same_var[&(a, b)];
+            let sv_ac = same_var[&(a, c)];
+            add_clause(&mut solver, &[sv_ab.neg_lit(), sv_ac.neg_lit()]);
+        }
+        profile.h4_clauses = fwd_clauses + incompat.len();
+
+        eprintln!(
+            "[sat] H4 same-var: {} triples, {} pairs, {} fwd + {} binary = {} clauses in {:.1}ms",
+            incompat.len(),
+            pair_set.len(),
+            fwd_clauses,
+            incompat.len(),
+            profile.h4_clauses,
+            t_h4.elapsed().as_secs_f64() * 1000.0
+        );
     }
 
     // Linear descent from k down to lb_components. Learned clauses from SAT calls at
     // higher bounds accumulate and make the UNSAT proof at opt-1 significantly cheaper.
+    let mut best_components: Option<Vec<Vec<usize>>> = None;
+
+    let t_total_solve = std::time::Instant::now();
     for bound in (lb_components..=k).rev() {
         let assumps_vec = totalizer.enforce_ub(bound).unwrap();
 
-        loop {
-            profile.sat_calls += 1;
+        profile.sat_calls += 1;
+        let t_solve = std::time::Instant::now();
+        let result = solver.solve_assumps(&assumps_vec).unwrap();
+        let solve_ms = t_solve.elapsed().as_secs_f64() * 1000.0;
+        profile.solve_ms += solve_ms;
+        let cumulative_s = t_total_solve.elapsed().as_secs_f64();
 
-            let t_solve = std::time::Instant::now();
-            let result = solver.solve_assumps(&assumps_vec).unwrap();
-            profile.solve_ms += t_solve.elapsed().as_secs_f64() * 1000.0;
-
-            match result {
-                SolverResult::Sat => {
-                    let t_cegar = std::time::Instant::now();
-                    let comps = extract_components(&solver, &enc, n, k);
-                    let (v, h4_new) = add_violated_triples(
-                        &mut solver,
-                        &enc,
-                        &comps,
-                        &nca_data,
-                        &mut added_triples,
-                    );
-                    profile.cegar_ms += t_cegar.elapsed().as_secs_f64() * 1000.0;
-                    profile.cegar_violations += v;
-                    profile.h4_clauses += h4_new;
-
-                    if v == 0 {
-                        profile.optimal_k = bound;
-                        best_components = Some(comps);
-                        break;
-                    }
+        match result {
+            SolverResult::Sat => {
+                let comps = extract_components(&solver, &enc, n, k);
+                let num_comps = comps.len();
+                let max_comp = comps.iter().map(|c| c.len()).max().unwrap_or(0);
+                eprintln!(
+                    "[sat] bound={} SAT {:.1}ms (cum {:.1}s) comps={} max_comp_size={}",
+                    bound, solve_ms, cumulative_s, num_comps, max_comp
+                );
+                profile.optimal_k = bound;
+                best_components = Some(comps);
+            }
+            SolverResult::Unsat => {
+                eprintln!(
+                    "[sat] bound={} UNSAT {:.1}ms (cum {:.1}s) — optimal={}",
+                    bound, solve_ms, cumulative_s, bound + 1
+                );
+                if best_components.is_some() {
+                    profile.optimal_k =
+                        best_components.as_ref().map(|c| c.len()).unwrap_or(k);
                 }
-                SolverResult::Unsat => {
-                    if best_components.is_some() {
-                        profile.optimal_k = best_components.as_ref().map(|c| c.len()).unwrap_or(k);
-                    }
-                    profile.report();
-                    return best_components
-                        .map(|c| components_to_trees(&c, &instance.trees[0], instance.num_leaves));
-                }
-                SolverResult::Interrupted => {
-                    profile.report();
-                    return best_components
-                        .map(|c| components_to_trees(&c, &instance.trees[0], instance.num_leaves));
-                }
+                profile.report();
+                return best_components
+                    .map(|c| components_to_trees(&c, &instance.trees[0], instance.num_leaves));
+            }
+            SolverResult::Interrupted => {
+                eprintln!(
+                    "[sat] bound={} INTERRUPTED {:.1}ms (cum {:.1}s)",
+                    bound, solve_ms, cumulative_s
+                );
+                profile.report();
+                return best_components
+                    .map(|c| components_to_trees(&c, &instance.trees[0], instance.num_leaves));
             }
         }
     }
@@ -981,6 +1031,292 @@ fn components_to_trees(components: &[Vec<usize>], ref_tree: &Tree, num_leaves: u
             ref_tree.prune_to_leafset(&leafset)
         })
         .collect()
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Cut-based encoding (k-independent!)
+// ═══════════════════════════════════════════════════════════════
+
+/// Compute the set of non-root nodes on the path from leaf a to leaf b in tree.
+/// These are the nodes whose parent-edge, if cut, would disconnect a from b.
+fn path_nodes(tree: &Tree, a: NodeId, b: NodeId) -> Vec<NodeId> {
+    let nca = tree.nearest_common_ancestor(a, b);
+    let mut nodes = Vec::new();
+    let mut cur = a;
+    while cur != nca {
+        nodes.push(cur);
+        cur = tree.parent[cur as usize];
+    }
+    cur = b;
+    while cur != nca {
+        nodes.push(cur);
+        cur = tree.parent[cur as usize];
+    }
+    nodes
+}
+
+fn sat_solve_maf_cut(
+    instance: &Instance,
+    k_max: usize,
+    lb_components: usize,
+    profile: &mut SolveProfile,
+) -> Option<Vec<Tree>> {
+    let n = instance.num_leaves as usize;
+    let m = instance.num_trees();
+    let t_start = std::time::Instant::now();
+
+    profile.n_reduced = n;
+    profile.k = k_max;
+    profile.m = m;
+
+    // Precompute NCA data for H4 incompatible triple detection.
+    let nca_data = NcaData::build(instance, n);
+
+    // Precompute paths between all leaf pairs for each tree.
+    // paths[q][(a,b)] = list of non-root nodes on path from leaf a+1 to leaf b+1.
+    let t_path = std::time::Instant::now();
+    let mut paths: Vec<Vec<Vec<Vec<NodeId>>>> = Vec::with_capacity(m);
+    for q in 0..m {
+        let tree = &instance.trees[q];
+        let mut pq = vec![vec![Vec::new(); n]; n];
+        for a in 0..n {
+            let na = tree.node_by_label((a + 1) as Label);
+            for b in (a + 1)..n {
+                let nb = tree.node_by_label((b + 1) as Label);
+                let pnodes = path_nodes(tree, na, nb);
+                pq[a][b] = pnodes;
+            }
+        }
+        paths.push(pq);
+    }
+    let path_ms = t_path.elapsed().as_secs_f64() * 1000.0;
+
+    let mut solver = CaDiCaL::default();
+    let mut vm = BasicVarManager::default();
+
+    // --- Variables ---
+    // del[q][v]: edge from node v to parent(v) in tree q is cut.
+    // Index: for tree q, node v (non-root), del[q][node_idx].
+    let num_nodes: Vec<usize> = instance.trees.iter().map(|t| t.num_nodes()).collect();
+    let del: Vec<Vec<Option<Var>>> = (0..m)
+        .map(|q| {
+            let tree = &instance.trees[q];
+            (0..num_nodes[q])
+                .map(|v| {
+                    if v as NodeId == tree.root {
+                        None // root has no parent edge
+                    } else {
+                        Some(vm.new_var())
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    let del_count: usize = del.iter().map(|d| d.iter().filter(|v| v.is_some()).count()).sum();
+
+    // conn[q][a][b]: leaves a and b are connected in tree q (no cut on path).
+    // Only for a < b.
+    let conn: Vec<Vec<Vec<Var>>> = (0..m)
+        .map(|_| {
+            (0..n)
+                .map(|_a| (0..n).map(|_| vm.new_var()).collect())
+                .collect()
+        })
+        .collect();
+    let conn_count = m * n * n;
+
+    let total_vars_pre_totalizer = vm.n_used();
+    eprintln!(
+        "[cut] Variables: {} del + {} conn = {} (path precomp {:.1}ms)",
+        del_count, conn_count, total_vars_pre_totalizer, path_ms
+    );
+
+    // --- Clauses ---
+    let t_enc = std::time::Instant::now();
+    let mut backward_count = 0usize;
+    let mut forward_count = 0usize;
+    let mut cross_count = 0usize;
+    let mut h4_count = 0usize;
+
+    // 1. Backward: conn[q][a][b] → ¬del[q][v] for each v on path_q(a,b).
+    //    i.e. ¬conn[q][a][b] ∨ ¬del[q][v]  (binary!)
+    for q in 0..m {
+        for a in 0..n {
+            for b in (a + 1)..n {
+                for &v in &paths[q][a][b] {
+                    if let Some(dv) = del[q][v as usize] {
+                        add_clause(
+                            &mut solver,
+                            &[conn[q][a][b].neg_lit(), dv.neg_lit()],
+                        );
+                        backward_count += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Forward: (∧_v ¬del[q][v]) → conn[q][a][b]
+    //    i.e. conn[q][a][b] ∨ ∨_v del[q][v]
+    for q in 0..m {
+        for a in 0..n {
+            for b in (a + 1)..n {
+                let mut clause = vec![conn[q][a][b].pos_lit()];
+                for &v in &paths[q][a][b] {
+                    if let Some(dv) = del[q][v as usize] {
+                        clause.push(dv.pos_lit());
+                    }
+                }
+                add_clause(&mut solver, &clause);
+                forward_count += 1;
+            }
+        }
+    }
+
+    // 3. Cross-tree consistency: conn[q1][a][b] ↔ conn[q2][a][b]
+    //    ¬conn[q1] ∨ conn[q2] and vice versa (binary!)
+    for a in 0..n {
+        for b in (a + 1)..n {
+            for q1 in 0..m {
+                for q2 in (q1 + 1)..m {
+                    add_clause(
+                        &mut solver,
+                        &[conn[q1][a][b].neg_lit(), conn[q2][a][b].pos_lit()],
+                    );
+                    add_clause(
+                        &mut solver,
+                        &[conn[q2][a][b].neg_lit(), conn[q1][a][b].pos_lit()],
+                    );
+                    cross_count += 2;
+                }
+            }
+        }
+    }
+
+    // 4. H4: incompatible triples.
+    //    ¬conn[0][a][b] ∨ ¬conn[0][a][c]  (binary!)
+    for a in 0..n {
+        for b in (a + 1)..n {
+            for c in (b + 1)..n {
+                if nca_data.is_incompatible(a, b, c) {
+                    add_clause(
+                        &mut solver,
+                        &[conn[0][a][b].neg_lit(), conn[0][a][c].neg_lit()],
+                    );
+                    h4_count += 1;
+                }
+            }
+        }
+    }
+
+    // 5. Totalizer on del[0][*] to count cuts in tree 0.
+    //    k components = k-1 cuts. Minimize cuts.
+    let del_0_lits: Vec<Lit> = del[0]
+        .iter()
+        .filter_map(|v| v.map(|var| var.pos_lit()))
+        .collect();
+    let del_0_count = del_0_lits.len();
+
+    let mut totalizer = Totalizer::default();
+    for lit in del_0_lits {
+        totalizer.extend([lit]);
+    }
+    let lb_cuts = if lb_components > 0 { lb_components - 1 } else { 0 };
+    let ub_cuts = k_max - 1;
+    totalizer
+        .encode_ub(lb_cuts..=ub_cuts, &mut solver, &mut vm)
+        .unwrap();
+
+    let encode_ms = t_enc.elapsed().as_secs_f64() * 1000.0;
+    let total_clauses = backward_count + forward_count + cross_count + h4_count;
+    profile.num_vars = vm.n_used() as usize;
+    profile.encode_ms = path_ms + encode_ms;
+
+    eprintln!(
+        "[cut] Clauses: {} total ({} backward + {} forward + {} cross + {} H4) in {:.1}ms",
+        total_clauses, backward_count, forward_count, cross_count, h4_count, encode_ms
+    );
+    eprintln!(
+        "[cut] Total: {} vars, {} clauses. Totalizer over {} del vars.",
+        profile.num_vars, total_clauses, del_0_count
+    );
+
+    // --- Descent ---
+    let t_total_solve = std::time::Instant::now();
+    let mut best_components: Option<Vec<Vec<usize>>> = None;
+
+    for cuts_bound in (lb_cuts..=ub_cuts).rev() {
+        let k_bound = cuts_bound + 1;
+        let assumps_vec = totalizer.enforce_ub(cuts_bound).unwrap();
+
+        profile.sat_calls += 1;
+        let t_solve = std::time::Instant::now();
+        let result = solver.solve_assumps(&assumps_vec).unwrap();
+        let solve_ms = t_solve.elapsed().as_secs_f64() * 1000.0;
+        profile.solve_ms += solve_ms;
+        let cum_s = t_total_solve.elapsed().as_secs_f64();
+
+        match result {
+            SolverResult::Sat => {
+                // Extract components from conn[0][*][*] using union-find.
+                let mut parent_uf: Vec<usize> = (0..n).collect();
+                fn find(p: &mut Vec<usize>, x: usize) -> usize {
+                    if p[x] != x {
+                        p[x] = find(p, p[x]);
+                    }
+                    p[x]
+                }
+                for a in 0..n {
+                    for b in (a + 1)..n {
+                        if solver.var_val(conn[0][a][b]).unwrap() == TernaryVal::True {
+                            let ra = find(&mut parent_uf, a);
+                            let rb = find(&mut parent_uf, b);
+                            if ra != rb {
+                                parent_uf[ra] = rb;
+                            }
+                        }
+                    }
+                }
+                let mut comp_map: fxhash::FxHashMap<usize, Vec<usize>> =
+                    fxhash::FxHashMap::default();
+                for j in 0..n {
+                    let r = find(&mut parent_uf, j);
+                    comp_map.entry(r).or_default().push(j);
+                }
+                let comps: Vec<Vec<usize>> = comp_map.into_values().collect();
+                let num_comps = comps.len();
+                let max_sz = comps.iter().map(|c| c.len()).max().unwrap_or(0);
+                eprintln!(
+                    "[cut] k={} SAT {:.1}ms (cum {:.1}s) comps={} max_size={}",
+                    k_bound, solve_ms, cum_s, num_comps, max_sz
+                );
+                best_components = Some(comps);
+            }
+            SolverResult::Unsat => {
+                eprintln!(
+                    "[cut] k={} UNSAT {:.1}ms (cum {:.1}s) — optimal={}",
+                    k_bound, solve_ms, cum_s, k_bound + 1
+                );
+                profile.optimal_k = best_components.as_ref().map(|c| c.len()).unwrap_or(k_max);
+                profile.report();
+                return best_components
+                    .map(|c| components_to_trees(&c, &instance.trees[0], instance.num_leaves));
+            }
+            SolverResult::Interrupted => {
+                eprintln!(
+                    "[cut] k={} INTERRUPTED {:.1}ms (cum {:.1}s)",
+                    k_bound, solve_ms, cum_s
+                );
+                profile.report();
+                return best_components
+                    .map(|c| components_to_trees(&c, &instance.trees[0], instance.num_leaves));
+            }
+        }
+    }
+
+    profile.optimal_k = best_components.as_ref().map(|c| c.len()).unwrap_or(k_max);
+    profile.report();
+    best_components.map(|c| components_to_trees(&c, &instance.trees[0], instance.num_leaves))
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1134,13 +1470,12 @@ fn solve_sat_inner_impl(
     stats.lower_bound = lb_components + param_reduction_32;
     stats.upper_bound = Some(ub_components + param_reduction_32);
 
-    let components = sat_solve_maf(
+    // Use cut-based encoding (k-independent, much smaller formula).
+    let components = sat_solve_maf_cut(
         reduced,
         ub_components,
         lb_components,
         &mut profile,
-        &preferred_singletons_reduced,
-        bounds.best_partition.as_ref(),
     )?;
 
     // Expand solution back to original label space.
