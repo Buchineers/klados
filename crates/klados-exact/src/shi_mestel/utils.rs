@@ -97,15 +97,7 @@ pub fn tree_canonical_for_labels(tree: &Tree, labels: &FixedBitSet) -> u64 {
 }
 
 pub fn make_singleton_tree(lbl: u32, num_leaves: u32) -> Tree {
-    let mut singleton = Tree::with_capacity(num_leaves);
-    singleton.parent.push(NONE);
-    singleton.left.push(NONE);
-    singleton.right.push(NONE);
-    singleton.label.push(lbl);
-    singleton.label_to_node[lbl as usize] = 0;
-    singleton.root = 0;
-    singleton.compute_metadata();
-    singleton
+    Tree::singleton(lbl, num_leaves)
 }
 
 pub fn trivial_forest(reference: &Tree, num_leaves: u32) -> Vec<Tree> {

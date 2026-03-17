@@ -3,6 +3,8 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use klados_core::kernelize::{self, KernelizeConfig};
+use klados_core::lower_bound::maf_bounds;
 use klados_core::{Instance, Label, SolverStats, Tree};
 
 use crate::HeuristicSolver;
@@ -40,11 +42,25 @@ impl MaxSatSolver {
             return Some(instance.trees.clone());
         }
 
-        let leaves: Vec<_> = instance.reference_tree().leaves().collect();
+        // Kernelize first to reduce the instance size before encoding.
+        let kern_config = KernelizeConfig::default();
+        let kern = kernelize::kernelize(instance, &kern_config);
+        let reduced = &kern.instance;
+
+        // Compute bounds on the reduced instance.
+        // Use the UB as k (instead of n), which dramatically shrinks the encoding.
+        let bounds = maf_bounds(&reduced.trees, reduced.num_leaves);
+        let param_reduction = kern.param_reduction;
+
+        let leaves: Vec<_> = reduced.reference_tree().leaves().collect();
 
         let n = leaves.len();
-        let k = n;
-        let m = instance.num_trees();
+        // k capped at UB (adjusted for param reduction already subtracted by kernelize).
+        // Ensure k >= 1 to avoid degenerate encodings.
+        let k = bounds.upper.max(1);
+        let m = reduced.num_trees();
+
+        println!("c Kernelized: {}→{} leaves, LB={}, UB={}", instance.num_leaves, n, bounds.lower, k);
 
         let mut msp = MaxSatProblem::new();
 
@@ -328,16 +344,25 @@ impl MaxSatSolver {
             }
         }
 
-        let mut result: Vec<Tree> = Vec::new();
+        let mut reduced_components: Vec<Tree> = Vec::new();
         for comp_leaves in components {
             if comp_leaves.is_empty() {
                 continue;
             }
             let labels: Vec<Label> = comp_leaves.iter().map(|&j| (j + 1) as Label).collect();
-            let tree = extract_induced_subtree(&instance.trees[0], &labels);
-            result.push(tree);
+            let tree = extract_induced_subtree(&reduced.trees[0], &labels);
+            reduced_components.push(tree);
         }
 
+        // Expand solution back to original label space.
+        let result = kernelize::expand_solution(
+            reduced_components,
+            &kern,
+            &instance.trees[0],
+            instance.num_leaves,
+        );
+
+        let _ = param_reduction; // accounted for by kernelize::expand_solution
         return Some(result);
     }
 }

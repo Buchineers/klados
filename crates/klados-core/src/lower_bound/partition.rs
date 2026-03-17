@@ -1,7 +1,7 @@
 //! Partition of labels into components.
 
 use fixedbitset::FixedBitSet;
-use klados_core::tree::Label;
+use crate::tree::Label;
 
 pub struct Partition {
     pub comp: Vec<u32>,

@@ -10,10 +10,8 @@
 
 use fixedbitset::FixedBitSet;
 use fxhash::FxHashMap;
-use klados_core::{Instance, NONE, Tree};
+use crate::{Instance, NONE, Tree};
 
-use crate::shi_mestel::extraction::build_component_tree;
-use crate::shi_mestel::utils::make_singleton_tree;
 
 /// Which reduction rules are enabled.
 #[derive(Clone, Debug)]
@@ -266,13 +264,13 @@ pub fn expand_solution(
             for &l in all_labels {
                 ls.insert(l as usize);
             }
-            components.push(build_component_tree(
+            components.push(Tree::component_from_leafset(
                 &ls,
                 original_ref_tree,
                 original_num_leaves,
             ));
         } else {
-            components.push(make_singleton_tree(orig_label, original_num_leaves));
+            components.push(Tree::singleton(orig_label, original_num_leaves));
         }
     }
 
@@ -333,7 +331,7 @@ fn expand_with_collapses(
             }
         }
 
-        result.push(build_component_tree(
+        result.push(Tree::component_from_leafset(
             &expanded_ls,
             original_ref_tree,
             original_num_leaves,
@@ -357,7 +355,7 @@ fn expand_with_reverse_map(
             let old_lbl = reverse_map[new_lbl as usize];
             expanded_ls.insert(old_lbl as usize);
         }
-        result.push(build_component_tree(
+        result.push(Tree::component_from_leafset(
             &expanded_ls,
             original_ref_tree,
             original_num_leaves,

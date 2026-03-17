@@ -1,7 +1,7 @@
 //! Precomputed tree data for efficient LCA queries.
 
 use fixedbitset::FixedBitSet;
-use klados_core::tree::{NONE, NodeId, Tree};
+use crate::tree::{NONE, NodeId, Tree};
 
 pub struct TreeData {
     pub tree: Tree,
