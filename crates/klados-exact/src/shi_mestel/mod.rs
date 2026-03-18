@@ -80,18 +80,41 @@ impl ShiMestelSolver {
                 kern.stats.chain_removed,
                 kern.stats.chain32_removed,
             );
-            let reduced_result = self.solve_inner(&kern.instance);
-            return reduced_result.map(|components| {
-                kernelize::expand_solution(
-                    components,
+        }
+
+        let reduced = &kern.instance;
+
+        // Try cluster decomposition on the reduced instance.
+        match crate::cluster_reduction::try_cluster_reduction(reduced, &mut |subinstance| {
+            let mut sub_solver = ShiMestelSolver::new();
+            ShiMestelSolver::solve(&mut sub_solver, subinstance)
+        })? {
+            crate::cluster_reduction::ClusterReductionResult::NotApplicable => {}
+            crate::cluster_reduction::ClusterReductionResult::Solved(solution) => {
+                trace!(
+                    "cluster decomposition: {} = {} + {}",
+                    reduced.num_leaves,
+                    solution.cluster_size,
+                    solution.rest_size
+                );
+                return Some(kernelize::expand_solution(
+                    solution.components,
                     &kern,
                     &instance.trees[0],
                     instance.num_leaves,
-                )
-            });
+                ));
+            }
         }
 
-        self.solve_inner(instance)
+        let reduced_result = self.solve_inner(reduced);
+        reduced_result.map(|components| {
+            kernelize::expand_solution(
+                components,
+                &kern,
+                &instance.trees[0],
+                instance.num_leaves,
+            )
+        })
     }
 
     fn solve_inner(&mut self, instance: &Instance) -> Option<Vec<Tree>> {

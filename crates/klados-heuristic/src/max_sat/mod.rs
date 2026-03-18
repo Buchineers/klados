@@ -156,7 +156,7 @@ impl MaxSatSolver {
         //  H3
         println!("c H3");
         for q in 0..m {
-            let tree = &instance.trees[q];
+            let tree = &reduced.trees[q];
             for i in 0..k {
                 for j in 0..n {
                     for k_idx in j + 1..n {
@@ -220,7 +220,7 @@ impl MaxSatSolver {
 
                     let mut impossible = false;
                     let mut first_odd: Option<Label> = None;
-                    for tree in &instance.trees {
+                    for tree in &reduced.trees {
                         let node_a = tree.node_by_label(label_a);
                         let node_b = tree.node_by_label(label_b);
                         let node_c = tree.node_by_label(label_c);

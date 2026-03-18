@@ -15,7 +15,7 @@ use crate::tree::Tree;
 
 pub use cherry::{
     cherry_reduce_ub, greedy_multi_tree_partition, greedy_multi_tree_ub,
-    greedy_multi_tree_ub_seeded,
+    greedy_multi_tree_ub_seeded, pairwise_refine_ub,
 };
 pub use red_blue::red_blue_approx;
 
@@ -80,13 +80,20 @@ pub fn maf_bounds(trees: &[Tree], num_leaves: u32) -> MafBounds {
         }
     }
 
+    // TODO: Triplet-based RH lower bound (Wu 2010) needs EXACT pairwise distances,
+    // not approximations. With approximate lb_cuts, the bound can exceed true OPT.
+    // Implement once we have exact pairwise rSPR computation with timeout fallback.
+
     let (upper, best_partition) = if trees.len() == 2 {
         (best_ub_pair.min(num_leaves as usize), None)
     } else {
-        // Multi-tree: run greedy with 20 seeds per ref_idx (matching the 2-tree cherry_reduce_ub).
-        // Each run is O(n^2) and takes <1ms for n≤200, so 20*m runs is cheap.
-        // Track the best (ref_idx, seed) pair to return the best partition.
-        let mut best_multi_ub = num_leaves as usize;
+        // Multi-tree UB: take the best of:
+        // (a) All-tree cherry reduction (requires all trees to agree on cherries)
+        // (b) Pairwise-seeded partition refinement (start from best pair, split for other trees)
+        let n = num_leaves as usize;
+
+        // (a) All-tree cherry reduction.
+        let mut best_multi_ub = n;
         let mut best_ref = 0usize;
         let mut best_seed = 0u64;
         for ref_idx in 0..m {
@@ -99,9 +106,22 @@ pub fn maf_bounds(trees: &[Tree], num_leaves: u32) -> MafBounds {
                 }
             }
         }
-        let ub = best_multi_ub.min(num_leaves as usize);
-        let (_, partition) = cherry::greedy_multi_tree_partition(trees, best_ref, best_seed);
-        (ub, Some(partition))
+
+        // (b) Pairwise-refine: start from best pair's partition, refine for all trees.
+        let t_pr = std::time::Instant::now();
+        let (pr_ub, pr_partition) = cherry::pairwise_refine_ub(trees, n);
+        eprintln!(
+            "[bounds] Pairwise-refine UB: {} (all-tree cherry: {}) in {:.1}ms",
+            pr_ub, best_multi_ub, t_pr.elapsed().as_secs_f64() * 1000.0
+        );
+
+        if pr_ub < best_multi_ub {
+            (pr_ub.min(n), Some(pr_partition))
+        } else {
+            let ub = best_multi_ub.min(n);
+            let (_, partition) = cherry::greedy_multi_tree_partition(trees, best_ref, best_seed);
+            (ub, Some(partition))
+        }
     };
 
     MafBounds {
@@ -109,6 +129,125 @@ pub fn maf_bounds(trees: &[Tree], num_leaves: u32) -> MafBounds {
         upper,
         best_partition,
     }
+}
+
+use crate::Instance;
+use crate::kernelize::{self, KernelizeConfig};
+
+/// Compute a tight lower bound on the multi-tree MAF using exact pairwise distances.
+///
+/// For each pair (Ti, Tj), kernelizes and calls `solve_pair` to find the exact
+/// pairwise MAF size. For m >= 3, applies the additive formula:
+///   MAF_size >= ceil(sum_{j!=i} d(Ti,Tj) / (m-1)) + 1  for any reference tree Ti
+///
+/// `solve_pair` takes a kernelized 2-tree Instance and returns `Some(num_components)`
+/// if solved, or `None` if the solver couldn't determine the answer (e.g., timeout).
+///
+/// Returns a lower bound >= `approx_lb`.
+pub fn exact_pairwise_lower_bound(
+    trees: &[Tree],
+    num_leaves: u32,
+    approx_lb: usize,
+    upper_bound: usize,
+    total_budget: std::time::Duration,
+    solve_pair: &mut dyn FnMut(&Instance) -> Option<usize>,
+) -> usize {
+    let m = trees.len();
+    if m < 3 {
+        return approx_lb;
+    }
+
+    let mut best_lb = approx_lb;
+
+    // Compute pairwise red_blue_approx for initial LB and sorting.
+    let mut pairs: Vec<(usize, usize, usize)> = Vec::new();
+    for i in 0..m {
+        for j in (i + 1)..m {
+            let two_approx = red_blue_approx(&trees[i], &trees[j]);
+            pairs.push((i, j, two_approx));
+        }
+    }
+    // Sort by highest approx LB first — most likely to tighten the bound.
+    pairs.sort_by(|a, b| b.2.cmp(&a.2));
+
+    let start = std::time::Instant::now();
+
+    let mut exact_dist: Vec<Vec<Option<usize>>> = vec![vec![None; m]; m];
+    let mut lb_dist: Vec<Vec<usize>> = vec![vec![0; m]; m];
+
+    for &(i, j, two_approx) in &pairs {
+        let lb = two_approx.div_ceil(2);
+        lb_dist[i][j] = lb;
+        lb_dist[j][i] = lb;
+    }
+
+    for &(i, j, _two_approx) in &pairs {
+        if start.elapsed() >= total_budget {
+            break;
+        }
+
+        // Kernelize the pair to shrink the search space.
+        let pair_instance = Instance::new(vec![trees[i].clone(), trees[j].clone()], num_leaves);
+        let kern_cfg = KernelizeConfig {
+            chain32_multi: false,
+            ..KernelizeConfig::default()
+        };
+        let kern = kernelize::kernelize(&pair_instance, &kern_cfg);
+        let pair_reduction = kern.param_reduction;
+
+        if kern.instance.num_leaves <= 1 {
+            // Pair fully reduced by kernelization alone.
+            let exact_cuts = pair_reduction;
+            let exact_comps = exact_cuts + 1;
+            exact_dist[i][j] = Some(exact_cuts);
+            exact_dist[j][i] = Some(exact_cuts);
+            if exact_cuts > lb_dist[i][j] {
+                lb_dist[i][j] = exact_cuts;
+                lb_dist[j][i] = exact_cuts;
+            }
+            if exact_comps > best_lb {
+                best_lb = exact_comps;
+            }
+            if best_lb >= upper_bound {
+                return best_lb;
+            }
+            continue;
+        }
+
+        // Call the solver on the kernelized pair.
+        if let Some(num_comps_reduced) = solve_pair(&kern.instance) {
+            let exact_comps = num_comps_reduced + pair_reduction;
+            let exact_cuts = exact_comps - 1;
+            exact_dist[i][j] = Some(exact_cuts);
+            exact_dist[j][i] = Some(exact_cuts);
+            if exact_cuts > lb_dist[i][j] {
+                lb_dist[i][j] = exact_cuts;
+                lb_dist[j][i] = exact_cuts;
+            }
+            if exact_comps > best_lb {
+                best_lb = exact_comps;
+            }
+            if best_lb >= upper_bound {
+                return best_lb;
+            }
+        }
+    }
+
+    // Additive multi-tree LB: for each reference Ti,
+    //   MAF_size >= ceil(sum_{j!=i} d(Ti,Tj) / (m-1)) + 1
+    for i in 0..m {
+        let sum_d: usize = (0..m)
+            .filter(|&j| j != i)
+            .map(|j| exact_dist[i][j].unwrap_or(lb_dist[i][j]))
+            .sum();
+        let lb_cuts = sum_d.div_ceil(m - 1);
+        let lb_comps = lb_cuts + 1;
+        if lb_comps > best_lb {
+            best_lb = lb_comps;
+        }
+    }
+
+    best_lb
 }
 
 pub fn approx_rspr_distance_pub(t1: &Tree, t2: &Tree) -> usize {
