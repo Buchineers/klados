@@ -352,3 +352,214 @@ fn pick_multi_tree_cut(mtrees: &[MutableTree], ref_idx: usize, a: Label, b: Labe
         b
     }
 }
+
+/// Compute a multi-tree UB by starting from the best pairwise partition
+/// and refining it to be valid across all trees.
+///
+/// For each tree, any component that isn't a connected subtree is split
+/// into its connected sub-components. Iterate until stable.
+/// This is much tighter than the all-tree cherry heuristic for large m.
+pub fn pairwise_refine_ub(trees: &[Tree], num_leaves: usize) -> (usize, Vec<usize>) {
+    let m = trees.len();
+    if m <= 1 {
+        return (1, vec![0; num_leaves]);
+    }
+
+    // Find the best pairwise partition across all pairs and seeds.
+    let mut best_ub = num_leaves;
+    let mut best_partition: Vec<usize> = (0..num_leaves).collect(); // singletons
+
+    for i in 0..m {
+        for j in (i + 1)..m {
+            let pair = [trees[i].clone(), trees[j].clone()];
+            for seed in 0..=10u64 {
+                let (k, part) = greedy_multi_tree_partition(&pair, 0, seed);
+                if k < best_ub {
+                    best_ub = k;
+                    best_partition = part;
+                }
+                let (k, part) = greedy_multi_tree_partition(&pair, 1, seed);
+                if k < best_ub {
+                    best_ub = k;
+                    best_partition = part;
+                }
+            }
+        }
+    }
+
+    // Refine: split components that aren't connected in some tree.
+    let mut partition = best_partition;
+    let mut next_comp = *partition.iter().max().unwrap_or(&0) + 1;
+
+    loop {
+        let mut changed = false;
+        for q in 0..m {
+            let tree = &trees[q];
+            let nn = tree.num_nodes();
+
+            // Bottom-up: compute uniform component per subtree.
+            let mut sub_comp = vec![usize::MAX; nn];
+            for v in tree.post_order() {
+                if tree.is_leaf(v) {
+                    let lbl = tree.label[v as usize];
+                    if lbl > 0 && (lbl as usize) <= num_leaves {
+                        sub_comp[v as usize] = partition[(lbl - 1) as usize];
+                    }
+                } else {
+                    let l = tree.left[v as usize];
+                    let r = tree.right[v as usize];
+                    if l != NONE && r != NONE {
+                        let lc = sub_comp[l as usize];
+                        let rc = sub_comp[r as usize];
+                        sub_comp[v as usize] = if lc == rc { lc } else { usize::MAX };
+                    }
+                }
+            }
+
+            // UF: merge leaves that are in the same uniform subtree.
+            let mut uf: Vec<usize> = (0..num_leaves).collect();
+            fn find(p: &mut [usize], x: usize) -> usize {
+                if p[x] != x { p[x] = find(p, p[x]); }
+                p[x]
+            }
+
+            for v in tree.post_order() {
+                if tree.is_leaf(v) || sub_comp[v as usize] == usize::MAX {
+                    continue;
+                }
+                // Uniform subtree: merge a leaf from left with a leaf from right.
+                let l = tree.left[v as usize];
+                let r = tree.right[v as usize];
+                if l == NONE || r == NONE { continue; }
+
+                let la = find_any_leaf_label(tree, l, num_leaves);
+                let ra = find_any_leaf_label(tree, r, num_leaves);
+                if let (Some(a), Some(b)) = (la, ra) {
+                    let fa = find(&mut uf, a);
+                    let fb = find(&mut uf, b);
+                    if fa != fb { uf[fa] = fb; }
+                }
+            }
+
+            // Check: if any component is split by this tree, refine.
+            // Group leaves by (input component, UF root).
+            let mut groups: std::collections::HashMap<(usize, usize), Vec<usize>> =
+                std::collections::HashMap::new();
+            for j in 0..num_leaves {
+                let comp = partition[j];
+                let root = find(&mut uf, j);
+                groups.entry((comp, root)).or_default().push(j);
+            }
+
+            // For each input component, if it has multiple UF groups, split.
+            let mut comp_groups: std::collections::HashMap<usize, Vec<Vec<usize>>> =
+                std::collections::HashMap::new();
+            for ((comp, _root), leaves) in &groups {
+                comp_groups.entry(*comp).or_default().push(leaves.clone());
+            }
+            for (_comp, sub_groups) in &comp_groups {
+                if sub_groups.len() > 1 {
+                    changed = true;
+                    // Keep largest sub-group with original comp_id, assign new to rest.
+                    let mut sorted = sub_groups.clone();
+                    sorted.sort_by(|a, b| b.len().cmp(&a.len()));
+                    for group in &sorted[1..] {
+                        for &j in group {
+                            partition[j] = next_comp;
+                        }
+                        next_comp += 1;
+                    }
+                }
+            }
+        }
+        if !changed { break; }
+    }
+
+    // Phase 2: Split components that contain incompatible triples (H4).
+    // An incompatible triple (a,b,c) has different "odd leaf" across trees.
+    loop {
+        let mut changed = false;
+        // Group leaves by component.
+        let mut comp_leaves: std::collections::HashMap<usize, Vec<usize>> =
+            std::collections::HashMap::new();
+        for j in 0..num_leaves {
+            comp_leaves.entry(partition[j]).or_default().push(j);
+        }
+
+        'outer: for (_comp, leaves) in &comp_leaves {
+            if leaves.len() < 3 { continue; }
+            // Check all triples within this component.
+            for ii in 0..leaves.len() {
+                for jj in (ii + 1)..leaves.len() {
+                    for kk in (jj + 1)..leaves.len() {
+                        let a = leaves[ii];
+                        let b = leaves[jj];
+                        let c = leaves[kk];
+                        if is_incompatible_triple(trees, a, b, c, num_leaves) {
+                            // Split: remove c from this component.
+                            partition[c] = next_comp;
+                            next_comp += 1;
+                            changed = true;
+                            break 'outer; // restart after any split
+                        }
+                    }
+                }
+            }
+        }
+        if !changed { break; }
+    }
+
+    // Count components.
+    let mut seen = std::collections::HashSet::new();
+    for &c in &partition { seen.insert(c); }
+    (seen.len(), partition)
+}
+
+/// Check if triple (a,b,c) is incompatible across trees (different odd leaf).
+fn is_incompatible_triple(trees: &[Tree], a: usize, b: usize, c: usize, n: usize) -> bool {
+    let la = (a + 1) as crate::tree::Label;
+    let lb = (b + 1) as crate::tree::Label;
+    let lc = (c + 1) as crate::tree::Label;
+    let mut first_odd = u8::MAX;
+    for tree in trees {
+        let na = tree.node_by_label(la);
+        let nb = tree.node_by_label(lb);
+        let nc = tree.node_by_label(lc);
+        let nca_ab = tree.nearest_common_ancestor(na, nb);
+        let nca_ac = tree.nearest_common_ancestor(na, nc);
+        let nca_bc = tree.nearest_common_ancestor(nb, nc);
+        let d_ab = tree.depth[nca_ab as usize];
+        let d_ac = tree.depth[nca_ac as usize];
+        let d_bc = tree.depth[nca_bc as usize];
+        let odd = if d_ab > d_ac && d_ab > d_bc {
+            2
+        } else if d_ac > d_ab && d_ac > d_bc {
+            1
+        } else {
+            0
+        };
+        if first_odd == u8::MAX {
+            first_odd = odd;
+        } else if odd != first_odd {
+            return true;
+        }
+    }
+    false
+}
+
+/// Find any leaf label (0-indexed) in the subtree rooted at `node`.
+fn find_any_leaf_label(tree: &Tree, node: NodeId, num_leaves: usize) -> Option<usize> {
+    if node == NONE { return None; }
+    if tree.is_leaf(node) {
+        let lbl = tree.label[node as usize];
+        if lbl > 0 && (lbl as usize) <= num_leaves {
+            return Some((lbl - 1) as usize);
+        }
+        return None;
+    }
+    let l = tree.left[node as usize];
+    if let Some(r) = find_any_leaf_label(tree, l, num_leaves) {
+        return Some(r);
+    }
+    find_any_leaf_label(tree, tree.right[node as usize], num_leaves)
+}

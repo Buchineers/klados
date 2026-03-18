@@ -1,28 +1,16 @@
-//! SAT-based MAF solver with CEGAR optimization.
-//!
-//! Key optimizations:
-//! - Precomputed indices for O(1) lookups
-//! - CEGAR for H4 (incompatible triples) - adds only violated constraints
-//! - H3 path consistency with fast index access
-
 use fixedbitset::FixedBitSet;
-use klados_core::tree::{Label, NONE, NodeId, Tree};
+use klados_core::tree::{Label, NodeId, Tree};
 use klados_core::{Instance, SolverStats};
 use rustsat::encodings::card::{BoundUpper, Totalizer};
 use rustsat::instances::{BasicVarManager, ManageVars};
-use rustsat::solvers::{PhaseLit, Solve, SolveIncremental, SolverResult};
+use rustsat::solvers::{Solve, SolveIncremental, SolverResult};
 use rustsat::types::{Clause, Lit, TernaryVal, Var};
 use rustsat_cadical::CaDiCaL;
 
-use crate::ExactSolver;
 use crate::cluster_reduction::{self, ClusterReductionResult};
 use crate::kernelize::{self, KernelizeConfig};
-use crate::lower_bound::{greedy_multi_tree_partition, maf_bounds};
-use crate::shi_mestel::algorithm::exact_pairwise_lower_bound;
-
-// ═══════════════════════════════════════════════════════════════
-// Timing / profiling
-// ═══════════════════════════════════════════════════════════════
+use crate::lower_bound::maf_bounds;
+use crate::ExactSolver;
 
 #[derive(Default)]
 struct SolveProfile {
@@ -96,7 +84,6 @@ impl SolveProfile {
 
 pub struct MafSatSolver {
     stats: SolverStats,
-    max_leaves: u32,
 }
 
 impl Default for MafSatSolver {
@@ -109,7 +96,6 @@ impl MafSatSolver {
     pub fn new() -> Self {
         Self {
             stats: SolverStats::default(),
-            max_leaves: 500,
         }
     }
 }
@@ -120,13 +106,6 @@ impl ExactSolver for MafSatSolver {
     }
 
     fn solve(&mut self, instance: &Instance) -> Option<Vec<Tree>> {
-        if instance.num_leaves > self.max_leaves {
-            eprintln!(
-                "maf-sat: instance has {} leaves, exceeding limit of {}",
-                instance.num_leaves, self.max_leaves
-            );
-            return None;
-        }
         if instance.trees.is_empty() {
             return None;
         }
@@ -144,36 +123,11 @@ impl ExactSolver for MafSatSolver {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════
-// Precomputed data structures
-// ═══════════════════════════════════════════════════════════════
-
-struct TreePrecomp {
-    internal_idx: Vec<usize>,
-    num_internal: usize,
-}
-
-impl TreePrecomp {
-    fn build(tree: &Tree) -> Self {
-        let num_nodes = tree.num_nodes();
-        let mut internal_idx = vec![usize::MAX; num_nodes];
-        let mut count = 0;
-        for v in 0..num_nodes as NodeId {
-            if !tree.is_leaf(v) {
-                internal_idx[v as usize] = count;
-                count += 1;
-            }
-        }
-        Self {
-            internal_idx,
-            num_internal: count,
-        }
-    }
-
-    #[inline(always)]
-    fn idx(&self, node: NodeId) -> usize {
-        self.internal_idx[node as usize]
-    }
+/// Solve a (typically 2-tree) instance with the SAT solver and return the component count.
+/// Used as a callback for pairwise lower bound computation.
+pub(crate) fn solve_pair_sat(instance: &Instance) -> Option<usize> {
+    let mut stats = SolverStats::default();
+    solve_sat(instance, &mut stats).map(|trees| trees.len())
 }
 
 struct NcaData {
@@ -230,793 +184,8 @@ impl NcaData {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════
-// Encoding with w variables for H3, but no H2/t (not needed)
-// ═══════════════════════════════════════════════════════════════
-
-struct MafEncoding {
-    l: Vec<Vec<Var>>,      // l[i][j]: leaf j in component i
-    u: Vec<Var>,           // u[i]: component i used
-    w: Vec<Vec<Vec<Var>>>, // w[q][i][idx]: internal node in component
-    s: Vec<Vec<Var>>,      // ladder aux for H1b
-    t: Vec<Vec<Vec<Var>>>, // ladder aux for H2
-    // Phase 1: Local propagation variables (only used for large instances)
-    d: Option<Vec<Vec<Vec<Var>>>>, // d[q][i][idx]: subtree has leaf of component i
-    e: Option<Vec<Vec<Vec<Var>>>>, // e[q][i][idx]: leaf of component i exists outside
-    n: usize,
-    k: usize,
-    m: usize,
-}
-
-fn create_variables(
-    vm: &mut BasicVarManager,
-    n: usize,
-    k: usize,
-    m: usize,
-    precomps: &[TreePrecomp],
-) -> MafEncoding {
-    let alloc = |vm: &mut BasicVarManager, count: usize| -> Vec<Var> {
-        (0..count).map(|_| vm.new_var()).collect()
-    };
-
-    let l: Vec<Vec<Var>> = (0..k).map(|_| alloc(vm, n)).collect();
-    let u: Vec<Var> = alloc(vm, k);
-    let s: Vec<Vec<Var>> = (0..k).map(|_| alloc(vm, n)).collect();
-
-    let w: Vec<Vec<Vec<Var>>> = (0..m)
-        .map(|q| {
-            let ni = precomps[q].num_internal;
-            (0..k).map(|_| alloc(vm, ni)).collect()
-        })
-        .collect();
-
-    let t: Vec<Vec<Vec<Var>>> = (0..m)
-        .map(|q| {
-            let ni = precomps[q].num_internal;
-            (0..k).map(|_| alloc(vm, ni)).collect()
-        })
-        .collect();
-
-    MafEncoding {
-        l,
-        u,
-        w,
-        s,
-        t,
-        d: None,
-        e: None,
-        n,
-        k,
-        m,
-    }
-}
-
-/// Tree navigation data for local propagation encoding.
-/// Used by Phase 1 adaptive H3 encoding.
-struct TreeNav {
-    /// For each internal index: (left_child_node, right_child_node)
-    children: Vec<(NodeId, NodeId)>,
-    /// For each internal index: parent node (NONE for root)
-    parent: Vec<NodeId>,
-    /// For each internal index: sibling node (NONE for root)
-    sibling: Vec<NodeId>,
-    /// Post-order of internal indices
-    post_order: Vec<usize>,
-    /// Pre-order of internal indices
-    pre_order: Vec<usize>,
-    /// Root internal index
-    root_idx: usize,
-    /// For each node: Some(leaf_index) if leaf, None if internal
-    leaf_idx: Vec<Option<usize>>,
-    /// Is this node a leaf?
-    is_leaf: Vec<bool>,
-}
-
-impl TreeNav {
-    fn build(tree: &Tree, pc: &TreePrecomp, n: usize) -> Self {
-        let num_nodes = tree.num_nodes();
-        let ni = pc.num_internal;
-
-        let mut children = vec![(NONE, NONE); ni];
-        let mut parent = vec![NONE; ni];
-        let mut sibling = vec![NONE; ni];
-        let mut leaf_idx = vec![None; num_nodes];
-        let mut is_leaf = vec![false; num_nodes];
-
-        for v in 0..num_nodes as NodeId {
-            if tree.is_leaf(v) {
-                is_leaf[v as usize] = true;
-                let lbl = tree.label[v as usize];
-                if lbl > 0 && (lbl as usize) <= n {
-                    leaf_idx[v as usize] = Some((lbl - 1) as usize);
-                }
-            } else {
-                let ii = pc.idx(v);
-                if let Some((l, r)) = tree.children(v) {
-                    children[ii] = (l, r);
-                }
-                let p = tree.parent[v as usize];
-                parent[ii] = p;
-                if p != NONE {
-                    let sib = if tree.left[p as usize] == v {
-                        tree.right[p as usize]
-                    } else {
-                        tree.left[p as usize]
-                    };
-                    sibling[ii] = sib;
-                }
-            }
-        }
-
-        let post_order: Vec<usize> = tree
-            .post_order()
-            .filter(|v| !tree.is_leaf(*v))
-            .map(|v| pc.idx(v))
-            .collect();
-        let pre_order: Vec<usize> = tree
-            .pre_order()
-            .filter(|v| !tree.is_leaf(*v))
-            .map(|v| pc.idx(v))
-            .collect();
-
-        Self {
-            children,
-            parent,
-            sibling,
-            post_order,
-            pre_order,
-            root_idx: pc.idx(tree.root),
-            leaf_idx,
-            is_leaf,
-        }
-    }
-}
-
 fn add_clause(solver: &mut CaDiCaL, lits: &[Lit]) {
     solver.add_clause(Clause::from(lits)).unwrap();
-}
-
-/// Encode H3 using local propagation.
-/// This is more efficient for large instances with many trees.
-/// Requires d and e variables to be allocated in enc.
-fn add_h3_local(
-    solver: &mut CaDiCaL,
-    _instance: &Instance,
-    precomps: &[TreePrecomp],
-    navs: &[TreeNav],
-    enc: &MafEncoding,
-    profile: &mut SolveProfile,
-) {
-    let k = enc.k;
-    let m = enc.m;
-    let mut count = 0usize;
-
-    // Get d and e variables (should be Some when this is called)
-    let d_vars = enc.d.as_ref().expect("d variables not allocated");
-    let e_vars = enc.e.as_ref().expect("e variables not allocated");
-
-    for q in 0..m {
-        let pc = &precomps[q];
-        let nav = &navs[q];
-
-        for i in 0..k {
-            // Bottom-up: d propagation
-            // d[v] = OR(d[left], d[right])
-            // Equivalent to: d[left] → d[v], d[right] → d[v], d[v] → (d[left] ∨ d[right])
-            for &ii in &nav.post_order {
-                let (c1, c2) = nav.children[ii];
-                let d_ii = d_vars[q][i][ii];
-
-                // Get d-literals for children
-                let dc1 = if nav.is_leaf[c1 as usize] {
-                    let j = nav.leaf_idx[c1 as usize].unwrap_or(0);
-                    enc.l[i][j]
-                } else {
-                    d_vars[q][i][pc.idx(c1)]
-                };
-                let dc2 = if nav.is_leaf[c2 as usize] {
-                    let j = nav.leaf_idx[c2 as usize].unwrap_or(0);
-                    enc.l[i][j]
-                } else {
-                    d_vars[q][i][pc.idx(c2)]
-                };
-
-                // d[c1] → d[v]: ¬d[c1] ∨ d[v]
-                add_clause(solver, &[dc1.neg_lit(), d_ii.pos_lit()]);
-                // d[c2] → d[v]: ¬d[c2] ∨ d[v]
-                add_clause(solver, &[dc2.neg_lit(), d_ii.pos_lit()]);
-                // d[v] → d[c1] ∨ d[c2]: ¬d[v] ∨ d[c1] ∨ d[c2]
-                add_clause(solver, &[d_ii.neg_lit(), dc1.pos_lit(), dc2.pos_lit()]);
-                count += 3;
-            }
-
-            // Top-down: e propagation
-            // e[v] = OR(e[parent], d[sibling])
-            // Root has e[root] = false
-            for &ii in &nav.pre_order {
-                let e_ii = e_vars[q][i][ii];
-
-                if ii == nav.root_idx {
-                    // Root: e[root] = false
-                    add_clause(solver, &[e_ii.neg_lit()]);
-                    count += 1;
-                } else {
-                    let p = nav.parent[ii];
-                    let sib = nav.sibling[ii];
-                    let p_ii = pc.idx(p);
-                    let e_p = e_vars[q][i][p_ii];
-
-                    // Get d[sibling]
-                    let d_sib = if nav.is_leaf[sib as usize] {
-                        let j = nav.leaf_idx[sib as usize].unwrap_or(0);
-                        enc.l[i][j]
-                    } else {
-                        d_vars[q][i][pc.idx(sib)]
-                    };
-
-                    // e[parent] → e[v]: ¬e[p] ∨ e[v]
-                    add_clause(solver, &[e_p.neg_lit(), e_ii.pos_lit()]);
-                    // d[sibling] → e[v]: ¬d[sib] ∨ e[v]
-                    add_clause(solver, &[d_sib.neg_lit(), e_ii.pos_lit()]);
-                    // e[v] → e[parent] ∨ d[sibling]: ¬e[v] ∨ e[p] ∨ d[sib]
-                    add_clause(solver, &[e_ii.neg_lit(), e_p.pos_lit(), d_sib.pos_lit()]);
-                    count += 3;
-                }
-            }
-
-            // w definition: w[v] ↔ at_least_2(d[c1], d[c2], e[v])
-            // This means w[v] is true iff at least 2 of {d[c1], d[c2], e[v]} are true
-            // For 3 variables, at_least_2(a,b,c) = (a∧b) ∨ (a∧c) ∨ (b∧c)
-            // In CNF: (¬a∨¬b∨w) ∧ (¬a∨¬c∨w) ∧ (¬b∨¬c∨w) ∧ (¬w∨a∨b) ∧ (¬w∨a∨c) ∧ (¬w∨b∨c)
-            for &ii in &nav.post_order {
-                let (c1, c2) = nav.children[ii];
-                let w_ii = enc.w[q][i][ii];
-                let e_ii = e_vars[q][i][ii];
-
-                // Get d-literals for children
-                let dc1 = if nav.is_leaf[c1 as usize] {
-                    let j = nav.leaf_idx[c1 as usize].unwrap_or(0);
-                    enc.l[i][j]
-                } else {
-                    d_vars[q][i][pc.idx(c1)]
-                };
-                let dc2 = if nav.is_leaf[c2 as usize] {
-                    let j = nav.leaf_idx[c2 as usize].unwrap_or(0);
-                    enc.l[i][j]
-                } else {
-                    d_vars[q][i][pc.idx(c2)]
-                };
-
-                // Forward: any pair → w
-                // (¬d[c1] ∨ ¬d[c2] ∨ w)
-                add_clause(solver, &[dc1.neg_lit(), dc2.neg_lit(), w_ii.pos_lit()]);
-                // (¬d[c1] ∨ ¬e[v] ∨ w)
-                add_clause(solver, &[dc1.neg_lit(), e_ii.neg_lit(), w_ii.pos_lit()]);
-                // (¬d[c2] ∨ ¬e[v] ∨ w)
-                add_clause(solver, &[dc2.neg_lit(), e_ii.neg_lit(), w_ii.pos_lit()]);
-                // Backward: w → at least 2
-                // (¬w ∨ d[c1] ∨ d[c2])
-                add_clause(solver, &[w_ii.neg_lit(), dc1.pos_lit(), dc2.pos_lit()]);
-                // (¬w ∨ d[c1] ∨ e[v])
-                add_clause(solver, &[w_ii.neg_lit(), dc1.pos_lit(), e_ii.pos_lit()]);
-                // (¬w ∨ d[c2] ∨ e[v])
-                add_clause(solver, &[w_ii.neg_lit(), dc2.pos_lit(), e_ii.pos_lit()]);
-                count += 6;
-            }
-        }
-    }
-    profile.h3_clauses = count;
-}
-
-/// Encode base clauses + H3. H4 added via CEGAR.
-/// Uses local propagation H3 encoding for better clause efficiency.
-fn add_structural_clauses(
-    solver: &mut CaDiCaL,
-    enc: &MafEncoding,
-    profile: &mut SolveProfile,
-    instance: &Instance,
-    precomps: &[TreePrecomp],
-    navs: &[TreeNav],
-) {
-    let n = enc.n;
-    let k = enc.k;
-    let m = enc.m;
-
-    // H1a: every leaf in at least one component.
-    // By O2+O3+H1, l[i][j]=FALSE for i>j (induction), so only components 0..=j
-    // can hold leaf j. The clause need only span those components.
-    for j in 0..n {
-        let hi = j.min(k - 1);
-        let clause: Vec<Lit> = (0..=hi).map(|i| enc.l[i][j].pos_lit()).collect();
-        add_clause(solver, &clause);
-    }
-    profile.h1_clauses += n;
-
-    // H1b: at most one component per leaf (ladder).
-    // Same observation: ladder only needs to run up to component min(j, k-1).
-    for j in 0..n {
-        let jk = j.min(k - 1); // max component that can hold leaf j
-        for i in 0..jk {
-            add_clause(solver, &[enc.l[i][j].neg_lit(), enc.s[i][j].pos_lit()]);
-        }
-        for i in 1..jk {
-            add_clause(solver, &[enc.s[i - 1][j].neg_lit(), enc.s[i][j].pos_lit()]);
-        }
-        for i in 1..=jk {
-            add_clause(solver, &[enc.s[i - 1][j].neg_lit(), enc.l[i][j].neg_lit()]);
-        }
-    }
-    profile.h1_clauses += n * (3 * k - 2);
-
-    // H2: at most one component per internal node (ladder)
-    for q in 0..m {
-        let ni = enc.w[q][0].len();
-        for idx in 0..ni {
-            for i in 0..k - 1 {
-                add_clause(
-                    solver,
-                    &[enc.w[q][i][idx].neg_lit(), enc.t[q][i][idx].pos_lit()],
-                );
-            }
-            for i in 1..k - 1 {
-                add_clause(
-                    solver,
-                    &[enc.t[q][i - 1][idx].neg_lit(), enc.t[q][i][idx].pos_lit()],
-                );
-            }
-            for i in 1..k {
-                add_clause(
-                    solver,
-                    &[enc.t[q][i - 1][idx].neg_lit(), enc.w[q][i][idx].neg_lit()],
-                );
-            }
-        }
-        profile.h2_clauses += ni * (3 * k - 2);
-    }
-
-    // H3: local propagation encoding (fewer clauses than path-based)
-    add_h3_local(solver, instance, precomps, navs, enc, profile);
-
-    // H5: usage tracking.
-    // l[i][j]=FALSE for j<i (O2+O3+H1), so only need j>=i.
-    let mut h5_count = 0;
-    for i in 0..k {
-        for j in i..n {
-            add_clause(solver, &[enc.l[i][j].neg_lit(), enc.u[i].pos_lit()]);
-            h5_count += 1;
-        }
-    }
-    profile.h5_clauses = h5_count;
-
-    // O1: ordered usage
-    for i in 0..k - 1 {
-        add_clause(solver, &[enc.u[i + 1].neg_lit(), enc.u[i].pos_lit()]);
-    }
-    // O2: leaf 0 in component 0
-    add_clause(solver, &[enc.l[0][0].pos_lit()]);
-    // O3: lex ordering
-    let mut sym = k; // k-1 from O1, 1 from O2
-    for i in 0..k - 1 {
-        for j in 0..n {
-            let mut lits = vec![enc.l[i + 1][j].neg_lit()];
-            for jp in 0..j {
-                lits.push(enc.l[i][jp].pos_lit());
-            }
-            add_clause(solver, &lits);
-            sym += 1;
-        }
-    }
-    profile.sym_clauses = sym;
-}
-
-fn seed_sibling_constraints(
-    solver: &mut CaDiCaL,
-    instance: &Instance,
-    enc: &MafEncoding,
-    profile: &mut SolveProfile,
-    ghost_leaves: &[usize],
-) {
-    let ref_tree = &instance.trees[0];
-    let k = enc.k;
-    let mut count = 0;
-
-    for node in ref_tree.post_order() {
-        if let Some((left, right)) = ref_tree.children(node) {
-            if ref_tree.is_leaf(left) && ref_tree.is_leaf(right) {
-                let la = ref_tree.label[left as usize];
-                let lb = ref_tree.label[right as usize];
-                if la == 0 || lb == 0 {
-                    continue;
-                }
-
-                let ja = (la - 1) as usize;
-                let jb = (lb - 1) as usize;
-
-                // Skip sibling constraints involving ghost leaves (cluster representatives).
-                // A ghost leaf is an artificial stand-in for a whole cluster sub-instance;
-                // it has no genuine cherry relationship in the original instance trees, so
-                // forcing it to be co-component with its structural cherry partner is wrong
-                // and will make the singleton assumption UNSAT.
-                if ghost_leaves.contains(&ja) || ghost_leaves.contains(&jb) {
-                    continue;
-                }
-
-                let is_common = instance.trees[1..].iter().all(|t| {
-                    let na = t.node_by_label(la);
-                    let nb = t.node_by_label(lb);
-                    let pa = t.parent[na as usize];
-                    let pb = t.parent[nb as usize];
-                    pa != NONE && pa == pb
-                });
-
-                if is_common {
-                    // l[i][j]=FALSE for i>j, so only need i<=min(ja,jb).
-                    let hi = ja.min(jb).min(k - 1);
-                    for i in 0..=hi {
-                        add_clause(solver, &[enc.l[i][ja].neg_lit(), enc.l[i][jb].pos_lit()]);
-                        add_clause(solver, &[enc.l[i][jb].neg_lit(), enc.l[i][ja].pos_lit()]);
-                        count += 2;
-                    }
-                }
-            }
-        }
-    }
-    profile.sibling_clauses = count;
-}
-
-// ═══════════════════════════════════════════════════════════════
-// CEGAR for H4 (incompatible triples)
-// ═══════════════════════════════════════════════════════════════
-// CEGAR for H4 (incompatible triples)
-// ═══════════════════════════════════════════════════════════════
-
-fn add_violated_triples(
-    solver: &mut CaDiCaL,
-    enc: &MafEncoding,
-    components: &[Vec<usize>],
-    nca_data: &NcaData,
-    added_triples: &mut fxhash::FxHashSet<(usize, usize, usize)>,
-) -> (usize, usize) {
-    let k = enc.k;
-    let mut violations = 0;
-    let mut clauses = 0;
-
-    for comp in components {
-        if comp.len() < 3 {
-            continue;
-        }
-
-        for ii in 0..comp.len() {
-            for jj in (ii + 1)..comp.len() {
-                for kk in (jj + 1)..comp.len() {
-                    let a = comp[ii];
-                    let b = comp[jj];
-                    let c = comp[kk];
-
-                    if nca_data.is_incompatible(a, b, c) {
-                        let key = (a, b, c);
-                        if added_triples.contains(&key) {
-                            continue; // Already added, skip duplicate
-                        }
-                        added_triples.insert(key);
-
-                        // l[i][x]=FALSE for i>x, so clause is trivially satisfied
-                        // for i > min(a,b,c). Only add for i<=min(a,b,c).
-                        let min_leaf = a.min(b).min(c);
-                        let hi = min_leaf.min(k - 1);
-                        for i in 0..=hi {
-                            add_clause(
-                                solver,
-                                &[
-                                    enc.l[i][a].neg_lit(),
-                                    enc.l[i][b].neg_lit(),
-                                    enc.l[i][c].neg_lit(),
-                                ],
-                            );
-                        }
-                        violations += 1;
-                        clauses += hi + 1;
-                    }
-                }
-            }
-        }
-    }
-
-    (violations, clauses)
-}
-
-// ═══════════════════════════════════════════════════════════════
-// Solver core
-// ═══════════════════════════════════════════════════════════════
-
-fn sat_solve_maf(
-    instance: &Instance,
-    k_max: usize,
-    lb_components: usize,
-    profile: &mut SolveProfile,
-    preferred_singletons: &[usize],
-    // Best partition from the UB computation (partition[j] = component for leaf j+1).
-    // Used for phase hints; None falls back to greedy(ref=0, seed=0).
-    best_partition: Option<&Vec<usize>>,
-) -> Option<Vec<Tree>> {
-    let n = instance.num_leaves as usize;
-    let k = k_max;
-    let m = instance.num_trees();
-
-    profile.n_reduced = n;
-    profile.k = k;
-    profile.m = m;
-
-    let precomps: Vec<TreePrecomp> = instance
-        .trees
-        .iter()
-        .map(|t| TreePrecomp::build(t))
-        .collect();
-
-    // Build TreeNav data for local propagation
-    let t_nav = std::time::Instant::now();
-    let navs: Vec<TreeNav> = (0..m)
-        .map(|q| TreeNav::build(&instance.trees[q], &precomps[q], n))
-        .collect();
-    let nav_ms = t_nav.elapsed().as_secs_f64() * 1000.0;
-
-    let nca_data = NcaData::build(instance, n);
-
-    let mut solver = CaDiCaL::default();
-    let mut vm = BasicVarManager::default();
-
-    // Create variables, including d/e for local propagation
-    let mut enc = create_variables(&mut vm, n, k, m, &precomps);
-    let t_vars = std::time::Instant::now();
-    let d: Vec<Vec<Vec<Var>>> = (0..m)
-        .map(|q| {
-            let ni = precomps[q].num_internal;
-            (0..k)
-                .map(|_| (0..ni).map(|_| vm.new_var()).collect())
-                .collect()
-        })
-        .collect();
-    let e: Vec<Vec<Vec<Var>>> = (0..m)
-        .map(|q| {
-            let ni = precomps[q].num_internal;
-            (0..k)
-                .map(|_| (0..ni).map(|_| vm.new_var()).collect())
-                .collect()
-        })
-        .collect();
-    enc.d = Some(d);
-    enc.e = Some(e);
-    let var_ms = t_vars.elapsed().as_secs_f64() * 1000.0;
-
-    let t_enc = std::time::Instant::now();
-    add_structural_clauses(&mut solver, &enc, profile, instance, &precomps, &navs);
-    seed_sibling_constraints(&mut solver, instance, &enc, profile, preferred_singletons);
-
-    // Hard singleton constraints for ghost leaves (cluster representatives).
-    // For every ghost p: ~l[i][p] \/ ~l[i][j] for all i, all j != p.
-    // This is a hard structural fact: a ghost leaf must be completely alone in its
-    // component so that combine_solutions can substitute the cluster sub-solution.
-    // Hard binary clauses (rather than a soft indicator variable + retry) ensure:
-    //   (a) The solver finds the TRUE optimal k under the isolation requirement
-    //       instead of a spuriously low k that groups the ghost with other leaves.
-    //   (b) No O2 collision: the ghost is free to land in any component index,
-    //       while O2 still pins leaf-index-0 to component 0.
-    let mut singleton_clauses = 0usize;
-    for &p in preferred_singletons {
-        for i in 0..k {
-            for q in 0..n {
-                if q != p {
-                    add_clause(&mut solver, &[enc.l[i][p].neg_lit(), enc.l[i][q].neg_lit()]);
-                    singleton_clauses += 1;
-                }
-            }
-        }
-    }
-    profile.singleton_clauses = singleton_clauses;
-
-    profile.encode_ms = t_enc.elapsed().as_secs_f64() * 1000.0 + nav_ms + var_ms;
-    profile.num_vars = vm.n_used() as usize;
-
-    let ni_avg = precomps.iter().map(|p| p.num_internal).sum::<usize>() as f64 / m as f64;
-    let struct_clauses = profile.h1_clauses + profile.h2_clauses + profile.h3_clauses
-        + profile.h5_clauses + profile.sym_clauses + profile.sibling_clauses
-        + profile.singleton_clauses;
-    eprintln!(
-        "[sat] Encoding (pre-H4): {} vars, {} clauses in {:.1}ms",
-        profile.num_vars, struct_clauses, profile.encode_ms
-    );
-    eprintln!(
-        "[sat]   H1={} H2={} H3={} H5={} sym={} sib={} sing={}",
-        profile.h1_clauses, profile.h2_clauses, profile.h3_clauses,
-        profile.h5_clauses, profile.sym_clauses, profile.sibling_clauses,
-        profile.singleton_clauses
-    );
-    eprintln!(
-        "[sat]   n={} k={} m={} ni_avg={:.0} encode={:.1}ms",
-        n, k, m, ni_avg, profile.encode_ms
-    );
-
-    // Phase hints: bias the solver toward the greedy upper-bound partition.
-    // CaDiCaL will override these via VSIDS if they are wrong, so the downside
-    // is negligible while the upside is faster SAT proofs at the UB bound.
-    // Prefer the best partition from maf_bounds (best ref_idx/seed) over the
-    // default (ref=0, seed=0) which may be much worse.
-    {
-        let fallback;
-        let partition: &Vec<usize> = if let Some(p) = best_partition {
-            p
-        } else {
-            let (_, p) = greedy_multi_tree_partition(&instance.trees, 0, 0);
-            fallback = p;
-            &fallback
-        };
-        // partition has length n (labels 1..=n, 0-indexed by label-1)
-        if partition.len() == n {
-            for j in 0..n {
-                let comp_idx = partition[j];
-                if comp_idx < k {
-                    for i in 0..k {
-                        let lit = if i == comp_idx {
-                            enc.l[i][j].pos_lit()
-                        } else {
-                            enc.l[i][j].neg_lit()
-                        };
-                        let _ = solver.phase_lit(lit);
-                    }
-                }
-            }
-        }
-    }
-
-    let u_lits: Vec<Lit> = enc.u.iter().map(|v| v.pos_lit()).collect();
-    let mut totalizer = Totalizer::default();
-    for lit in u_lits {
-        totalizer.extend([lit]);
-    }
-
-    let mut best_components: Option<Vec<Vec<usize>>> = None;
-
-    // Pre-encode the full range once so enforce_ub can assume any bound in [lb_components, k].
-    totalizer
-        .encode_ub(lb_components..=k, &mut solver, &mut vm)
-        .unwrap();
-
-    // H4 via "same-component" auxiliary variables.
-    // For each leaf pair (a,b) in some incompatible triple, create same[a][b].
-    // Forward: l[i][a] ∧ l[i][b] → same[a][b]  (ternary, shared across triples)
-    // H4:      ¬same[a][b] ∨ ¬same[a][c]        (binary, one per triple — strong propagation)
-    // No backward direction needed: over-approximation is sound.
-    let mut added_triples: fxhash::FxHashSet<(usize, usize, usize)> = fxhash::FxHashSet::default();
-    {
-        let t_h4 = std::time::Instant::now();
-
-        // 1. Enumerate all incompatible triples and collect unique pairs.
-        let mut incompat: Vec<(usize, usize, usize)> = Vec::new();
-        let mut pair_set: fxhash::FxHashSet<(usize, usize)> = fxhash::FxHashSet::default();
-        for a in 0..n {
-            for b in (a + 1)..n {
-                for c in (b + 1)..n {
-                    if nca_data.is_incompatible(a, b, c) {
-                        incompat.push((a, b, c));
-                        pair_set.insert((a, b));
-                        pair_set.insert((a, c));
-                        // (b,c) not needed — we use pairs involving the smallest leaf
-                    }
-                }
-            }
-        }
-
-        // 2. Create same[a][b] variable for each unique pair.
-        let mut same_var: fxhash::FxHashMap<(usize, usize), Var> = fxhash::FxHashMap::default();
-        for &(a, b) in &pair_set {
-            same_var.insert((a, b), vm.new_var());
-        }
-
-        // 3. Forward clauses: ¬l[i][a] ∨ ¬l[i][b] ∨ same[a][b]
-        let mut fwd_clauses = 0usize;
-        for (&(a, b), &sv) in &same_var {
-            let hi = a.min(k - 1); // O3 pruning: l[i][a]=false for i>a
-            for i in 0..=hi {
-                add_clause(
-                    &mut solver,
-                    &[enc.l[i][a].neg_lit(), enc.l[i][b].neg_lit(), sv.pos_lit()],
-                );
-                fwd_clauses += 1;
-            }
-        }
-
-        // 4. H4 binary clauses: ¬same[a][b] ∨ ¬same[a][c]
-        for &(a, b, c) in &incompat {
-            added_triples.insert((a, b, c));
-            let sv_ab = same_var[&(a, b)];
-            let sv_ac = same_var[&(a, c)];
-            add_clause(&mut solver, &[sv_ab.neg_lit(), sv_ac.neg_lit()]);
-        }
-        profile.h4_clauses = fwd_clauses + incompat.len();
-
-        eprintln!(
-            "[sat] H4 same-var: {} triples, {} pairs, {} fwd + {} binary = {} clauses in {:.1}ms",
-            incompat.len(),
-            pair_set.len(),
-            fwd_clauses,
-            incompat.len(),
-            profile.h4_clauses,
-            t_h4.elapsed().as_secs_f64() * 1000.0
-        );
-    }
-
-    // Linear descent from k down to lb_components. Learned clauses from SAT calls at
-    // higher bounds accumulate and make the UNSAT proof at opt-1 significantly cheaper.
-    let mut best_components: Option<Vec<Vec<usize>>> = None;
-
-    let t_total_solve = std::time::Instant::now();
-    for bound in (lb_components..=k).rev() {
-        let assumps_vec = totalizer.enforce_ub(bound).unwrap();
-
-        profile.sat_calls += 1;
-        let t_solve = std::time::Instant::now();
-        let result = solver.solve_assumps(&assumps_vec).unwrap();
-        let solve_ms = t_solve.elapsed().as_secs_f64() * 1000.0;
-        profile.solve_ms += solve_ms;
-        let cumulative_s = t_total_solve.elapsed().as_secs_f64();
-
-        match result {
-            SolverResult::Sat => {
-                let comps = extract_components(&solver, &enc, n, k);
-                let num_comps = comps.len();
-                let max_comp = comps.iter().map(|c| c.len()).max().unwrap_or(0);
-                eprintln!(
-                    "[sat] bound={} SAT {:.1}ms (cum {:.1}s) comps={} max_comp_size={}",
-                    bound, solve_ms, cumulative_s, num_comps, max_comp
-                );
-                profile.optimal_k = bound;
-                best_components = Some(comps);
-            }
-            SolverResult::Unsat => {
-                eprintln!(
-                    "[sat] bound={} UNSAT {:.1}ms (cum {:.1}s) — optimal={}",
-                    bound, solve_ms, cumulative_s, bound + 1
-                );
-                if best_components.is_some() {
-                    profile.optimal_k =
-                        best_components.as_ref().map(|c| c.len()).unwrap_or(k);
-                }
-                profile.report();
-                return best_components
-                    .map(|c| components_to_trees(&c, &instance.trees[0], instance.num_leaves));
-            }
-            SolverResult::Interrupted => {
-                eprintln!(
-                    "[sat] bound={} INTERRUPTED {:.1}ms (cum {:.1}s)",
-                    bound, solve_ms, cumulative_s
-                );
-                profile.report();
-                return best_components
-                    .map(|c| components_to_trees(&c, &instance.trees[0], instance.num_leaves));
-            }
-        }
-    }
-
-    profile.optimal_k = best_components.as_ref().map(|c| c.len()).unwrap_or(k);
-    profile.report();
-
-    best_components.map(|c| components_to_trees(&c, &instance.trees[0], instance.num_leaves))
-}
-
-fn extract_components(solver: &CaDiCaL, enc: &MafEncoding, n: usize, k: usize) -> Vec<Vec<usize>> {
-    let mut components = Vec::new();
-    for i in 0..k {
-        let mut comp = Vec::new();
-        for j in 0..n {
-            if solver.var_val(enc.l[i][j]).unwrap() == TernaryVal::True {
-                comp.push(j);
-            }
-        }
-        if !comp.is_empty() {
-            components.push(comp);
-        }
-    }
-    components
 }
 
 fn components_to_trees(components: &[Vec<usize>], ref_tree: &Tree, num_leaves: u32) -> Vec<Tree> {
@@ -1063,7 +232,6 @@ fn sat_solve_maf_cut(
 ) -> Option<Vec<Tree>> {
     let n = instance.num_leaves as usize;
     let m = instance.num_trees();
-    let t_start = std::time::Instant::now();
 
     profile.n_reduced = n;
     profile.k = k_max;
@@ -1096,7 +264,6 @@ fn sat_solve_maf_cut(
 
     // --- Variables ---
     // del[q][v]: edge from node v to parent(v) in tree q is cut.
-    // Index: for tree q, node v (non-root), del[q][node_idx].
     let num_nodes: Vec<usize> = instance.trees.iter().map(|t| t.num_nodes()).collect();
     let del: Vec<Vec<Option<Var>>> = (0..m)
         .map(|q| {
@@ -1104,7 +271,7 @@ fn sat_solve_maf_cut(
             (0..num_nodes[q])
                 .map(|v| {
                     if v as NodeId == tree.root {
-                        None // root has no parent edge
+                        None
                     } else {
                         Some(vm.new_var())
                     }
@@ -1114,32 +281,30 @@ fn sat_solve_maf_cut(
         .collect();
     let del_count: usize = del.iter().map(|d| d.iter().filter(|v| v.is_some()).count()).sum();
 
-    // conn[q][a][b]: leaves a and b are connected in tree q (no cut on path).
-    // Only for a < b.
-    let conn: Vec<Vec<Vec<Var>>> = (0..m)
-        .map(|_| {
+    // conn[a][b]: leaves a and b are in the same component (single set, not per-tree).
+    // Cross-tree consistency is enforced via backward clauses on ALL trees' del vars.
+    // Only allocate for a < b (upper triangle). conn[a][b] for a >= b is unused.
+    let conn: Vec<Vec<Option<Var>>> = (0..n)
+        .map(|a| {
             (0..n)
-                .map(|_a| (0..n).map(|_| vm.new_var()).collect())
+                .map(|b| if b > a { Some(vm.new_var()) } else { None })
                 .collect()
         })
         .collect();
-    let conn_count = m * n * n;
+    let conn_count = n * (n - 1) / 2;
 
-    let total_vars_pre_totalizer = vm.n_used();
     eprintln!(
         "[cut] Variables: {} del + {} conn = {} (path precomp {:.1}ms)",
-        del_count, conn_count, total_vars_pre_totalizer, path_ms
+        del_count, conn_count, vm.n_used(), path_ms
     );
 
     // --- Clauses ---
     let t_enc = std::time::Instant::now();
     let mut backward_count = 0usize;
     let mut forward_count = 0usize;
-    let mut cross_count = 0usize;
     let mut h4_count = 0usize;
 
-    // 1. Backward: conn[q][a][b] → ¬del[q][v] for each v on path_q(a,b).
-    //    i.e. ¬conn[q][a][b] ∨ ¬del[q][v]  (binary!)
+    // 1. Backward for ALL trees: conn[a][b] → ¬del[q][v].
     for q in 0..m {
         for a in 0..n {
             for b in (a + 1)..n {
@@ -1147,7 +312,7 @@ fn sat_solve_maf_cut(
                     if let Some(dv) = del[q][v as usize] {
                         add_clause(
                             &mut solver,
-                            &[conn[q][a][b].neg_lit(), dv.neg_lit()],
+                            &[conn[a][b].unwrap().neg_lit(), dv.neg_lit()],
                         );
                         backward_count += 1;
                     }
@@ -1156,12 +321,12 @@ fn sat_solve_maf_cut(
         }
     }
 
-    // 2. Forward: (∧_v ¬del[q][v]) → conn[q][a][b]
-    //    i.e. conn[q][a][b] ∨ ∨_v del[q][v]
+    // 2. Forward for ALL trees: (no cut on path_q) → conn[a][b].
+    //    Needed for correctness: conn must be true only if connected in ALL trees.
     for q in 0..m {
         for a in 0..n {
             for b in (a + 1)..n {
-                let mut clause = vec![conn[q][a][b].pos_lit()];
+                let mut clause = vec![conn[a][b].unwrap().pos_lit()];
                 for &v in &paths[q][a][b] {
                     if let Some(dv) = del[q][v as usize] {
                         clause.push(dv.pos_lit());
@@ -1173,35 +338,14 @@ fn sat_solve_maf_cut(
         }
     }
 
-    // 3. Cross-tree consistency: conn[q1][a][b] ↔ conn[q2][a][b]
-    //    ¬conn[q1] ∨ conn[q2] and vice versa (binary!)
-    for a in 0..n {
-        for b in (a + 1)..n {
-            for q1 in 0..m {
-                for q2 in (q1 + 1)..m {
-                    add_clause(
-                        &mut solver,
-                        &[conn[q1][a][b].neg_lit(), conn[q2][a][b].pos_lit()],
-                    );
-                    add_clause(
-                        &mut solver,
-                        &[conn[q2][a][b].neg_lit(), conn[q1][a][b].pos_lit()],
-                    );
-                    cross_count += 2;
-                }
-            }
-        }
-    }
-
-    // 4. H4: incompatible triples.
-    //    ¬conn[0][a][b] ∨ ¬conn[0][a][c]  (binary!)
+    // 3. H4: incompatible triples. ¬conn[a][b] ∨ ¬conn[a][c] (binary!)
     for a in 0..n {
         for b in (a + 1)..n {
             for c in (b + 1)..n {
                 if nca_data.is_incompatible(a, b, c) {
                     add_clause(
                         &mut solver,
-                        &[conn[0][a][b].neg_lit(), conn[0][a][c].neg_lit()],
+                        &[conn[a][b].unwrap().neg_lit(), conn[a][c].unwrap().neg_lit()],
                     );
                     h4_count += 1;
                 }
@@ -1228,22 +372,29 @@ fn sat_solve_maf_cut(
         .unwrap();
 
     let encode_ms = t_enc.elapsed().as_secs_f64() * 1000.0;
-    let total_clauses = backward_count + forward_count + cross_count + h4_count;
+    let total_clauses = backward_count + forward_count + h4_count;
     profile.num_vars = vm.n_used() as usize;
     profile.encode_ms = path_ms + encode_ms;
 
     eprintln!(
-        "[cut] Clauses: {} total ({} backward + {} forward + {} cross + {} H4) in {:.1}ms",
-        total_clauses, backward_count, forward_count, cross_count, h4_count, encode_ms
+        "[cut] Clauses: {} total ({} backward + {} forward + {} H4) in {:.1}ms",
+        total_clauses, backward_count, forward_count, h4_count, encode_ms
     );
     eprintln!(
         "[cut] Total: {} vars, {} clauses. Totalizer over {} del vars.",
         profile.num_vars, total_clauses, del_0_count
     );
 
-    // --- Descent ---
+    // --- Descent with CEGAR for cross-tree consistency ---
     let t_total_solve = std::time::Instant::now();
     let mut best_components: Option<Vec<Vec<usize>>> = None;
+
+    fn uf_find(p: &mut [usize], x: usize) -> usize {
+        if p[x] != x {
+            p[x] = uf_find(p, p[x]);
+        }
+        p[x]
+    }
 
     for cuts_bound in (lb_cuts..=ub_cuts).rev() {
         let k_bound = cuts_bound + 1;
@@ -1258,21 +409,14 @@ fn sat_solve_maf_cut(
 
         match result {
             SolverResult::Sat => {
-                // Extract components from conn[0][*][*] using union-find.
-                let mut parent_uf: Vec<usize> = (0..n).collect();
-                fn find(p: &mut Vec<usize>, x: usize) -> usize {
-                    if p[x] != x {
-                        p[x] = find(p, p[x]);
-                    }
-                    p[x]
-                }
+                let mut uf: Vec<usize> = (0..n).collect();
                 for a in 0..n {
                     for b in (a + 1)..n {
-                        if solver.var_val(conn[0][a][b]).unwrap() == TernaryVal::True {
-                            let ra = find(&mut parent_uf, a);
-                            let rb = find(&mut parent_uf, b);
+                        if solver.var_val(conn[a][b].unwrap()).unwrap() == TernaryVal::True {
+                            let ra = uf_find(&mut uf, a);
+                            let rb = uf_find(&mut uf, b);
                             if ra != rb {
-                                parent_uf[ra] = rb;
+                                uf[ra] = rb;
                             }
                         }
                     }
@@ -1280,7 +424,7 @@ fn sat_solve_maf_cut(
                 let mut comp_map: fxhash::FxHashMap<usize, Vec<usize>> =
                     fxhash::FxHashMap::default();
                 for j in 0..n {
-                    let r = find(&mut parent_uf, j);
+                    let r = uf_find(&mut uf, j);
                     comp_map.entry(r).or_default().push(j);
                 }
                 let comps: Vec<Vec<usize>> = comp_map.into_values().collect();
@@ -1297,19 +441,18 @@ fn sat_solve_maf_cut(
                     "[cut] k={} UNSAT {:.1}ms (cum {:.1}s) — optimal={}",
                     k_bound, solve_ms, cum_s, k_bound + 1
                 );
-                profile.optimal_k = best_components.as_ref().map(|c| c.len()).unwrap_or(k_max);
+                profile.optimal_k =
+                    best_components.as_ref().map(|c| c.len()).unwrap_or(k_max);
                 profile.report();
-                return best_components
-                    .map(|c| components_to_trees(&c, &instance.trees[0], instance.num_leaves));
+                return best_components.map(|c| {
+                    components_to_trees(&c, &instance.trees[0], instance.num_leaves)
+                });
             }
             SolverResult::Interrupted => {
-                eprintln!(
-                    "[cut] k={} INTERRUPTED {:.1}ms (cum {:.1}s)",
-                    k_bound, solve_ms, cum_s
-                );
                 profile.report();
-                return best_components
-                    .map(|c| components_to_trees(&c, &instance.trees[0], instance.num_leaves));
+                return best_components.map(|c| {
+                    components_to_trees(&c, &instance.trees[0], instance.num_leaves)
+                });
             }
         }
     }
@@ -1413,16 +556,34 @@ fn solve_sat_inner_impl(
     // Compute LB, UB, and best partition via the shared maf_bounds pipeline.
     // This uses 20 seeds per ref_idx for multi-tree (vs the old 4), and returns
     // the best greedy partition for use as SAT phase hints.
+    let t_bounds = std::time::Instant::now();
     let bounds = maf_bounds(&reduced.trees, reduced.num_leaves);
     let ub_components = bounds.upper;
+    let bounds_ms = t_bounds.elapsed().as_secs_f64() * 1000.0;
+    eprintln!(
+        "[sat] Greedy bounds: LB={}, UB={} in {:.1}ms (n'={}, m={})",
+        bounds.lower, ub_components, bounds_ms, n_reduced, reduced.num_trees()
+    );
 
     // For multi-tree instances, try to tighten LB via exact pairwise distances + additive formula.
+    // Uses the SAT solver itself for pairwise solves (faster than FPT).
     let lb_components = if reduced.trees.len() >= 3 && bounds.upper > bounds.lower {
-        let exact_lb = exact_pairwise_lower_bound(
+        let t_exact = std::time::Instant::now();
+        let exact_lb = klados_core::lower_bound::exact_pairwise_lower_bound(
             &reduced.trees,
             reduced.num_leaves,
             bounds.lower,
             bounds.upper,
+            std::time::Duration::from_secs(3),
+            &mut |pair| {
+                let mut sub_stats = SolverStats::default();
+                solve_sat_inner(pair, &mut sub_stats, vec![]).map(|trees| trees.len())
+            },
+        );
+        let exact_ms = t_exact.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "[sat] Exact pairwise LB: {} (was {}) in {:.1}ms",
+            exact_lb, bounds.lower, exact_ms
         );
         exact_lb
     } else {
@@ -1430,8 +591,8 @@ fn solve_sat_inner_impl(
     };
 
     eprintln!(
-        "[sat] Bounds: LB={}, UB={} (n'={}, approx_lb={})",
-        lb_components, ub_components, n_reduced, bounds.lower
+        "[sat] Final bounds: LB={}, UB={}, gap={}",
+        lb_components, ub_components, ub_components - lb_components
     );
 
     // Translate all preferred singleton labels into 0-based indices in the fully-reduced instance.
