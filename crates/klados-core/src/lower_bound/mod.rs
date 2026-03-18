@@ -17,7 +17,7 @@ pub use cherry::{
     cherry_reduce_ub, greedy_multi_tree_partition, greedy_multi_tree_ub,
     greedy_multi_tree_ub_seeded, pairwise_refine_ub,
 };
-pub use red_blue::red_blue_approx;
+pub use red_blue::{red_blue_approx, red_blue_approx_detailed, RedBlueResult};
 
 pub struct MafBounds {
     pub lower: usize,
@@ -44,8 +44,10 @@ pub fn maf_bounds(trees: &[Tree], num_leaves: u32) -> MafBounds {
 
     for i in 0..m {
         for j in (i + 1)..m {
-            let approx_2 = red_blue_approx(&trees[i], &trees[j]);
-            let pair_lb = approx_2.div_ceil(2);
+            let rb = red_blue_approx_detailed(&trees[i], &trees[j]);
+
+            // Use the dual value D as LB on cuts (tighter than ceil(UB/2)).
+            let pair_lb = rb.dual_lb;
             lb_cuts[i][j] = pair_lb;
             lb_cuts[j][i] = pair_lb;
 
@@ -53,7 +55,7 @@ pub fn maf_bounds(trees: &[Tree], num_leaves: u32) -> MafBounds {
             if lb_components > best_lb {
                 best_lb = lb_components;
             }
-            let approx_ub_components = approx_2 + 1;
+            let approx_ub_components = rb.ub + 1;
             if approx_ub_components < best_ub_pair {
                 best_ub_pair = approx_ub_components;
             }

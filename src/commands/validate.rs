@@ -22,7 +22,7 @@ struct ScoreEntry {
     path: String,
 }
 
-// STRIDE summary.json format
+// STRIDE summary.json format (one JSON object per line)
 #[derive(serde::Deserialize, Debug)]
 #[allow(dead_code)]
 struct SummaryEntry {
@@ -42,6 +42,25 @@ struct SummaryEntry {
     path: String,
 }
 
+// PACE public database format (JSON array)
+#[derive(serde::Deserialize, Debug)]
+#[allow(dead_code)]
+struct PaceSummaryEntry {
+    track: String,
+    inst_num: usize,
+    name: String,
+    trees: usize,
+    leaves: usize,
+    idigest: String,
+    best_known_score: usize,
+    #[serde(default)]
+    num_best: usize,
+    #[serde(default)]
+    num_valid: usize,
+    #[serde(default)]
+    avg_best_compute_time_secs: f64,
+}
+
 pub fn run(scores_file: &PathBuf, top_n: usize) -> Result<(), Box<dyn std::error::Error>> {
     let content = fs::read_to_string(scores_file)?;
 
@@ -49,15 +68,46 @@ pub fn run(scores_file: &PathBuf, top_n: usize) -> Result<(), Box<dyn std::error
     let first_line = content.lines().next().unwrap_or("");
     let is_summary_format = first_line.contains("s_key") || first_line.contains("s_prev_best");
 
-    let entries: HashMap<String, ScoreEntry> = if is_summary_format {
-        // Parse summary.json format
+    // Try pace_summary.json format first (JSON array with "idigest", "best_known_score")
+    let is_pace_format = first_line.trim_start().starts_with('[');
+
+    let entries: HashMap<String, ScoreEntry> = if is_pace_format {
+        // Parse PACE public database format: JSON array of objects.
+        // Resolve instance files via stride-downloads/<h[0:2]>/<h[2:4]>/<h[4:]>
+        let pace_entries: Vec<PaceSummaryEntry> = serde_json::from_str(&content)?;
+        let mut entries = HashMap::new();
+        let base = scores_file.parent().unwrap_or(std::path::Path::new("."));
+        for pe in &pace_entries {
+            if pe.track != "exact" {
+                continue;
+            }
+            let h = pe.idigest.to_lowercase();
+            let path = base
+                .join("stride-downloads")
+                .join(&h[..2])
+                .join(&h[2..4])
+                .join(&h[4..]);
+            entries.insert(
+                h.clone(),
+                ScoreEntry {
+                    best_known: pe.best_known_score,
+                    our_score: pe.best_known_score,
+                    leaves: pe.leaves,
+                    trees: pe.trees,
+                    name: pe.name.clone(),
+                    path: path.to_string_lossy().into_owned(),
+                },
+            );
+        }
+        entries
+    } else if is_summary_format {
+        // Parse summary.json format (one JSON object per line)
         let mut entries = HashMap::new();
         for line in content.lines() {
             if line.trim().is_empty() {
                 continue;
             }
             if let Ok(summary) = serde_json::from_str::<SummaryEntry>(line) {
-                // Use the best of: our solver's result (guaranteed optimal) or database best
                 let optimal = if let Some(db_best) = summary.prev_best {
                     (summary.score as usize).min(db_best as usize)
                 } else {
@@ -111,7 +161,12 @@ pub fn run(scores_file: &PathBuf, top_n: usize) -> Result<(), Box<dyn std::error
     let mut tightness_pcts: Vec<f64> = Vec::new();
 
     for (digest, entry) in sorted_entries {
-        let full_path = base_dir.join(&entry.path);
+        let entry_path = std::path::Path::new(&entry.path);
+        let full_path = if entry_path.is_absolute() {
+            entry_path.to_path_buf()
+        } else {
+            base_dir.join(entry_path)
+        };
 
         if !full_path.exists() {
             println!(

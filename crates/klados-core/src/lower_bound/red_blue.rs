@@ -9,6 +9,166 @@ use super::feasibility::{
 use super::partition::Partition;
 use super::tree_data::TreeData;
 
+/// Result of the detailed red-blue 2-approximation algorithm.
+pub struct RedBlueResult {
+    /// Upper bound: the solution cost (number of components - 1 after merging).
+    pub ub: usize,
+    /// Dual lower bound D on OPT: |P_before_merge| - 1 - y_decrements.
+    pub dual_lb: usize,
+}
+
+pub fn red_blue_approx_detailed(t1: &Tree, t2: &Tree) -> RedBlueResult {
+    let n = t1.num_leaves;
+    if n <= 1 {
+        return RedBlueResult { ub: 0, dual_lb: 0 };
+    }
+
+    let trace = std::env::var("RED_BLUE_TRACE").is_ok();
+
+    let td1 = TreeData::build(t1);
+    let td2 = TreeData::build(t2);
+    let mut partition = Partition::new_single(n);
+    let mut pairslist: Vec<(Label, Label)> = Vec::new();
+    let mut y_decrements: usize = 0;
+
+    if trace {
+        eprintln!("[RB] Starting red_blue_approx_detailed with {} leaves", n);
+        eprintln!("[RB] T1 root={}, T2 root={}", t1.root, t2.root);
+    }
+
+    let max_iterations = 4 * n as usize;
+    for iter in 0..max_iterations {
+        if trace {
+            eprintln!("[RB] === Iteration {} ===", iter);
+            eprintln!(
+                "[RB] Partition has {} components",
+                partition.count_components()
+            );
+            for cid in partition.active_component_ids() {
+                let members: Vec<usize> = partition.members[cid as usize].ones().collect();
+                eprintln!("[RB]   comp {}: {:?}", cid, members);
+            }
+        }
+
+        let u = match find_lowest_roi(&td1, &td2, &partition) {
+            Some(u) => u,
+            None => {
+                if trace {
+                    eprintln!("[RB] No ROI found — partition is feasible");
+                }
+                break;
+            }
+        };
+
+        // y decrement for lca1(R∪B) at start of iteration
+        y_decrements += 1;
+
+        let (u_l, u_r) = t1.children(u).unwrap();
+
+        let red = &td1.leaf_set[u_r as usize];
+        let blue = &td1.leaf_set[u_l as usize];
+        let mut white = FixedBitSet::with_capacity(n as usize + 1);
+        for lbl in 1..=n as usize {
+            if !red.contains(lbl) && !blue.contains(lbl) {
+                white.insert(lbl);
+            }
+        }
+
+        if trace {
+            let reds: Vec<usize> = red.ones().collect();
+            let blues: Vec<usize> = blue.ones().collect();
+            let whites: Vec<usize> = white.ones().collect();
+            eprintln!("[RB] ROI: u={} (u_l={}, u_r={})", u, u_l, u_r);
+            eprintln!("[RB] Red (L(u_r)): {:?}", reds);
+            eprintln!("[RB] Blue (L(u_l)): {:?}", blues);
+            eprintln!("[RB] White: {:?}", whites);
+        }
+
+        let original_comp = partition.comp.clone();
+
+        y_decrements += make_rub_compatible(&td1, &td2, &mut partition, red, blue);
+        if trace {
+            eprintln!(
+                "[RB] After Make-RUB-compatible: {} components",
+                partition.count_components()
+            );
+            for cid in partition.active_component_ids() {
+                let members: Vec<usize> = partition.members[cid as usize].ones().collect();
+                eprintln!("[RB]   comp {}: {:?}", cid, members);
+            }
+        }
+
+        y_decrements += make_splittable(&td2, &mut partition, red, blue, &white);
+        if trace {
+            eprintln!(
+                "[RB] After Make-Splittable: {} components",
+                partition.count_components()
+            );
+            for cid in partition.active_component_ids() {
+                let members: Vec<usize> = partition.members[cid as usize].ones().collect();
+                eprintln!("[RB]   comp {}: {:?}", cid, members);
+            }
+        }
+
+        y_decrements += split_procedure(&td1, &td2, &mut partition, red, blue, &white);
+        if trace {
+            eprintln!(
+                "[RB] After Split: {} components",
+                partition.count_components()
+            );
+            for cid in partition.active_component_ids() {
+                let members: Vec<usize> = partition.members[cid as usize].ones().collect();
+                eprintln!("[RB]   comp {}: {:?}", cid, members);
+            }
+        }
+
+        if let Some(pair) = find_merge_pair(&td1, &td2, &partition, red, blue, &original_comp) {
+            if trace {
+                eprintln!("[RB] Find-Merge-Pair found: ({}, {})", pair.0, pair.1);
+            }
+            pairslist.push(pair);
+        } else if trace {
+            eprintln!("[RB] Find-Merge-Pair: no pair found");
+        }
+    }
+
+    // D = |P_before_merge| - 1 - y_decrements
+    let p_before_merge = partition.count_components();
+    let dual_lb = p_before_merge.saturating_sub(1).saturating_sub(y_decrements);
+
+    if trace {
+        eprintln!("[RB] === Merge-Components: {} pairs ===", pairslist.len());
+        eprintln!(
+            "[RB] Dual: |P_before_merge|={}, y_decrements={}, D={}",
+            p_before_merge, y_decrements, dual_lb
+        );
+    }
+    for &(x1, x2) in pairslist.iter() {
+        let c1 = partition.component_of(x1);
+        let c2 = partition.component_of(x2);
+        if trace {
+            eprintln!("[RB] Merge: x1={}, x2={}, c1={}, c2={}", x1, x2, c1, c2);
+        }
+        partition.merge(c1, c2);
+    }
+
+    let nc = partition.count_components();
+    if trace {
+        eprintln!(
+            "[RB] Final: {} components (UB={}, dual_LB={})",
+            nc,
+            nc.saturating_sub(1),
+            dual_lb,
+        );
+        for cid in partition.active_component_ids() {
+            let members: Vec<usize> = partition.members[cid as usize].ones().collect();
+            eprintln!("[RB]   comp {}: {:?}", cid, members);
+        }
+    }
+    let ub = if nc == 0 { 0 } else { nc - 1 };
+    RedBlueResult { ub, dual_lb }
+}
+
 pub fn red_blue_approx(t1: &Tree, t2: &Tree) -> usize {
     let n = t1.num_leaves;
     if n <= 1 {
@@ -74,7 +234,7 @@ pub fn red_blue_approx(t1: &Tree, t2: &Tree) -> usize {
 
         let original_comp = partition.comp.clone();
 
-        make_rub_compatible(&td1, &td2, &mut partition, red, blue);
+        let _ = make_rub_compatible(&td1, &td2, &mut partition, red, blue);
         if trace {
             eprintln!(
                 "[RB] After Make-RUB-compatible: {} components",
@@ -86,7 +246,7 @@ pub fn red_blue_approx(t1: &Tree, t2: &Tree) -> usize {
             }
         }
 
-        make_splittable(&td2, &mut partition, red, blue, &white);
+        let _ = make_splittable(&td2, &mut partition, red, blue, &white);
         if trace {
             eprintln!(
                 "[RB] After Make-Splittable: {} components",
@@ -98,7 +258,7 @@ pub fn red_blue_approx(t1: &Tree, t2: &Tree) -> usize {
             }
         }
 
-        split_procedure(&td1, &td2, &mut partition, red, blue, &white);
+        let _ = split_procedure(&td1, &td2, &mut partition, red, blue, &white);
         if trace {
             eprintln!(
                 "[RB] After Split: {} components",
@@ -147,15 +307,17 @@ pub fn red_blue_approx(t1: &Tree, t2: &Tree) -> usize {
     if nc == 0 { 0 } else { nc - 1 }
 }
 
+/// Returns the number of splits performed (= number of y decrements).
 fn make_rub_compatible(
     td1: &TreeData,
     td2: &TreeData,
     partition: &mut Partition,
     red: &FixedBitSet,
     blue: &FixedBitSet,
-) {
+) -> usize {
     let mut rub = red.clone();
     rub.union_with(blue);
+    let mut num_splits = 0usize;
 
     loop {
         let mut split_done = false;
@@ -177,6 +339,7 @@ fn make_rub_compatible(
                 inside.intersect_with(u_hat_leaves);
                 if inside.count_ones(..) > 0 && inside.count_ones(..) < labels.count_ones(..) {
                     partition.split_off(&inside);
+                    num_splits += 1;
                     split_done = true;
                     break;
                 }
@@ -186,6 +349,7 @@ fn make_rub_compatible(
             break;
         }
     }
+    num_splits
 }
 
 fn find_rub_split_node(
@@ -247,13 +411,15 @@ fn find_rub_split_node(
     best
 }
 
+/// Returns the number of splits performed (= number of y decrements).
 fn make_splittable(
     td2: &TreeData,
     partition: &mut Partition,
     red: &FixedBitSet,
     blue: &FixedBitSet,
     white: &FixedBitSet,
-) {
+) -> usize {
+    let mut num_splits = 0usize;
     loop {
         let mut split_done = false;
         for cid in partition.active_component_ids() {
@@ -267,6 +433,7 @@ fn make_splittable(
                 inside.intersect_with(u_hat_leaves);
                 if inside.count_ones(..) > 0 && inside.count_ones(..) < labels.count_ones(..) {
                     partition.split_off(&inside);
+                    num_splits += 1;
                     split_done = true;
                     break;
                 }
@@ -276,6 +443,7 @@ fn make_splittable(
             break;
         }
     }
+    num_splits
 }
 
 fn is_splittable(
@@ -360,6 +528,7 @@ fn find_splittable_split_node(
     None
 }
 
+/// Returns the number of y decrements from special_split's else branch.
 fn split_procedure(
     td1: &TreeData,
     td2: &TreeData,
@@ -367,7 +536,8 @@ fn split_procedure(
     red: &FixedBitSet,
     blue: &FixedBitSet,
     white: &FixedBitSet,
-) {
+) -> usize {
+    let mut y_decrements = 0usize;
     let comp_ids = partition.active_component_ids();
     for cid in comp_ids {
         let labels = partition.members[cid as usize].clone();
@@ -389,7 +559,7 @@ fn split_procedure(
             a_r.count_ones(..) > 0 && a_b.count_ones(..) > 0 && a_w.count_ones(..) > 0;
 
         if is_tricolored && has_compatible_tricolored_triple(td1, td2, &a_r, &a_b, &a_w) {
-            special_split(td1, td2, partition, cid, &a_r, &a_b, &a_w);
+            y_decrements += special_split(td1, td2, partition, cid, &a_r, &a_b, &a_w);
         } else {
             if a_r.count_ones(..) > 0 && (a_b.count_ones(..) > 0 || a_w.count_ones(..) > 0) {
                 partition.split_off(&a_r);
@@ -399,6 +569,7 @@ fn split_procedure(
             }
         }
     }
+    y_decrements
 }
 
 fn has_compatible_tricolored_triple(
@@ -420,6 +591,7 @@ fn has_compatible_tricolored_triple(
     false
 }
 
+/// Returns 1 if the else branch was executed (y decrement for û = lca2(A∩(R∪B))), 0 otherwise.
 fn special_split(
     td1: &TreeData,
     td2: &TreeData,
@@ -428,7 +600,7 @@ fn special_split(
     a_r: &FixedBitSet,
     a_b: &FixedBitSet,
     a_w: &FixedBitSet,
-) {
+) -> usize {
     let all_compatible = a_r.ones().all(|r| {
         a_b.ones().all(|b| {
             a_w.ones()
@@ -438,11 +610,12 @@ fn special_split(
 
     if all_compatible {
         partition.split_off(a_r);
+        0
     } else {
         let mut rub = a_r.clone();
         rub.union_with(a_b);
         if rub.count_ones(..) == 0 {
-            return;
+            return 0;
         }
         let u_hat = td2.lca_of_labels(&rub);
         let u_hat_leaves = &td2.leaf_set[u_hat as usize];
@@ -474,6 +647,7 @@ fn special_split(
         if apb.count_ones(..) > 0 {
             partition.split_off(&apb);
         }
+        1
     }
 }
 
