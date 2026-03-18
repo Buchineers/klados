@@ -338,7 +338,10 @@ fn sat_solve_maf_cut(
         }
     }
 
-    // 3. H4: incompatible triples. ¬conn[a][b] ∨ ¬conn[a][c] (binary!)
+    // 3. H4: incompatible triples — all 3 binary clauses per triple.
+    //    For integer solutions, at most one pair from an incompatible triple can
+    //    be in the same component (s(a,b) + s(a,c) + s(b,c) ≤ 1).
+    //    All 3 binary clauses maximize unit propagation in CaDiCaL.
     for a in 0..n {
         for b in (a + 1)..n {
             for c in (b + 1)..n {
@@ -347,7 +350,15 @@ fn sat_solve_maf_cut(
                         &mut solver,
                         &[conn[a][b].unwrap().neg_lit(), conn[a][c].unwrap().neg_lit()],
                     );
-                    h4_count += 1;
+                    add_clause(
+                        &mut solver,
+                        &[conn[a][b].unwrap().neg_lit(), conn[b][c].unwrap().neg_lit()],
+                    );
+                    add_clause(
+                        &mut solver,
+                        &[conn[a][c].unwrap().neg_lit(), conn[b][c].unwrap().neg_lit()],
+                    );
+                    h4_count += 3;
                 }
             }
         }
