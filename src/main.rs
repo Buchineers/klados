@@ -49,6 +49,8 @@ enum Commands {
     Info,
     Bounds,
     RedBlueUB,
+    /// Print detailed bounds comparison (red-blue, LP relaxation, Olver LP*).
+    BoundsDetail,
     ValidateBounds {
         #[arg(value_name = "FILE")]
         scores_file: std::path::PathBuf,
@@ -131,6 +133,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Some(Commands::Bounds) => {
                     commands::bounds::run(&instance, cli.verbose)?;
+                }
+                Some(Commands::BoundsDetail) => {
+                    commands::bounds_detail::run(&instance)?;
                 }
                 Some(Commands::Exact { approach }) => {
                     commands::exact::run(&instance, &approach, cli.verbose)?;
