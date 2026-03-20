@@ -86,7 +86,7 @@ fn chain32_finds_interceptor() {
     ]);
     let rev: Vec<u32> = (0..=inst.num_leaves).collect();
     let ctx = make_ctx(&inst, &rev);
-    let rule = Chain32Rule { allow_multi: false };
+    let rule = Chain32Rule { allow_multi: false, max_partners: usize::MAX };
     let action = rule.find(&ctx);
     assert!(matches!(action, Some(ReductionAction::Delete { .. })));
 }
