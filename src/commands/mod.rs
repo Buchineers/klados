@@ -8,4 +8,5 @@ pub mod compare;
 pub mod exact;
 pub mod heuristic;
 pub mod kernelize;
+pub mod kernelize_diag;
 pub mod validate;

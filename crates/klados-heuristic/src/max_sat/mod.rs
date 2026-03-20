@@ -44,7 +44,7 @@ impl MaxSatSolver {
 
         // Kernelize first to reduce the instance size before encoding.
         let kern_config = KernelizeConfig::default();
-        let kern = kernelize::kernelize(instance, &kern_config);
+        let kern = kernelize::kernelize_best(instance, &kern_config);
         let reduced = &kern.instance;
 
         // Compute bounds on the reduced instance.

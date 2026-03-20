@@ -39,13 +39,18 @@ enum Commands {
         /// Enable chain reduction
         #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
         chain: bool,
-        /// Enable 3-2 chain reduction (2-tree only)
+        /// Enable 3-2 chain reduction
         #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
         chain32: bool,
-        /// Experimental: enable 3-2 chain reduction for multi-tree (unproven)
-        #[arg(long, default_value = "false", action = clap::ArgAction::Set)]
+        /// Enable 3-2 chain reduction for multi-tree (proven for all t >= 2)
+        #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
         chain32_multi: bool,
+        /// Victim selection strategy for parameter-reducing rules: first, last, max-cascade
+        #[arg(long, default_value = "first")]
+        strategy: String,
     },
+    /// Diagnose kernelization gaps: find singletons missed by reduction rules.
+    KernelizeDiag,
     Info,
     Bounds,
     RedBlueUB,
@@ -145,6 +150,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     chain,
                     chain32,
                     chain32_multi,
+                    strategy,
                 }) => {
                     commands::kernelize::run(
                         &instance,
@@ -152,8 +158,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         chain,
                         chain32,
                         chain32_multi,
+                        &strategy,
                         cli.verbose,
                     )?;
+                }
+                Some(Commands::KernelizeDiag) => {
+                    commands::kernelize_diag::run(&instance, cli.verbose)?;
                 }
                 Some(Commands::Heuristic { solver }) => {
                     commands::heuristic::run(&instance, &solver, cli.verbose)?;

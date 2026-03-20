@@ -45,13 +45,7 @@ pub fn run(list_file: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let mut total_lb = 0usize;
     let mut total_ub = 0usize;
 
-    let kern_config = KernelizeConfig {
-        subtree: true,
-        chain: true,
-        chain32: true,
-        chain32_multi: true,
-        protected_labels: Vec::new(),
-    };
+    let kern_config = KernelizeConfig::default();
 
     for line in &lines {
         let line = line.trim();
@@ -143,9 +137,9 @@ pub fn run(list_file: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
             m,
             num_leaves,
             n_kern,
-            kern.stats.subtree_removed,
-            kern.stats.chain_removed,
-            kern.stats.chain32_removed,
+            kern.stats.subtree_removed(),
+            kern.stats.chain_removed(),
+            kern.stats.chain32_removed(),
             lb,
             ub,
             gap,

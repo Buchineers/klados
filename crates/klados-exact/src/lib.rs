@@ -28,6 +28,7 @@ pub fn available_solvers() -> Vec<Box<dyn ExactSolver>> {
         Box::new(shi_mestel::ShiMestelSolver::new()),
         Box::new(maf_ilp::MafIlpSolver::new()),
         Box::new(maf_sat::MafSatSolver::new()),
+        Box::new(maf_sat::MafSatOlverSolver::new()),
     ]
 }
 
@@ -58,6 +59,12 @@ mod tests {
     #[test]
     fn test_registry_has_maf_sat() {
         let solver = solver_by_name("maf-sat");
+        assert!(solver.is_some());
+    }
+
+    #[test]
+    fn test_registry_has_maf_sat_olver() {
+        let solver = solver_by_name("maf-sat-olver");
         assert!(solver.is_some());
     }
 }
