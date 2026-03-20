@@ -66,19 +66,19 @@ impl ShiMestelSolver {
         }
 
         let config = KernelizeConfig::default();
-        let kern = kernelize::kernelize(instance, &config);
+        let kern = kernelize::kernelize_best(instance, &config);
 
         if kern.stats.reduced_leaves < instance.num_leaves {
             let total =
-                kern.stats.subtree_removed + kern.stats.chain_removed + kern.stats.chain32_removed;
+                kern.stats.subtree_removed() + kern.stats.chain_removed() + kern.stats.chain32_removed();
             trace!(
                 "kernelized: {} → {} leaves ({} removed: {} subtree, {} chain, {} 3-2)",
                 instance.num_leaves,
                 kern.stats.reduced_leaves,
                 total,
-                kern.stats.subtree_removed,
-                kern.stats.chain_removed,
-                kern.stats.chain32_removed,
+                kern.stats.subtree_removed(),
+                kern.stats.chain_removed(),
+                kern.stats.chain32_removed(),
             );
         }
 
