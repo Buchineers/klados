@@ -51,6 +51,8 @@ pub struct KernelizeConfig {
     pub protected_labels: Vec<u32>,
     /// Strategy for selecting among multiple parameter-reducing candidates.
     pub victim_strategy: VictimStrategy,
+    /// Max distinct cherry partners for multi-tree 3-2 rule (2 = classic, usize::MAX = extended).
+    pub max_partners: usize,
 }
 
 impl Default for KernelizeConfig {
@@ -62,6 +64,7 @@ impl Default for KernelizeConfig {
             chain32_multi: true,
             protected_labels: Vec::new(),
             victim_strategy: VictimStrategy::First,
+            max_partners: usize::MAX,
         }
     }
 }
@@ -99,6 +102,7 @@ fn build_rules(config: &KernelizeConfig) -> Vec<Box<dyn ReductionRule>> {
     if config.chain32 || config.chain32_multi {
         rules.push(Box::new(Chain32Rule {
             allow_multi: config.chain32_multi,
+            max_partners: config.max_partners,
         }));
     }
     // Rules 3 and 4 (Kelk & Linz 2020): crossed/external cherry on common 3-chains.

@@ -13,6 +13,7 @@ pub fn run(
     chain32: bool,
     chain32_multi: bool,
     strategy: &str,
+    max_partners: usize,
     verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let victim_strategy = match strategy {
@@ -32,6 +33,7 @@ pub fn run(
         chain32_multi,
         protected_labels: Vec::new(),
         victim_strategy,
+        max_partners,
     };
 
     let start = Instant::now();

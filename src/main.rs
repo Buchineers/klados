@@ -48,6 +48,9 @@ enum Commands {
         /// Victim selection strategy for parameter-reducing rules: first, last, max-cascade
         #[arg(long, default_value = "first")]
         strategy: String,
+        /// Max distinct cherry partners for multi-tree 3-2 (2=classic, 0=unlimited)
+        #[arg(long, default_value = "0")]
+        max_partners: usize,
     },
     /// Diagnose kernelization gaps: find singletons missed by reduction rules.
     KernelizeDiag,
@@ -151,6 +154,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     chain32,
                     chain32_multi,
                     strategy,
+                    max_partners,
                 }) => {
                     commands::kernelize::run(
                         &instance,
@@ -159,6 +163,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         chain32,
                         chain32_multi,
                         &strategy,
+                        if max_partners == 0 { usize::MAX } else { max_partners },
                         cli.verbose,
                     )?;
                 }

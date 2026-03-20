@@ -17,6 +17,8 @@ use super::rule::{ReductionAction, ReductionRule, RuleContext, VictimStrategy};
 pub struct Chain32Rule {
     /// Whether to apply the rule on multi-tree instances (t >= 3).
     pub allow_multi: bool,
+    /// Max distinct cherry partners to consider (2 = classic, usize::MAX = extended).
+    pub max_partners: usize,
 }
 
 impl ReductionRule for Chain32Rule {
@@ -30,27 +32,26 @@ impl ReductionRule for Chain32Rule {
             return None;
         }
 
+        let max_p = self.max_partners;
         let victim = match ctx.victim_strategy {
             VictimStrategy::First => {
                 if inst.num_trees() == 2 {
                     find_32_chain_candidate(&inst.trees[0], &inst.trees[1], inst.num_leaves)
                 } else if self.allow_multi && inst.num_trees() >= 3 {
-                    find_32_chain_candidate_multi(&inst.trees, inst.num_leaves)
+                    find_32_chain_candidate_multi(&inst.trees, inst.num_leaves, max_p)
                 } else {
                     None
                 }
             }
             VictimStrategy::Last => {
-                let candidates = find_all_32_candidates(inst, self.allow_multi);
+                let candidates = find_all_32_candidates(inst, self.allow_multi, max_p);
                 candidates.into_iter().last()
             }
             VictimStrategy::MaxCascade => {
-                let candidates = find_all_32_candidates(inst, self.allow_multi);
+                let candidates = find_all_32_candidates(inst, self.allow_multi, max_p);
                 if candidates.len() <= 1 {
                     candidates.into_iter().next()
                 } else {
-                    // Score each candidate by how many new common cherries
-                    // would appear after deleting it
                     candidates
                         .into_iter()
                         .max_by_key(|&v| count_new_cherries_after_delete(inst, v))
@@ -63,11 +64,11 @@ impl ReductionRule for Chain32Rule {
 }
 
 /// Find ALL 3-2 chain candidates in the instance.
-fn find_all_32_candidates(inst: &crate::Instance, allow_multi: bool) -> Vec<u32> {
+fn find_all_32_candidates(inst: &crate::Instance, allow_multi: bool, max_partners: usize) -> Vec<u32> {
     if inst.num_trees() == 2 {
         find_all_32_chain_candidates_2tree(&inst.trees[0], &inst.trees[1], inst.num_leaves)
     } else if allow_multi && inst.num_trees() >= 3 {
-        find_all_32_chain_candidates_multi(&inst.trees, inst.num_leaves)
+        find_all_32_chain_candidates_multi(&inst.trees, inst.num_leaves, max_partners)
     } else {
         Vec::new()
     }
@@ -242,9 +243,9 @@ fn check_32_at_pivot(t1: &Tree, t2: &Tree, p: u32, _num_leaves: u32) -> Option<u
 // ═══════════════════════════════════════════════════════════════
 
 /// Find a single 3-2 chain reduction candidate across multiple trees.
-fn find_32_chain_candidate_multi(trees: &[Tree], num_leaves: u32) -> Option<u32> {
+fn find_32_chain_candidate_multi(trees: &[Tree], num_leaves: u32, max_partners: usize) -> Option<u32> {
     for p in 1..=num_leaves {
-        if let Some(victim) = check_32_multi_at_pivot(trees, p) {
+        if let Some(victim) = check_32_multi_at_pivot(trees, p, max_partners) {
             return Some(victim);
         }
     }
@@ -252,10 +253,10 @@ fn find_32_chain_candidate_multi(trees: &[Tree], num_leaves: u32) -> Option<u32>
 }
 
 /// Find ALL 3-2 chain candidates across multiple trees.
-fn find_all_32_chain_candidates_multi(trees: &[Tree], num_leaves: u32) -> Vec<u32> {
+fn find_all_32_chain_candidates_multi(trees: &[Tree], num_leaves: u32, max_partners: usize) -> Vec<u32> {
     let mut candidates = Vec::new();
     for p in 1..=num_leaves {
-        if let Some(victim) = check_32_multi_at_pivot(trees, p) {
+        if let Some(victim) = check_32_multi_at_pivot(trees, p, max_partners) {
             if !candidates.contains(&victim) {
                 candidates.push(victim);
             }
@@ -265,7 +266,7 @@ fn find_all_32_chain_candidates_multi(trees: &[Tree], num_leaves: u32) -> Vec<u3
 }
 
 /// Check 3-2 multi-tree pattern at pivot p.
-fn check_32_multi_at_pivot(trees: &[Tree], p: u32) -> Option<u32> {
+fn check_32_multi_at_pivot(trees: &[Tree], p: u32, max_partners: usize) -> Option<u32> {
     let mut siblings: Vec<u32> = Vec::with_capacity(trees.len());
     for tree in trees {
         let node_p = tree.node_by_label(p);
@@ -284,23 +285,85 @@ fn check_32_multi_at_pivot(trees: &[Tree], p: u32) -> Option<u32> {
     unique_sibs.sort_unstable();
     unique_sibs.dedup();
 
-    if unique_sibs.len() != 2 {
+    if unique_sibs.len() < 2 || unique_sibs.len() > max_partners {
         return None;
     }
 
-    let q = unique_sibs[0];
-    let r = unique_sibs[1];
-
-    if try_32_delete(trees, &siblings, q, r) {
-        return Some(r);
-    }
-    if try_32_delete(trees, &siblings, r, q) {
-        return Some(q);
+    // For each distinct partner as potential victim, check if the 3-2
+    // interceptor condition holds. With 2 partners this is the classic rule.
+    // With 3+ partners (only possible for t >= 3), we try each partner as victim:
+    // trees where p's partner IS the victim must satisfy the interceptor condition
+    // with some other partner as keeper. Trees where p's partner is NOT the victim
+    // are automatically in "cherry state" (they don't have the victim as partner).
+    for &victim in &unique_sibs {
+        if try_32_delete_multi_partner(trees, &siblings, &unique_sibs, victim) {
+            return Some(victim);
+        }
     }
     None
 }
 
-/// Check if `victim` can be deleted in a multi-tree 3-2 reduction.
+/// Check if `victim` can be deleted with multiple possible keepers.
+///
+/// For each tree where p's partner is the victim, the interceptor condition must
+/// hold with SOME keeper (any non-victim partner). For trees where p's partner
+/// is not the victim, they're automatically in cherry state.
+fn try_32_delete_multi_partner(
+    trees: &[Tree],
+    siblings: &[u32],
+    _all_partners: &[u32],
+    victim: u32,
+) -> bool {
+    let mut interceptor_exists = false;
+
+    for (t_idx, tree) in trees.iter().enumerate() {
+        if siblings[t_idx] != victim {
+            // This tree has a non-victim partner → cherry state, OK
+            continue;
+        }
+
+        // This tree has {p, victim} as cherry. Need interceptor condition
+        // with some keeper: par(keeper in tree) == grandpar(victim in tree)
+        let node_victim = tree.node_by_label(victim);
+        if node_victim == NONE {
+            return false;
+        }
+        let parent_victim = tree.parent[node_victim as usize];
+        if parent_victim == NONE {
+            return false;
+        }
+        let gp_victim = tree.parent[parent_victim as usize];
+        if gp_victim == NONE {
+            return false;
+        }
+
+        // Check if ANY non-victim partner satisfies the interceptor
+        let mut found_keeper = false;
+        for &other_partner in siblings.iter() {
+            if other_partner == victim {
+                continue;
+            }
+            let node_keeper = tree.node_by_label(other_partner);
+            if node_keeper == NONE {
+                continue;
+            }
+            let parent_keeper = tree.parent[node_keeper as usize];
+            if parent_keeper != NONE && parent_keeper == gp_victim {
+                found_keeper = true;
+                break;
+            }
+        }
+
+        if !found_keeper {
+            return false;
+        }
+        interceptor_exists = true;
+    }
+
+    interceptor_exists
+}
+
+/// Check if `victim` can be deleted in a multi-tree 3-2 reduction (original 2-partner version).
 fn try_32_delete(trees: &[Tree], siblings: &[u32], keeper: u32, victim: u32) -> bool {
     let mut interceptor_exists = false;
 
