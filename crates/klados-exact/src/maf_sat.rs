@@ -291,6 +291,12 @@ fn add_rspr_implications(
 
     let mut clause_count = 0usize;
 
+    // Only proven correct for m=2. For m>2, the implications may be
+    // invalid because they don't account for all tree constraints.
+    if m != 2 {
+        return 0;
+    }
+
     // For each tree q, find sibling pairs and check against other trees.
     for q in 0..m {
         let tree_q = &instance.trees[q];
@@ -446,6 +452,7 @@ fn sat_solve_maf_cut(
     k_max: usize,
     lb_components: usize,
     profile: &mut SolveProfile,
+    use_cegar: bool,
 ) -> Option<Vec<Tree>> {
     let n = instance.num_leaves as usize;
     let m = instance.num_trees();
@@ -522,16 +529,20 @@ fn sat_solve_maf_cut(
     let mut h4_count = 0usize;
 
     // 1. Backward for ALL trees: conn[a][b] → ¬del[q][v].
-    for q in 0..m {
-        for a in 0..n {
-            for b in (a + 1)..n {
-                for &v in &paths[q][a][b] {
-                    if let Some(dv) = del[q][v as usize] {
-                        add_clause(
-                            &mut solver,
-                            &[conn[a][b].unwrap().neg_lit(), dv.neg_lit()],
-                        );
-                        backward_count += 1;
+    //    Can be deferred via CEGAR (use_cegar=true) to reduce initial formula size,
+    //    but the overhead of CEGAR rounds often outweighs the benefit.
+    if !use_cegar {
+        for q in 0..m {
+            for a in 0..n {
+                for b in (a + 1)..n {
+                    for &v in &paths[q][a][b] {
+                        if let Some(dv) = del[q][v as usize] {
+                            add_clause(
+                                &mut solver,
+                                &[conn[a][b].unwrap().neg_lit(), dv.neg_lit()],
+                            );
+                            backward_count += 1;
+                        }
                     }
                 }
             }
@@ -617,7 +628,7 @@ fn sat_solve_maf_cut(
         profile.num_vars, total_clauses, del_0_count
     );
 
-    // --- Descent with CEGAR for cross-tree consistency ---
+    // --- Descent with CEGAR for backward clauses ---
     let t_total_solve = std::time::Instant::now();
     let mut best_components: Option<Vec<Vec<usize>>> = None;
 
@@ -632,85 +643,126 @@ fn sat_solve_maf_cut(
         let k_bound = cuts_bound + 1;
         let assumps_vec = totalizer.enforce_ub(cuts_bound).unwrap();
 
-        profile.sat_calls += 1;
-        let t_solve = std::time::Instant::now();
-        let result = solver.solve_assumps(&assumps_vec).unwrap();
-        let solve_ms = t_solve.elapsed().as_secs_f64() * 1000.0;
-        profile.solve_ms += solve_ms;
-        let cum_s = t_total_solve.elapsed().as_secs_f64();
+        // CEGAR loop: solve, check backward violations, add them, re-solve.
+        loop {
+            profile.sat_calls += 1;
+            let t_solve = std::time::Instant::now();
+            let result = solver.solve_assumps(&assumps_vec).unwrap();
+            let solve_ms = t_solve.elapsed().as_secs_f64() * 1000.0;
+            profile.solve_ms += solve_ms;
+            let cum_s = t_total_solve.elapsed().as_secs_f64();
 
-        match result {
-            SolverResult::Sat => {
-                let mut uf: Vec<usize> = (0..n).collect();
-                for a in 0..n {
-                    for b in (a + 1)..n {
-                        if solver.var_val(conn[a][b].unwrap()).unwrap() == TernaryVal::True {
-                            let ra = uf_find(&mut uf, a);
-                            let rb = uf_find(&mut uf, b);
-                            if ra != rb {
-                                uf[ra] = rb;
+            match result {
+                SolverResult::Sat => {
+                    // CEGAR: check for backward constraint violations (only when enabled).
+                    if use_cegar {
+                        let mut violated_clauses: Vec<[Lit; 2]> = Vec::new();
+                        for a in 0..n {
+                            for b in (a + 1)..n {
+                                if solver.var_val(conn[a][b].unwrap()).unwrap() != TernaryVal::True {
+                                    continue;
+                                }
+                                for q in 0..m {
+                                    for &v in &paths[q][a][b] {
+                                        if let Some(dv) = del[q][v as usize] {
+                                            if solver.var_val(dv).unwrap() == TernaryVal::True {
+                                                violated_clauses.push([
+                                                    conn[a][b].unwrap().neg_lit(),
+                                                    dv.neg_lit(),
+                                                ]);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if !violated_clauses.is_empty() {
+                            let violations = violated_clauses.len();
+                            for clause in &violated_clauses {
+                                add_clause(&mut solver, clause);
+                            }
+                            backward_count += violations;
+                            profile.cegar_violations += violations;
+                            eprintln!(
+                                "[cut] k={} CEGAR +{} backward clauses (total={}) {:.1}ms (cum {:.1}s)",
+                                k_bound, violations, backward_count, solve_ms, cum_s
+                            );
+                            continue; // Re-solve with new clauses.
+                        }
+                    }
+
+                    // No violations — valid solution.
+                    let mut uf: Vec<usize> = (0..n).collect();
+                    for a in 0..n {
+                        for b in (a + 1)..n {
+                            if solver.var_val(conn[a][b].unwrap()).unwrap() == TernaryVal::True {
+                                let ra = uf_find(&mut uf, a);
+                                let rb = uf_find(&mut uf, b);
+                                if ra != rb {
+                                    uf[ra] = rb;
+                                }
                             }
                         }
                     }
-                }
-                let mut comp_map: fxhash::FxHashMap<usize, Vec<usize>> =
-                    fxhash::FxHashMap::default();
-                for j in 0..n {
-                    let r = uf_find(&mut uf, j);
-                    comp_map.entry(r).or_default().push(j);
-                }
-                let comps: Vec<Vec<usize>> = comp_map.into_values().collect();
-                let num_comps = comps.len();
-                let max_sz = comps.iter().map(|c| c.len()).max().unwrap_or(0);
-                eprintln!(
-                    "[cut] k={} SAT {:.1}ms (cum {:.1}s) comps={} max_size={}",
-                    k_bound, solve_ms, cum_s, num_comps, max_sz
-                );
-                best_components = Some(comps);
-
-                // Phase hints: bias next solve toward current solution.
-                // This helps CaDiCaL find similar solutions at k-1 faster.
-                for a in 0..n {
-                    for b in (a + 1)..n {
-                        let var = conn[a][b].unwrap();
-                        let val = solver.var_val(var).unwrap();
-                        if val == TernaryVal::True {
-                            solver.phase_lit(var.pos_lit()).unwrap();
-                        } else {
-                            solver.phase_lit(var.neg_lit()).unwrap();
-                        }
+                    let mut comp_map: fxhash::FxHashMap<usize, Vec<usize>> =
+                        fxhash::FxHashMap::default();
+                    for j in 0..n {
+                        let r = uf_find(&mut uf, j);
+                        comp_map.entry(r).or_default().push(j);
                     }
-                }
-                for q in 0..m {
-                    for v in 0..num_nodes[q] {
-                        if let Some(dv) = del[q][v] {
-                            let val = solver.var_val(dv).unwrap();
+                    let comps: Vec<Vec<usize>> = comp_map.into_values().collect();
+                    let num_comps = comps.len();
+                    let max_sz = comps.iter().map(|c| c.len()).max().unwrap_or(0);
+                    eprintln!(
+                        "[cut] k={} SAT {:.1}ms (cum {:.1}s) comps={} max_size={}",
+                        k_bound, solve_ms, cum_s, num_comps, max_sz
+                    );
+                    best_components = Some(comps);
+
+                    // Phase hints for next k.
+                    for a in 0..n {
+                        for b in (a + 1)..n {
+                            let var = conn[a][b].unwrap();
+                            let val = solver.var_val(var).unwrap();
                             if val == TernaryVal::True {
-                                solver.phase_lit(dv.pos_lit()).unwrap();
+                                solver.phase_lit(var.pos_lit()).unwrap();
                             } else {
-                                solver.phase_lit(dv.neg_lit()).unwrap();
+                                solver.phase_lit(var.neg_lit()).unwrap();
                             }
                         }
                     }
+                    for q in 0..m {
+                        for v in 0..num_nodes[q] {
+                            if let Some(dv) = del[q][v] {
+                                let val = solver.var_val(dv).unwrap();
+                                if val == TernaryVal::True {
+                                    solver.phase_lit(dv.pos_lit()).unwrap();
+                                } else {
+                                    solver.phase_lit(dv.neg_lit()).unwrap();
+                                }
+                            }
+                        }
+                    }
+                    break; // Move to next k.
                 }
-            }
-            SolverResult::Unsat => {
-                eprintln!(
-                    "[cut] k={} UNSAT {:.1}ms (cum {:.1}s) — optimal={}",
-                    k_bound, solve_ms, cum_s, k_bound + 1
-                );
-                profile.optimal_k =
-                    best_components.as_ref().map(|c| c.len()).unwrap_or(k_max);
-                profile.report();
-                return best_components.map(|c| {
-                    components_to_trees(&c, &instance.trees[0], instance.num_leaves)
-                });
-            }
-            SolverResult::Interrupted => {
-                profile.report();
-                return best_components.map(|c| {
-                    components_to_trees(&c, &instance.trees[0], instance.num_leaves)
-                });
+                SolverResult::Unsat => {
+                    eprintln!(
+                        "[cut] k={} UNSAT {:.1}ms (cum {:.1}s) — optimal={}",
+                        k_bound, solve_ms, cum_s, k_bound + 1
+                    );
+                    profile.optimal_k =
+                        best_components.as_ref().map(|c| c.len()).unwrap_or(k_max);
+                    profile.report();
+                    return best_components.map(|c| {
+                        components_to_trees(&c, &instance.trees[0], instance.num_leaves)
+                    });
+                }
+                SolverResult::Interrupted => {
+                    profile.report();
+                    return best_components.map(|c| {
+                        components_to_trees(&c, &instance.trees[0], instance.num_leaves)
+                    });
+                }
             }
         }
     }
@@ -1565,6 +1617,7 @@ fn solve_sat_inner_impl(
             ub_components,
             lb_components,
             &mut profile,
+            false, // use_cegar: disabled by default (overhead > benefit on most instances)
         )?
     };
 
