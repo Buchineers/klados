@@ -108,6 +108,15 @@ pub fn alg_maf(
     if non_iso_comps.is_empty() {
         let result =
             extract_maf_components(&state.forests[0], &state.collapses, label_space, num_leaves);
+        if result.len() > target_s {
+            super::trace!(
+                "BUG: extraction produced {} components but target_s={}, all_comps={}",
+                result.len(), target_s, all_comps.len()
+            );
+            // Extraction disagrees with search state — reject this solution.
+            state.rollback();
+            return None;
+        }
         state.rollback();
         return Some(result);
     }
@@ -120,22 +129,149 @@ pub fn alg_maf(
         return None;
     }
 
-    if false && non_iso_comps.len() >= 2 {
-        let result = super::decomposition::solve_decomposed(
-            &state.forests,
-            target_s,
-            &state.collapses,
-            label_space,
-            num_leaves,
-            &non_iso_comps,
-            &all_comps,
-            stats,
-        );
-        if result.is_none() {
+    // Component decomposition (Shi Section 4 / Mestel Section 4.2):
+    // After LSI is satisfied and overlaps resolved, non-isomorphic components
+    // can be solved independently. Each component's sub-forests are restrictions
+    // of the current forests to that component's leaf set.
+    // Correctness: Shi Lemma 4.1 guarantees that solving each component in the
+    // same label space with its own budget produces a valid MAF.
+    if non_iso_comps.len() >= 2 {
+        let _iso_count = all_comps.len() - non_iso_comps.len();
+        let remaining = target_s.saturating_sub(all_comps.len());
+
+        // Solve each non-iso component by creating restricted sub-forests and
+        // recursing into alg_maf directly (no re-kernelization, same label space).
+        //
+        // Budget allocation: each non-iso component needs at least 1 MAF component.
+        // Track minimum costs (initially 1 per component) and update with actual
+        // costs as sub-problems are solved, giving tighter budgets to later components.
+        let mut min_costs: Vec<usize> = vec![1; non_iso_comps.len()];
+        let mut sub_results: Vec<Vec<Tree>> = Vec::new();
+
+        // Early check: if the sum of minimum costs exceeds remaining budget, fail fast.
+        let total_min: usize = min_costs.iter().sum();
+        if total_min > remaining + non_iso_comps.len() {
             tt_insert(tt, tt_hash, target_s);
+            state.rollback();
+            return None;
         }
+
+        for (idx, comp_ls) in non_iso_comps.iter().enumerate() {
+            let comp_size = comp_ls.count_ones(..);
+            if comp_size <= 1 {
+                // Singleton -- trivial, costs 0 additional components.
+                sub_results.push(Vec::new());
+                min_costs[idx] = 1;
+                continue;
+            }
+
+            // Build restricted sub-forests for this component.
+            let sub_forests: Vec<XForest> = state.forests.iter()
+                .map(|f| {
+                    let pruned = f.tree.prune_to_leafset(comp_ls);
+                    XForest::from_tree(pruned)
+                })
+                .collect();
+
+            let sub_zobrist = ZobristTable::new(label_space);
+            let mut sub_tt: FxHashMap<u64, TTEntry> = FxHashMap::default();
+
+            // Budget for this component: total budget for non-iso components minus
+            // minimum cost of all other components.
+            // Total non-iso budget = remaining + non_iso_comps.len() (since each
+            // component contributes at least 1 to the count, already subtracted).
+            let other_min: usize = min_costs.iter().enumerate()
+                .filter(|&(i, _)| i != idx)
+                .map(|(_, &c)| c)
+                .sum();
+            let non_iso_budget = remaining + non_iso_comps.len();
+            let max_budget_for_this = non_iso_budget.saturating_sub(other_min);
+
+            let mut found = false;
+            for sub_target in 1..=max_budget_for_this.min(comp_size) {
+                let mut sub_state = SearchState::new(sub_forests.clone());
+                let mut sub_stats = SolverStats::default();
+                if let Some(result) = alg_maf(
+                    &mut sub_state,
+                    sub_target,
+                    label_space,
+                    num_leaves,
+                    &mut sub_stats,
+                    &sub_zobrist,
+                    &mut sub_tt,
+                ) {
+                    // Update min_costs with the actual cost for tighter budgets
+                    // on subsequent components.
+                    min_costs[idx] = sub_target;
+                    sub_results.push(result);
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                // This component can't be solved within budget -- decomposition fails.
+                tt_insert(tt, tt_hash, target_s);
+                state.rollback();
+                return None;
+            }
+        }
+
+        // Assemble: isomorphic components + sub-problem results.
+        let mut result_trees: Vec<Tree> = Vec::new();
+
+        // Isomorphic components from the current search state.
+        let collapsed_into = super::extraction::build_collapsed_into(&state.collapses, num_leaves);
+        for comp_ls in &all_comps {
+            let is_non_iso = non_iso_comps.iter().any(|c| c.as_slice() == comp_ls.as_slice());
+            if is_non_iso {
+                continue;
+            }
+            if comp_ls.count_ones(..) == 0 {
+                continue;
+            }
+            let expanded = super::extraction::expand_leafset(comp_ls, &collapsed_into, num_leaves, label_space);
+            result_trees.push(super::extraction::build_component_tree(
+                &expanded, &state.forests[0].tree, num_leaves,
+            ));
+        }
+
+        // Non-iso component results: alg_maf returns trees using the pruned forest's
+        // label space. We need to expand collapsed labels just like isomorphic components.
+        for sub_result in sub_results {
+            for sub_tree in &sub_result {
+                // Extract leaf labels from the sub-tree.
+                let mut sub_ls = FixedBitSet::with_capacity(label_space + 1);
+                for node in sub_tree.pre_order() {
+                    if sub_tree.is_leaf(node) {
+                        let lbl = sub_tree.label[node as usize];
+                        if lbl > 0 {
+                            sub_ls.insert(lbl as usize);
+                        }
+                    }
+                }
+                // Expand through outer collapses and build from reference tree.
+                let expanded = super::extraction::expand_leafset(
+                    &sub_ls, &collapsed_into, num_leaves, label_space,
+                );
+                result_trees.push(super::extraction::build_component_tree(
+                    &expanded, &state.forests[0].tree, num_leaves,
+                ));
+            }
+        }
+
+        // Verify total component count doesn't exceed target.
+        if result_trees.len() > target_s {
+            super::trace!(
+                "decomposition produced {} components but target_s={}",
+                result_trees.len(), target_s
+            );
+            tt_insert(tt, tt_hash, target_s);
+            state.rollback();
+            return None;
+        }
+
         state.rollback();
-        return result;
+        return Some(result_trees);
     }
 
     let (a, b) = match find_best_sibling_pair(&state.forests, label_space) {

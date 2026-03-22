@@ -140,6 +140,8 @@ fn score_sibling_pair(forests: &[XForest], a: u32, b: u32) -> i32 {
         .map(|(i, _)| i)
         .collect();
 
+    let base_score;
+
     if !omega1.is_empty() {
         let lca_sets: Vec<FixedBitSet> = omega1
             .iter()
@@ -147,22 +149,37 @@ fn score_sibling_pair(forests: &[XForest], a: u32, b: u32) -> i32 {
             .collect();
         let all_same_lca = lca_sets.windows(2).all(|w| w[0] == w[1]);
         if all_same_lca {
-            return 10000;
+            base_score = 10000;
+        } else if max_e >= 3 {
+            base_score = 5000 + max_e as i32;
+        } else if max_e >= 2 {
+            base_score = 3000;
+        } else {
+            base_score = 0;
+        }
+    } else if max_e >= 3 {
+        base_score = 5000 + max_e as i32;
+    } else if max_e >= 2 {
+        base_score = 3000;
+    } else {
+        base_score = -1000;
+    }
+
+    // DEEPEST_ORDER: prefer deeper sibling pairs (deeper = more specific = better pruning).
+    // Use max depth across all forests as a tiebreaker.
+    let mut max_depth = 0i32;
+    for f in forests {
+        let a_node = f.tree.label_to_node[a as usize];
+        let b_node = f.tree.label_to_node[b as usize];
+        if f.live_leafsets[a_node as usize].count_ones(..) > 0 {
+            max_depth = max_depth.max(f.tree.depth[a_node as usize] as i32);
+        }
+        if f.live_leafsets[b_node as usize].count_ones(..) > 0 {
+            max_depth = max_depth.max(f.tree.depth[b_node as usize] as i32);
         }
     }
 
-    if max_e >= 3 {
-        return 5000 + max_e as i32;
-    }
-    if max_e >= 2 {
-        return 3000;
-    }
-
-    if !omega1.is_empty() {
-        return 0;
-    }
-
-    -1000
+    base_score + max_depth * 100
 }
 
 pub fn compute_e_f(forest: &XForest, a: u32, b: u32) -> Vec<NodeId> {
@@ -253,6 +270,200 @@ fn lca_leafset(forest: &XForest, a: u32, b: u32) -> FixedBitSet {
     }
 }
 
+struct CutInfo {
+    forest_idx: usize,
+    node: NodeId,
+}
+
+/// CUT_ONE_B: For m=2, check if a 3-way BR-2.1 branch can be reduced to a single cut.
+///
+/// Given sibling pair (a, b) that are siblings in forest q, check in the other forest r:
+/// - If grandparent of a == parent of b in r, we only need to cut the sibling of a in r.
+/// - Symmetric: if grandparent of b == parent of a in r, cut the sibling of b in r.
+fn check_cut_one_b(state: &SearchState, a: u32, b: u32) -> Option<CutInfo> {
+    for q in 0..state.forests.len() {
+        let fq = &state.forests[q];
+        let a_node_q = fq.tree.label_to_node[a as usize];
+        let b_node_q = fq.tree.label_to_node[b as usize];
+
+        // Check if a_node_q and b_node_q are live
+        if fq.live_leafsets[a_node_q as usize].count_ones(..) == 0
+            || fq.live_leafsets[b_node_q as usize].count_ones(..) == 0
+        {
+            continue;
+        }
+
+        let parent_a_q = fq.tree.parent[a_node_q as usize];
+        if parent_a_q == NONE {
+            continue;
+        }
+
+        // Check if a and b are siblings in forest q (same parent)
+        let sib_of_a_q = if fq.tree.left[parent_a_q as usize] == a_node_q {
+            fq.tree.right[parent_a_q as usize]
+        } else {
+            fq.tree.left[parent_a_q as usize]
+        };
+        if sib_of_a_q != b_node_q {
+            continue;
+        }
+
+        // They're siblings in forest q. Check CUT_ONE_B against other forests.
+        for r in 0..state.forests.len() {
+            if r == q {
+                continue;
+            }
+            let fr = &state.forests[r];
+            let a_node_r = fr.tree.label_to_node[a as usize];
+            let b_node_r = fr.tree.label_to_node[b as usize];
+
+            // Check both nodes are live in forest r
+            if fr.live_leafsets[a_node_r as usize].count_ones(..) == 0
+                || fr.live_leafsets[b_node_r as usize].count_ones(..) == 0
+            {
+                continue;
+            }
+
+            let parent_a_r = fr.tree.parent[a_node_r as usize];
+            let parent_b_r = fr.tree.parent[b_node_r as usize];
+            if parent_a_r == NONE || parent_b_r == NONE {
+                continue;
+            }
+
+            // Check: grandparent_a == parent_b in forest r
+            let grandparent_a_r = fr.tree.parent[parent_a_r as usize];
+            if grandparent_a_r != NONE && grandparent_a_r == parent_b_r {
+                // CUT_ONE_B: cut the sibling of a in forest r
+                let sib_a_r = if fr.tree.left[parent_a_r as usize] == a_node_r {
+                    fr.tree.right[parent_a_r as usize]
+                } else {
+                    fr.tree.left[parent_a_r as usize]
+                };
+                if sib_a_r != NONE && !fr.is_cut(sib_a_r) {
+                    super::trace!(
+                        "CUT_ONE_B: sibling pair ({},{}) in forest {}, cut sib_a={} in forest {}",
+                        a, b, q, sib_a_r, r
+                    );
+                    return Some(CutInfo {
+                        forest_idx: r,
+                        node: sib_a_r,
+                    });
+                }
+            }
+
+            // Symmetric: grandparent_b == parent_a in forest r
+            let grandparent_b_r = fr.tree.parent[parent_b_r as usize];
+            if grandparent_b_r != NONE && grandparent_b_r == parent_a_r {
+                // CUT_ONE_B: cut the sibling of b in forest r
+                let sib_b_r = if fr.tree.left[parent_b_r as usize] == b_node_r {
+                    fr.tree.right[parent_b_r as usize]
+                } else {
+                    fr.tree.left[parent_b_r as usize]
+                };
+                if sib_b_r != NONE && !fr.is_cut(sib_b_r) {
+                    super::trace!(
+                        "CUT_ONE_B: sibling pair ({},{}) in forest {}, cut sib_b={} in forest {}",
+                        a, b, q, sib_b_r, r
+                    );
+                    return Some(CutInfo {
+                        forest_idx: r,
+                        node: sib_b_r,
+                    });
+                }
+            }
+
+            // REVERSE_CUT_ONE_B: check the sibling of (a,b)'s parent in forest q.
+            // If that sibling is a leaf `s`, check s's twin in forest r.
+            let grandparent_q = fq.tree.parent[parent_a_q as usize];
+            if grandparent_q != NONE {
+                let uncle_q = if fq.tree.left[grandparent_q as usize] == parent_a_q {
+                    fq.tree.right[grandparent_q as usize]
+                } else {
+                    fq.tree.left[grandparent_q as usize]
+                };
+
+                if uncle_q != NONE && fq.tree.is_leaf(uncle_q) {
+                    let s_label = fq.tree.label[uncle_q as usize];
+                    if s_label != 0 {
+                        let s_node_r = fr.tree.label_to_node[s_label as usize];
+                        if fr.live_leafsets[s_node_r as usize].count_ones(..) > 0 {
+                            let s_parent_r = fr.tree.parent[s_node_r as usize];
+                            if s_parent_r != NONE {
+                                // If s and a share a parent in forest r → must cut b
+                                if s_parent_r == parent_a_r {
+                                    let b_node_r2 = fr.tree.label_to_node[b as usize];
+                                    if !fr.is_cut(b_node_r2) {
+                                        super::trace!(
+                                            "REVERSE_CUT_ONE_B: ({},{}) forest {}, s={} shares parent with a in forest {} → cut b={}",
+                                            a, b, q, s_label, r, b_node_r2
+                                        );
+                                        return Some(CutInfo {
+                                            forest_idx: r,
+                                            node: b_node_r2,
+                                        });
+                                    }
+                                }
+                                // If s and b share a parent in forest r → must cut a
+                                if s_parent_r == parent_b_r {
+                                    let a_node_r2 = fr.tree.label_to_node[a as usize];
+                                    if !fr.is_cut(a_node_r2) {
+                                        super::trace!(
+                                            "REVERSE_CUT_ONE_B: ({},{}) forest {}, s={} shares parent with b in forest {} → cut a={}",
+                                            a, b, q, s_label, r, a_node_r2
+                                        );
+                                        return Some(CutInfo {
+                                            forest_idx: r,
+                                            node: a_node_r2,
+                                        });
+                                    }
+                                }
+                            }
+
+                            // CUT_TWO_B: check if uncle relationship forces a single cut.
+                            // In forest r: if grandparent of a == grandparent of b (= l),
+                            // and s's twin in r is the sibling of l, then cut sibling of a in r.
+                            let grandparent_a_r2 = fr.tree.parent[parent_a_r as usize];
+                            if grandparent_a_r2 != NONE {
+                                let grandparent_b_r2 = fr.tree.parent[parent_b_r as usize];
+                                if grandparent_b_r2 == grandparent_a_r2 {
+                                    let l_r = grandparent_a_r2;
+                                    let l_parent_r = fr.tree.parent[l_r as usize];
+                                    if l_parent_r != NONE {
+                                        let l_sibling_r = if fr.tree.left[l_parent_r as usize] == l_r {
+                                            fr.tree.right[l_parent_r as usize]
+                                        } else {
+                                            fr.tree.left[l_parent_r as usize]
+                                        };
+                                        if l_sibling_r != NONE && l_sibling_r == s_node_r {
+                                            // Cut sibling of a in r
+                                            let sib_a_r = if fr.tree.left[parent_a_r as usize] == a_node_r {
+                                                fr.tree.right[parent_a_r as usize]
+                                            } else {
+                                                fr.tree.left[parent_a_r as usize]
+                                            };
+                                            if sib_a_r != NONE && !fr.is_cut(sib_a_r) {
+                                                super::trace!(
+                                                    "CUT_TWO_B: ({},{}) forest {}, s={} is sibling of l in forest {} → cut sib_a={}",
+                                                    a, b, q, s_label, r, sib_a_r
+                                                );
+                                                return Some(CutInfo {
+                                                    forest_idx: r,
+                                                    node: sib_a_r,
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 pub fn apply_case_2_branching(
     state: &mut SearchState,
     target_s: usize,
@@ -264,10 +475,56 @@ pub fn apply_case_2_branching(
     zobrist: &ZobristTable,
     tt: &mut FxHashMap<u64, TTEntry>,
 ) -> Option<Vec<klados_core::Tree>> {
+    // CUT_ONE_B: for m=2, check if we can reduce 3-way branching to a single cut.
+    if state.forests.len() == 2 {
+        if let Some(cut_info) = check_cut_one_b(state, a, b) {
+            state.checkpoint();
+            state.cut_node(cut_info.forest_idx, cut_info.node);
+            if let Some(result) = super::algorithm::alg_maf(
+                state,
+                target_s,
+                label_space,
+                num_leaves,
+                stats,
+                zobrist,
+                tt,
+            ) {
+                state.rollback();
+                return Some(result);
+            }
+            state.rollback();
+            return None;
+        }
+    }
+
     let e_sets: Vec<Vec<NodeId>> = state.forests.iter().map(|f| compute_e_f(f, a, b)).collect();
     let max_e = e_sets.iter().map(|e| e.len()).max().unwrap_or(0);
 
     if max_e >= 2 {
+        // BB: Approximation-based pruning before 3-way BR-2.1 branch (m=2 only).
+        // Use red-blue 2-approximation on pruned trees from current live leaves.
+        // Only worth the overhead for larger instances.
+        if state.forests.len() == 2 {
+            let live = &state.forests[0].live_leafsets[state.forests[0].tree.root as usize];
+            let live_count = live.count_ones(..);
+            if live_count >= 15 {
+                let t1_pruned = state.forests[0].tree.prune_to_leafset(live);
+                let t2_pruned = state.forests[1].tree.prune_to_leafset(live);
+                let approx = klados_core::lower_bound::red_blue_approx(&t1_pruned, &t2_pruned);
+                // approx is an upper bound on rSPR distance. MAF components = distance + 1.
+                // But this is a 2-approx: OPT >= ceil(approx / 2), so LB on components = ceil(approx/2) + 1.
+                let approx_lb_comps = approx.div_ceil(2) + 1;
+                if approx_lb_comps > target_s {
+                    stats.branches_pruned += 1;
+                    super::trace!(
+                        "BB prune: approx={}, lb_comps={}, target_s={}",
+                        approx, approx_lb_comps, target_s
+                    );
+                    return None;
+                }
+            }
+        }
+
         return apply_branching_rule_2_1(
             state,
             target_s,
