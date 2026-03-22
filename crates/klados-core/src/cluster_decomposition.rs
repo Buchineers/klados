@@ -1,19 +1,73 @@
-//! rspr-style cluster decomposition for 2-tree MAF instances.
+//! rspr-style cluster decomposition for MAF instances.
 //!
-//! Implements Whidden's cluster decomposition: identifies "cluster points" in
-//! T1 whose subtree leaf-sets can be solved independently, then recombines the
-//! sub-solutions with remapped labels.
-//!
-//! Only applicable when the instance has exactly 2 trees.
+//! Implements Whidden's cluster decomposition generalized to m >= 2 trees:
+//! identifies "cluster points" in a reference tree T0 whose subtree leaf-sets
+//! can be solved independently (verified against ALL other trees), then
+//! recombines the sub-solutions with remapped labels.
 
 use fixedbitset::FixedBitSet;
 
 use crate::tree::{Label, NodeId, NONE, Tree};
 use crate::Instance;
 
-/// Attempt rspr-style cluster decomposition on a 2-tree instance.
+/// A selected cluster: a disjoint leaf set that can be solved independently.
+#[derive(Clone, Debug)]
+pub struct SelectedCluster {
+    /// The leaf set of this cluster (1-based labels).
+    pub leaves: FixedBitSet,
+}
+
+/// Find disjoint rspr-style clusters for any m >= 2 instance.
 ///
-/// Returns `None` if m != 2, no useful clusters are found, or a sub-problem
+/// Uses T0 (first tree) as reference. A node in T0 is a cluster point if the
+/// round-trip depth check passes against ALL other trees.
+///
+/// Returns None if m < 2, n < 5, or no useful clusters found.
+pub fn find_clusters(instance: &Instance) -> Option<Vec<SelectedCluster>> {
+    let m = instance.num_trees();
+    if m < 2 {
+        return None;
+    }
+    let n = instance.num_leaves as usize;
+    if n < 5 {
+        return None;
+    }
+
+    let t0 = &instance.trees[0];
+    let leaf_sets = compute_leaf_sets(t0, n);
+
+    // Compute twins from T0 to each other tree, and back.
+    let mut twins_0_to_t: Vec<Vec<NodeId>> = Vec::with_capacity(m);
+    let mut twins_t_to_0: Vec<Vec<NodeId>> = Vec::with_capacity(m);
+    for t in 0..m {
+        twins_0_to_t.push(compute_twins(t0, &instance.trees[t]));
+        twins_t_to_0.push(compute_twins(&instance.trees[t], t0));
+    }
+
+    // Find cluster points: must pass round-trip depth check against ALL other trees.
+    let cluster_points =
+        find_cluster_points_multi(t0, &twins_0_to_t, &twins_t_to_0, &leaf_sets, n, m);
+
+    if cluster_points.is_empty() {
+        return None;
+    }
+    let selected = select_disjoint_clusters(t0, &cluster_points, &leaf_sets, n);
+    if selected.is_empty() {
+        return None;
+    }
+    Some(
+        selected
+            .iter()
+            .map(|&node| SelectedCluster {
+                leaves: leaf_sets[node as usize].clone(),
+            })
+            .collect(),
+    )
+}
+
+/// Attempt rspr-style cluster decomposition on an instance with m >= 2 trees.
+///
+/// Returns `None` if no useful clusters are found or a sub-problem
 /// cannot be solved. Otherwise returns the combined agreement-forest
 /// components with original labels restored.
 pub fn try_rspr_cluster_decomposition<S>(
@@ -23,7 +77,8 @@ pub fn try_rspr_cluster_decomposition<S>(
 where
     S: FnMut(&Instance) -> Option<Vec<Tree>>,
 {
-    if instance.num_trees() != 2 {
+    let m = instance.num_trees();
+    if m < 2 {
         return None;
     }
 
@@ -32,26 +87,29 @@ where
         return None;
     }
 
-    let t1 = &instance.trees[0];
-    let t2 = &instance.trees[1];
+    let t0 = &instance.trees[0];
 
-    // Step 1: compute twins (LCA mappings) between the two trees
-    let twin_1to2 = compute_twins(t1, t2);
-    let twin_2to1 = compute_twins(t2, t1);
+    // Step 1: compute twins between T0 and all other trees
+    let mut twins_0_to_t: Vec<Vec<NodeId>> = Vec::with_capacity(m);
+    let mut twins_t_to_0: Vec<Vec<NodeId>> = Vec::with_capacity(m);
+    for t in 0..m {
+        twins_0_to_t.push(compute_twins(t0, &instance.trees[t]));
+        twins_t_to_0.push(compute_twins(&instance.trees[t], t0));
+    }
 
-    // Step 2: compute leaf-sets for each node in T1 (for sub-instance extraction)
-    let leaf_sets = compute_leaf_sets(t1, n);
+    // Step 2: compute leaf-sets for each node in T0
+    let leaf_sets = compute_leaf_sets(t0, n);
 
-    // Step 3: find cluster points
+    // Step 3: find cluster points (must pass for ALL trees)
     let cluster_points =
-        find_cluster_points(t1, &twin_1to2, &twin_2to1, &leaf_sets, n);
+        find_cluster_points_multi(t0, &twins_0_to_t, &twins_t_to_0, &leaf_sets, n, m);
 
     if cluster_points.is_empty() {
         return None;
     }
 
-    // Step 4: select disjoint clusters in post-order, skipping overlaps
-    let selected = select_disjoint_clusters(t1, &cluster_points, &leaf_sets, n);
+    // Step 4: select disjoint clusters
+    let selected = select_disjoint_clusters(t0, &cluster_points, &leaf_sets, n);
 
     if selected.is_empty() {
         return None;
@@ -169,25 +227,21 @@ fn compute_leaf_sets(tree: &Tree, n: usize) -> Vec<FixedBitSet> {
     leaf_sets
 }
 
-/// Identify cluster points in T1 using the rspr criteria.
-fn find_cluster_points(
-    t1: &Tree,
-    twin_1to2: &[NodeId],
-    twin_2to1: &[NodeId],
+/// Identify cluster points in T0 that pass the round-trip depth check
+/// against ALL other trees.
+fn find_cluster_points_multi(
+    t0: &Tree,
+    twins_0_to_t: &[Vec<NodeId>],
+    twins_t_to_0: &[Vec<NodeId>],
     leaf_sets: &[FixedBitSet],
     n: usize,
+    m: usize,
 ) -> Vec<NodeId> {
-    let mut is_cluster_point = vec![false; t1.num_nodes()];
+    let mut is_cluster_point = vec![false; t0.num_nodes()];
     let mut candidates = Vec::new();
 
-    // First pass: identify all nodes satisfying the basic criteria
-    for node in t1.post_order() {
-        if t1.is_leaf(node) || t1.is_root(node) {
-            continue;
-        }
-
-        let twin_in_t2 = twin_1to2[node as usize];
-        if twin_in_t2 == NONE {
+    for node in t0.post_order() {
+        if t0.is_leaf(node) || t0.is_root(node) {
             continue;
         }
 
@@ -196,30 +250,40 @@ fn find_cluster_points(
             continue;
         }
 
-        // Round-trip depth check: depth_t1[n] <= depth_t1[twin_2to1[twin_1to2[n]]]
-        let round_trip = twin_2to1[twin_in_t2 as usize];
-        if round_trip == NONE {
-            continue;
+        // Check round-trip depth condition against EVERY other tree.
+        let depth_node = t0.depth[node as usize];
+        let mut passes_all = true;
+
+        for t in 1..m {
+            let twin_in_t = twins_0_to_t[t][node as usize];
+            if twin_in_t == NONE {
+                passes_all = false;
+                break;
+            }
+
+            let round_trip = twins_t_to_0[t][twin_in_t as usize];
+            if round_trip == NONE {
+                passes_all = false;
+                break;
+            }
+
+            if depth_node > t0.depth[round_trip as usize] {
+                passes_all = false;
+                break;
+            }
         }
 
-        let depth_node = t1.depth[node as usize];
-        let depth_roundtrip = t1.depth[round_trip as usize];
-        if depth_node > depth_roundtrip {
-            continue;
+        if passes_all {
+            is_cluster_point[node as usize] = true;
+            candidates.push(node);
         }
-
-        is_cluster_point[node as usize] = true;
-        candidates.push(node);
     }
 
-    // Second pass: remove redundant cluster points where ALL children are also
-    // cluster points
+    // Remove redundant: skip nodes where ALL children are also cluster points.
     let mut result = Vec::new();
     for &node in &candidates {
-        if let Some((left, right)) = t1.children(node) {
-            let all_children_are_cluster_points =
-                is_cluster_point[left as usize] && is_cluster_point[right as usize];
-            if all_children_are_cluster_points {
+        if let Some((left, right)) = t0.children(node) {
+            if is_cluster_point[left as usize] && is_cluster_point[right as usize] {
                 continue;
             }
         }

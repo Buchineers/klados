@@ -1266,7 +1266,7 @@ fn solve_sat_inner_impl(
             }
         }
 
-        // Try rspr-style cluster decomposition (2-tree only, more general).
+        // Try rspr-style cluster decomposition (any m, more general than Kelk).
         if let Some(components) =
             klados_core::cluster_decomposition::try_rspr_cluster_decomposition(
                 reduced,
