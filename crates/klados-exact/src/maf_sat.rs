@@ -1238,6 +1238,7 @@ fn solve_sat_inner_impl(
     }
 
     if !skip_cluster_decomp {
+        // Try Kelk common-cluster decomposition (works for any m).
         match cluster_reduction::try_cluster_reduction(reduced, &mut |subinstance| {
             let mut sub_stats = SolverStats::default();
             solve_sat_inner(subinstance, &mut sub_stats, vec![])
@@ -1263,6 +1264,36 @@ fn solve_sat_inner_impl(
                 );
                 return Some(components);
             }
+        }
+
+        // Try rspr-style cluster decomposition (2-tree only, more general).
+        if let Some(components) =
+            klados_core::cluster_decomposition::try_rspr_cluster_decomposition(
+                reduced,
+                &mut |subinstance| {
+                    let mut sub_stats = SolverStats::default();
+                    solve_sat_inner(subinstance, &mut sub_stats, vec![])
+                },
+            )
+        {
+            eprintln!(
+                "[sat] rspr cluster decomposition: {} → {} components",
+                n_reduced,
+                components.len()
+            );
+            let exact_k = components.len() + param_reduction_32;
+            profile.bounds_computed = (exact_k, exact_k);
+            profile.optimal_k = exact_k;
+            profile.report();
+            stats.lower_bound = exact_k;
+            stats.upper_bound = Some(exact_k);
+            let components = kernelize::expand_solution(
+                components,
+                &kern,
+                &instance.trees[0],
+                instance.num_leaves,
+            );
+            return Some(components);
         }
     }
 
