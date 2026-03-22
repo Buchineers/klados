@@ -27,9 +27,12 @@ impl KernelizeStats {
         *self.rule_counts.get("chain").unwrap_or(&0)
     }
 
-    /// Number of leaves removed by 3-2 chain reduction.
+    /// Number of leaves removed by triple reduction (generalized 3-2).
     pub fn chain32_removed(&self) -> usize {
-        *self.rule_counts.get("chain-3-2").unwrap_or(&0)
+        // Check both old and new rule names for backward compatibility
+        let old = *self.rule_counts.get("chain-3-2").unwrap_or(&0);
+        let new = *self.rule_counts.get("triple").unwrap_or(&0);
+        old + new
     }
 
     /// Total leaves removed across all rules.
@@ -63,7 +66,9 @@ pub fn print_stats(stats: &KernelizeStats) {
     );
     // Any additional rules beyond the core three
     for (name, &count) in &stats.rule_counts {
-        if *name != "cherry" && *name != "chain" && *name != "chain-3-2" && count > 0 {
+        if *name != "cherry" && *name != "chain" && *name != "chain-3-2"
+            && *name != "triple" && count > 0
+        {
             eprintln!("// --- Due to {} reduction: {}", name, count);
         }
     }
