@@ -2,7 +2,7 @@
 //!
 //! Each approach is implemented as its own solver and registered here.
 
-pub mod cluster_reduction;
+pub use klados_core::cluster_reduction;
 // kernelize and lower_bound now live in klados-core; re-export for backward compatibility
 pub use klados_core::kernelize;
 pub use klados_core::lower_bound;

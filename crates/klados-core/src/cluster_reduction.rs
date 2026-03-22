@@ -12,8 +12,8 @@
 
 use fixedbitset::FixedBitSet;
 use fxhash::FxHashMap;
-use klados_core::Instance;
-use klados_core::tree::{Label, NONE, NodeId, Tree};
+use crate::Instance;
+use crate::tree::{Label, NONE, NodeId, Tree};
 
 #[derive(Clone, Debug)]
 pub struct CommonCluster {
@@ -70,7 +70,7 @@ pub fn find_best_common_cluster(instance: &Instance) -> Option<CommonCluster> {
 
     let n = instance.num_leaves as usize;
 
-    // Build per-tree lookup: leafset-key → NodeId
+    // Build per-tree lookup: leafset-key -> NodeId
     let per_tree: Vec<FxHashMap<Vec<usize>, NodeId>> = instance
         .trees
         .iter()
