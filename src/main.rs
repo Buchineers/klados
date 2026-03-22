@@ -54,6 +54,11 @@ enum Commands {
     },
     /// Diagnose kernelization gaps: find singletons missed by reduction rules.
     KernelizeDiag,
+    /// Delete a specific leaf and output the reduced instance.
+    DeleteLeaf {
+        #[arg(long)]
+        leaf: u32,
+    },
     Info,
     Bounds,
     RedBlueUB,
@@ -169,6 +174,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Some(Commands::KernelizeDiag) => {
                     commands::kernelize_diag::run(&instance, cli.verbose)?;
+                }
+                Some(Commands::DeleteLeaf { leaf }) => {
+                    commands::delete_leaf::run(&instance, leaf)?;
                 }
                 Some(Commands::Heuristic { solver }) => {
                     commands::heuristic::run(&instance, &solver, cli.verbose)?;

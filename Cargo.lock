@@ -682,6 +682,7 @@ version = "0.1.0"
 dependencies = [
  "atree",
  "clap",
+ "fixedbitset",
  "klados-core",
  "klados-exact",
  "klados-heuristic",

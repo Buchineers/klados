@@ -3,7 +3,7 @@ use klados_core::tree::{Label, NodeId, Tree};
 use klados_core::{Instance, SolverStats};
 use rustsat::encodings::card::{BoundUpper, Totalizer};
 use rustsat::instances::{BasicVarManager, ManageVars};
-use rustsat::solvers::{Solve, SolveIncremental, SolverResult};
+use rustsat::solvers::{PhaseLit, Solve, SolveIncremental, SolverResult};
 use rustsat::types::{Clause, Lit, TernaryVal, Var};
 use rustsat_cadical::CaDiCaL;
 
@@ -491,6 +491,32 @@ fn sat_solve_maf_cut(
                     k_bound, solve_ms, cum_s, num_comps, max_sz
                 );
                 best_components = Some(comps);
+
+                // Phase hints: bias next solve toward current solution.
+                // This helps CaDiCaL find similar solutions at k-1 faster.
+                for a in 0..n {
+                    for b in (a + 1)..n {
+                        let var = conn[a][b].unwrap();
+                        let val = solver.var_val(var).unwrap();
+                        if val == TernaryVal::True {
+                            solver.phase_lit(var.pos_lit()).unwrap();
+                        } else {
+                            solver.phase_lit(var.neg_lit()).unwrap();
+                        }
+                    }
+                }
+                for q in 0..m {
+                    for v in 0..num_nodes[q] {
+                        if let Some(dv) = del[q][v] {
+                            let val = solver.var_val(dv).unwrap();
+                            if val == TernaryVal::True {
+                                solver.phase_lit(dv.pos_lit()).unwrap();
+                            } else {
+                                solver.phase_lit(dv.neg_lit()).unwrap();
+                            }
+                        }
+                    }
+                }
             }
             SolverResult::Unsat => {
                 eprintln!(

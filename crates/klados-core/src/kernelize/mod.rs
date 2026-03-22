@@ -13,6 +13,7 @@
 mod chain;
 mod chain32;
 mod cherry;
+mod cherry_rotation;
 mod expansion;
 mod helpers;
 mod instance_ops;
@@ -33,9 +34,8 @@ pub use rule::{ReductionAction, ReductionRule, RuleContext, RuleEvent, VictimStr
 pub use stats::{KernelizeStats, build_surviving_taxa, print_stats, print_taxa_detail};
 
 use chain::ChainRule;
-use chain32::Chain32Rule;
 use cherry::CherryRule;
-use short_chain::{Rule3CrossedCherry, Rule4ExternalCherry};
+use cherry_rotation::TripleRule;
 
 /// Which reduction rules are enabled.
 #[derive(Clone, Debug)]
@@ -64,7 +64,7 @@ impl Default for KernelizeConfig {
             chain32_multi: true,
             protected_labels: Vec::new(),
             victim_strategy: VictimStrategy::First,
-            max_partners: usize::MAX,
+            max_partners: 2,  // SAFETY: only 2-partner 3-2 is proven correct
         }
     }
 }
@@ -99,17 +99,20 @@ fn build_rules(config: &KernelizeConfig) -> Vec<Box<dyn ReductionRule>> {
     if config.chain {
         rules.push(Box::new(ChainRule));
     }
+    // 3-2 chain rule (standard, proven for all t >= 2)
     if config.chain32 || config.chain32_multi {
-        rules.push(Box::new(Chain32Rule {
+        rules.push(Box::new(chain32::Chain32Rule {
             allow_multi: config.chain32_multi,
             max_partners: config.max_partners,
         }));
     }
-    // Rules 3 and 4 (Kelk & Linz 2020): crossed/external cherry on common 3-chains.
-    // For ROOTED MAF, these are subsumed by the 3-2 interceptor rule.
-    // Kept as code for reference but disabled — the 3-2 rule catches all their patterns.
-    // rules.push(Box::new(Rule3CrossedCherry));
-    // rules.push(Box::new(Rule4ExternalCherry));
+    // Generalized Triple Reduction: extends 3-2 with RotationQR state.
+    // The RotationQR state ({q,r} cherry, no interceptor needed on p) allows
+    // trees where the keeper-victim pair forms a cherry. This is a new state
+    // only useful for m >= 3. NEEDS FORMAL VERIFICATION before enabling.
+    // if config.chain32 || config.chain32_multi {
+    //     rules.push(Box::new(TripleRule));
+    // }
     rules
 }
 

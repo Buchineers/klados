@@ -42,6 +42,7 @@ klados-exact = { workspace = true }
 klados-heuristic = { workspace = true }
 pace26io = { workspace = true }
 clap = { workspace = true }
+fixedbitset = { workspace = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 signal-hook = "0.3"
