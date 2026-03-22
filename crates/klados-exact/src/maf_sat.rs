@@ -28,6 +28,7 @@ struct SolveProfile {
     sym_clauses: usize,
     sibling_clauses: usize,
     singleton_clauses: usize,
+    rspr_clauses: usize,
     encode_ms: f64,
     solve_ms: f64,
     cegar_ms: f64,
@@ -47,12 +48,13 @@ impl SolveProfile {
             + self.sym_clauses
             + self.sibling_clauses
             + self.singleton_clauses
+            + self.rspr_clauses
     }
 
     fn report(&self) {
         eprintln!(
             "[profile] n={} n'={} k={} m={} splits={} vars={} clauses={} \
-             (H1={} H2={} H3={} H4={} H5={} sym={} sib={} sing={}) \
+             (H1={} H2={} H3={} H4={} H5={} sym={} sib={} sing={} rspr={}) \
              encode={:.1}ms solve={:.1}ms cegar={:.1}ms \
              sat_calls={} violations={} bounds=[{},{}] opt={}",
             self.n,
@@ -70,6 +72,7 @@ impl SolveProfile {
             self.sym_clauses,
             self.sibling_clauses,
             self.singleton_clauses,
+            self.rspr_clauses,
             self.encode_ms,
             self.solve_ms,
             self.cegar_ms,
@@ -269,6 +272,175 @@ fn path_nodes(tree: &Tree, a: NodeId, b: NodeId) -> Vec<NodeId> {
     nodes
 }
 
+/// Add rSPR-inspired preprocessing implications derived from sibling pair analysis.
+///
+/// For each pair of leaves that are siblings in one tree, analyze their structural
+/// relationship in the other trees to derive implied clauses that help CaDiCaL
+/// propagate faster.
+///
+/// Returns the number of clauses added.
+fn add_rspr_implications(
+    solver: &mut CaDiCaL,
+    instance: &Instance,
+    del: &[Vec<Option<Var>>],
+    conn: &[Vec<Option<Var>>],
+    n: usize,
+    m: usize,
+) -> usize {
+    use klados_core::tree::NONE;
+
+    let mut clause_count = 0usize;
+
+    // For each tree q, find sibling pairs and check against other trees.
+    for q in 0..m {
+        let tree_q = &instance.trees[q];
+
+        // Find all sibling leaf pairs in tree q.
+        // Two leaves are siblings if they share the same parent.
+        for a in 0..n {
+            let a_label = (a + 1) as Label;
+            let a_node_q = tree_q.node_by_label(a_label);
+            let parent_a_q = tree_q.parent[a_node_q as usize];
+            if parent_a_q == NONE {
+                continue;
+            }
+
+            // Find sibling of a in tree q
+            let sib_of_a_q = if tree_q.left[parent_a_q as usize] == a_node_q {
+                tree_q.right[parent_a_q as usize]
+            } else {
+                tree_q.left[parent_a_q as usize]
+            };
+
+            // Only consider sibling pairs where the sibling is also a leaf
+            // and we use a < c to avoid processing the same pair twice
+            if !tree_q.is_leaf(sib_of_a_q) {
+                continue;
+            }
+            let c_label = tree_q.label[sib_of_a_q as usize];
+            if c_label == 0 {
+                continue;
+            }
+            let c = (c_label - 1) as usize;
+            if c >= n || a >= c {
+                // Only process each pair once (a < c)
+                continue;
+            }
+
+            // (a, c) are sibling leaves in tree q with shared parent parent_a_q.
+            // conn index: min(a,c) = a, max(a,c) = c since a < c.
+            let conn_var = match conn[a][c] {
+                Some(v) => v,
+                None => continue,
+            };
+
+            // Check against every other tree r.
+            for r in 0..m {
+                if r == q {
+                    continue;
+                }
+                let tree_r = &instance.trees[r];
+
+                let a_node_r = tree_r.node_by_label(a_label);
+                let c_node_r = tree_r.node_by_label(c_label);
+                let parent_a_r = tree_r.parent[a_node_r as usize];
+                let parent_c_r = tree_r.parent[c_node_r as usize];
+
+                if parent_a_r == NONE || parent_c_r == NONE {
+                    continue;
+                }
+
+                // --- CUT_ONE_B check ---
+                // If grandparent of a in T_r == parent of c in T_r,
+                // then the sibling of a in T_r must be cut to separate a from c's subtree.
+                let grandparent_a_r = tree_r.parent[parent_a_r as usize];
+                if grandparent_a_r != NONE && grandparent_a_r == parent_c_r {
+                    // Find sibling of a_node_r in tree r (other child of parent_a_r)
+                    let b_node_r = if tree_r.left[parent_a_r as usize] == a_node_r {
+                        tree_r.right[parent_a_r as usize]
+                    } else {
+                        tree_r.left[parent_a_r as usize]
+                    };
+
+                    if let Some(del_b) = del[r][b_node_r as usize] {
+                        // conn(a,c) ∨ del[r][b_node_r]
+                        add_clause(solver, &[conn_var.pos_lit(), del_b.pos_lit()]);
+                        clause_count += 1;
+                    }
+                }
+
+                // Also check the symmetric case: grandparent of c in T_r == parent of a in T_r
+                let grandparent_c_r = tree_r.parent[parent_c_r as usize];
+                if grandparent_c_r != NONE && grandparent_c_r == parent_a_r {
+                    let b_node_r = if tree_r.left[parent_c_r as usize] == c_node_r {
+                        tree_r.right[parent_c_r as usize]
+                    } else {
+                        tree_r.left[parent_c_r as usize]
+                    };
+
+                    if let Some(del_b) = del[r][b_node_r as usize] {
+                        // conn(a,c) ∨ del[r][b_node_r]
+                        add_clause(solver, &[conn_var.pos_lit(), del_b.pos_lit()]);
+                        clause_count += 1;
+                    }
+                }
+
+                // --- REVERSE_CUT_ONE_B check ---
+                // parent_ac_q is the shared parent of (a, c) in tree q.
+                // Check if parent_ac_q has a sibling in tree q that is a leaf.
+                let grandparent_ac_q = tree_q.parent[parent_a_q as usize];
+                if grandparent_ac_q == NONE {
+                    continue;
+                }
+
+                // Find sibling of parent_a_q (= parent_ac_q) in tree q
+                let uncle_q = if tree_q.left[grandparent_ac_q as usize] == parent_a_q {
+                    tree_q.right[grandparent_ac_q as usize]
+                } else {
+                    tree_q.left[grandparent_ac_q as usize]
+                };
+
+                if !tree_q.is_leaf(uncle_q) {
+                    continue;
+                }
+
+                let s_label = tree_q.label[uncle_q as usize];
+                if s_label == 0 || s_label as usize > n {
+                    continue;
+                }
+
+                // s is a leaf sibling of the (a,c) parent node in tree q.
+                // Look at s in tree r.
+                let s_node_r = tree_r.node_by_label(s_label);
+                let s_parent_r = tree_r.parent[s_node_r as usize];
+                if s_parent_r == NONE {
+                    continue;
+                }
+
+                if s_parent_r == parent_a_r {
+                    // s and a share a parent in tree r → cutting c is forced
+                    if let Some(del_c) = del[r][c_node_r as usize] {
+                        // conn(a,c) ∨ del[r][c_node_r]
+                        add_clause(solver, &[conn_var.pos_lit(), del_c.pos_lit()]);
+                        clause_count += 1;
+                    }
+                }
+
+                if s_parent_r == parent_c_r {
+                    // s and c share a parent in tree r → cutting a is forced
+                    if let Some(del_a) = del[r][a_node_r as usize] {
+                        // conn(a,c) ∨ del[r][a_node_r]
+                        add_clause(solver, &[conn_var.pos_lit(), del_a.pos_lit()]);
+                        clause_count += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    clause_count
+}
+
 fn sat_solve_maf_cut(
     instance: &Instance,
     k_max: usize,
@@ -409,6 +581,9 @@ fn sat_solve_maf_cut(
         }
     }
 
+    // 4. rSPR-inspired structural implications from sibling pair analysis.
+    let rspr_count = add_rspr_implications(&mut solver, instance, &del, &conn, n, m);
+
     // 5. Totalizer on del[0][*] to count cuts in tree 0.
     //    k components = k-1 cuts. Minimize cuts.
     let del_0_lits: Vec<Lit> = del[0]
@@ -428,13 +603,14 @@ fn sat_solve_maf_cut(
         .unwrap();
 
     let encode_ms = t_enc.elapsed().as_secs_f64() * 1000.0;
-    let total_clauses = backward_count + forward_count + h4_count;
+    let total_clauses = backward_count + forward_count + h4_count + rspr_count;
     profile.num_vars = vm.n_used() as usize;
     profile.encode_ms = path_ms + encode_ms;
+    profile.rspr_clauses = rspr_count;
 
     eprintln!(
-        "[cut] Clauses: {} total ({} backward + {} forward + {} H4) in {:.1}ms",
-        total_clauses, backward_count, forward_count, h4_count, encode_ms
+        "[cut] Clauses: {} total ({} backward + {} forward + {} H4 + {} rspr) in {:.1}ms",
+        total_clauses, backward_count, forward_count, h4_count, rspr_count, encode_ms
     );
     eprintln!(
         "[cut] Total: {} vars, {} clauses. Totalizer over {} del vars.",
