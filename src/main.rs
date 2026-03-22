@@ -59,6 +59,8 @@ enum Commands {
         #[arg(long)]
         leaf: u32,
     },
+    /// Analyze cluster decomposition potential (Kelk + rspr).
+    ClusterAnalyze,
     Info,
     Bounds,
     RedBlueUB,
@@ -146,6 +148,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Some(Commands::Bounds) => {
                     commands::bounds::run(&instance, cli.verbose)?;
+                }
+                Some(Commands::ClusterAnalyze) => {
+                    commands::cluster_analyze::run(&instance)?;
                 }
                 Some(Commands::BoundsDetail) => {
                     commands::bounds_detail::run(&instance)?;
