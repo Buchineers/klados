@@ -14,13 +14,28 @@ pub fn extract_maf_components(
 ) -> Vec<Tree> {
     let collapsed_into = build_collapsed_into(collapses, num_leaves);
     let comps = component_leaf_sets_xf(forest, label_space);
+    if super::trace_enabled() {
+        eprintln!("[extract] {} raw components from forest, {} collapses", comps.len(), collapses.len());
+        for (i, c) in comps.iter().enumerate() {
+            let labels: Vec<usize> = c.ones().collect();
+            eprintln!("[extract]   raw comp {}: {:?}", i, labels);
+        }
+    }
     let mut result = Vec::new();
     for comp_ls in &comps {
         if comp_ls.count_ones(..) == 0 {
             continue;
         }
         let expanded = expand_leafset(comp_ls, &collapsed_into, num_leaves, label_space);
+        if super::trace_enabled() {
+            let raw_labels: Vec<usize> = comp_ls.ones().collect();
+            let exp_labels: Vec<usize> = expanded.ones().collect();
+            eprintln!("[extract]   raw {:?} → expanded {:?}", raw_labels, exp_labels);
+        }
         result.push(build_component_tree(&expanded, &forest.tree, num_leaves));
+    }
+    if super::trace_enabled() {
+        eprintln!("[extract] {} final components", result.len());
     }
     result
 }
