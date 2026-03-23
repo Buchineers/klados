@@ -31,8 +31,13 @@ pub struct SearchState {
     /// Stack of T2 nodes whose edges were protected (most recent last).
     /// Used by DEEPEST_PROTECTED_ORDER to constrain sibling pair selection.
     pub protected_stack: Vec<NodeId>,
+    /// Incrementally maintained T1 sibling pairs stored as (label_a, label_b).
+    /// Append-only; stale pairs are skipped during iteration.
+    /// Checkpointed by length — rollback truncates appended entries.
+    pub sibling_pairs: Vec<(u32, u32)>,
     undo_log: Vec<UndoOp>,
-    checkpoint_stack: Vec<(usize, usize)>,
+    /// (undo_log_len, collapses_len, sibling_pairs_len)
+    checkpoint_stack: Vec<(usize, usize, usize)>,
 }
 
 impl SearchState {
@@ -46,23 +51,26 @@ impl SearchState {
             protected,
             collapses: Vec::new(),
             protected_stack: Vec::new(),
+            sibling_pairs: Vec::new(),
             undo_log: Vec::new(),
             checkpoint_stack: Vec::new(),
         }
     }
 
     pub fn checkpoint(&mut self) -> usize {
-        let cp = (self.undo_log.len(), self.collapses.len());
+        let cp = (self.undo_log.len(), self.collapses.len(), self.sibling_pairs.len());
         self.checkpoint_stack.push(cp);
         self.undo_log.len()
     }
 
     pub fn rollback(&mut self) {
-        let (undo_target, collapses_target) = self.checkpoint_stack.pop().unwrap();
+        let (undo_target, collapses_target, pairs_target) =
+            self.checkpoint_stack.pop().unwrap();
         while self.undo_log.len() > undo_target {
             self.undo_one();
         }
         self.collapses.truncate(collapses_target);
+        self.sibling_pairs.truncate(pairs_target);
     }
 
     pub fn rollback_to(&mut self, target: usize) {

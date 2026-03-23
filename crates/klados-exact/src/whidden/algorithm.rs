@@ -45,6 +45,7 @@ pub fn solve(instance: &Instance, stats: &mut SolverStats) -> Option<Vec<Tree>> 
             .map(|t| XForest::from_tree(t.clone()))
             .collect();
         let mut state = SearchState::new(forests);
+        init_sibling_pairs(&mut state);
 
         if trace_enabled() {
             eprintln!("[whidden] trying k={}", k);
@@ -121,6 +122,64 @@ fn ep_enabled() -> bool {
 }
 
 
+/// Build the initial T1 sibling pair set by scanning the tree once.
+fn init_sibling_pairs(state: &mut SearchState) {
+    state.sibling_pairs.clear();
+    let f1 = &state.forests[0];
+    for node in f1.tree.post_order() {
+        if f1.tree.is_leaf(node) || f1.is_cut(node) {
+            continue;
+        }
+        if f1.live_leaf_count[node as usize] == 0 {
+            continue;
+        }
+        if descend_to_effective(f1, node) != node {
+            continue;
+        }
+        let children = active_children_xf(f1, node);
+        if children.len() != 2 {
+            continue;
+        }
+        let left = descend_to_effective(f1, children[0]);
+        let right = descend_to_effective(f1, children[1]);
+        if !is_effective_leaf(f1, left) || !is_effective_leaf(f1, right) {
+            continue;
+        }
+        let ll = single_live_label(f1, left);
+        let lr = single_live_label(f1, right);
+        if ll != 0 && lr != 0 {
+            state.sibling_pairs.push((ll, lr));
+        }
+    }
+}
+
+/// Check if `t1_node` is the effective parent of a new sibling pair; if so, add it.
+fn try_add_pair_at(state: &mut SearchState, t1_node: NodeId) {
+    let pair = {
+        let f1 = &state.forests[0];
+        if t1_node == NONE {
+            return;
+        }
+        let eff = descend_to_effective(f1, t1_node);
+        let children = active_children_xf(f1, eff);
+        if children.len() != 2 {
+            return;
+        }
+        let left = descend_to_effective(f1, children[0]);
+        let right = descend_to_effective(f1, children[1]);
+        if !is_effective_leaf(f1, left) || !is_effective_leaf(f1, right) {
+            return;
+        }
+        let ll = single_live_label(f1, left);
+        let lr = single_live_label(f1, right);
+        if ll == 0 || lr == 0 {
+            return;
+        }
+        (ll, lr)
+    };
+    state.sibling_pairs.push(pair);
+}
+
 fn branch_and_bound(
     state: &mut SearchState,
     k: i32,
@@ -154,7 +213,7 @@ fn branch_and_bound_inner(
         let action = if cut_b_only && forced_pair.is_some() {
             find_next_action_with_forced(state, label_space, forced_pair.unwrap())
         } else {
-            find_next_action(state, label_space)
+            find_next_action_mut(state, label_space)
         };
 
         match action {
@@ -170,6 +229,19 @@ fn branch_and_bound_inner(
                     eprintln!("[whidden] Singleton: t1_node={} label={}, k={}", t1_node, lbl, k);
                 }
                 state.cut_node(0, t1_node);
+                // After cutting, the sibling's effective parent may form a new pair.
+                let sib_eff_parent = {
+                    let f1 = &state.forests[0];
+                    let sib = sibling_in_tree(&f1.tree, t1_node);
+                    if sib != NONE {
+                        effective_parent(f1, sib)
+                    } else {
+                        NONE
+                    }
+                };
+                if sib_eff_parent != NONE {
+                    try_add_pair_at(state, sib_eff_parent);
+                }
             }
             Action::Contract { label_a, label_b } => {
                 if trace_enabled() {
@@ -193,6 +265,19 @@ fn branch_and_bound_inner(
                     }
                 }
                 state.add_collapse(label_a, label_b);
+                // After contraction, the kept label's effective parent may form a new pair.
+                let eff_parent = {
+                    let f1 = &state.forests[0];
+                    let t1_kept = f1.tree.label_to_node[label_b as usize];
+                    if t1_kept != NONE {
+                        effective_parent(f1, t1_kept)
+                    } else {
+                        NONE
+                    }
+                };
+                if eff_parent != NONE {
+                    try_add_pair_at(state, eff_parent);
+                }
                 cut_b_only = false;
                 forced_pair = None;
             }
@@ -556,7 +641,23 @@ fn find_next_action_with_forced(
     find_next_action(state, label_space)
 }
 
-/// Scan forests for the next action.
+/// Wrapper that tries the incremental pair set first, then rebuilds it from a
+/// full tree scan if no valid pair was found.  This ensures correctness even
+/// when incremental updates miss a pair: the full rebuild is amortised over
+/// the lifetime of the rebuilt set.
+fn find_next_action_mut(state: &mut SearchState, label_space: usize) -> Action {
+    let action = find_next_action(state, label_space);
+    match action {
+        Action::Done | Action::Failure => {
+            // Incremental set may have missed pairs — rebuild from scratch.
+            init_sibling_pairs(state);
+            find_next_action(state, label_space)
+        }
+        other => other,
+    }
+}
+
+/// Scan forests for the next action using the incrementally maintained pair set.
 ///
 /// Priority: singletons first, then sibling pairs (Case 2 before Case 3).
 /// Returns Done only when no sibling pairs and no singletons remain.
@@ -564,14 +665,8 @@ fn find_next_action(state: &SearchState, label_space: usize) -> Action {
     let f1 = &state.forests[0];
     let f2 = &state.forests[1];
 
-    // First, check for singletons: a leaf whose component in one forest
-    // is a single leaf while its component in the other has multiple leaves.
-    // In rspr, a singleton in T2 means: a leaf in T2 that is NOT in the
-    // first component, and has become isolated (component = just itself).
-    // Equivalently: cut above the twin in T1.
-    //
-    // We check: for each label, if it's in a 1-leaf component in T2 but
-    // a multi-leaf component in T1 (or vice versa).
+    // 1. Singleton check: for each label, is its T2 component a single leaf
+    //    while its T1 component has multiple leaves?
     for lbl in 1..=label_space as u32 {
         if lbl as usize >= f1.tree.label_to_node.len() {
             continue;
@@ -581,8 +676,8 @@ fn find_next_action(state: &SearchState, label_space: usize) -> Action {
         if t1_node == NONE || t2_node == NONE {
             continue;
         }
-        if !f1.live_leafsets[t1_node as usize].contains(lbl as usize) {
-            continue; // deactivated
+        if f1.live_leaf_count[t1_node as usize] == 0 {
+            continue;
         }
 
         let t2_comp_root = f2.component_root(t2_node);
@@ -592,31 +687,18 @@ fn find_next_action(state: &SearchState, label_space: usize) -> Action {
         if trace_enabled() {
             eprintln!("[whidden]   singleton check: lbl={} t1_comp_size={} t2_comp_size={}", lbl, t1_comp_size, t2_comp_size);
         }
-        if t2_comp_size == 1 {
-            if t1_comp_size > 1 {
-                return Action::Singleton { t1_node };
-            }
+        if t2_comp_size == 1 && t1_comp_size > 1 {
+            return Action::Singleton { t1_node };
         }
     }
 
-    // Next, find sibling pairs in T1.
-    // A sibling pair is two effective leaves that share an effective parent.
-    //
-    // DEEPEST_ORDER (matching rspr): select the Case 3 pair with the greatest
-    // effective depth.  Primary key = max T1 depth of the pair, secondary =
-    // max T2 depth of the twins.  This ordering is required for edge-protection
-    // soundness: processing deeper pairs first ensures that protecting T2_a
-    // after Branch C does not prune valid cuts at shallower levels.
-    //
-    // DEEPEST_PROTECTED_ORDER: when the protected stack is non-empty, only
-    // accept pairs where T1_a is a descendant of the T1 parent of the last
-    // protected T2 node's twin.  This confines EP's scope to the subtree
-    // where the protection is semantically valid.
+    // 2. Iterate the maintained sibling pair set instead of a full tree scan.
+    //    DEEPEST_ORDER selects the Case 3 pair with greatest effective depth.
+    //    DEEPEST_PROTECTED_ORDER constrains to pairs within the DPO scope.
     let mut best_branch: Option<Action> = None;
     let mut best_t1_depth: usize = 0;
     let mut best_t2_depth: usize = 0;
 
-    // Compute the DEEPEST_PROTECTED_ORDER constraint scope.
     let dpo_scope: NodeId = if ep_enabled() {
         if let Some(&last_protected_t2) = state.protected_stack.last() {
             let label = f2.tree.label[last_protected_t2 as usize];
@@ -641,37 +723,27 @@ fn find_next_action(state: &SearchState, label_space: usize) -> Action {
         eprintln!("[whidden]   DPO scope: node {} (stack len={})", dpo_scope, state.protected_stack.len());
     }
 
-    for node in f1.tree.post_order() {
-        if f1.tree.is_leaf(node) {
+    for &(label_l, label_r) in &state.sibling_pairs {
+        // Validity: both labels still active
+        let t1_l = f1.tree.label_to_node[label_l as usize];
+        let t1_r = f1.tree.label_to_node[label_r as usize];
+        if t1_l == NONE || t1_r == NONE {
             continue;
         }
-        if f1.is_cut(node) {
-            continue;
-        }
-        if f1.live_leaf_count[node as usize] == 0 {
-            continue;
-        }
-
-        let eff = descend_to_effective(f1, node);
-        let children = active_children_xf(f1, eff);
-        if children.len() != 2 {
+        if f1.live_leaf_count[t1_l as usize] == 0
+            || f1.live_leaf_count[t1_r as usize] == 0
+        {
             continue;
         }
 
-        let left = descend_to_effective(f1, children[0]);
-        let right = descend_to_effective(f1, children[1]);
-
-        if !is_effective_leaf(f1, left) || !is_effective_leaf(f1, right) {
+        // Check they're still T1 siblings (same effective parent)
+        let ep_l = effective_parent(f1, t1_l);
+        let ep_r = effective_parent(f1, t1_r);
+        if ep_l != ep_r || ep_l == NONE {
             continue;
         }
 
-        let label_l = single_live_label(f1, left);
-        let label_r = single_live_label(f1, right);
-        if label_l == 0 || label_r == 0 {
-            continue;
-        }
-
-        // Found sibling pair (label_l, label_r) in T1.
+        // T2 counterparts
         let t2_l = f2.tree.label_to_node[label_l as usize];
         let t2_r = f2.tree.label_to_node[label_r as usize];
         if t2_l == NONE || t2_r == NONE {
@@ -685,20 +757,22 @@ fn find_next_action(state: &SearchState, label_space: usize) -> Action {
             && t2_r_eff_parent != NONE
             && t2_l_eff_parent == t2_r_eff_parent
         {
-            // Case 2: matching sibling pair → contract immediately.
             return Action::Contract {
                 label_a: label_l,
                 label_b: label_r,
             };
         }
 
-        // PREFER_NONBRANCHING (rspr): if this Case 3 pair has trivially
-        // determined branching, select it immediately (before deeper pairs).
-        if is_nonbranching(f1, f2, left, right, t2_l, t2_r, state) {
+        // PREFER_NONBRANCHING: select immediately if branching is trivially determined.
+        if is_nonbranching(f1, f2, t1_l, t1_r, t2_l, t2_r, state) {
             let (t1_a, t1_c, t2_a_node, t2_c_node) = {
                 let dl = effective_depth(f2, t2_l);
                 let dr = effective_depth(f2, t2_r);
-                if dl >= dr { (left, right, t2_l, t2_r) } else { (right, left, t2_r, t2_l) }
+                if dl >= dr {
+                    (t1_l, t1_r, t2_l, t2_r)
+                } else {
+                    (t1_r, t1_l, t2_r, t2_l)
+                }
             };
             let t2_b_node = effective_sibling(f2, t2_a_node);
             if t2_b_node != NONE {
@@ -712,16 +786,14 @@ fn find_next_action(state: &SearchState, label_space: usize) -> Action {
             }
         }
 
-        // Case 3: non-matching → potential branch point.
-        // DEEPEST_ORDER: pick the deepest pair by (T1 depth, T2 depth).
-        let t1_depth = effective_depth(f1, left).max(effective_depth(f1, right));
+        // Case 3: DEEPEST_ORDER — track best by (T1 depth, T2 depth).
+        let t1_depth = effective_depth(f1, t1_l).max(effective_depth(f1, t1_r));
         let t2_depth_l = effective_depth(f2, t2_l);
         let t2_depth_r = effective_depth(f2, t2_r);
         let t2_depth = t2_depth_l.max(t2_depth_r);
 
-        // DEEPEST_PROTECTED_ORDER: only accept pairs within the DPO scope.
         if dpo_scope != NONE
-            && !is_effective_descendant_or_equal(f1, dpo_scope, left)
+            && !is_effective_descendant_or_equal(f1, dpo_scope, t1_l)
         {
             if trace_enabled() {
                 eprintln!("[whidden]   DPO: rejecting pair ({},{}) - not in scope", label_l, label_r);
@@ -733,13 +805,10 @@ fn find_next_action(state: &SearchState, label_space: usize) -> Action {
             || t1_depth > best_t1_depth
             || (t1_depth == best_t1_depth && t2_depth > best_t2_depth)
         {
-            // T2_a = the deeper twin in T2 (convention from rspr).
-            let (t1_a, t1_c, t2_a_node, t2_c_node) = {
-                if t2_depth_l >= t2_depth_r {
-                    (left, right, t2_l, t2_r)
-                } else {
-                    (right, left, t2_r, t2_l)
-                }
+            let (t1_a, t1_c, t2_a_node, t2_c_node) = if t2_depth_l >= t2_depth_r {
+                (t1_l, t1_r, t2_l, t2_r)
+            } else {
+                (t1_r, t1_l, t2_r, t2_l)
             };
 
             let t2_b_node = effective_sibling(f2, t2_a_node);
@@ -765,7 +834,6 @@ fn find_next_action(state: &SearchState, label_space: usize) -> Action {
         }
     }
 
-    // If we found a branch point, return it.
     if let Some(branch) = best_branch {
         if trace_enabled() { eprintln!("[whidden]   returning Branch action"); }
         return branch;
@@ -773,7 +841,6 @@ fn find_next_action(state: &SearchState, label_space: usize) -> Action {
 
     if trace_enabled() { eprintln!("[whidden]   no branch found, checking components_match"); }
 
-    // No singletons and no sibling pairs → check if done.
     use crate::shi_mestel::forest_nav::component_leaf_sets_xf;
     let comps1 = component_leaf_sets_xf(f1, label_space);
     let comps2 = component_leaf_sets_xf(f2, label_space);
@@ -782,8 +849,6 @@ fn find_next_action(state: &SearchState, label_space: usize) -> Action {
         return Action::Done;
     }
 
-    // Components don't match but no actionable sibling pair found.
-    // This shouldn't happen if the algorithm is correct.
     if trace_enabled() {
         eprintln!("[whidden] BUG: no action found but components don't match!");
         eprintln!("[whidden]   comps1: {:?}", comps1.iter().map(|c| c.ones().collect::<Vec<_>>()).collect::<Vec<_>>());
