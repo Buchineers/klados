@@ -7,7 +7,7 @@ pub(crate) mod algorithm;
 mod branching;
 mod decomposition;
 pub(crate) mod extraction;
-mod forest_nav;
+pub(crate) mod forest_nav;
 mod reduction;
 mod search_state;
 mod split;
