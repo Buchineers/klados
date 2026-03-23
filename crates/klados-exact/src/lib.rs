@@ -9,6 +9,7 @@ pub use klados_core::lower_bound;
 pub mod maf_ilp;
 pub mod maf_sat;
 pub mod shi_mestel;
+pub mod whidden;
 
 use klados_core::{Instance, SolverStats, Tree};
 
@@ -29,6 +30,7 @@ pub fn available_solvers() -> Vec<Box<dyn ExactSolver>> {
         Box::new(maf_ilp::MafIlpSolver::new()),
         Box::new(maf_sat::MafSatSolver::new()),
         Box::new(maf_sat::MafSatOlverSolver::new()),
+        Box::new(whidden::WhiddenSolver::new()),
     ]
 }
 
