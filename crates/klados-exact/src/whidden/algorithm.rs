@@ -489,9 +489,9 @@ fn find_next_action_with_forced(
             continue;
         }
         let t2_comp_root = f2.component_root(t2_node);
-        let t2_comp_size = f2.live_leafsets[t2_comp_root as usize].count_ones(..);
+        let t2_comp_size = f2.live_leaf_count[t2_comp_root as usize];
         let t1_comp_root = f1.component_root(t1_node);
-        let t1_comp_size = f1.live_leafsets[t1_comp_root as usize].count_ones(..);
+        let t1_comp_size = f1.live_leaf_count[t1_comp_root as usize];
         if trace_enabled() {
             eprintln!("[whidden]   singleton check: lbl={} t1_comp_size={} t2_comp_size={}", lbl, t1_comp_size, t2_comp_size);
         }
@@ -586,9 +586,9 @@ fn find_next_action(state: &SearchState, label_space: usize) -> Action {
         }
 
         let t2_comp_root = f2.component_root(t2_node);
-        let t2_comp_size = f2.live_leafsets[t2_comp_root as usize].count_ones(..);
+        let t2_comp_size = f2.live_leaf_count[t2_comp_root as usize];
         let t1_comp_root = f1.component_root(t1_node);
-        let t1_comp_size = f1.live_leafsets[t1_comp_root as usize].count_ones(..);
+        let t1_comp_size = f1.live_leaf_count[t1_comp_root as usize];
         if trace_enabled() {
             eprintln!("[whidden]   singleton check: lbl={} t1_comp_size={} t2_comp_size={}", lbl, t1_comp_size, t2_comp_size);
         }
@@ -648,7 +648,7 @@ fn find_next_action(state: &SearchState, label_space: usize) -> Action {
         if f1.is_cut(node) {
             continue;
         }
-        if f1.live_leafsets[node as usize].count_ones(..) == 0 {
+        if f1.live_leaf_count[node as usize] == 0 {
             continue;
         }
 
@@ -825,11 +825,10 @@ fn is_effective_leaf(f: &XForest, node: NodeId) -> bool {
 }
 
 fn single_live_label(f: &XForest, node: NodeId) -> u32 {
-    let ls = &f.live_leafsets[node as usize];
-    if ls.count_ones(..) != 1 {
+    if f.live_leaf_count[node as usize] != 1 {
         return 0;
     }
-    ls.ones().next().unwrap() as u32
+    f.live_leafsets[node as usize].ones().next().unwrap() as u32
 }
 
 fn effective_parent(f: &XForest, node: NodeId) -> NodeId {

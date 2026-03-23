@@ -49,13 +49,13 @@ pub fn active_children_xf(forest: &XForest, node: NodeId) -> Children {
     if let Some((left, right)) = tree.children(node) {
         if left != NONE
             && !forest.is_cut(left)
-            && forest.live_leafsets[left as usize].count_ones(..) > 0
+            && forest.live_leaf_count[left as usize] > 0
         {
             out.push(left);
         }
         if right != NONE
             && !forest.is_cut(right)
-            && forest.live_leafsets[right as usize].count_ones(..) > 0
+            && forest.live_leaf_count[right as usize] > 0
         {
             out.push(right);
         }
@@ -68,13 +68,13 @@ pub fn forest_children(forest: &XForest, node: NodeId) -> Children {
     if let Some((left, right)) = forest.tree.children(node) {
         if left != NONE
             && !forest.is_cut(left)
-            && forest.live_leafsets[left as usize].count_ones(..) > 0
+            && forest.live_leaf_count[left as usize] > 0
         {
             out.push(descend_to_effective(forest, left));
         }
         if right != NONE
             && !forest.is_cut(right)
-            && forest.live_leafsets[right as usize].count_ones(..) > 0
+            && forest.live_leaf_count[right as usize] > 0
         {
             out.push(descend_to_effective(forest, right));
         }
@@ -162,14 +162,12 @@ pub fn forest_lca(forest: &XForest, mut a: NodeId, mut b: NodeId) -> NodeId {
 
 pub fn component_leaf_sets_xf(forest: &XForest, _label_space: usize) -> Vec<FixedBitSet> {
     let mut components = Vec::new();
-    let root_ls = &forest.live_leafsets[forest.tree.root as usize];
-    if root_ls.count_ones(..) > 0 {
-        components.push(root_ls.clone());
+    if forest.live_leaf_count[forest.tree.root as usize] > 0 {
+        components.push(forest.live_leafsets[forest.tree.root as usize].clone());
     }
     for node in forest.cut_edges.ones() {
-        let ls = &forest.live_leafsets[node];
-        if ls.count_ones(..) > 0 {
-            components.push(ls.clone());
+        if forest.live_leaf_count[node] > 0 {
+            components.push(forest.live_leafsets[node].clone());
         }
     }
     components

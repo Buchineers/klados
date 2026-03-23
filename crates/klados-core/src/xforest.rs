@@ -17,6 +17,9 @@ pub struct XForest {
     pub cut_edges: FixedBitSet,
     pub full_leafsets: Vec<FixedBitSet>,
     pub live_leafsets: Vec<FixedBitSet>,
+    /// Number of live leaves in each node's subtree — O(1) replacement for
+    /// `live_leafsets[node].count_ones(..)`.
+    pub live_leaf_count: Vec<u32>,
     pub component_roots: Vec<NodeId>,
 }
 
@@ -42,11 +45,16 @@ impl XForest {
         }
         let root = tree.root;
         let live_leafsets = full_leafsets.clone();
+        let live_leaf_count: Vec<u32> = live_leafsets
+            .iter()
+            .map(|ls| ls.count_ones(..) as u32)
+            .collect();
         Self {
             tree,
             cut_edges: FixedBitSet::with_capacity(num_nodes),
             full_leafsets,
             live_leafsets,
+            live_leaf_count,
             component_roots: vec![root],
         }
     }
@@ -62,9 +70,11 @@ impl XForest {
             self.cut_edges.insert(node as usize);
             self.component_roots.push(node);
             let removed = self.live_leafsets[node as usize].clone();
+            let removed_count = self.live_leaf_count[node as usize];
             let mut cur = self.tree.parent[node as usize];
             while cur != NONE {
                 self.live_leafsets[cur as usize].difference_with(&removed);
+                self.live_leaf_count[cur as usize] -= removed_count;
                 if self.is_cut(cur) {
                     break;
                 }
@@ -80,9 +90,11 @@ impl XForest {
             self.component_roots.swap_remove(pos);
         }
         let restored = self.live_leafsets[node as usize].clone();
+        let restored_count = self.live_leaf_count[node as usize];
         let mut cur = self.tree.parent[node as usize];
         while cur != NONE {
             self.live_leafsets[cur as usize].union_with(&restored);
+            self.live_leaf_count[cur as usize] += restored_count;
             if self.is_cut(cur) {
                 break;
             }
@@ -93,9 +105,11 @@ impl XForest {
     pub fn reactivate_label(&mut self, lbl: u32) {
         let a_node = self.tree.label_to_node[lbl as usize];
         self.live_leafsets[a_node as usize].insert(lbl as usize);
+        self.live_leaf_count[a_node as usize] += 1;
         let mut cur = self.tree.parent[a_node as usize];
         while cur != NONE {
             self.live_leafsets[cur as usize].insert(lbl as usize);
+            self.live_leaf_count[cur as usize] += 1;
             if self.is_cut(cur) {
                 break;
             }

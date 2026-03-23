@@ -111,9 +111,11 @@ impl SearchState {
         for f in &mut self.forests {
             let a_node = f.tree.label_to_node[removed as usize];
             f.live_leafsets[a_node as usize].clear();
+            f.live_leaf_count[a_node as usize] = 0;
             let mut cur = f.tree.parent[a_node as usize];
             while cur != NONE {
                 f.live_leafsets[cur as usize].set(removed as usize, false);
+                f.live_leaf_count[cur as usize] -= 1;
                 if f.is_cut(cur) {
                     break;
                 }
