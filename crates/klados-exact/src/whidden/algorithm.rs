@@ -44,8 +44,11 @@ pub fn solve(instance: &Instance, stats: &mut SolverStats) -> Option<Vec<Tree>> 
             .iter()
             .map(|t| XForest::from_tree(t.clone()))
             .collect();
+        let num_nodes = forests[0].tree.num_nodes();
         let mut state = SearchState::new(forests);
         init_sibling_pairs(&mut state);
+        state.init_singletons(num_leaves as usize);
+        let mut scratch = ScratchPad::new(num_nodes);
 
         if trace_enabled() {
             eprintln!("[whidden] trying k={}", k);
@@ -56,6 +59,7 @@ pub fn solve(instance: &Instance, stats: &mut SolverStats) -> Option<Vec<Tree>> 
             k as i32,
             num_leaves as usize,
             stats,
+            &mut scratch,
         );
 
         if result >= 0 {
@@ -67,6 +71,9 @@ pub fn solve(instance: &Instance, stats: &mut SolverStats) -> Option<Vec<Tree>> 
                 let cuts2: Vec<usize> = state.forests[1].cut_edges.ones().collect();
                 eprintln!("[whidden] f1 cut nodes: {:?}", cuts2);
                 eprintln!("[whidden] collapses: {:?}", state.collapses);
+            }
+            if trace_enabled() {
+                eprintln!("[whidden] nodes_explored={} k={}", stats.nodes_explored, k);
             }
             let components = extract_maf_components(
                 &state.forests[0],
@@ -81,10 +88,112 @@ pub fn solve(instance: &Instance, stats: &mut SolverStats) -> Option<Vec<Tree>> 
     None
 }
 
-/// Main branch-and-bound loop.
-///
-/// Returns the remaining k if successful (>= 0), or -1 if no solution.
-/// `k` is the number of cuts still allowed.
+// ---------------------------------------------------------------------------
+// ScratchPad: per-invocation caches for effective_parent and effective_depth
+// ---------------------------------------------------------------------------
+
+/// Reusable scratch space for caching effective_parent and effective_depth.
+/// Allocated once per iterative-deepening round, cleared per find_next_action call.
+struct ScratchPad {
+    /// Cached effective_parent per (forest_idx, node). NONE = not yet computed.
+    /// Index: [forest_idx * num_nodes + node_id].
+    /// We use NONE as "uncomputed" and NONE-1 as "computed, result is NONE".
+    eff_parent: Vec<NodeId>,
+    /// Precomputed effective_depth per (forest_idx, node). u16::MAX = not computed.
+    eff_depth: Vec<u16>,
+    num_nodes: usize,
+    /// Generation counter — bumped on each invalidate(), entries with old
+    /// generation are treated as uncomputed.
+    generation: u32,
+    eff_parent_gen: Vec<u32>,
+    eff_depth_gen: Vec<u32>,
+}
+
+/// Sentinel for "computed, result is NONE" (distinct from NONE = "not computed").
+const CACHED_NONE: NodeId = NONE - 1;
+
+impl ScratchPad {
+    fn new(num_nodes: usize) -> Self {
+        let total = 2 * num_nodes; // 2 forests
+        Self {
+            eff_parent: vec![NONE; total],
+            eff_depth: vec![u16::MAX; total],
+            num_nodes,
+            generation: 1,
+            eff_parent_gen: vec![0; total],
+            eff_depth_gen: vec![0; total],
+        }
+    }
+
+    /// Invalidate all caches (O(1) via generation bump).
+    #[inline]
+    fn invalidate(&mut self) {
+        self.generation += 1;
+    }
+
+    /// Get cached effective_parent, or compute and cache it.
+    #[inline]
+    fn effective_parent(&mut self, f: &XForest, fi: usize, node: NodeId) -> NodeId {
+        let idx = fi * self.num_nodes + node as usize;
+        if self.eff_parent_gen[idx] == self.generation {
+            let v = self.eff_parent[idx];
+            return if v == CACHED_NONE { NONE } else { v };
+        }
+        let result = effective_parent_raw(f, node);
+        self.eff_parent[idx] = if result == NONE { CACHED_NONE } else { result };
+        self.eff_parent_gen[idx] = self.generation;
+        result
+    }
+
+    /// Get cached effective_depth, or compute and cache it.
+    #[inline]
+    fn effective_depth(&mut self, f: &XForest, fi: usize, node: NodeId) -> u16 {
+        let idx = fi * self.num_nodes + node as usize;
+        if self.eff_depth_gen[idx] == self.generation {
+            return self.eff_depth[idx];
+        }
+        let mut depth: u16 = 0;
+        let mut cur = node;
+        loop {
+            let ep = self.effective_parent(f, fi, cur);
+            if ep == NONE {
+                break;
+            }
+            depth += 1;
+            cur = ep;
+        }
+        self.eff_depth[idx] = depth;
+        self.eff_depth_gen[idx] = self.generation;
+        depth
+    }
+
+    /// Compute effective_sibling using the cache for effective_parent.
+    fn effective_sibling(&mut self, f: &XForest, fi: usize, node: NodeId) -> NodeId {
+        let eff_parent = self.effective_parent(f, fi, node);
+        if eff_parent == NONE {
+            return NONE;
+        }
+        let children = active_children_xf(f, eff_parent);
+        if children.len() != 2 {
+            return NONE;
+        }
+        let left = descend_to_effective(f, children[0]);
+        let right = descend_to_effective(f, children[1]);
+
+        if is_ancestor_or_equal(f, left, node) {
+            right
+        } else if is_ancestor_or_equal(f, right, node) {
+            left
+        } else {
+            NONE
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
 fn trace_enabled() -> bool {
     use std::sync::OnceLock;
     static CACHED: OnceLock<bool> = OnceLock::new();
@@ -120,6 +229,7 @@ fn ep_enabled() -> bool {
     static CACHED: OnceLock<bool> = OnceLock::new();
     *CACHED.get_or_init(|| optimizations_enabled() && std::env::var("WHIDDEN_NO_EP").ok().as_deref() != Some("1"))
 }
+
 
 
 /// Build the initial T1 sibling pair set by scanning the tree once.
@@ -185,8 +295,9 @@ fn branch_and_bound(
     k: i32,
     label_space: usize,
     stats: &mut SolverStats,
+    scratch: &mut ScratchPad,
 ) -> i32 {
-    branch_and_bound_inner(state, k, label_space, stats, false, None)
+    branch_and_bound_inner(state, k, label_space, stats, false, None, scratch)
 }
 
 /// Inner branch-and-bound.
@@ -201,6 +312,7 @@ fn branch_and_bound_inner(
     stats: &mut SolverStats,
     cut_b_only: bool,
     forced_pair: Option<(NodeId, NodeId)>,
+    scratch: &mut ScratchPad,
 ) -> i32 {
     stats.nodes_explored += 1;
 
@@ -208,12 +320,15 @@ fn branch_and_bound_inner(
     let mut forced_pair = forced_pair;
 
     loop {
+        // Invalidate scratch caches — state has changed since last call.
+        scratch.invalidate();
+
         // When cut_b_only with a forced pair, check the forced pair first
         // (after processing singletons). This matches rspr's prev_T1_a/prev_T1_c.
         let action = if cut_b_only && forced_pair.is_some() {
-            find_next_action_with_forced(state, label_space, forced_pair.unwrap())
+            find_next_action_with_forced(state, label_space, forced_pair.unwrap(), scratch)
         } else {
-            find_next_action_mut(state, label_space)
+            find_next_action_mut(state, label_space, scratch)
         };
 
         match action {
@@ -234,7 +349,7 @@ fn branch_and_bound_inner(
                     let f1 = &state.forests[0];
                     let sib = sibling_in_tree(&f1.tree, t1_node);
                     if sib != NONE {
-                        effective_parent(f1, sib)
+                        effective_parent_raw(f1, sib)
                     } else {
                         NONE
                     }
@@ -270,7 +385,7 @@ fn branch_and_bound_inner(
                     let f1 = &state.forests[0];
                     let t1_kept = f1.tree.label_to_node[label_b as usize];
                     if t1_kept != NONE {
-                        effective_parent(f1, t1_kept)
+                        effective_parent_raw(f1, t1_kept)
                     } else {
                         NONE
                     }
@@ -293,7 +408,7 @@ fn branch_and_bound_inner(
                 }
                 return do_branch(
                     state, k, label_space, stats,
-                    t1_a, t1_c, t2_a, t2_b, t2_c, cut_b_only,
+                    t1_a, t1_c, t2_a, t2_b, t2_c, cut_b_only, scratch,
                 );
             }
             Action::Failure => {
@@ -318,6 +433,7 @@ fn do_branch(
     t2_b: NodeId,
     t2_c: NodeId,
     incoming_b_only: bool,
+    scratch: &mut ScratchPad,
 ) -> i32 {
     if trace_enabled() {
         eprintln!("[whidden] ENTER do_branch k={} b_only={}", k, incoming_b_only);
@@ -338,15 +454,15 @@ fn do_branch(
     {
         let t2 = &state.forests[1];
         let t1 = &state.forests[0];
-        let t1_ac = effective_parent(t1, t1_a);
+        let t1_ac = scratch.effective_parent(t1, 0, t1_a);
 
-        t2_a_eff_parent = effective_parent(t2, t2_a);
-        t2_c_eff_parent = effective_parent(t2, t2_c);
+        t2_a_eff_parent = scratch.effective_parent(t2, 1, t2_a);
+        t2_c_eff_parent = scratch.effective_parent(t2, 1, t2_c);
 
         if optimizations_enabled() {
             // --- COB: Cut-One-B ---
             if cob_enabled() && !incoming_b_only && t2_a_eff_parent != NONE && t2_c_eff_parent != NONE {
-                let t2_a_grandparent = effective_parent(t2, t2_a_eff_parent);
+                let t2_a_grandparent = scratch.effective_parent(t2, 1, t2_a_eff_parent);
                 if t2_a_grandparent != NONE && t2_a_grandparent == t2_c_eff_parent {
                     cut_a = false;
                     cut_c = false;
@@ -358,13 +474,13 @@ fn do_branch(
 
             // --- RCOB: Reverse Cut-One-B ---
             if rcob_enabled() && !incoming_b_only && cut_a && cut_c && t1_ac != NONE {
-                let t1_s = effective_sibling(t1, t1_ac);
+                let t1_s = scratch.effective_sibling(t1, 0, t1_ac);
                 if t1_s != NONE {
                     let t1_s_label = single_live_label(t1, t1_s);
                     if t1_s_label != 0 {
                         let t2_s = t2.tree.label_to_node[t1_s_label as usize];
                         if t2_s != NONE {
-                            let t2_s_eff_parent = effective_parent(t2, t2_s);
+                            let t2_s_eff_parent = scratch.effective_parent(t2, 1, t2_s);
                             if trace_enabled() {
                                 let la = t2.tree.label[t2_a as usize];
                                 let lc = t2.tree.label[t2_c as usize];
@@ -399,13 +515,13 @@ fn do_branch(
                         if cut_a && cut_c && t1_s_label != 0 {
                             let t2_s_ctb = t2.tree.label_to_node[t1_s_label as usize];
                             if t2_s_ctb != NONE && t2_a_eff_parent != NONE {
-                                let t2_l = effective_parent(t2, t2_a_eff_parent);
+                                let t2_l = scratch.effective_parent(t2, 1, t2_a_eff_parent);
                                 if t2_l != NONE && t2_c_eff_parent != NONE {
-                                    let t2_c_gp = effective_parent(t2, t2_c_eff_parent);
+                                    let t2_c_gp = scratch.effective_parent(t2, 1, t2_c_eff_parent);
                                     if (t2_c_gp != NONE && t2_c_gp == t2_l)
                                         || t2_c_eff_parent == t2_l
                                     {
-                                        let t2_l_sib = effective_sibling(t2, t2_l);
+                                        let t2_l_sib = scratch.effective_sibling(t2, 1, t2_l);
                                         if t2_l_sib != NONE && t2_l_sib == t2_s_ctb {
                                             cut_a = false;
                                             cut_c = false;
@@ -425,12 +541,12 @@ fn do_branch(
         // Branch C sibling-protection guard: when T2_c is at the root of its
         // component and T2_c's sibling is protected, skip Branch C.
         branch_c_sib_blocked = {
-            let t2_c_parent = effective_parent(t2, t2_c);
+            let t2_c_parent = scratch.effective_parent(t2, 1, t2_c);
             if t2_c_parent != NONE {
                 let comp_root = t2.component_root(t2_c);
-                let parent_parent = effective_parent(t2, t2_c_parent);
+                let parent_parent = scratch.effective_parent(t2, 1, t2_c_parent);
                 if parent_parent == NONE && t2_c_parent == comp_root {
-                    let t2_c_sib = effective_sibling(t2, t2_c);
+                    let t2_c_sib = scratch.effective_sibling(t2, 1, t2_c);
                     t2_c_sib != NONE && state.is_protected(1, t2_c_sib)
                 } else {
                     false
@@ -442,9 +558,9 @@ fn do_branch(
 
         // Branch B root guard: when T2_a.parent is the root and T2_a is protected.
         branch_b_root_blocked = {
-            let t2_a_parent = effective_parent(t2, t2_a);
+            let t2_a_parent = scratch.effective_parent(t2, 1, t2_a);
             t2_a_parent != NONE
-                && effective_parent(t2, t2_a_parent) == NONE
+                && scratch.effective_parent(t2, 1, t2_a_parent) == NONE
                 && state.is_protected(1, t2_a)
         };
     }
@@ -496,7 +612,7 @@ fn do_branch(
     if cut_a {
         state.checkpoint();
         state.cut_node(1, t2_a);
-        let result = branch_and_bound(state, k - 1, label_space, stats);
+        let result = branch_and_bound(state, k - 1, label_space, stats, scratch);
         if result >= 0 {
             return result;
         }
@@ -513,7 +629,7 @@ fn do_branch(
         let use_cut_all_b = if optimizations_enabled() { cut_all_b_enabled() } else { false };
         let forced = if use_cut_all_b { Some((t1_a, t1_c)) } else { None };
         let result = branch_and_bound_inner(
-            state, k - 1, label_space, stats, use_cut_all_b, forced,
+            state, k - 1, label_space, stats, use_cut_all_b, forced, scratch,
         );
         if result >= 0 {
             return result;
@@ -534,7 +650,7 @@ fn do_branch(
             state.push_protected_stack(t2_a);
         }
         state.cut_node(1, t2_c);
-        let result = branch_and_bound(state, k - 1, label_space, stats);
+        let result = branch_and_bound(state, k - 1, label_space, stats, scratch);
         if result >= 0 {
             return result;
         }
@@ -578,33 +694,14 @@ fn find_next_action_with_forced(
     state: &SearchState,
     label_space: usize,
     forced: (NodeId, NodeId),
+    scratch: &mut ScratchPad,
 ) -> Action {
     let f1 = &state.forests[0];
     let f2 = &state.forests[1];
 
     // Singletons first (same as normal).
-    for lbl in 1..=label_space as u32 {
-        if lbl as usize >= f1.tree.label_to_node.len() {
-            continue;
-        }
-        let t1_node = f1.tree.label_to_node[lbl as usize];
-        let t2_node = f2.tree.label_to_node[lbl as usize];
-        if t1_node == NONE || t2_node == NONE {
-            continue;
-        }
-        if !f1.live_leafsets[t1_node as usize].contains(lbl as usize) {
-            continue;
-        }
-        let t2_comp_root = f2.component_root(t2_node);
-        let t2_comp_size = f2.live_leaf_count[t2_comp_root as usize];
-        let t1_comp_root = f1.component_root(t1_node);
-        let t1_comp_size = f1.live_leaf_count[t1_comp_root as usize];
-        if trace_enabled() {
-            eprintln!("[whidden]   singleton check: lbl={} t1_comp_size={} t2_comp_size={}", lbl, t1_comp_size, t2_comp_size);
-        }
-        if t2_comp_size == 1 && t1_comp_size > 1 {
-            return Action::Singleton { t1_node };
-        }
+    if let Some(action) = find_singleton_incremental(state) {
+        return action;
     }
 
     // Check the forced pair specifically.
@@ -616,8 +713,8 @@ fn find_next_action_with_forced(
         let t2_a_node = f2.tree.label_to_node[label_a as usize];
         let t2_c_node = f2.tree.label_to_node[label_c as usize];
         if t2_a_node != NONE && t2_c_node != NONE {
-            let t2_a_ep = effective_parent(f2, t2_a_node);
-            let t2_c_ep = effective_parent(f2, t2_c_node);
+            let t2_a_ep = scratch.effective_parent(f2, 1, t2_a_node);
+            let t2_c_ep = scratch.effective_parent(f2, 1, t2_c_node);
             if t2_a_ep != NONE && t2_c_ep != NONE && t2_a_ep == t2_c_ep {
                 if trace_enabled() {
                     eprintln!("[whidden]   forced pair ({},{}) now Case 2 → contract", label_a, label_c);
@@ -630,15 +727,15 @@ fn find_next_action_with_forced(
 
             // Still Case 3: determine a/c orientation and find T2_b.
             let (t1_a_o, t1_c_o, t2_a_o, t2_c_o) = {
-                let depth_a = effective_depth(f2, t2_a_node);
-                let depth_c = effective_depth(f2, t2_c_node);
+                let depth_a = scratch.effective_depth(f2, 1, t2_a_node);
+                let depth_c = scratch.effective_depth(f2, 1, t2_c_node);
                 if depth_a >= depth_c {
                     (t1_a, t1_c, t2_a_node, t2_c_node)
                 } else {
                     (t1_c, t1_a, t2_c_node, t2_a_node)
                 }
             };
-            let t2_b_node = effective_sibling(f2, t2_a_o);
+            let t2_b_node = scratch.effective_sibling(f2, 1, t2_a_o);
             if trace_enabled() {
                 let lb = if t2_b_node != NONE { f2.tree.label[t2_b_node as usize] } else { 0 };
                 eprintln!("[whidden]   forced pair ({},{}) still Case 3, T2_b={}",
@@ -657,60 +754,129 @@ fn find_next_action_with_forced(
     }
 
     // Forced pair is no longer valid — fall through to normal scan.
+    // Do full singleton scan here since we don't go through find_next_action_mut.
+    if let Some(action) = find_singleton_full(state, label_space) {
+        return action;
+    }
     if trace_enabled() {
         eprintln!("[whidden]   forced pair invalid, falling through to normal scan");
     }
-    find_next_action(state, label_space)
+    find_next_action(state, label_space, scratch)
 }
 
 /// Wrapper that tries the incremental pair set first, then rebuilds it from a
 /// full tree scan if no valid pair was found.  This ensures correctness even
 /// when incremental updates miss a pair: the full rebuild is amortised over
 /// the lifetime of the rebuilt set.
-fn find_next_action_mut(state: &mut SearchState, label_space: usize) -> Action {
-    let action = find_next_action(state, label_space);
+fn find_next_action_mut(state: &mut SearchState, label_space: usize, scratch: &mut ScratchPad) -> Action {
+    let action = find_next_action(state, label_space, scratch);
     match action {
         Action::Done | Action::Failure => {
-            // Incremental set may have missed pairs — rebuild from scratch.
+            // Incremental sets may have missed entries — rebuild from scratch.
             init_sibling_pairs(state);
-            find_next_action(state, label_space)
+            state.init_singletons(label_space);
+            find_next_action(state, label_space, scratch)
         }
         other => other,
     }
+}
+
+/// Find a singleton using the incremental candidate list only.
+/// Scans candidates from the back; stale entries are skipped.
+fn find_singleton_incremental(state: &SearchState) -> Option<Action> {
+    let f1 = &state.forests[0];
+    let f2 = &state.forests[1];
+
+    for &lbl in state.singleton_candidates.iter().rev() {
+        if let Some(action) = validate_singleton(f1, f2, lbl) {
+            return Some(action);
+        }
+    }
+    None
+}
+
+/// Full scan for singletons — used as fallback when incremental misses.
+fn find_singleton_full(state: &SearchState, label_space: usize) -> Option<Action> {
+    let f1 = &state.forests[0];
+    let f2 = &state.forests[1];
+
+    for lbl in 1..=label_space as u32 {
+        if lbl as usize >= f1.tree.label_to_node.len() {
+            continue;
+        }
+        if let Some(action) = validate_singleton(f1, f2, lbl) {
+            return Some(action);
+        }
+    }
+    None
+}
+
+/// Check if a label is currently a valid singleton.
+#[inline]
+fn validate_singleton(f1: &XForest, f2: &XForest, lbl: u32) -> Option<Action> {
+    let t1_node = f1.tree.label_to_node[lbl as usize];
+    let t2_node = f2.tree.label_to_node[lbl as usize];
+    if t1_node == NONE || t2_node == NONE {
+        return None;
+    }
+    if f1.live_leaf_count[t1_node as usize] == 0 {
+        return None;
+    }
+    // Quick rejection: if T2 leaf's parent exists and is not cut, the component
+    // has at least the parent + leaf (so size >= 2, not a singleton).
+    let t2_parent = f2.tree.parent[t2_node as usize];
+    if t2_parent != NONE && !f2.is_cut(t2_node) {
+        // Parent exists and the edge to parent is not cut.
+        // Check if parent has other live children — if so, not a singleton.
+        if f2.live_leaf_count[t2_parent as usize] > 1 {
+            return None;
+        }
+    }
+    // Full component root check for edge cases.
+    let t2_comp_root = f2.component_root(t2_node);
+    if f2.live_leaf_count[t2_comp_root as usize] != 1 {
+        return None;
+    }
+    // T1: the twin must NOT be a singleton (must be in a component with >1 leaves)
+    let t1_comp_root = f1.component_root(t1_node);
+    if f1.live_leaf_count[t1_comp_root as usize] <= 1 {
+        return None;
+    }
+    Some(Action::Singleton { t1_node })
 }
 
 /// Scan forests for the next action using the incrementally maintained pair set.
 ///
 /// Priority: singletons first, then sibling pairs (Case 2 before Case 3).
 /// Returns Done only when no sibling pairs and no singletons remain.
-fn find_next_action(state: &SearchState, label_space: usize) -> Action {
+fn find_next_action(state: &SearchState, label_space: usize, scratch: &mut ScratchPad) -> Action {
     let f1 = &state.forests[0];
     let f2 = &state.forests[1];
 
-    // 1. Singleton check: for each label, is its T2 component a single leaf
-    //    while its T1 component has multiple leaves?
-    for lbl in 1..=label_space as u32 {
-        if lbl as usize >= f1.tree.label_to_node.len() {
-            continue;
-        }
-        let t1_node = f1.tree.label_to_node[lbl as usize];
-        let t2_node = f2.tree.label_to_node[lbl as usize];
-        if t1_node == NONE || t2_node == NONE {
-            continue;
-        }
-        if f1.live_leaf_count[t1_node as usize] == 0 {
-            continue;
-        }
+    // 1. Singleton check (incremental only — full scan in find_next_action_mut fallback)
+    if let Some(action) = find_singleton_incremental(state) {
+        return action;
+    }
 
-        let t2_comp_root = f2.component_root(t2_node);
-        let t2_comp_size = f2.live_leaf_count[t2_comp_root as usize];
-        let t1_comp_root = f1.component_root(t1_node);
-        let t1_comp_size = f1.live_leaf_count[t1_comp_root as usize];
-        if trace_enabled() {
-            eprintln!("[whidden]   singleton check: lbl={} t1_comp_size={} t2_comp_size={}", lbl, t1_comp_size, t2_comp_size);
-        }
-        if t2_comp_size == 1 && t1_comp_size > 1 {
-            return Action::Singleton { t1_node };
+    // Protected stack disconnect guard (rspr lines 3716-3728):
+    // If the protected stack top's T1 twin has been disconnected
+    // (cut off from the main component), this subtree is infeasible.
+    if ep_enabled() && !state.protected_stack.is_empty() {
+        let top = *state.protected_stack.last().unwrap();
+        let top_label = f2.tree.label[top as usize];
+        if top_label != 0 {
+            let t1_twin = f1.tree.label_to_node[top_label as usize];
+            if t1_twin != NONE
+                && f1.live_leaf_count[t1_twin as usize] > 0
+            {
+                let t1_twin_parent = f1.tree.parent[t1_twin as usize];
+                if t1_twin_parent == NONE || f1.is_cut(t1_twin) {
+                    // T1 twin is a component root by itself — disconnected
+                    if t1_twin != f1.tree.root {
+                        return Action::Failure;
+                    }
+                }
+            }
         }
     }
 
@@ -718,8 +884,8 @@ fn find_next_action(state: &SearchState, label_space: usize) -> Action {
     //    DEEPEST_ORDER selects the Case 3 pair with greatest effective depth.
     //    DEEPEST_PROTECTED_ORDER constrains to pairs within the DPO scope.
     let mut best_branch: Option<Action> = None;
-    let mut best_t1_depth: usize = 0;
-    let mut best_t2_depth: usize = 0;
+    let mut best_t1_depth: u16 = 0;
+    let mut best_t2_depth: u16 = 0;
 
     let dpo_scope: NodeId = if ep_enabled() {
         if let Some(&last_protected_t2) = state.protected_stack.last() {
@@ -727,7 +893,7 @@ fn find_next_action(state: &SearchState, label_space: usize) -> Action {
             if label != 0 {
                 let t1_twin = f1.tree.label_to_node[label as usize];
                 if t1_twin != NONE {
-                    effective_parent(f1, t1_twin)
+                    scratch.effective_parent(f1, 0, t1_twin)
                 } else {
                     NONE
                 }
@@ -759,8 +925,8 @@ fn find_next_action(state: &SearchState, label_space: usize) -> Action {
         }
 
         // Check they're still T1 siblings (same effective parent)
-        let ep_l = effective_parent(f1, t1_l);
-        let ep_r = effective_parent(f1, t1_r);
+        let ep_l = scratch.effective_parent(f1, 0, t1_l);
+        let ep_r = scratch.effective_parent(f1, 0, t1_r);
         if ep_l != ep_r || ep_l == NONE {
             continue;
         }
@@ -772,8 +938,8 @@ fn find_next_action(state: &SearchState, label_space: usize) -> Action {
             continue;
         }
 
-        let t2_l_eff_parent = effective_parent(f2, t2_l);
-        let t2_r_eff_parent = effective_parent(f2, t2_r);
+        let t2_l_eff_parent = scratch.effective_parent(f2, 1, t2_l);
+        let t2_r_eff_parent = scratch.effective_parent(f2, 1, t2_r);
 
         if t2_l_eff_parent != NONE
             && t2_r_eff_parent != NONE
@@ -786,17 +952,17 @@ fn find_next_action(state: &SearchState, label_space: usize) -> Action {
         }
 
         // PREFER_NONBRANCHING: select immediately if branching is trivially determined.
-        if is_nonbranching(f1, f2, t1_l, t1_r, t2_l, t2_r, state) {
+        if is_nonbranching(f1, f2, t1_l, t1_r, t2_l, t2_r, state, scratch) {
             let (t1_a, t1_c, t2_a_node, t2_c_node) = {
-                let dl = effective_depth(f2, t2_l);
-                let dr = effective_depth(f2, t2_r);
+                let dl = scratch.effective_depth(f2, 1, t2_l);
+                let dr = scratch.effective_depth(f2, 1, t2_r);
                 if dl >= dr {
                     (t1_l, t1_r, t2_l, t2_r)
                 } else {
                     (t1_r, t1_l, t2_r, t2_l)
                 }
             };
-            let t2_b_node = effective_sibling(f2, t2_a_node);
+            let t2_b_node = scratch.effective_sibling(f2, 1, t2_a_node);
             if t2_b_node != NONE {
                 return Action::Branch {
                     t1_a,
@@ -809,9 +975,9 @@ fn find_next_action(state: &SearchState, label_space: usize) -> Action {
         }
 
         // Case 3: DEEPEST_ORDER — track best by (T1 depth, T2 depth).
-        let t1_depth = effective_depth(f1, t1_l).max(effective_depth(f1, t1_r));
-        let t2_depth_l = effective_depth(f2, t2_l);
-        let t2_depth_r = effective_depth(f2, t2_r);
+        let t1_depth = scratch.effective_depth(f1, 0, t1_l).max(scratch.effective_depth(f1, 0, t1_r));
+        let t2_depth_l = scratch.effective_depth(f2, 1, t2_l);
+        let t2_depth_r = scratch.effective_depth(f2, 1, t2_r);
         let t2_depth = t2_depth_l.max(t2_depth_r);
 
         if dpo_scope != NONE
@@ -833,7 +999,7 @@ fn find_next_action(state: &SearchState, label_space: usize) -> Action {
                 (t1_r, t1_l, t2_r, t2_l)
             };
 
-            let t2_b_node = effective_sibling(f2, t2_a_node);
+            let t2_b_node = scratch.effective_sibling(f2, 1, t2_a_node);
             if t2_b_node != NONE {
                 if trace_enabled() {
                     let la = f2.tree.label[t2_a_node as usize];
@@ -918,7 +1084,8 @@ fn single_live_label(f: &XForest, node: NodeId) -> u32 {
     f.live_leafsets[node as usize].ones().next().unwrap() as u32
 }
 
-fn effective_parent(f: &XForest, node: NodeId) -> NodeId {
+/// Raw (uncached) effective_parent — used when scratch is not available.
+fn effective_parent_raw(f: &XForest, node: NodeId) -> NodeId {
     if f.is_cut(node) || f.tree.parent[node as usize] == NONE {
         return NONE;
     }
@@ -938,45 +1105,6 @@ fn effective_parent(f: &XForest, node: NodeId) -> NodeId {
     }
 }
 
-fn effective_sibling(f: &XForest, node: NodeId) -> NodeId {
-    let eff_parent = effective_parent(f, node);
-    if eff_parent == NONE {
-        return NONE;
-    }
-    let children = active_children_xf(f, eff_parent);
-    if children.len() != 2 {
-        return NONE;
-    }
-    let left = descend_to_effective(f, children[0]);
-    let right = descend_to_effective(f, children[1]);
-
-    if is_ancestor_or_equal(f, left, node) {
-        right
-    } else if is_ancestor_or_equal(f, right, node) {
-        left
-    } else {
-        NONE
-    }
-}
-
-/// Compute effective depth of a node in the forest.
-/// Counts the number of effective ancestors (nodes with >= 2 active children)
-/// between the node and its component root. This is the depth in the
-/// "contracted" tree that rspr would physically build.
-fn effective_depth(f: &XForest, node: NodeId) -> usize {
-    let mut depth = 0;
-    let mut cur = node;
-    loop {
-        let ep = effective_parent(f, cur);
-        if ep == NONE {
-            break;
-        }
-        depth += 1;
-        cur = ep;
-    }
-    depth
-}
-
 /// Check if a Case 3 pair is "nonbranching" — i.e., the branching is trivially
 /// determined (only one branch is viable).  Matches rspr's `is_nonbranching`.
 /// When true, the pair is selected immediately (before deeper Case 3 pairs) via
@@ -989,20 +1117,21 @@ fn is_nonbranching(
     t2_l: NodeId,
     t2_r: NodeId,
     state: &SearchState,
+    scratch: &mut ScratchPad,
 ) -> bool {
     // Orient: T2_a = deeper twin.
     let (t2_a, t2_c) = {
-        let dl = effective_depth(f2, t2_l);
-        let dr = effective_depth(f2, t2_r);
+        let dl = scratch.effective_depth(f2, 1, t2_l);
+        let dr = scratch.effective_depth(f2, 1, t2_r);
         if dl >= dr { (t2_l, t2_r) } else { (t2_r, t2_l) }
     };
-    let t2_a_ep = effective_parent(f2, t2_a);
-    let t2_c_ep = effective_parent(f2, t2_c);
+    let t2_a_ep = scratch.effective_parent(f2, 1, t2_a);
+    let t2_c_ep = scratch.effective_parent(f2, 1, t2_c);
 
     // 1. Two or more of {T2_a, T2_b, T2_c} are protected → nonbranching.
     let mut num_prot = state.is_protected(1, t2_a) as i32
         + state.is_protected(1, t2_c) as i32;
-    let t2_b = effective_sibling(f2, t2_a);
+    let t2_b = scratch.effective_sibling(f2, 1, t2_a);
     if t2_b != NONE {
         num_prot += state.is_protected(1, t2_b) as i32;
     }
@@ -1012,7 +1141,7 @@ fn is_nonbranching(
 
     // 2. COB applies: T2_a.parent.parent == T2_c.parent → only Branch B.
     if cob_enabled() && t2_a_ep != NONE && t2_c_ep != NONE {
-        let t2_a_gp = effective_parent(f2, t2_a_ep);
+        let t2_a_gp = scratch.effective_parent(f2, 1, t2_a_ep);
         if t2_a_gp != NONE && t2_a_gp == t2_c_ep {
             return true;
         }
@@ -1020,18 +1149,18 @@ fn is_nonbranching(
 
     // 3. RCOB applies: T1_s is an effective leaf whose T2 twin shares a parent
     //    with T2_a or T2_c → only one branch.
-    let t1_left_ep = effective_parent(f1, t1_left);
+    let t1_left_ep = scratch.effective_parent(f1, 0, t1_left);
     if rcob_enabled() && t1_left_ep != NONE {
         let t1_ac = t1_left_ep;
-        let t1_ac_parent = effective_parent(f1, t1_ac);
+        let t1_ac_parent = scratch.effective_parent(f1, 0, t1_ac);
         if t1_ac_parent != NONE {
-            let t1_s = effective_sibling(f1, t1_ac);
+            let t1_s = scratch.effective_sibling(f1, 0, t1_ac);
             if t1_s != NONE {
                 let t1_s_label = single_live_label(f1, t1_s);
                 if t1_s_label != 0 {
                     let t2_s = f2.tree.label_to_node[t1_s_label as usize];
                     if t2_s != NONE {
-                        let t2_s_ep = effective_parent(f2, t2_s);
+                        let t2_s_ep = scratch.effective_parent(f2, 1, t2_s);
                         if (t2_s_ep != NONE && t2_a_ep != NONE && t2_s_ep == t2_a_ep)
                             || (t2_s_ep != NONE && t2_c_ep != NONE && t2_s_ep == t2_c_ep)
                         {
@@ -1078,3 +1207,10 @@ fn sibling_in_tree(tree: &klados_core::Tree, node: NodeId) -> NodeId {
         left
     }
 }
+
+// ---------------------------------------------------------------------------
+// NOTE: Dynamic cluster decomposition was attempted here but removed.
+// The static cluster reduction in mod.rs already handles common clades
+// before the B&B starts. Per-branch-node decomposition was too expensive
+// (~O(n) per branch for cluster detection + O(n·k) for recursive solve).
+// A cheaper lower bound (component count) could be used for pruning in future.
