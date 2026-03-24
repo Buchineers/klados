@@ -392,6 +392,28 @@ fn do_branch(
                                 }
                             }
                         }
+
+                        // --- CUT_TWO_B (rspr lines 3987-4022) ---
+                        // If uncle of (a,c) in T1 is leaf `s`, and in T2 the
+                        // grandparent of `a` has `s`'s twin as sibling → cut_b_only.
+                        if cut_a && cut_c && t1_s_label != 0 {
+                            let t2_s_ctb = t2.tree.label_to_node[t1_s_label as usize];
+                            if t2_s_ctb != NONE && t2_a_eff_parent != NONE {
+                                let t2_l = effective_parent(t2, t2_a_eff_parent);
+                                if t2_l != NONE && t2_c_eff_parent != NONE {
+                                    let t2_c_gp = effective_parent(t2, t2_c_eff_parent);
+                                    if (t2_c_gp != NONE && t2_c_gp == t2_l)
+                                        || t2_c_eff_parent == t2_l
+                                    {
+                                        let t2_l_sib = effective_sibling(t2, t2_l);
+                                        if t2_l_sib != NONE && t2_l_sib == t2_s_ctb {
+                                            cut_a = false;
+                                            cut_c = false;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
