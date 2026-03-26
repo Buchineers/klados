@@ -1,13 +1,14 @@
 //! Whidden's FPT algorithm for rSPR distance (2-tree MAF).
 //!
-//! Ports the core branching strategy from rspr (Whidden & Zeh) to klados's
-//! arena-based tree representation. Uses 3-way branching on sibling pairs
-//! with COB/RCOB optimizations and edge protection to achieve O(2^k · n).
+//! Faithful port of rspr (Whidden & Zeh) using SoA arrays with physical
+//! tree mutations (matching rspr's cut_parent / contract semantics).
 //!
-//! Currently restricted to m=2 (two input trees).
+//! Phase 1: correct base algorithm without branch-pruning optimizations.
+//! Restricted to m=2 (two input trees).
 
+mod forest;
+mod undo;
 mod algorithm;
-mod search_state;
 
 use klados_core::{Instance, SolverStats, Tree};
 
@@ -31,7 +32,8 @@ impl WhiddenSolver {
     }
 
     pub fn solve(&mut self, instance: &Instance) -> Option<Vec<Tree>> {
-        assert_eq!(instance.num_trees(), 2, "Whidden solver requires exactly 2 trees, got {}", instance.num_trees());
+        assert_eq!(instance.num_trees(), 2,
+            "Whidden solver requires exactly 2 trees, got {}", instance.num_trees());
 
         if instance.num_leaves <= 1 {
             return Some(vec![instance.trees[0].clone()]);
@@ -41,21 +43,27 @@ impl WhiddenSolver {
         let kern = kernelize::kernelize_best(instance, &config);
         let reduced = &kern.instance;
 
-        eprintln!("[whidden-solve] n={} n_reduced={}", instance.num_leaves, reduced.num_leaves);
+        if reduced.num_leaves <= 1 {
+            let trivial_components = if reduced.num_leaves == 0 {
+                vec![]
+            } else {
+                vec![reduced.trees[0].clone()]
+            };
+            return Some(kernelize::expand_solution(
+                trivial_components,
+                &kern,
+                &instance.trees[0],
+                instance.num_leaves,
+            ));
+        }
 
         // Try cluster decomposition on the reduced instance.
         match crate::cluster_reduction::try_cluster_reduction(reduced, &mut |subinstance| {
-            eprintln!("[whidden-solve] cluster sub-instance: n={} m={}", subinstance.num_leaves, subinstance.num_trees());
             let mut sub_solver = WhiddenSolver::new();
-            let result = WhiddenSolver::solve(&mut sub_solver, subinstance);
-            eprintln!("[whidden-solve] cluster sub-result: {:?} components", result.as_ref().map(|r| r.len()));
-            result
+            WhiddenSolver::solve(&mut sub_solver, subinstance)
         })? {
-            crate::cluster_reduction::ClusterReductionResult::NotApplicable => {
-                eprintln!("[whidden-solve] cluster reduction: not applicable");
-            }
+            crate::cluster_reduction::ClusterReductionResult::NotApplicable => {}
             crate::cluster_reduction::ClusterReductionResult::Solved(solution) => {
-                eprintln!("[whidden-solve] cluster reduction solved: {} components", solution.components.len());
                 return Some(kernelize::expand_solution(
                     solution.components,
                     &kern,
@@ -65,9 +73,7 @@ impl WhiddenSolver {
             }
         }
 
-        eprintln!("[whidden-solve] running algorithm on n={}", reduced.num_leaves);
         let reduced_result = algorithm::solve(reduced, &mut self.stats);
-        eprintln!("[whidden-solve] algorithm result: {:?} components", reduced_result.as_ref().map(|r| r.len()));
         reduced_result.map(|components| {
             kernelize::expand_solution(
                 components,
