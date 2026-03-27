@@ -793,6 +793,51 @@ fn do_case3_branch(
         && !cob && !rcob_a && !rcob_c
         && find_root(tf, T2, t2_a) != find_root(tf, T2, t2_c);
 
+    // RCOB3 Part 1: when uncle's twin is protected and positioned as cousin of
+    // T2_a, preemptively protect T2_a. Only fires when COB/RCOB didn't restrict.
+    if config.reverse_cut_one_b_3 && !cob && !rcob_a && !rcob_c {
+        let t1_parent = tf.parent[T1][t1_a as usize];
+        if t1_parent != NONE {
+            let t1_ac_parent = tf.parent[T1][t1_parent as usize];
+            if t1_ac_parent != NONE {
+                let t1_s = tf.sibling(T1, t1_parent); // uncle
+                if t1_s != NONE && tf.is_leaf(T1, t1_s) {
+                    let t2_s = tf.twin[T1][t1_s as usize];
+                    if t2_s != NONE && tf.protected[t2_s as usize] {
+                        let t2_s_parent = tf.parent[T2][t2_s as usize];
+                        let t2_a_parent = tf.parent[T2][t2_a as usize];
+                        if t2_s_parent != NONE && t2_a_parent != NONE
+                            && tf.parent[T2][t2_s_parent as usize] == t2_a_parent
+                        {
+                            undo::protect_edge(tf, t2_a, um);
+                        }
+                    }
+                }
+
+                // RCOB3 Part 2: same idea but for the granduncle.
+                // rspr has a bug here: uses get_sibling() instead of get_twin(),
+                // making it dead code (checks a T1 node's protection, always false).
+                // We implement the likely-intended version: granduncle's T2 twin.
+                let t1_gp = tf.parent[T1][t1_ac_parent as usize];
+                if t1_gp != NONE {
+                    let t1_gs = tf.sibling(T1, t1_ac_parent); // granduncle
+                    if t1_gs != NONE && tf.is_leaf(T1, t1_gs) {
+                        let t2_gs = tf.twin[T1][t1_gs as usize];
+                        if t2_gs != NONE && tf.protected[t2_gs as usize] {
+                            let t2_gs_parent = tf.parent[T2][t2_gs as usize];
+                            let t2_a_parent = tf.parent[T2][t2_a as usize];
+                            if t2_gs_parent != NONE && t2_a_parent != NONE
+                                && tf.parent[T2][t2_gs_parent as usize] == t2_a_parent
+                            {
+                                undo::protect_edge(tf, t2_a, um);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // EP: edge protection gates
     let ep = config.edge_protection;
     let ep_skip_a = ep && tf.protected[t2_a as usize];
