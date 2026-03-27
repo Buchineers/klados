@@ -233,7 +233,7 @@ fn bb_inner(
                         // Fall through to normal loop
                     }
                     PairResult::Case3 { t1_a, t1_c, t2_a, t2_b, t2_c,
-                                          cut_b_only: _, cut_c_only: _, cut_a_only: _ } => {
+                                          path_length, .. } => {
                         if *k <= 0 {
                             return -1;
                         }
@@ -244,7 +244,7 @@ fn bb_inner(
                         return do_case3_branch(
                             tf, *k, um, stats, config,
                             t1_a, t1_c, t2_a, t2_b, t2_c,
-                            true, false, false,
+                            true, false, false, path_length,
                         );
                     }
                     _ => {}
@@ -270,7 +270,7 @@ fn bb_inner(
                 continue;
             }
             PairResult::Case3 { t1_a, t1_c, t2_a, t2_b, t2_c,
-                                  cut_b_only, cut_c_only, cut_a_only } => {
+                                  cut_b_only, cut_c_only, cut_a_only, path_length } => {
                 if *k <= 0 {
                     return -1;
                 }
@@ -280,7 +280,7 @@ fn bb_inner(
                 return do_case3_branch(
                     tf, *k, um, stats, config,
                     t1_a, t1_c, t2_a, t2_b, t2_c,
-                    cut_b_only, cut_a_only, cut_c_only,
+                    cut_b_only, cut_a_only, cut_c_only, path_length,
                 );
             }
         }
@@ -353,6 +353,8 @@ enum PairResult {
         cut_c_only: bool,
         /// RCOB: uncle's twin is sibling of T2_c → only branch A needed.
         cut_a_only: bool,
+        /// Path length from T2_a to T2_c through their LCA (for EP_TWO_B).
+        path_length: u16,
     },
 }
 
@@ -537,7 +539,10 @@ fn classify_pair(
         }
     }
 
-    Some(PairResult::Case3 { t1_a, t1_c, t2_a, t2_b, t2_c, cut_b_only, cut_c_only, cut_a_only })
+    // Path length: walk T2_a and T2_c up to their LCA, counting steps.
+    let path_length = compute_path_length(tf, T2, t2_a, t2_c);
+
+    Some(PairResult::Case3 { t1_a, t1_c, t2_a, t2_b, t2_c, cut_b_only, cut_c_only, cut_a_only, path_length })
 }
 
 /// Distance from node to its component root (via parent pointers).
@@ -549,6 +554,25 @@ fn depth_to_root(tf: &TwinForest, ti: usize, mut node: NodeId) -> u16 {
         d += 1;
         node = p;
     }
+}
+
+/// Compute path length from a to b through their LCA (rspr's same_component).
+fn compute_path_length(tf: &TwinForest, ti: usize, mut a: NodeId, mut b: NodeId) -> u16 {
+    let da = depth_to_root(tf, ti, a);
+    let db = depth_to_root(tf, ti, b);
+    let mut len: u16 = 0;
+    // Level both to same depth
+    let mut a_depth = da;
+    let mut b_depth = db;
+    while a_depth > b_depth { a = tf.parent[ti][a as usize]; a_depth -= 1; len += 1; }
+    while b_depth > a_depth { b = tf.parent[ti][b as usize]; b_depth -= 1; len += 1; }
+    // Walk both up until they meet
+    while a != b {
+        a = tf.parent[ti][a as usize];
+        b = tf.parent[ti][b as usize];
+        len += 2;
+    }
+    len
 }
 
 /// Walk parent pointers to find the component root.
@@ -714,6 +738,7 @@ fn do_case3_branch(
     cut_b_only: bool,
     cut_a_only: bool,
     cut_c_only: bool,
+    path_length: u16,
 ) -> i32 {
     // Determine which branches to try based on optimization flags.
     // COB: cut_b_only → only B
@@ -745,6 +770,31 @@ fn do_case3_branch(
         undo::add_component(tf, T2, t2_a, um);
         if t2_a_parent != NONE {
             undo::contract(tf, T2, t2_a_parent, um);
+        }
+
+        // EP_TWO_B: when T2_c is protected and path_length==4, protect T2_b and T2_b2.
+        // This restricts future branching on these edges, improving pruning.
+        if config.edge_protection_two_b && tf.protected[t2_c as usize]
+            && !cut_a_only && path_length == 4
+        {
+            // balanced: T2_a and T2_c share the same grandparent (before cuts)
+            // Since T2_a was just cut, use t2_a_parent (saved before cut) to check.
+            let balanced = t2_a_parent != NONE
+                && tf.parent[T2][t2_a_parent as usize] != NONE
+                && tf.parent[T2][t2_a_parent as usize]
+                    == tf.parent[T2][tf.parent[T2][t2_c as usize] as usize];
+            undo::protect_edge(tf, t2_b, um);
+            let t2_b2 = if balanced {
+                // T2_b2 = sibling of T2_c
+                tf.sibling(T2, t2_c)
+            } else {
+                // T2_b2 = sibling of T2_b's parent
+                let bp = tf.parent[T2][t2_b as usize];
+                if bp != NONE { tf.sibling(T2, bp) } else { NONE }
+            };
+            if t2_b2 != NONE {
+                undo::protect_edge(tf, t2_b2, um);
+            }
         }
 
         let result = branch_and_bound(tf, k - 1, um, stats, config);
