@@ -309,13 +309,16 @@ enum PairResult {
 /// Walks from T1 component roots — only visits live nodes.
 ///
 /// With `prefer_nonbranching`: prefers Case 2 or COB (1-branch) pairs over
-/// full 3-way Case 3 pairs. Does two passes: first looks for non-branching,
-/// then falls back to any pair.
+/// full 3-way Case 3 pairs. With `deepest_order`: among Case 3 pairs, picks
+/// the deepest (most constrained → prunes faster).
 fn find_sibling_pair(tf: &TwinForest, config: &BBConfig) -> PairResult {
-    if config.prefer_nonbranching {
+    if config.prefer_nonbranching || config.deepest_order {
         let mut fallback = PairResult::NoPairs;
+        let mut best_depth = (0u16, 0u16);
         for &root in &tf.components[T1] {
-            let result = find_preferred_pair(tf, root, &mut fallback);
+            let result = find_preferred_pair(
+                tf, root, config.deepest_order, &mut fallback, &mut best_depth,
+            );
             if !matches!(result, PairResult::NoPairs) {
                 return result; // found a non-branching pair
             }
@@ -357,10 +360,18 @@ fn find_any_pair(tf: &TwinForest, node: NodeId) -> PairResult {
     PairResult::NoPairs
 }
 
-/// DFS to find a non-branching pair (Case 2 or COB).
-/// Returns the pair immediately if non-branching; otherwise stores the first
-/// Case 3 found in `fallback` and returns NoPairs.
-fn find_preferred_pair(tf: &TwinForest, node: NodeId, fallback: &mut PairResult) -> PairResult {
+/// DFS to find the best sibling pair.
+/// Returns immediately if a non-branching pair (Case 2 or COB/RCOB) is found.
+/// Otherwise stores the best Case 3 in `fallback`:
+///   - with deepest_order: prefer deepest pair (max depth in T2)
+///   - without: take the first one found
+fn find_preferred_pair(
+    tf: &TwinForest,
+    node: NodeId,
+    deepest_order: bool,
+    fallback: &mut PairResult,
+    best_depth: &mut (u16, u16),
+) -> PairResult {
     let lc = tf.left[T1][node as usize];
     let rc = tf.right[T1][node as usize];
 
@@ -370,12 +381,25 @@ fn find_preferred_pair(tf: &TwinForest, node: NodeId, fallback: &mut PairResult)
         if let Some(result) = classify_pair(tf, node, lc, rc) {
             match &result {
                 PairResult::Case2 { .. } => return result,
-                PairResult::Case3 { cut_b_only, cut_a_only, cut_c_only, .. } => {
+                PairResult::Case3 { t2_a, t2_c, cut_b_only, cut_a_only, cut_c_only, .. } => {
                     if *cut_b_only || *cut_a_only || *cut_c_only {
-                        // 1-way branching — effectively non-branching
-                        return result;
+                        return result; // 1-way branching
                     }
-                    if matches!(fallback, PairResult::NoPairs) {
+                    if deepest_order {
+                        // Score: max T2 depth of the pair (primary),
+                        // min T2 depth (secondary tiebreak)
+                        let da = depth_to_root(tf, T2, *t2_a);
+                        let dc = depth_to_root(tf, T2, *t2_c);
+                        let depth1 = da.max(dc);
+                        let depth2 = da.min(dc);
+                        if matches!(fallback, PairResult::NoPairs)
+                            || depth1 > best_depth.0
+                            || (depth1 == best_depth.0 && depth2 > best_depth.1)
+                        {
+                            *fallback = result;
+                            *best_depth = (depth1, depth2);
+                        }
+                    } else if matches!(fallback, PairResult::NoPairs) {
                         *fallback = result;
                     }
                 }
@@ -385,11 +409,11 @@ fn find_preferred_pair(tf: &TwinForest, node: NodeId, fallback: &mut PairResult)
     }
 
     if lc != NONE {
-        let r = find_preferred_pair(tf, lc, fallback);
+        let r = find_preferred_pair(tf, lc, deepest_order, fallback, best_depth);
         if !matches!(r, PairResult::NoPairs) { return r; }
     }
     if rc != NONE {
-        let r = find_preferred_pair(tf, rc, fallback);
+        let r = find_preferred_pair(tf, rc, deepest_order, fallback, best_depth);
         if !matches!(r, PairResult::NoPairs) { return r; }
     }
     PairResult::NoPairs
