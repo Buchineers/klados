@@ -1,13 +1,12 @@
 //! Core branch-and-bound for 2-tree rSPR distance.
 //!
 //! Faithful port of rspr's rSPR_branch_and_bound_hlpr.
-//! Phase 1: base algorithm only, no pruning optimizations.
 //!
 //! Flow:
 //!   1. Process singletons (free: no k decrement)
 //!   2. Find sibling pair in T1
 //!   3. Case 2: pair matches in T2 → contract (free)
-//!   4. Case 3: pair doesn't match → 3-way branch (k-1 each)
+//!   4. Case 3: optional BB prune check, then 3-way branch (k-1 each)
 
 use klados_core::tree::{Label, NodeId, Tree, NONE};
 use klados_core::{Instance, SolverStats};
@@ -17,10 +16,145 @@ use super::undo::{self, UndoMachine};
 use crate::lower_bound::maf_bounds;
 
 // ---------------------------------------------------------------------------
+// Configuration — maps to rspr's optimization flags
+// ---------------------------------------------------------------------------
+
+/// Controls which rspr optimizations are active.
+///
+/// Flag names and semantics match rspr's globals.
+/// `default()` enables the same set as rspr's `-allopt` (DEFAULT_OPTIMIZATIONS).
+#[derive(Clone, Debug)]
+pub struct BBConfig {
+    // --- Approximation-based pruning ---
+    /// BB: prune branches where 3-approx > 3k (rspr's `BB` flag).
+    pub bb: bool,
+
+    // --- Branching reductions (reduce 3-way to fewer branches) ---
+    /// COB: "cut one B" — skip branch A when T2_ab and T2_c are siblings.
+    pub cut_one_b: bool,
+    /// RCOB: "reverse cut one B" — skip branch C via uncle check.
+    pub reverse_cut_one_b: bool,
+    /// RCOB3: variant of reverse_cut_one_b (rspr's REVERSE_CUT_ONE_B_3).
+    pub reverse_cut_one_b_3: bool,
+    /// C2B: "cut two B" — uncle-sibling leaf check.
+    pub cut_two_b: bool,
+    /// CAB: "cut all B" — when safe, only branch on B.
+    pub cut_all_b: bool,
+    /// SC: "separate components" — cut A and C when they're in separate components.
+    pub cut_ac_separate_components: bool,
+
+    // --- Edge protection ---
+    /// EP: protect edges in T2 from being cut (reduces branching).
+    pub edge_protection: bool,
+    /// EP2B: edge protection variant for two-B case.
+    pub edge_protection_two_b: bool,
+
+    // --- Sibling pair ordering ---
+    /// DPO: prefer deepest protected sibling pair.
+    pub deepest_protected_order: bool,
+    /// DO: prefer deepest sibling pair (tiebreaker).
+    pub deepest_order: bool,
+    /// Near-preorder traversal for sibling pair enumeration.
+    pub near_preorder_sibling_pairs: bool,
+
+    // --- Leaf reduction ---
+    /// LR: leaf reduction rule (rspr's LEAF_REDUCTION).
+    pub leaf_reduction: bool,
+    /// LR2: second leaf reduction rule (rspr's LEAF_REDUCTION2).
+    pub leaf_reduction2: bool,
+
+    // --- Approximation optimizations (used inside approx_3) ---
+    /// Approx COB: cut-one-B inside 3-approximation.
+    pub approx_cut_one_b: bool,
+    /// Approx C2B: cut-two-B inside 3-approximation.
+    pub approx_cut_two_b: bool,
+    /// Approx RCOB: reverse-cut-one-B inside 3-approximation.
+    pub approx_reverse_cut_one_b: bool,
+
+    // --- Prefer rho (cluster-related) ---
+    /// PREFER_RHO: prefer the rho component for sibling pair search.
+    pub prefer_rho: bool,
+    /// Prefer non-branching sibling pairs (Case 2 over Case 3).
+    pub prefer_nonbranching: bool,
+}
+
+impl Default for BBConfig {
+    /// rspr's DEFAULT_OPTIMIZATIONS + DEFAULT_ALGORITHM.
+    fn default() -> Self {
+        Self {
+            bb: true,
+            cut_one_b: true,
+            reverse_cut_one_b: true,
+            reverse_cut_one_b_3: true,
+            cut_two_b: true,
+            cut_all_b: true,
+            cut_ac_separate_components: true,
+            edge_protection: true,
+            edge_protection_two_b: true,
+            deepest_protected_order: true,
+            deepest_order: true,
+            near_preorder_sibling_pairs: true,
+            leaf_reduction: true,
+            leaf_reduction2: true,
+            approx_cut_one_b: true,
+            approx_cut_two_b: true,
+            approx_reverse_cut_one_b: true,
+            prefer_rho: true,
+            prefer_nonbranching: true,
+        }
+    }
+}
+
+impl BBConfig {
+    /// No optimizations — pure 3-way branching (rspr's `-noopt`).
+    #[allow(dead_code)]
+    pub fn noopt() -> Self {
+        Self {
+            bb: false,
+            cut_one_b: false,
+            reverse_cut_one_b: false,
+            reverse_cut_one_b_3: false,
+            cut_two_b: false,
+            cut_all_b: false,
+            cut_ac_separate_components: false,
+            edge_protection: false,
+            edge_protection_two_b: false,
+            deepest_protected_order: false,
+            deepest_order: false,
+            near_preorder_sibling_pairs: false,
+            leaf_reduction: false,
+            leaf_reduction2: false,
+            approx_cut_one_b: false,
+            approx_cut_two_b: false,
+            approx_reverse_cut_one_b: false,
+            prefer_rho: false,
+            prefer_nonbranching: false,
+        }
+    }
+
+    /// Only BB pruning enabled (current baseline).
+    #[allow(dead_code)]
+    pub fn bb_only() -> Self {
+        Self {
+            bb: true,
+            ..Self::noopt()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
 pub fn solve(instance: &Instance, stats: &mut SolverStats) -> Option<Vec<Tree>> {
+    solve_with_config(instance, stats, &BBConfig::default())
+}
+
+pub fn solve_with_config(
+    instance: &Instance,
+    stats: &mut SolverStats,
+    config: &BBConfig,
+) -> Option<Vec<Tree>> {
     debug_assert!(instance.num_trees() == 2);
     let n = instance.num_leaves;
     if n <= 1 {
@@ -42,7 +176,7 @@ pub fn solve(instance: &Instance, stats: &mut SolverStats) -> Option<Vec<Tree>> 
 
     for k in lb_k..=ub_k {
         let cp = um.checkpoint();
-        let result = branch_and_bound(&mut tf, k as i32, &mut um, stats);
+        let result = branch_and_bound(&mut tf, k as i32, &mut um, stats, config);
 
         if result >= 0 {
             return Some(extract_components(&tf));
@@ -62,6 +196,7 @@ fn branch_and_bound(
     mut k: i32,
     um: &mut UndoMachine,
     stats: &mut SolverStats,
+    config: &BBConfig,
 ) -> i32 {
 
     stats.nodes_explored += 1;
@@ -86,8 +221,12 @@ fn branch_and_bound(
                 if k <= 0 {
                     return -1;
                 }
+                // BB: 3-approximation lower bound prune
+                if config.bb && approx_3(tf, um) > 3 * k {
+                    return -1;
+                }
                 return do_case3_branch(
-                    tf, k, um, stats,
+                    tf, k, um, stats, config,
                     t1_a, t1_c, t2_a, t2_b, t2_c,
                 );
             }
@@ -240,6 +379,109 @@ fn depth_to_root(tf: &TwinForest, ti: usize, mut node: NodeId) -> u16 {
 }
 
 // ---------------------------------------------------------------------------
+// 3-approximation lower bound (rspr's BB pruning)
+// ---------------------------------------------------------------------------
+
+/// Greedy 3-approximation of rSPR distance on the current forest state.
+/// Faithful port of rspr's `rSPR_worse_3_approx_binary_hlpr`.
+///
+/// Each Case 3 round: cut T1_a, T1_c from T1; cut T2_a (and maybe T2_b,
+/// T2_c) from T2; count 3. Resolves the pair in one round.
+/// Guarantee: num_cut ≤ 3 × optimal.
+///
+/// Non-destructive: uses checkpoint/undo on the live TwinForest.
+fn approx_3(tf: &mut TwinForest, um: &mut UndoMachine) -> i32 {
+    let cp = um.checkpoint();
+    let mut num_cut: i32 = 0;
+
+    loop {
+        // Process singletons (free — no contribution to num_cut)
+        loop {
+            let singleton = find_singleton(tf);
+            if singleton == NONE { break; }
+            let t2_node = singleton;
+            let t1_node = tf.twin[T2][t2_node as usize];
+            if t1_node == NONE { continue; }
+            let t1_parent = tf.parent[T1][t1_node as usize];
+            if t1_parent == NONE { continue; }
+            undo::cut_parent(tf, T1, t1_node, um);
+            undo::add_component(tf, T1, t1_node, um);
+            undo::contract(tf, T1, t1_parent, um);
+        }
+
+        // Find sibling pair in T1
+        match find_sibling_pair(tf) {
+            PairResult::NoPairs => break,
+            PairResult::Case2 { t1_parent, t2_parent } => {
+                do_case2_contract(tf, t1_parent, t2_parent, um);
+            }
+            PairResult::Case3 { t1_a, t1_c, t2_a, t2_b: _, t2_c } => {
+                let t1_parent = tf.parent[T1][t1_a as usize];
+
+                // Check cut_b_only: T2_a.parent.parent == T2_c.parent
+                // (T2_ab and T2_c are siblings → only need to cut T2_b)
+                let t2_a_parent = tf.parent[T2][t2_a as usize];
+                let t2_c_parent = tf.parent[T2][t2_c as usize];
+                let cut_b_only = t2_a_parent != NONE
+                    && tf.parent[T2][t2_a_parent as usize] != NONE
+                    && tf.parent[T2][t2_a_parent as usize] == t2_c_parent;
+
+                if cut_b_only {
+                    // Only cut T2_b (sibling of T2_a). The pair will become
+                    // Case 2 in the next iteration after T2_ab contracts.
+                    let t2_b = tf.sibling(T2, t2_a);
+                    if t2_b != NONE {
+                        let t2_b_parent = tf.parent[T2][t2_b as usize];
+                        undo::cut_parent(tf, T2, t2_b, um);
+                        undo::add_component(tf, T2, t2_b, um);
+                        if t2_b_parent != NONE {
+                            undo::contract(tf, T2, t2_b_parent, um);
+                        }
+                    }
+                } else {
+                    // Full Case 3: cut T1_a, T1_c from T1
+                    undo::cut_parent(tf, T1, t1_a, um);
+                    undo::add_component(tf, T1, t1_a, um);
+                    if t1_parent != NONE {
+                        undo::contract(tf, T1, t1_parent, um);
+                    }
+                    // T1_c may have moved up after contracting t1_parent
+                    undo::cut_parent(tf, T1, t1_c, um);
+                    undo::add_component(tf, T1, t1_c, um);
+                    let t1_c_parent = tf.parent[T1][t1_c as usize];
+                    if t1_c_parent != NONE {
+                        undo::contract(tf, T1, t1_c_parent, um);
+                    }
+
+                    // Cut T2_a from T2
+                    if t2_a_parent != NONE {
+                        undo::cut_parent(tf, T2, t2_a, um);
+                        undo::add_component(tf, T2, t2_a, um);
+                        undo::contract(tf, T2, t2_a_parent, um);
+                    }
+
+                    // Cut T2_c from T2 (re-read twin in case it moved)
+                    let t2_c_now = tf.twin[T1][t1_c as usize];
+                    if t2_c_now != NONE {
+                        let t2_c_p = tf.parent[T2][t2_c_now as usize];
+                        if t2_c_p != NONE {
+                            undo::cut_parent(tf, T2, t2_c_now, um);
+                            undo::add_component(tf, T2, t2_c_now, um);
+                            undo::contract(tf, T2, t2_c_p, um);
+                        }
+                    }
+                }
+
+                num_cut += 3;
+            }
+        }
+    }
+
+    um.undo_to(cp, tf);
+    num_cut
+}
+
+// ---------------------------------------------------------------------------
 // Case 2: Contract matching sibling pair
 // ---------------------------------------------------------------------------
 
@@ -288,6 +530,7 @@ fn do_case3_branch(
     k: i32,
     um: &mut UndoMachine,
     stats: &mut SolverStats,
+    config: &BBConfig,
     _t1_a: NodeId,
     _t1_c: NodeId,
     t2_a: NodeId,
@@ -304,7 +547,7 @@ fn do_case3_branch(
             undo::contract(tf, T2, t2_a_parent, um);
         }
 
-        let result = branch_and_bound(tf, k - 1, um, stats);
+        let result = branch_and_bound(tf, k - 1, um, stats, config);
         if result >= 0 { return result; }
         um.undo_to(cp, tf);
     }
@@ -319,7 +562,7 @@ fn do_case3_branch(
             undo::contract(tf, T2, t2_b_parent, um);
         }
 
-        let result = branch_and_bound(tf, k - 1, um, stats);
+        let result = branch_and_bound(tf, k - 1, um, stats, config);
         if result >= 0 { return result; }
         um.undo_to(cp, tf);
     }
@@ -334,7 +577,7 @@ fn do_case3_branch(
             undo::contract(tf, T2, t2_c_parent, um);
         }
 
-        let result = branch_and_bound(tf, k - 1, um, stats);
+        let result = branch_and_bound(tf, k - 1, um, stats, config);
         if result >= 0 { return result; }
         um.undo_to(cp, tf);
     }
