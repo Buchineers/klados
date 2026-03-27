@@ -43,8 +43,18 @@ pub struct TwinForest {
     // --- Precomputed T2 depth (immutable, for Case 3 orientation) ---
     pub t2_depth: Vec<u16>,
 
+    // --- Precomputed T1 preorder numbering (immutable, for DPO constraint) ---
+    /// Preorder number of each T1 node.
+    pub t1_pre_num: Vec<i32>,
+    /// Max preorder number in subtree (edge_pre_end in rspr).
+    pub t1_pre_end: Vec<i32>,
+
     // --- Edge protection (T2 only, for branch pruning) ---
     pub protected: Vec<bool>,
+
+    // --- Protected stack (for DEEPEST_PROTECTED_ORDER) ---
+    /// Stack of protected T2 nodes; constrains pair selection to their T1 subtrees.
+    pub protected_stack: Vec<NodeId>,
 
     // --- Metadata ---
     pub num_nodes: [usize; 2],
@@ -72,7 +82,10 @@ impl TwinForest {
             orig_right:  t1.right.clone(),
             orig_label:  t1.label.clone(),
             t2_depth: vec![0; n2],
+            t1_pre_num: vec![-1; n1],
+            t1_pre_end: vec![-1; n1],
             protected: vec![false; n2],
+            protected_stack: Vec::new(),
             num_nodes: [n1, n2],
             root: [t1.root, t2.root],
             num_leaves,
@@ -80,6 +93,12 @@ impl TwinForest {
 
         // Precompute T2 depth (distance from original root, immutable)
         Self::compute_depth(&tf.left[T2], &tf.right[T2], t2.root, &mut tf.t2_depth);
+
+        // Precompute T1 preorder numbering and edge intervals (immutable, for DPO)
+        Self::compute_preorder(
+            &tf.left[T1], &tf.right[T1], t1.root,
+            &mut tf.t1_pre_num, &mut tf.t1_pre_end,
+        );
 
         // Set up twin pointers by matching leaf labels
         for lbl in 1..=num_leaves {
@@ -92,6 +111,46 @@ impl TwinForest {
         }
 
         tf
+    }
+
+    /// Precompute preorder numbering and edge intervals via iterative DFS.
+    /// `pre_num[v]` = preorder number (= edge_pre_start in rspr).
+    /// `pre_end[v]` = max preorder number in subtree (= edge_pre_end in rspr).
+    fn compute_preorder(
+        left: &[NodeId], right: &[NodeId], root: NodeId,
+        pre_num: &mut [i32], pre_end: &mut [i32],
+    ) {
+        // Phase 1: assign preorder numbers via iterative DFS.
+        let mut counter: i32 = 0;
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            pre_num[node as usize] = counter;
+            counter += 1;
+            // Push right first so left is visited first (preorder).
+            let rc = right[node as usize];
+            if rc != NONE { stack.push(rc); }
+            let lc = left[node as usize];
+            if lc != NONE { stack.push(lc); }
+        }
+        // Phase 2: compute pre_end bottom-up via post-order.
+        // For a leaf, pre_end = pre_num. For internal, pre_end = max(children's pre_end).
+        let mut post_stack: Vec<(NodeId, bool)> = vec![(root, false)];
+        while let Some((node, visited)) = post_stack.pop() {
+            if visited {
+                let mut end = pre_num[node as usize];
+                let lc = left[node as usize];
+                if lc != NONE { end = end.max(pre_end[lc as usize]); }
+                let rc = right[node as usize];
+                if rc != NONE { end = end.max(pre_end[rc as usize]); }
+                pre_end[node as usize] = end;
+            } else {
+                post_stack.push((node, true));
+                let rc = right[node as usize];
+                if rc != NONE { post_stack.push((rc, false)); }
+                let lc = left[node as usize];
+                if lc != NONE { post_stack.push((lc, false)); }
+            }
+        }
     }
 
     /// Precompute depth via iterative DFS.

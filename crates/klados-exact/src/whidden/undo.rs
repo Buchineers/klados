@@ -20,6 +20,8 @@ pub enum UndoOp {
     AddComponent   { ti: u8 },
     ReplaceComponent { ti: u8, idx: u16, old: NodeId }, // u16: components < 65536
     SetProtected   { node: NodeId },  // always T2; old is always false
+    PushProtectedStack,                // undo = pop
+    PopProtectedStack { old: NodeId }, // undo = push back
 }
 
 pub struct UndoMachine {
@@ -62,6 +64,12 @@ impl UndoMachine {
                 }
                 UndoOp::SetProtected { node } => {
                     tf.protected[node as usize] = false;
+                }
+                UndoOp::PushProtectedStack => {
+                    tf.protected_stack.pop();
+                }
+                UndoOp::PopProtectedStack { old } => {
+                    tf.protected_stack.push(old);
                 }
             }
         }
@@ -208,5 +216,20 @@ pub fn protect_edge(tf: &mut TwinForest, node: NodeId, um: &mut UndoMachine) {
     if !tf.protected[node as usize] {
         um.push(UndoOp::SetProtected { node });
         tf.protected[node as usize] = true;
+    }
+}
+
+/// Push a T2 node onto the protected stack (for DPO).
+#[inline]
+pub fn push_protected_stack(tf: &mut TwinForest, node: NodeId, um: &mut UndoMachine) {
+    tf.protected_stack.push(node);
+    um.push(UndoOp::PushProtectedStack);
+}
+
+/// Pop from the protected stack (for DPO cleanup).
+#[inline]
+pub fn pop_protected_stack(tf: &mut TwinForest, um: &mut UndoMachine) {
+    if let Some(old) = tf.protected_stack.pop() {
+        um.push(UndoOp::PopProtectedStack { old });
     }
 }

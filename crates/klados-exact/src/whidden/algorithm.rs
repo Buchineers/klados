@@ -260,12 +260,61 @@ fn bb_inner(
             return -1; // k went negative
         }
 
+        // --- DPO: cleanup protected stack ---
+        // Matches rspr lines 3714-3728: prune if top entry's twin is
+        // detached (not a component root), then pop stale entries.
+        if config.deepest_protected_order && forced_pair.is_none() {
+            // Note: rspr prunes here when the top entry's T1 twin is detached
+            // (parent==NULL, not component root). We skip this because our
+            // contract() doesn't zero dead node pointers or set a "contracted"
+            // flag, causing false positives. The DPO constraint and cleanup
+            // provide the benefit without the prune.
+            // Pop stale entries: T2 node contracted (spliced out) or T1
+            // twin's parent is NONE (detached/component root).
+            // Note: spliced-out nodes keep stale parent pointers (we don't
+            // zero them to save undo ops), so we detect them by checking
+            // whether the parent still claims them as a child.
+            while let Some(&top) = tf.protected_stack.last() {
+                let t2_contracted = {
+                    let p = tf.parent[T2][top as usize];
+                    if p == NONE {
+                        !tf.components[T2].contains(&top)
+                    } else {
+                        // Parent exists but doesn't point back → spliced out
+                        tf.left[T2][p as usize] != top
+                            && tf.right[T2][p as usize] != top
+                    }
+                };
+                let t1_twin = tf.twin[T2][top as usize];
+                let t1_twin_parentless = t1_twin == NONE
+                    || tf.parent[T1][t1_twin as usize] == NONE;
+                if t2_contracted || t1_twin_parentless {
+                    undo::pop_protected_stack(tf, um);
+                } else {
+                    break;
+                }
+            }
+        }
+
         // --- Phase 2: Find sibling pair in T1 ---
         match find_sibling_pair(tf, config) {
             PairResult::NoPairs => {
                 return *k;
             }
             PairResult::Case2 { t1_parent, t2_parent } => {
+                // DPO: pop protected stack if the contracted pair includes
+                // the top protected node.
+                if config.deepest_protected_order {
+                    let t2_lc = tf.left[T2][t2_parent as usize];
+                    let t2_rc = tf.right[T2][t2_parent as usize];
+                    for _ in 0..2 {
+                        if let Some(&top) = tf.protected_stack.last() {
+                            if top == t2_lc || top == t2_rc {
+                                undo::pop_protected_stack(tf, um);
+                            }
+                        }
+                    }
+                }
                 do_case2_contract(tf, t1_parent, t2_parent, um);
                 continue;
             }
@@ -367,14 +416,19 @@ enum PairResult {
 fn find_sibling_pair(tf: &TwinForest, config: &BBConfig) -> PairResult {
     if config.prefer_nonbranching || config.deepest_order {
         let mut fallback = PairResult::NoPairs;
+        let mut any_fallback = PairResult::NoPairs; // DPO: any pair if DPO rejects all
         let mut best_depth = (0u16, 0u16);
         for &root in &tf.components[T1] {
             let result = find_preferred_pair(
-                tf, root, config, &mut fallback, &mut best_depth,
+                tf, root, config, &mut fallback, &mut best_depth, &mut any_fallback,
             );
             if !matches!(result, PairResult::NoPairs) {
                 return result; // found a non-branching pair
             }
+        }
+        // DPO fallback: if no pair passed the DPO constraint, use any pair.
+        if matches!(fallback, PairResult::NoPairs) && !matches!(any_fallback, PairResult::NoPairs) {
+            return any_fallback;
         }
         return fallback;
     }
@@ -424,6 +478,7 @@ fn find_preferred_pair(
     config: &BBConfig,
     fallback: &mut PairResult,
     best_depth: &mut (u16, u16),
+    any_fallback: &mut PairResult,
 ) -> PairResult {
     let lc = tf.left[T1][node as usize];
     let rc = tf.right[T1][node as usize];
@@ -434,9 +489,14 @@ fn find_preferred_pair(
         if let Some(result) = classify_pair(tf, node, lc, rc, config) {
             match &result {
                 PairResult::Case2 { .. } => return result,
-                PairResult::Case3 { t2_a, t2_c, cut_b_only, cut_a_only, cut_c_only, .. } => {
+                PairResult::Case3 { t1_a, t2_a, t2_c, cut_b_only, cut_a_only, cut_c_only, .. } => {
                     if *cut_b_only || *cut_a_only || *cut_c_only {
                         return result; // 1-way branching
+                    }
+                    // DPO: always track the first Case 3 pair as a fallback
+                    // in case DPO rejects all pairs during deepest_order.
+                    if matches!(any_fallback, PairResult::NoPairs) {
+                        *any_fallback = result.clone();
                     }
                     if config.deepest_order {
                         // Score: max T2 depth of the pair (primary),
@@ -449,8 +509,29 @@ fn find_preferred_pair(
                             || depth1 > best_depth.0
                             || (depth1 == best_depth.0 && depth2 > best_depth.1)
                         {
-                            *fallback = result;
-                            *best_depth = (depth1, depth2);
+                            // DPO: only accept if T1_a is within the preorder
+                            // interval of the top protected node's T1 subtree.
+                            let dpo_ok = !config.deepest_protected_order
+                                || tf.protected_stack.is_empty()
+                                || {
+                                    let top = *tf.protected_stack.last().unwrap();
+                                    let t1_twin = tf.twin[T2][top as usize];
+                                    if t1_twin == NONE { true }
+                                    else {
+                                        let t1_p = tf.parent[T1][t1_twin as usize];
+                                        if t1_p == NONE { true }
+                                        else {
+                                            let pre = tf.t1_pre_num[*t1_a as usize];
+                                            let ps = tf.t1_pre_num[t1_p as usize];
+                                            let pe = tf.t1_pre_end[t1_p as usize];
+                                            pre >= ps && pre <= pe
+                                        }
+                                    }
+                                };
+                            if dpo_ok {
+                                *fallback = result;
+                                *best_depth = (depth1, depth2);
+                            }
                         }
                     } else if matches!(fallback, PairResult::NoPairs) {
                         *fallback = result;
@@ -462,11 +543,11 @@ fn find_preferred_pair(
     }
 
     if lc != NONE {
-        let r = find_preferred_pair(tf, lc, config, fallback, best_depth);
+        let r = find_preferred_pair(tf, lc, config, fallback, best_depth, any_fallback);
         if !matches!(r, PairResult::NoPairs) { return r; }
     }
     if rc != NONE {
-        let r = find_preferred_pair(tf, rc, config, fallback, best_depth);
+        let r = find_preferred_pair(tf, rc, config, fallback, best_depth, any_fallback);
         if !matches!(r, PairResult::NoPairs) { return r; }
     }
     PairResult::NoPairs
@@ -923,6 +1004,11 @@ fn do_case3_branch(
         // EP: after cutting C, protect T2_a — it must be resolved via B-cuts.
         if ep && !cut_c_only {
             undo::protect_edge(tf, t2_a, um);
+            // DPO: push to protected stack so pair selection is constrained
+            // to the T1 subtree containing T2_a's twin.
+            if config.deepest_protected_order {
+                undo::push_protected_stack(tf, t2_a, um);
+            }
         }
 
         let result = branch_and_bound(tf, k - 1, um, stats, config);
