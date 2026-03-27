@@ -198,36 +198,87 @@ fn branch_and_bound(
     stats: &mut SolverStats,
     config: &BBConfig,
 ) -> i32 {
+    bb_inner(tf, &mut k, um, stats, config, None)
+}
+
+/// Inner B&B with optional forced pair (from CUT_ALL_B).
+/// When `forced_pair` is Some, skip pair scanning and use it directly.
+fn bb_inner(
+    tf: &mut TwinForest,
+    k: &mut i32,
+    um: &mut UndoMachine,
+    stats: &mut SolverStats,
+    config: &BBConfig,
+    forced_pair: Option<(NodeId, NodeId)>,
+) -> i32 {
 
     stats.nodes_explored += 1;
 
+    // CAB: if we have a forced pair from a previous B-cut, try it first.
+    if let Some((t1_a, t1_c)) = forced_pair {
+        // Process singletons first (some may have been created by the B-cut)
+        if !process_singletons(tf, k, um) {
+            return -1;
+        }
+        // Check if the forced pair is still valid (both still siblings in T1)
+        let p_a = tf.parent[T1][t1_a as usize];
+        let p_c = tf.parent[T1][t1_c as usize];
+        if p_a != NONE && p_a == p_c
+            && tf.is_leaf(T1, t1_a) && tf.is_leaf(T1, t1_c)
+        {
+            if let Some(result) = classify_pair(tf, p_a, t1_a, t1_c) {
+                match result {
+                    PairResult::Case2 { t1_parent, t2_parent } => {
+                        do_case2_contract(tf, t1_parent, t2_parent, um);
+                        // Fall through to normal loop
+                    }
+                    PairResult::Case3 { t1_a, t1_c, t2_a, t2_b, t2_c,
+                                          cut_b_only: _, cut_c_only: _, cut_a_only: _ } => {
+                        if *k <= 0 {
+                            return -1;
+                        }
+                        if config.bb && approx_3(tf, um) > 3 * *k {
+                            return -1;
+                        }
+                        // Force cut_b_only for the CAB forced pair
+                        return do_case3_branch(
+                            tf, *k, um, stats, config,
+                            t1_a, t1_c, t2_a, t2_b, t2_c,
+                            true, false, false,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Forced pair no longer valid — fall through to normal B&B
+    }
+
     loop {
         // --- Phase 1: Process singletons ---
-        if !process_singletons(tf, &mut k, um) {
+        if !process_singletons(tf, k, um) {
             return -1; // k went negative
         }
 
         // --- Phase 2: Find sibling pair in T1 ---
         match find_sibling_pair(tf, config) {
             PairResult::NoPairs => {
-                return k;
+                return *k;
             }
             PairResult::Case2 { t1_parent, t2_parent } => {
                 do_case2_contract(tf, t1_parent, t2_parent, um);
-                // Loop back to check for new singletons
                 continue;
             }
             PairResult::Case3 { t1_a, t1_c, t2_a, t2_b, t2_c,
                                   cut_b_only, cut_c_only, cut_a_only } => {
-                if k <= 0 {
+                if *k <= 0 {
                     return -1;
                 }
-                // BB: 3-approximation lower bound prune
-                if config.bb && approx_3(tf, um) > 3 * k {
+                if config.bb && approx_3(tf, um) > 3 * *k {
                     return -1;
                 }
                 return do_case3_branch(
-                    tf, k, um, stats, config,
+                    tf, *k, um, stats, config,
                     t1_a, t1_c, t2_a, t2_b, t2_c,
                     cut_b_only, cut_a_only, cut_c_only,
                 );
@@ -657,8 +708,8 @@ fn do_case3_branch(
     um: &mut UndoMachine,
     stats: &mut SolverStats,
     config: &BBConfig,
-    _t1_a: NodeId,
-    _t1_c: NodeId,
+    t1_a: NodeId,
+    t1_c: NodeId,
     t2_a: NodeId,
     t2_b: NodeId,
     t2_c: NodeId,
@@ -707,7 +758,14 @@ fn do_case3_branch(
             undo::contract(tf, T2, t2_b_parent, um);
         }
 
-        let result = branch_and_bound(tf, k - 1, um, stats, config);
+        // CAB: after cutting B, the T1 pair (a,c) is still valid — force it
+        // to be re-evaluated with cut_b_only in the next level.
+        let mut k_b = k - 1;
+        let result = if config.cut_all_b {
+            bb_inner(tf, &mut k_b, um, stats, config, Some((t1_a, t1_c)))
+        } else {
+            branch_and_bound(tf, k - 1, um, stats, config)
+        };
         if result >= 0 { return result; }
         um.undo_to(cp, tf);
     }
