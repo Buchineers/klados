@@ -1,133 +1,142 @@
-//! SoA forest with physical tree mutations matching rspr's semantics.
+//! Twin-pointer forest pair for 2-tree rSPR branch-and-bound.
 //!
-//! Every structural change (cut, contract, splice) physically modifies the
-//! parent/left/right arrays. The undo machine records old values for rollback.
+//! Stores both T1 and T2 in a single struct with direct twin pointers
+//! between corresponding leaves. Physical tree mutations (cut, contract,
+//! splice) modify the topology arrays; the undo machine records old values.
 //!
-//! Key operations matching rspr:
-//! - `cut_parent(n)`: detach n from its parent → n becomes a component root
-//! - `contract(n)`: if n has 1 child, splice n out; if 0 children and is root,
-//!   mark component dead
-//! - `contract_sibling_pair(parent)`: detach both children → parent becomes leaf
-//! - `is_leaf(n)`: left[n] == NONE (physical, not flag-based)
+//! Optimized for the 2-tree case: no generic tree indexing,
+//! twin lookups are O(1) array access.
 
 use klados_core::tree::{Label, Tree, NONE, NodeId};
 
-/// A forest built from a Tree, supporting physical cut/contract/undo.
-#[derive(Clone)]
-pub struct Forest {
-    // --- Topology (mutable via undo machine) ---
-    pub parent: Vec<NodeId>,
-    pub left: Vec<NodeId>,
-    pub right: Vec<NodeId>,
+/// Index into the tree pair: T1 = 0, T2 = 1.
+pub const T1: usize = 0;
+pub const T2: usize = 1;
 
-    // --- Original topology (immutable, for solution extraction) ---
-    pub orig_parent: Vec<NodeId>,
-    pub orig_left: Vec<NodeId>,
-    pub orig_right: Vec<NodeId>,
+/// Paired forest for T1 and T2 with twin pointers.
+#[derive(Clone)]
+pub struct TwinForest {
+    // --- Topology (mutable via undo) ---
+    pub parent: [Vec<NodeId>; 2],
+    pub left:   [Vec<NodeId>; 2],
+    pub right:  [Vec<NodeId>; 2],
 
     // --- Labels ---
-    pub label: Vec<Label>,         // current label (changes during contraction)
-    pub orig_label: Vec<Label>,    // original label (immutable)
-    pub label_to_node: Vec<NodeId>, // label → current node
+    pub label:         [Vec<Label>; 2],
+    pub label_to_node: [Vec<NodeId>; 2],
 
-    // --- Twin pointers (T1↔T2 by label) ---
-    pub twin: Vec<NodeId>,
+    // --- Twin pointers: twin[T1][node] → T2 node, twin[T2][node] → T1 node ---
+    pub twin: [Vec<NodeId>; 2],
 
     // --- Components ---
-    pub components: Vec<NodeId>,
+    pub components: [Vec<NodeId>; 2],
 
-    // --- Contraction tracking ---
-    /// collapsed_into[lbl] = representative label after contractions.
-    /// Updated during Case 2 contractions. Used for solution extraction.
+    // --- Contraction tracking (T1 only, for extraction) ---
     pub collapsed_into: Vec<Label>,
 
+    // --- Immutable T1 original (for solution extraction) ---
+    pub orig_parent: Vec<NodeId>,
+    pub orig_left:   Vec<NodeId>,
+    pub orig_right:  Vec<NodeId>,
+    pub orig_label:  Vec<Label>,
+
+    // --- Precomputed T2 depth (immutable, for Case 3 orientation) ---
+    pub t2_depth: Vec<u16>,
+
     // --- Metadata ---
+    pub num_nodes: [usize; 2],
+    pub root:      [NodeId; 2],
     pub num_leaves: u32,
-    pub root: NodeId,
-    pub num_nodes: usize,
 }
 
-impl Forest {
-    /// Build a Forest from a klados Tree.
-    pub fn from_tree(tree: &Tree) -> Self {
-        let n = tree.num_nodes();
-        Self {
-            parent: tree.parent.clone(),
-            left: tree.left.clone(),
-            right: tree.right.clone(),
-            orig_parent: tree.parent.clone(),
-            orig_left: tree.left.clone(),
-            orig_right: tree.right.clone(),
-            label: tree.label.clone(),
-            orig_label: tree.label.clone(),
-            label_to_node: tree.label_to_node.clone(),
-            twin: vec![NONE; n],
-            components: vec![tree.root],
-            collapsed_into: (0..=tree.num_leaves).collect(),
-            num_leaves: tree.num_leaves,
-            root: tree.root,
-            num_nodes: n,
+impl TwinForest {
+    /// Build from two klados Trees, setting up twin pointers by label.
+    pub fn from_trees(t1: &Tree, t2: &Tree, num_leaves: u32) -> Self {
+        let n1 = t1.num_nodes();
+        let n2 = t2.num_nodes();
+
+        let mut tf = Self {
+            parent: [t1.parent.clone(), t2.parent.clone()],
+            left:   [t1.left.clone(),   t2.left.clone()],
+            right:  [t1.right.clone(),  t2.right.clone()],
+            label:         [t1.label.clone(),         t2.label.clone()],
+            label_to_node: [t1.label_to_node.clone(), t2.label_to_node.clone()],
+            twin: [vec![NONE; n1], vec![NONE; n2]],
+            components: [vec![t1.root], vec![t2.root]],
+            collapsed_into: (0..=num_leaves).collect(),
+            orig_parent: t1.parent.clone(),
+            orig_left:   t1.left.clone(),
+            orig_right:  t1.right.clone(),
+            orig_label:  t1.label.clone(),
+            t2_depth: vec![0; n2],
+            num_nodes: [n1, n2],
+            root: [t1.root, t2.root],
+            num_leaves,
+        };
+
+        // Precompute T2 depth (distance from original root, immutable)
+        Self::compute_depth(&tf.left[T2], &tf.right[T2], t2.root, &mut tf.t2_depth);
+
+        // Set up twin pointers by matching leaf labels
+        for lbl in 1..=num_leaves {
+            let n1 = tf.label_to_node[T1][lbl as usize];
+            let n2 = tf.label_to_node[T2][lbl as usize];
+            if n1 != NONE && n2 != NONE {
+                tf.twin[T1][n1 as usize] = n2;
+                tf.twin[T2][n2 as usize] = n1;
+            }
+        }
+
+        tf
+    }
+
+    /// Precompute depth via iterative DFS.
+    fn compute_depth(left: &[NodeId], right: &[NodeId], root: NodeId, depth: &mut [u16]) {
+        let mut stack = vec![(root, 0u16)];
+        while let Some((node, d)) = stack.pop() {
+            depth[node as usize] = d;
+            let rc = right[node as usize];
+            if rc != NONE { stack.push((rc, d + 1)); }
+            let lc = left[node as usize];
+            if lc != NONE { stack.push((lc, d + 1)); }
         }
     }
 
     // --- Predicates ---
 
     #[inline(always)]
-    pub fn is_leaf(&self, node: NodeId) -> bool {
-        self.left[node as usize] == NONE
+    pub fn is_leaf(&self, ti: usize, node: NodeId) -> bool {
+        self.left[ti][node as usize] == NONE
     }
 
-    /// A sibling pair: internal node with two leaf children.
     #[inline]
-    pub fn is_sibling_pair(&self, node: NodeId) -> bool {
-        let lc = self.left[node as usize];
-        let rc = self.right[node as usize];
+    #[allow(dead_code)] // utility for future optimizations
+    pub fn is_sibling_pair(&self, ti: usize, node: NodeId) -> bool {
+        let lc = self.left[ti][node as usize];
+        let rc = self.right[ti][node as usize];
         lc != NONE && rc != NONE
-            && self.is_leaf(lc) && self.is_leaf(rc)
-    }
-
-    /// Is this node a singleton component (leaf that is a component root)?
-    #[inline]
-    pub fn is_singleton(&self, node: NodeId) -> bool {
-        self.is_leaf(node) && self.parent[node as usize] == NONE
+            && self.is_leaf(ti, lc) && self.is_leaf(ti, rc)
     }
 
     // --- Navigation ---
 
-    /// Sibling: the other child of this node's parent.
     #[inline]
-    pub fn sibling(&self, node: NodeId) -> NodeId {
-        let p = self.parent[node as usize];
+    pub fn sibling(&self, ti: usize, node: NodeId) -> NodeId {
+        let p = self.parent[ti][node as usize];
         if p == NONE { return NONE; }
-        let l = self.left[p as usize];
-        if l == node { self.right[p as usize] } else { l }
+        let l = self.left[ti][p as usize];
+        if l == node { self.right[ti][p as usize] } else { l }
     }
 
-    /// Number of live children (0, 1, or 2).
     #[inline]
-    pub fn num_children(&self, node: NodeId) -> u8 {
-        let l = self.left[node as usize] != NONE;
-        let r = self.right[node as usize] != NONE;
-        l as u8 + r as u8
+    pub fn num_children(&self, ti: usize, node: NodeId) -> u8 {
+        (self.left[ti][node as usize] != NONE) as u8
+            + (self.right[ti][node as usize] != NONE) as u8
     }
 
-    /// Get the single child (when node has exactly 1 child).
     #[inline]
-    pub fn only_child(&self, node: NodeId) -> NodeId {
-        let lc = self.left[node as usize];
-        let rc = self.right[node as usize];
-        if lc != NONE { lc } else { rc }
-    }
-}
-
-/// Set up twin pointers between two forests based on leaf labels.
-pub fn sync_twins(f1: &mut Forest, f2: &mut Forest) {
-    for lbl in 1..=f1.num_leaves {
-        let n1 = f1.label_to_node[lbl as usize];
-        let n2 = f2.label_to_node[lbl as usize];
-        if n1 != NONE && n2 != NONE {
-            f1.twin[n1 as usize] = n2;
-            f2.twin[n2 as usize] = n1;
-        }
+    pub fn only_child(&self, ti: usize, node: NodeId) -> NodeId {
+        let lc = self.left[ti][node as usize];
+        if lc != NONE { lc } else { self.right[ti][node as usize] }
     }
 }

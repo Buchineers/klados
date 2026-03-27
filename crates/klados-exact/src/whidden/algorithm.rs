@@ -12,7 +12,7 @@
 use klados_core::tree::{Label, NodeId, Tree, NONE};
 use klados_core::{Instance, SolverStats};
 
-use super::forest::{Forest, sync_twins};
+use super::forest::{TwinForest, T1, T2};
 use super::undo::{self, UndoMachine};
 use crate::lower_bound::maf_bounds;
 
@@ -36,19 +36,18 @@ pub fn solve(instance: &Instance, stats: &mut SolverStats) -> Option<Vec<Tree>> 
     let lb_k = lb.saturating_sub(1);
     let ub_k = ub.saturating_sub(1);
 
+    // Build once; reuse across k iterations (undo rewinds to initial state).
+    let mut tf = TwinForest::from_trees(&instance.trees[0], &instance.trees[1], n);
+    let mut um = UndoMachine::new();
+
     for k in lb_k..=ub_k {
-        let mut f1 = Forest::from_tree(&instance.trees[0]);
-        let mut f2 = Forest::from_tree(&instance.trees[1]);
-        sync_twins(&mut f1, &mut f2);
-
-        let mut forests = [f1, f2];
-        let mut um = UndoMachine::new();
-
-        let result = branch_and_bound(&mut forests, k as i32, &mut um, stats);
+        let cp = um.checkpoint();
+        let result = branch_and_bound(&mut tf, k as i32, &mut um, stats);
 
         if result >= 0 {
-            return Some(extract_components(&forests));
+            return Some(extract_components(&tf));
         }
+        um.undo_to(cp, &mut tf);
     }
 
     None
@@ -59,7 +58,7 @@ pub fn solve(instance: &Instance, stats: &mut SolverStats) -> Option<Vec<Tree>> 
 // ---------------------------------------------------------------------------
 
 fn branch_and_bound(
-    forests: &mut [Forest; 2],
+    tf: &mut TwinForest,
     mut k: i32,
     um: &mut UndoMachine,
     stats: &mut SolverStats,
@@ -69,17 +68,17 @@ fn branch_and_bound(
 
     loop {
         // --- Phase 1: Process singletons ---
-        if !process_singletons(forests, &mut k, um) {
+        if !process_singletons(tf, &mut k, um) {
             return -1; // k went negative
         }
 
         // --- Phase 2: Find sibling pair in T1 ---
-        match find_sibling_pair(forests) {
+        match find_sibling_pair(tf) {
             PairResult::NoPairs => {
                 return k;
             }
             PairResult::Case2 { t1_parent, t2_parent } => {
-                do_case2_contract(forests, t1_parent, t2_parent, um);
+                do_case2_contract(tf, t1_parent, t2_parent, um);
                 // Loop back to check for new singletons
                 continue;
             }
@@ -88,7 +87,7 @@ fn branch_and_bound(
                     return -1;
                 }
                 return do_case3_branch(
-                    forests, k, um, stats,
+                    tf, k, um, stats,
                     t1_a, t1_c, t2_a, t2_b, t2_c,
                 );
             }
@@ -102,50 +101,41 @@ fn branch_and_bound(
 
 /// Process all singletons. Returns false if k goes negative.
 fn process_singletons(
-    forests: &mut [Forest; 2],
-    k: &mut i32,
+    tf: &mut TwinForest,
+    _k: &mut i32, // reserved for future singleton-charging optimizations
     um: &mut UndoMachine,
 ) -> bool {
     loop {
-        let singleton = find_singleton(forests);
+        let singleton = find_singleton(tf);
         if singleton == NONE { return true; }
 
         // singleton is a T2 leaf that is a component root (singleton in T2)
         let t2_node = singleton;
-        let t1_node = forests[1].twin[t2_node as usize];
+        let t1_node = tf.twin[T2][t2_node as usize];
         if t1_node == NONE { continue; }
 
-        let t1_parent = forests[0].parent[t1_node as usize];
+        let t1_parent = tf.parent[T1][t1_node as usize];
         if t1_parent == NONE {
             // T1_a is already a component root — skip
             continue;
         }
 
-        // Check if parent is a sibling pair BEFORE cutting
-        let was_sibling_pair = forests[0].is_sibling_pair(t1_parent);
-
         // Cut T1_a from its parent → T1_a becomes a new component
-        undo::cut_parent(&mut forests[0], 0, t1_node, um);
-        undo::add_component(&mut forests[0], 0, t1_node, um);
+        undo::cut_parent(tf, T1, t1_node, um);
+        undo::add_component(tf, T1, t1_node, um);
 
         // Contract the parent (may become degree-1 and get spliced)
-        let contracted = undo::contract(&mut forests[0], 0, t1_parent, um);
-
-        // If contracted node is a new sibling pair, it will be found naturally
-        // in the next iteration of the main loop.
-        let _ = (was_sibling_pair, contracted);
+        undo::contract(tf, T1, t1_parent, um);
     }
 }
 
 /// Find a singleton: a T2 component that is a single leaf.
 /// Skip singletons whose twin is already a component root in T1.
-fn find_singleton(forests: &[Forest; 2]) -> NodeId {
-    let f2 = &forests[1];
-    let f1 = &forests[0];
-    for &root in &f2.components {
-        if f2.is_leaf(root) {
-            let twin = f2.twin[root as usize];
-            if twin != NONE && f1.parent[twin as usize] != NONE {
+fn find_singleton(tf: &TwinForest) -> NodeId {
+    for &root in &tf.components[T2] {
+        if tf.is_leaf(T2, root) {
+            let twin = tf.twin[T2][root as usize];
+            if twin != NONE && tf.parent[T1][twin as usize] != NONE {
                 // Twin has a parent in T1 → can cut it
                 return root;
             }
@@ -165,57 +155,84 @@ enum PairResult {
 }
 
 /// Find a sibling pair in T1 and classify it.
-fn find_sibling_pair(forests: &[Forest; 2]) -> PairResult {
-    let f1 = &forests[0];
-    let f2 = &forests[1];
-
-    // Walk T1 to find sibling pairs (internal node with 2 leaf children)
-    for node in 0..f1.num_nodes as NodeId {
-        if !f1.is_sibling_pair(node) { continue; }
-
-        let t1_a = f1.left[node as usize];
-        let t1_c = f1.right[node as usize];
-
-        // Get T2 twins
-        let t2_a = f1.twin[t1_a as usize];
-        let t2_c = f1.twin[t1_c as usize];
-        if t2_a == NONE || t2_c == NONE { continue; }
-
-        // Case 2: T2_a and T2_c share a parent in T2
-        let t2_a_parent = f2.parent[t2_a as usize];
-        let t2_c_parent = f2.parent[t2_c as usize];
-        if t2_a_parent != NONE && t2_a_parent == t2_c_parent {
-            return PairResult::Case2 {
-                t1_parent: node,
-                t2_parent: t2_a_parent,
-            };
+/// Walks from T1 component roots — only visits live nodes.
+fn find_sibling_pair(tf: &TwinForest) -> PairResult {
+    for &root in &tf.components[T1] {
+        let result = find_pair_in(tf, root);
+        if !matches!(result, PairResult::NoPairs) {
+            return result;
         }
-
-        // Case 3: different parents → need to branch
-        // Orient: T2_a is the deeper one (further from root)
-        let da = depth_to_root(f2, t2_a);
-        let dc = depth_to_root(f2, t2_c);
-        let (t1_a, t1_c, t2_a, t2_c) = if da >= dc {
-            (t1_a, t1_c, t2_a, t2_c)
-        } else {
-            (t1_c, t1_a, t2_c, t2_a)
-        };
-
-        // T2_b = sibling of T2_a in T2
-        let t2_b = f2.sibling(t2_a);
-        if t2_b == NONE { continue; }
-
-        return PairResult::Case3 { t1_a, t1_c, t2_a, t2_b, t2_c };
     }
-
     PairResult::NoPairs
 }
 
+/// Recursive DFS within a T1 component to find a sibling pair.
+fn find_pair_in(tf: &TwinForest, node: NodeId) -> PairResult {
+    let lc = tf.left[T1][node as usize];
+    let rc = tf.right[T1][node as usize];
+
+    if lc == NONE { return PairResult::NoPairs; } // leaf
+
+    // Check if this node is a sibling pair
+    if rc != NONE && tf.is_leaf(T1, lc) && tf.is_leaf(T1, rc) {
+        if let Some(result) = classify_pair(tf, node, lc, rc) {
+            return result;
+        }
+    }
+
+    // Recurse into children
+    if lc != NONE {
+        let r = find_pair_in(tf, lc);
+        if !matches!(r, PairResult::NoPairs) { return r; }
+    }
+    if rc != NONE {
+        let r = find_pair_in(tf, rc);
+        if !matches!(r, PairResult::NoPairs) { return r; }
+    }
+    PairResult::NoPairs
+}
+
+/// Classify a confirmed T1 sibling pair as Case 2 or Case 3.
+fn classify_pair(
+    tf: &TwinForest,
+    t1_parent: NodeId,
+    t1_a: NodeId,
+    t1_c: NodeId,
+) -> Option<PairResult> {
+    let t2_a = tf.twin[T1][t1_a as usize];
+    let t2_c = tf.twin[T1][t1_c as usize];
+    if t2_a == NONE || t2_c == NONE { return None; }
+
+    // Case 2: T2_a and T2_c share a parent in T2
+    let t2_a_parent = tf.parent[T2][t2_a as usize];
+    let t2_c_parent = tf.parent[T2][t2_c as usize];
+    if t2_a_parent != NONE && t2_a_parent == t2_c_parent {
+        return Some(PairResult::Case2 {
+            t1_parent,
+            t2_parent: t2_a_parent,
+        });
+    }
+
+    // Case 3: orient so T2_a is deeper (from current component root)
+    let da = depth_to_root(tf, T2, t2_a);
+    let dc = depth_to_root(tf, T2, t2_c);
+    let (t1_a, t1_c, t2_a, t2_c) = if da >= dc {
+        (t1_a, t1_c, t2_a, t2_c)
+    } else {
+        (t1_c, t1_a, t2_c, t2_a)
+    };
+
+    let t2_b = tf.sibling(T2, t2_a);
+    if t2_b == NONE { return None; }
+
+    Some(PairResult::Case3 { t1_a, t1_c, t2_a, t2_b, t2_c })
+}
+
 /// Distance from node to its component root (via parent pointers).
-fn depth_to_root(f: &Forest, mut node: NodeId) -> u16 {
+fn depth_to_root(tf: &TwinForest, ti: usize, mut node: NodeId) -> u16 {
     let mut d: u16 = 0;
     loop {
-        let p = f.parent[node as usize];
+        let p = tf.parent[ti][node as usize];
         if p == NONE { return d; }
         d += 1;
         node = p;
@@ -227,41 +244,39 @@ fn depth_to_root(f: &Forest, mut node: NodeId) -> u16 {
 // ---------------------------------------------------------------------------
 
 fn do_case2_contract(
-    forests: &mut [Forest; 2],
+    tf: &mut TwinForest,
     t1_parent: NodeId,
     t2_parent: NodeId,
     um: &mut UndoMachine,
 ) {
     // Get children labels BEFORE detaching (right child's label is "kept")
-    let t1_lc = forests[0].left[t1_parent as usize];
-    let t1_rc = forests[0].right[t1_parent as usize];
-    let t2_lc = forests[1].left[t2_parent as usize];
-    let t2_rc = forests[1].right[t2_parent as usize];
-    let kept_label = forests[0].label[t1_rc as usize];
-    let removed_label = forests[0].label[t1_lc as usize];
+    let t1_lc = tf.left[T1][t1_parent as usize];
+    let t1_rc = tf.right[T1][t1_parent as usize];
+    let kept_label = tf.label[T1][t1_rc as usize];
+    let removed_label = tf.label[T1][t1_lc as usize];
 
     // Contract in T1: detach both children, parent becomes leaf
-    undo::contract_sibling_pair(&mut forests[0], 0, t1_parent, um);
+    undo::contract_sibling_pair(tf, T1, t1_parent, um);
     // Contract in T2: detach both children, parent becomes leaf
-    undo::contract_sibling_pair(&mut forests[1], 1, t2_parent, um);
+    undo::contract_sibling_pair(tf, T2, t2_parent, um);
 
     // Parent takes on "kept" label so it's visible to label-based operations
-    undo::set_label(&mut forests[0], 0, t1_parent, kept_label, um);
-    undo::set_label(&mut forests[1], 1, t2_parent, kept_label, um);
+    undo::set_label(tf, T1, t1_parent, kept_label, um);
+    undo::set_label(tf, T2, t2_parent, kept_label, um);
     // Update label_to_node: kept label → parent node
-    undo::set_label_to_node(&mut forests[0], 0, kept_label, t1_parent, um);
-    undo::set_label_to_node(&mut forests[1], 1, kept_label, t2_parent, um);
+    undo::set_label_to_node(tf, T1, kept_label, t1_parent, um);
+    undo::set_label_to_node(tf, T2, kept_label, t2_parent, um);
     // Removed label → NONE
     if removed_label != 0 {
-        undo::set_label_to_node(&mut forests[0], 0, removed_label, NONE, um);
-        undo::set_label_to_node(&mut forests[1], 1, removed_label, NONE, um);
+        undo::set_label_to_node(tf, T1, removed_label, NONE, um);
+        undo::set_label_to_node(tf, T2, removed_label, NONE, um);
         // Track: removed_label collapses into kept_label
-        undo::set_collapsed(&mut forests[0], 0, removed_label, kept_label, um);
+        undo::set_collapsed(tf, removed_label, kept_label, um);
     }
 
     // Update twins: parents now represent the contracted pair
-    undo::set_twin(&mut forests[0], 0, t1_parent, t2_parent, um);
-    undo::set_twin(&mut forests[1], 1, t2_parent, t1_parent, um);
+    undo::set_twin(tf, T1, t1_parent, t2_parent, um);
+    undo::set_twin(tf, T2, t2_parent, t1_parent, um);
 }
 
 // ---------------------------------------------------------------------------
@@ -269,70 +284,62 @@ fn do_case2_contract(
 // ---------------------------------------------------------------------------
 
 fn do_case3_branch(
-    forests: &mut [Forest; 2],
+    tf: &mut TwinForest,
     k: i32,
     um: &mut UndoMachine,
     stats: &mut SolverStats,
-    t1_a: NodeId,
-    t1_c: NodeId,
+    _t1_a: NodeId,
+    _t1_c: NodeId,
     t2_a: NodeId,
     t2_b: NodeId,
     t2_c: NodeId,
 ) -> i32 {
-    let mut best_k: i32 = -1;
-
     // --- Branch A: cut T2_a ---
     {
         let cp = um.checkpoint();
-        let t2_a_parent = forests[1].parent[t2_a as usize];
-        undo::cut_parent(&mut forests[1], 1, t2_a, um);
-        undo::add_component(&mut forests[1], 1, t2_a, um);
-        // Contract T2_a's old parent (now has 1 child)
+        let t2_a_parent = tf.parent[T2][t2_a as usize];
+        undo::cut_parent(tf, T2, t2_a, um);
+        undo::add_component(tf, T2, t2_a, um);
         if t2_a_parent != NONE {
-            let node = undo::contract(&mut forests[1], 1, t2_a_parent, um);
-            let _ = node;
+            undo::contract(tf, T2, t2_a_parent, um);
         }
 
-        let result = branch_and_bound(forests, k - 1, um, stats);
+        let result = branch_and_bound(tf, k - 1, um, stats);
         if result >= 0 { return result; }
-        um.undo_to(cp, forests);
+        um.undo_to(cp, tf);
     }
 
     // --- Branch B: cut T2_b ---
     {
         let cp = um.checkpoint();
-        let t2_b_parent = forests[1].parent[t2_b as usize];
-        undo::cut_parent(&mut forests[1], 1, t2_b, um);
-        undo::add_component(&mut forests[1], 1, t2_b, um);
+        let t2_b_parent = tf.parent[T2][t2_b as usize];
+        undo::cut_parent(tf, T2, t2_b, um);
+        undo::add_component(tf, T2, t2_b, um);
         if t2_b_parent != NONE {
-            let node = undo::contract(&mut forests[1], 1, t2_b_parent, um);
-            let _ = node;
+            undo::contract(tf, T2, t2_b_parent, um);
         }
 
-        let result = branch_and_bound(forests, k - 1, um, stats);
+        let result = branch_and_bound(tf, k - 1, um, stats);
         if result >= 0 { return result; }
-        um.undo_to(cp, forests);
+        um.undo_to(cp, tf);
     }
 
     // --- Branch C: cut T2_c ---
     {
         let cp = um.checkpoint();
-        let t2_c_parent = forests[1].parent[t2_c as usize];
+        let t2_c_parent = tf.parent[T2][t2_c as usize];
         if t2_c_parent != NONE {
-            undo::cut_parent(&mut forests[1], 1, t2_c, um);
-            undo::add_component(&mut forests[1], 1, t2_c, um);
-            let node = undo::contract(&mut forests[1], 1, t2_c_parent, um);
-            let _ = node;
+            undo::cut_parent(tf, T2, t2_c, um);
+            undo::add_component(tf, T2, t2_c, um);
+            undo::contract(tf, T2, t2_c_parent, um);
         }
-        // If T2_c is already a root, cutting is free (k++ in rspr)
-        // For now, still decrement k.
 
-        let result = branch_and_bound(forests, k - 1, um, stats);
+        let result = branch_and_bound(tf, k - 1, um, stats);
         if result >= 0 { return result; }
-        um.undo_to(cp, forests);
+        um.undo_to(cp, tf);
     }
 
-    best_k
+    -1
 }
 
 // ---------------------------------------------------------------------------
@@ -340,12 +347,11 @@ fn do_case3_branch(
 // ---------------------------------------------------------------------------
 
 /// Extract MAF components from the solved forest state.
-fn extract_components(forests: &[Forest; 2]) -> Vec<Tree> {
-    let f1 = &forests[0];
-    let n = f1.num_leaves;
+fn extract_components(tf: &TwinForest) -> Vec<Tree> {
+    let n = tf.num_leaves;
 
     // Resolve collapsed_into to final representatives (transitive closure)
-    let mut collapsed: Vec<Label> = f1.collapsed_into[..=n as usize].to_vec();
+    let mut collapsed: Vec<Label> = tf.collapsed_into[..=n as usize].to_vec();
     for _ in 0..n {
         let mut changed = false;
         for lbl in 1..=n {
@@ -359,11 +365,11 @@ fn extract_components(forests: &[Forest; 2]) -> Vec<Tree> {
     }
 
     // Collect label sets per component
-    let orig_tree = tree_from_original(f1);
+    let orig_tree = tree_from_original(tf);
     let mut result = Vec::new();
-    for &root in &f1.components {
+    for &root in &tf.components[T1] {
         let mut current_labels = Vec::new();
-        collect_labels(f1, root, &mut current_labels);
+        collect_labels(tf, root, &mut current_labels);
         if current_labels.is_empty() { continue; }
 
         // Expand: find all original labels whose representative is in this component
@@ -384,36 +390,36 @@ fn extract_components(forests: &[Forest; 2]) -> Vec<Tree> {
 }
 
 /// Collect current labels reachable from node.
-fn collect_labels(f: &Forest, node: NodeId, out: &mut Vec<Label>) {
-    let lbl = f.label[node as usize];
+fn collect_labels(tf: &TwinForest, node: NodeId, out: &mut Vec<Label>) {
+    let lbl = tf.label[T1][node as usize];
     if lbl != 0 {
         out.push(lbl);
         return;
     }
-    let lc = f.left[node as usize];
-    let rc = f.right[node as usize];
-    if lc != NONE { collect_labels(f, lc, out); }
-    if rc != NONE { collect_labels(f, rc, out); }
+    let lc = tf.left[T1][node as usize];
+    let rc = tf.right[T1][node as usize];
+    if lc != NONE { collect_labels(tf, lc, out); }
+    if rc != NONE { collect_labels(tf, rc, out); }
 }
 
 
-/// Reconstruct original Tree from Forest's immutable orig_* arrays.
-fn tree_from_original(f: &Forest) -> Tree {
-    let mut t = Tree::with_capacity(f.num_leaves);
-    t.parent = f.orig_parent.clone();
-    t.left = f.orig_left.clone();
-    t.right = f.orig_right.clone();
-    t.label = f.orig_label.clone();
-    t.label_to_node = vec![NONE; f.num_leaves as usize + 1];
-    for node in 0..f.num_nodes as NodeId {
-        let lbl = f.orig_label[node as usize];
-        if lbl != 0 && f.orig_left[node as usize] == NONE {
+/// Reconstruct original Tree from TwinForest's immutable orig_* arrays.
+fn tree_from_original(tf: &TwinForest) -> Tree {
+    let mut t = Tree::with_capacity(tf.num_leaves);
+    t.parent = tf.orig_parent.clone();
+    t.left = tf.orig_left.clone();
+    t.right = tf.orig_right.clone();
+    t.label = tf.orig_label.clone();
+    t.label_to_node = vec![NONE; tf.num_leaves as usize + 1];
+    for node in 0..tf.num_nodes[T1] as NodeId {
+        let lbl = tf.orig_label[node as usize];
+        if lbl != 0 && tf.orig_left[node as usize] == NONE {
             t.label_to_node[lbl as usize] = node;
         }
     }
-    t.num_leaves = f.num_leaves;
-    t.root = f.root;
-    t.depth = vec![0; f.num_nodes];
-    t.subtree_size = vec![0; f.num_nodes];
+    t.num_leaves = tf.num_leaves;
+    t.root = tf.root[T1];
+    t.depth = vec![0; tf.num_nodes[T1]];
+    t.subtree_size = vec![0; tf.num_nodes[T1]];
     t
 }
