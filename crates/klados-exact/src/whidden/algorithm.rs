@@ -423,6 +423,16 @@ fn depth_to_root(tf: &TwinForest, ti: usize, mut node: NodeId) -> u16 {
     }
 }
 
+/// Walk parent pointers to find the component root.
+#[inline]
+fn find_root(tf: &TwinForest, ti: usize, mut node: NodeId) -> NodeId {
+    loop {
+        let p = tf.parent[ti][node as usize];
+        if p == NONE { return node; }
+        node = p;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 3-approximation lower bound (rspr's BB pruning)
 // ---------------------------------------------------------------------------
@@ -584,8 +594,14 @@ fn do_case3_branch(
     let cob = config.cut_one_b && cut_b_only;
     let rcob_a = config.reverse_cut_one_b && cut_a_only && !cob;
     let rcob_c = config.reverse_cut_one_b && cut_c_only && !cob;
+
+    // SC: if T2_a and T2_c are in different components, cutting B can't help.
+    let separate_components = config.cut_ac_separate_components
+        && !cob && !rcob_a && !rcob_c
+        && find_root(tf, T2, t2_a) != find_root(tf, T2, t2_c);
+
     let skip_a = cob || rcob_c;
-    let skip_b = rcob_a || rcob_c;
+    let skip_b = rcob_a || rcob_c || separate_components;
     let skip_c = cob || rcob_a;
 
     // --- Branch A: cut T2_a ---
