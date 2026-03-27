@@ -226,7 +226,7 @@ fn bb_inner(
         if p_a != NONE && p_a == p_c
             && tf.is_leaf(T1, t1_a) && tf.is_leaf(T1, t1_c)
         {
-            if let Some(result) = classify_pair(tf, p_a, t1_a, t1_c) {
+            if let Some(result) = classify_pair(tf, p_a, t1_a, t1_c, config) {
                 match result {
                     PairResult::Case2 { t1_parent, t2_parent } => {
                         do_case2_contract(tf, t1_parent, t2_parent, um);
@@ -370,7 +370,7 @@ fn find_sibling_pair(tf: &TwinForest, config: &BBConfig) -> PairResult {
         let mut best_depth = (0u16, 0u16);
         for &root in &tf.components[T1] {
             let result = find_preferred_pair(
-                tf, root, config.deepest_order, &mut fallback, &mut best_depth,
+                tf, root, config, &mut fallback, &mut best_depth,
             );
             if !matches!(result, PairResult::NoPairs) {
                 return result; // found a non-branching pair
@@ -381,7 +381,7 @@ fn find_sibling_pair(tf: &TwinForest, config: &BBConfig) -> PairResult {
 
     // No preference: return first pair found.
     for &root in &tf.components[T1] {
-        let result = find_any_pair(tf, root);
+        let result = find_any_pair(tf, root, config);
         if !matches!(result, PairResult::NoPairs) {
             return result;
         }
@@ -390,24 +390,24 @@ fn find_sibling_pair(tf: &TwinForest, config: &BBConfig) -> PairResult {
 }
 
 /// DFS to find any sibling pair (no preference).
-fn find_any_pair(tf: &TwinForest, node: NodeId) -> PairResult {
+fn find_any_pair(tf: &TwinForest, node: NodeId, config: &BBConfig) -> PairResult {
     let lc = tf.left[T1][node as usize];
     let rc = tf.right[T1][node as usize];
 
     if lc == NONE { return PairResult::NoPairs; }
 
     if rc != NONE && tf.is_leaf(T1, lc) && tf.is_leaf(T1, rc) {
-        if let Some(result) = classify_pair(tf, node, lc, rc) {
+        if let Some(result) = classify_pair(tf, node, lc, rc, config) {
             return result;
         }
     }
 
     if lc != NONE {
-        let r = find_any_pair(tf, lc);
+        let r = find_any_pair(tf, lc, config);
         if !matches!(r, PairResult::NoPairs) { return r; }
     }
     if rc != NONE {
-        let r = find_any_pair(tf, rc);
+        let r = find_any_pair(tf, rc, config);
         if !matches!(r, PairResult::NoPairs) { return r; }
     }
     PairResult::NoPairs
@@ -421,7 +421,7 @@ fn find_any_pair(tf: &TwinForest, node: NodeId) -> PairResult {
 fn find_preferred_pair(
     tf: &TwinForest,
     node: NodeId,
-    deepest_order: bool,
+    config: &BBConfig,
     fallback: &mut PairResult,
     best_depth: &mut (u16, u16),
 ) -> PairResult {
@@ -431,14 +431,14 @@ fn find_preferred_pair(
     if lc == NONE { return PairResult::NoPairs; }
 
     if rc != NONE && tf.is_leaf(T1, lc) && tf.is_leaf(T1, rc) {
-        if let Some(result) = classify_pair(tf, node, lc, rc) {
+        if let Some(result) = classify_pair(tf, node, lc, rc, config) {
             match &result {
                 PairResult::Case2 { .. } => return result,
                 PairResult::Case3 { t2_a, t2_c, cut_b_only, cut_a_only, cut_c_only, .. } => {
                     if *cut_b_only || *cut_a_only || *cut_c_only {
                         return result; // 1-way branching
                     }
-                    if deepest_order {
+                    if config.deepest_order {
                         // Score: max T2 depth of the pair (primary),
                         // min T2 depth (secondary tiebreak)
                         let da = depth_to_root(tf, T2, *t2_a);
@@ -462,11 +462,11 @@ fn find_preferred_pair(
     }
 
     if lc != NONE {
-        let r = find_preferred_pair(tf, lc, deepest_order, fallback, best_depth);
+        let r = find_preferred_pair(tf, lc, config, fallback, best_depth);
         if !matches!(r, PairResult::NoPairs) { return r; }
     }
     if rc != NONE {
-        let r = find_preferred_pair(tf, rc, deepest_order, fallback, best_depth);
+        let r = find_preferred_pair(tf, rc, config, fallback, best_depth);
         if !matches!(r, PairResult::NoPairs) { return r; }
     }
     PairResult::NoPairs
@@ -478,6 +478,7 @@ fn classify_pair(
     t1_parent: NodeId,
     t1_a: NodeId,
     t1_c: NodeId,
+    config: &BBConfig,
 ) -> Option<PairResult> {
     let t2_a = tf.twin[T1][t1_a as usize];
     let t2_c = tf.twin[T1][t1_c as usize];
@@ -509,7 +510,7 @@ fn classify_pair(
     // are siblings, so only cutting B can resolve the pair.
     let t2_a_parent = tf.parent[T2][t2_a as usize];
     let t2_c_parent = tf.parent[T2][t2_c as usize];
-    let cut_b_only = t2_a_parent != NONE && {
+    let mut cut_b_only = t2_a_parent != NONE && {
         let t2_ab_parent = tf.parent[T2][t2_a_parent as usize];
         t2_ab_parent != NONE && t2_ab_parent == t2_c_parent
     };
@@ -533,6 +534,46 @@ fn classify_pair(
                         // Uncle's twin is sibling of T2_c → only cut A
                         // (binary trees always have ≤ 2 children)
                         cut_a_only = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // CUT_TWO_B: if the uncle's twin is sibling of the LCA of T2_a/T2_c,
+    // then only cutting B resolves both the pair and the uncle.
+    if config.cut_two_b && !cut_b_only {
+        let t1_ac_parent = tf.parent[T1][t1_parent as usize];
+        if t1_ac_parent != NONE {
+            let t1_s = tf.sibling(T1, t1_parent); // uncle
+            if t1_s != NONE && tf.is_leaf(T1, t1_s) {
+                let t2_s = tf.twin[T1][t1_s as usize];
+                if t2_s != NONE {
+                    let t2_l = if t2_a_parent != NONE {
+                        tf.parent[T2][t2_a_parent as usize]
+                    } else {
+                        NONE
+                    };
+                    if t2_l != NONE {
+                        // Subcase 1: path_length 4 (balanced)
+                        // T2_c.parent.parent == T2_l
+                        if t2_c_parent != NONE
+                            && tf.parent[T2][t2_c_parent as usize] == t2_l
+                        {
+                            if tf.sibling(T2, t2_l) == t2_s {
+                                cut_b_only = true;
+                            }
+                        }
+                        // Subcase 2: path_length 5
+                        // T2_c.parent == T2_l.parent
+                        if !cut_b_only {
+                            let t2_l2 = tf.parent[T2][t2_l as usize];
+                            if t2_l2 != NONE && t2_c_parent == t2_l2 {
+                                if tf.sibling(T2, t2_l2) == t2_s {
+                                    cut_b_only = true;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -616,7 +657,7 @@ fn approx_3(tf: &mut TwinForest, um: &mut UndoMachine) -> i32 {
             undo::contract(tf, T1, t1_parent, um);
         }
 
-        // Find sibling pair in T1 (no preference in approx — just take first)
+        // Find a sibling pair in T1 (no preference in approx — just take first)
         let approx_config = BBConfig::noopt();
         match find_sibling_pair(tf, &approx_config) {
             PairResult::NoPairs => break,
