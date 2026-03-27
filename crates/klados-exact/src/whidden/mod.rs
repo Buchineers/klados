@@ -2,13 +2,13 @@
 //!
 //! Faithful port of rspr (Whidden & Zeh) using SoA arrays with physical
 //! tree mutations (matching rspr's cut_parent / contract semantics).
-//!
-//! Phase 1: correct base algorithm without branch-pruning optimizations.
 //! Restricted to m=2 (two input trees).
 
 mod forest;
 mod undo;
 mod algorithm;
+
+pub use algorithm::BBConfig;
 
 use klados_core::{Instance, SolverStats, Tree};
 
