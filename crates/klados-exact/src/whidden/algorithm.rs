@@ -604,8 +604,7 @@ fn approx_3(tf: &mut TwinForest, um: &mut UndoMachine) -> i32 {
                 let t2_a_parent = tf.parent[T2][t2_a as usize];
 
                 if cut_b_only {
-                    // Only cut T2_b (sibling of T2_a). The pair will become
-                    // Case 2 in the next iteration after T2_ab contracts.
+                    // COB: Only cut T2_b. Pair becomes Case 2 next iteration.
                     let t2_b = tf.sibling(T2, t2_a);
                     if t2_b != NONE {
                         let t2_b_parent = tf.parent[T2][t2_b as usize];
@@ -622,7 +621,6 @@ fn approx_3(tf: &mut TwinForest, um: &mut UndoMachine) -> i32 {
                     if t1_parent != NONE {
                         undo::contract(tf, T1, t1_parent, um);
                     }
-                    // T1_c may have moved up after contracting t1_parent
                     undo::cut_parent(tf, T1, t1_c, um);
                     undo::add_component(tf, T1, t1_c, um);
                     let t1_c_parent = tf.parent[T1][t1_c as usize];
@@ -729,9 +727,15 @@ fn do_case3_branch(
         && !cob && !rcob_a && !rcob_c
         && find_root(tf, T2, t2_a) != find_root(tf, T2, t2_c);
 
-    let skip_a = cob || rcob_c;
-    let skip_b = rcob_a || rcob_c || separate_components;
-    let skip_c = cob || rcob_a;
+    // EP: edge protection gates
+    let ep = config.edge_protection;
+    let ep_skip_a = ep && tf.protected[t2_a as usize];
+    let ep_skip_b = ep && tf.protected[t2_b as usize];
+    let ep_skip_c = ep && tf.protected[t2_c as usize];
+
+    let skip_a = cob || rcob_c || ep_skip_a;
+    let skip_b = rcob_a || rcob_c || separate_components || ep_skip_b;
+    let skip_c = cob || rcob_a || ep_skip_c;
 
     // --- Branch A: cut T2_a ---
     if !skip_a {
@@ -778,6 +782,11 @@ fn do_case3_branch(
             undo::cut_parent(tf, T2, t2_c, um);
             undo::add_component(tf, T2, t2_c, um);
             undo::contract(tf, T2, t2_c_parent, um);
+        }
+
+        // EP: after cutting C, protect T2_a — it must be resolved via B-cuts.
+        if ep && !cut_c_only {
+            undo::protect_edge(tf, t2_a, um);
         }
 
         let result = branch_and_bound(tf, k - 1, um, stats, config);

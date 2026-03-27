@@ -19,6 +19,7 @@ pub enum UndoOp {
     SetCollapsed   { label: u32, old: u32 },
     AddComponent   { ti: u8 },
     ReplaceComponent { ti: u8, idx: u16, old: NodeId }, // u16: components < 65536
+    SetProtected   { node: NodeId },  // always T2; old is always false
 }
 
 pub struct UndoMachine {
@@ -58,6 +59,9 @@ impl UndoMachine {
                 }
                 UndoOp::ReplaceComponent { ti, idx, old } => {
                     tf.components[ti as usize][idx as usize] = old;
+                }
+                UndoOp::SetProtected { node } => {
+                    tf.protected[node as usize] = false;
                 }
             }
         }
@@ -196,4 +200,13 @@ pub fn set_collapsed(tf: &mut TwinForest, label: u32, target: u32, um: &mut Undo
 pub fn set_label_to_node(tf: &mut TwinForest, ti: usize, label: u32, node: NodeId, um: &mut UndoMachine) {
     um.push(UndoOp::SetLabelToNode { ti: ti as u8, label, old: tf.label_to_node[ti][label as usize] });
     tf.label_to_node[ti][label as usize] = node;
+}
+
+/// Protect a T2 edge with undo. No-op if already protected.
+#[inline]
+pub fn protect_edge(tf: &mut TwinForest, node: NodeId, um: &mut UndoMachine) {
+    if !tf.protected[node as usize] {
+        um.push(UndoOp::SetProtected { node });
+        tf.protected[node as usize] = true;
+    }
 }
