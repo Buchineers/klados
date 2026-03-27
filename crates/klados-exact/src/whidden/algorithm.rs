@@ -217,7 +217,8 @@ fn branch_and_bound(
                 // Loop back to check for new singletons
                 continue;
             }
-            PairResult::Case3 { t1_a, t1_c, t2_a, t2_b, t2_c } => {
+            PairResult::Case3 { t1_a, t1_c, t2_a, t2_b, t2_c,
+                                  cut_b_only, cut_c_only, cut_a_only } => {
                 if k <= 0 {
                     return -1;
                 }
@@ -228,6 +229,7 @@ fn branch_and_bound(
                 return do_case3_branch(
                     tf, k, um, stats, config,
                     t1_a, t1_c, t2_a, t2_b, t2_c,
+                    cut_b_only, cut_a_only, cut_c_only,
                 );
             }
         }
@@ -290,7 +292,16 @@ fn find_singleton(tf: &TwinForest) -> NodeId {
 enum PairResult {
     NoPairs,
     Case2 { t1_parent: NodeId, t2_parent: NodeId },
-    Case3 { t1_a: NodeId, t1_c: NodeId, t2_a: NodeId, t2_b: NodeId, t2_c: NodeId },
+    Case3 {
+        t1_a: NodeId, t1_c: NodeId,
+        t2_a: NodeId, t2_b: NodeId, t2_c: NodeId,
+        /// COB: T2_ab and T2_c are siblings → only branch B needed.
+        cut_b_only: bool,
+        /// RCOB: uncle's twin is sibling of T2_a → only branch C needed.
+        cut_c_only: bool,
+        /// RCOB: uncle's twin is sibling of T2_c → only branch A needed.
+        cut_a_only: bool,
+    },
 }
 
 /// Find a sibling pair in T1 and classify it.
@@ -364,7 +375,41 @@ fn classify_pair(
     let t2_b = tf.sibling(T2, t2_a);
     if t2_b == NONE { return None; }
 
-    Some(PairResult::Case3 { t1_a, t1_c, t2_a, t2_b, t2_c })
+    // COB detection: T2_a.parent.parent == T2_c.parent means T2_ab and T2_c
+    // are siblings, so only cutting B can resolve the pair.
+    let t2_a_parent = tf.parent[T2][t2_a as usize];
+    let t2_c_parent = tf.parent[T2][t2_c as usize];
+    let cut_b_only = t2_a_parent != NONE && {
+        let t2_ab_parent = tf.parent[T2][t2_a_parent as usize];
+        t2_ab_parent != NONE && t2_ab_parent == t2_c_parent
+    };
+
+    // RCOB detection: uncle of sibling pair is a leaf whose T2 twin
+    // constrains branching to a single direction.
+    let mut cut_a_only = false;
+    let mut cut_c_only = false;
+    if !cut_b_only {
+        let t1_ac_parent = tf.parent[T1][t1_parent as usize];
+        if t1_ac_parent != NONE {
+            let t1_s = tf.sibling(T1, t1_parent); // uncle
+            if t1_s != NONE && tf.is_leaf(T1, t1_s) {
+                let t2_s = tf.twin[T1][t1_s as usize];
+                if t2_s != NONE {
+                    let t2_s_parent = tf.parent[T2][t2_s as usize];
+                    if t2_s_parent == t2_a_parent {
+                        // Uncle's twin is sibling of T2_a → only cut C
+                        cut_c_only = true;
+                    } else if t2_s_parent == t2_c_parent {
+                        // Uncle's twin is sibling of T2_c → only cut A
+                        // (binary trees always have ≤ 2 children)
+                        cut_a_only = true;
+                    }
+                }
+            }
+        }
+    }
+
+    Some(PairResult::Case3 { t1_a, t1_c, t2_a, t2_b, t2_c, cut_b_only, cut_c_only, cut_a_only })
 }
 
 /// Distance from node to its component root (via parent pointers).
@@ -415,16 +460,9 @@ fn approx_3(tf: &mut TwinForest, um: &mut UndoMachine) -> i32 {
             PairResult::Case2 { t1_parent, t2_parent } => {
                 do_case2_contract(tf, t1_parent, t2_parent, um);
             }
-            PairResult::Case3 { t1_a, t1_c, t2_a, t2_b: _, t2_c } => {
+            PairResult::Case3 { t1_a, t1_c, t2_a, t2_b: _, t2_c, cut_b_only, .. } => {
                 let t1_parent = tf.parent[T1][t1_a as usize];
-
-                // Check cut_b_only: T2_a.parent.parent == T2_c.parent
-                // (T2_ab and T2_c are siblings → only need to cut T2_b)
                 let t2_a_parent = tf.parent[T2][t2_a as usize];
-                let t2_c_parent = tf.parent[T2][t2_c as usize];
-                let cut_b_only = t2_a_parent != NONE
-                    && tf.parent[T2][t2_a_parent as usize] != NONE
-                    && tf.parent[T2][t2_a_parent as usize] == t2_c_parent;
 
                 if cut_b_only {
                     // Only cut T2_b (sibling of T2_a). The pair will become
@@ -536,9 +574,22 @@ fn do_case3_branch(
     t2_a: NodeId,
     t2_b: NodeId,
     t2_c: NodeId,
+    cut_b_only: bool,
+    cut_a_only: bool,
+    cut_c_only: bool,
 ) -> i32 {
+    // Determine which branches to try based on optimization flags.
+    // COB: cut_b_only → only B
+    // RCOB: cut_a_only → only A; cut_c_only → only C
+    let cob = config.cut_one_b && cut_b_only;
+    let rcob_a = config.reverse_cut_one_b && cut_a_only && !cob;
+    let rcob_c = config.reverse_cut_one_b && cut_c_only && !cob;
+    let skip_a = cob || rcob_c;
+    let skip_b = rcob_a || rcob_c;
+    let skip_c = cob || rcob_a;
+
     // --- Branch A: cut T2_a ---
-    {
+    if !skip_a {
         let cp = um.checkpoint();
         let t2_a_parent = tf.parent[T2][t2_a as usize];
         undo::cut_parent(tf, T2, t2_a, um);
@@ -553,7 +604,7 @@ fn do_case3_branch(
     }
 
     // --- Branch B: cut T2_b ---
-    {
+    if !skip_b {
         let cp = um.checkpoint();
         let t2_b_parent = tf.parent[T2][t2_b as usize];
         undo::cut_parent(tf, T2, t2_b, um);
@@ -568,7 +619,7 @@ fn do_case3_branch(
     }
 
     // --- Branch C: cut T2_c ---
-    {
+    if !skip_c {
         let cp = um.checkpoint();
         let t2_c_parent = tf.parent[T2][t2_c as usize];
         if t2_c_parent != NONE {
