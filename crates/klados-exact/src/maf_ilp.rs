@@ -921,7 +921,7 @@ mod tests {
     ///   1  2 3  4  (leaves: nodes 0,1,2,3 with labels 1,2,3,4)
     fn tree_1234_cherry12_34(n: u32) -> Tree {
         // Arena layout: allocate nodes 0..6 for n=4 (7 nodes = 2*4-1)
-        assert!(n == 4);
+        assert_eq!(n, 4);
         let mut t = Tree::with_capacity(4);
 
         // We need to push nodes into the arrays.
@@ -976,7 +976,7 @@ mod tests {
 
     /// Build tree ((1,3),(2,4))
     fn tree_1234_cherry13_24(n: u32) -> Tree {
-        assert!(n == 4);
+        assert_eq!(n, 4);
         let nodes = 7;
         let mut t = Tree::with_capacity(4);
         t.parent = vec![NONE; nodes];

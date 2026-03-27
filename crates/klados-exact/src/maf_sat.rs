@@ -801,7 +801,7 @@ fn sat_solve_maf_olver(
     profile: &mut SolveProfile,
 ) -> Option<Vec<Tree>> {
     let n = instance.num_leaves as usize;
-    assert!(instance.num_trees() == 2, "Olver encoding requires exactly 2 trees");
+    assert_eq!(instance.num_trees(), 2, "Olver encoding requires exactly 2 trees");
 
     profile.n_reduced = n;
     profile.k = k_max;
