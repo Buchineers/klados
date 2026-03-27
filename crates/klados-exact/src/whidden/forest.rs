@@ -43,6 +43,9 @@ pub struct TwinForest {
     // --- Precomputed T2 depth (immutable, for Case 3 orientation) ---
     pub t2_depth: Vec<u16>,
 
+    // --- Edge protection (T2 only, for branch pruning) ---
+    pub protected: Vec<bool>,
+
     // --- Metadata ---
     pub num_nodes: [usize; 2],
     pub root:      [NodeId; 2],
@@ -69,6 +72,7 @@ impl TwinForest {
             orig_right:  t1.right.clone(),
             orig_label:  t1.label.clone(),
             t2_depth: vec![0; n2],
+            protected: vec![false; n2],
             num_nodes: [n1, n2],
             root: [t1.root, t2.root],
             num_leaves,
