@@ -208,7 +208,7 @@ fn branch_and_bound(
         }
 
         // --- Phase 2: Find sibling pair in T1 ---
-        match find_sibling_pair(tf) {
+        match find_sibling_pair(tf, config) {
             PairResult::NoPairs => {
                 return k;
             }
@@ -289,6 +289,7 @@ fn find_singleton(tf: &TwinForest) -> NodeId {
 // Sibling pair detection
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 enum PairResult {
     NoPairs,
     Case2 { t1_parent: NodeId, t2_parent: NodeId },
@@ -306,9 +307,25 @@ enum PairResult {
 
 /// Find a sibling pair in T1 and classify it.
 /// Walks from T1 component roots — only visits live nodes.
-fn find_sibling_pair(tf: &TwinForest) -> PairResult {
+///
+/// With `prefer_nonbranching`: prefers Case 2 or COB (1-branch) pairs over
+/// full 3-way Case 3 pairs. Does two passes: first looks for non-branching,
+/// then falls back to any pair.
+fn find_sibling_pair(tf: &TwinForest, config: &BBConfig) -> PairResult {
+    if config.prefer_nonbranching {
+        let mut fallback = PairResult::NoPairs;
+        for &root in &tf.components[T1] {
+            let result = find_preferred_pair(tf, root, &mut fallback);
+            if !matches!(result, PairResult::NoPairs) {
+                return result; // found a non-branching pair
+            }
+        }
+        return fallback;
+    }
+
+    // No preference: return first pair found.
     for &root in &tf.components[T1] {
-        let result = find_pair_in(tf, root);
+        let result = find_any_pair(tf, root);
         if !matches!(result, PairResult::NoPairs) {
             return result;
         }
@@ -316,27 +333,63 @@ fn find_sibling_pair(tf: &TwinForest) -> PairResult {
     PairResult::NoPairs
 }
 
-/// Recursive DFS within a T1 component to find a sibling pair.
-fn find_pair_in(tf: &TwinForest, node: NodeId) -> PairResult {
+/// DFS to find any sibling pair (no preference).
+fn find_any_pair(tf: &TwinForest, node: NodeId) -> PairResult {
     let lc = tf.left[T1][node as usize];
     let rc = tf.right[T1][node as usize];
 
-    if lc == NONE { return PairResult::NoPairs; } // leaf
+    if lc == NONE { return PairResult::NoPairs; }
 
-    // Check if this node is a sibling pair
     if rc != NONE && tf.is_leaf(T1, lc) && tf.is_leaf(T1, rc) {
         if let Some(result) = classify_pair(tf, node, lc, rc) {
             return result;
         }
     }
 
-    // Recurse into children
     if lc != NONE {
-        let r = find_pair_in(tf, lc);
+        let r = find_any_pair(tf, lc);
         if !matches!(r, PairResult::NoPairs) { return r; }
     }
     if rc != NONE {
-        let r = find_pair_in(tf, rc);
+        let r = find_any_pair(tf, rc);
+        if !matches!(r, PairResult::NoPairs) { return r; }
+    }
+    PairResult::NoPairs
+}
+
+/// DFS to find a non-branching pair (Case 2 or COB).
+/// Returns the pair immediately if non-branching; otherwise stores the first
+/// Case 3 found in `fallback` and returns NoPairs.
+fn find_preferred_pair(tf: &TwinForest, node: NodeId, fallback: &mut PairResult) -> PairResult {
+    let lc = tf.left[T1][node as usize];
+    let rc = tf.right[T1][node as usize];
+
+    if lc == NONE { return PairResult::NoPairs; }
+
+    if rc != NONE && tf.is_leaf(T1, lc) && tf.is_leaf(T1, rc) {
+        if let Some(result) = classify_pair(tf, node, lc, rc) {
+            match &result {
+                PairResult::Case2 { .. } => return result,
+                PairResult::Case3 { cut_b_only, cut_a_only, cut_c_only, .. } => {
+                    if *cut_b_only || *cut_a_only || *cut_c_only {
+                        // 1-way branching — effectively non-branching
+                        return result;
+                    }
+                    if matches!(fallback, PairResult::NoPairs) {
+                        *fallback = result;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if lc != NONE {
+        let r = find_preferred_pair(tf, lc, fallback);
+        if !matches!(r, PairResult::NoPairs) { return r; }
+    }
+    if rc != NONE {
+        let r = find_preferred_pair(tf, rc, fallback);
         if !matches!(r, PairResult::NoPairs) { return r; }
     }
     PairResult::NoPairs
@@ -464,8 +517,9 @@ fn approx_3(tf: &mut TwinForest, um: &mut UndoMachine) -> i32 {
             undo::contract(tf, T1, t1_parent, um);
         }
 
-        // Find sibling pair in T1
-        match find_sibling_pair(tf) {
+        // Find sibling pair in T1 (no preference in approx — just take first)
+        let approx_config = BBConfig::noopt();
+        match find_sibling_pair(tf, &approx_config) {
             PairResult::NoPairs => break,
             PairResult::Case2 { t1_parent, t2_parent } => {
                 do_case2_contract(tf, t1_parent, t2_parent, um);
