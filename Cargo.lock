@@ -92,12 +92,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5f0e0fee31ef5ed1ba1316088939cea399010ed7731dba877ed44aeb407a75ea"
 
 [[package]]
-name = "atree"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "132573478eb9ff973c6f75d0ed425ac12da77d266506483345f46743ecc83a98"
-
-[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -680,13 +674,11 @@ dependencies = [
 name = "klados"
 version = "0.1.0"
 dependencies = [
- "atree",
  "clap",
  "fixedbitset",
  "klados-core",
  "klados-exact",
  "klados-heuristic",
- "libc",
  "pace26io",
  "serde",
  "serde_json",
@@ -714,20 +706,15 @@ dependencies = [
  "klados-core",
  "rustsat",
  "rustsat-cadical",
- "thiserror",
 ]
 
 [[package]]
 name = "klados-heuristic"
 version = "0.1.0"
 dependencies = [
- "fixedbitset",
- "fxhash",
- "highs",
  "klados-core",
  "libc",
  "pace26io",
- "thiserror",
 ]
 
 [[package]]
@@ -1098,9 +1085,9 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
 name = "signal-hook"
-version = "0.3.18"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d881a16cf4426aa584979d30bd82cb33429027e42122b169753d6ef1085ed6e2"
+checksum = "3b57709da74f9ff9f4a27dce9526eec25ca8407c45a7887243b031a58935fb8e"
 dependencies = [
  "libc",
  "signal-hook-registry",
