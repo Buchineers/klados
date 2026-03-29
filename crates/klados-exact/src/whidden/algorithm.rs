@@ -667,6 +667,7 @@ fn approx_3(tf: &mut TwinForest, um: &mut UndoMachine) -> i32 {
             PairResult::Case3 { t1_a, t1_c, t2_a, t2_b: _, t2_c, cut_b_only, .. } => {
                 let t1_parent = tf.parent[T1][t1_a as usize];
                 let t2_a_parent = tf.parent[T2][t2_a as usize];
+                let mut case_cuts: i32 = 0;
 
                 if cut_b_only {
                     // COB: Only cut T2_b. Pair becomes Case 2 next iteration.
@@ -675,6 +676,7 @@ fn approx_3(tf: &mut TwinForest, um: &mut UndoMachine) -> i32 {
                         let t2_b_parent = tf.parent[T2][t2_b as usize];
                         undo::cut_parent(tf, T2, t2_b, um);
                         undo::add_component(tf, T2, t2_b, um);
+                        case_cuts += 1;
                         if t2_b_parent != NONE {
                             undo::contract(tf, T2, t2_b_parent, um);
                         }
@@ -697,6 +699,7 @@ fn approx_3(tf: &mut TwinForest, um: &mut UndoMachine) -> i32 {
                     if t2_a_parent != NONE {
                         undo::cut_parent(tf, T2, t2_a, um);
                         undo::add_component(tf, T2, t2_a, um);
+                        case_cuts += 1;
                         undo::contract(tf, T2, t2_a_parent, um);
                     }
 
@@ -707,12 +710,13 @@ fn approx_3(tf: &mut TwinForest, um: &mut UndoMachine) -> i32 {
                         if t2_c_p != NONE {
                             undo::cut_parent(tf, T2, t2_c_now, um);
                             undo::add_component(tf, T2, t2_c_now, um);
+                            case_cuts += 1;
                             undo::contract(tf, T2, t2_c_p, um);
                         }
                     }
                 }
 
-                num_cut += 3;
+                num_cut += case_cuts;
             }
         }
     }
