@@ -88,6 +88,22 @@ enum Commands {
         #[arg(long, default_value = "10")]
         top_n: usize,
     },
+    WhiddenStats {
+        #[arg(value_name = "FILE")]
+        list_file: std::path::PathBuf,
+        #[arg(long)]
+        max_instances: Option<usize>,
+        #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+        show_instances: bool,
+        #[arg(long, value_enum, default_value_t = commands::whidden_stats::OutputFormat::Human)]
+        format: commands::whidden_stats::OutputFormat,
+        #[arg(long, value_enum, default_value_t = commands::whidden_stats::ProgressMode::Auto)]
+        progress: commands::whidden_stats::ProgressMode,
+        #[arg(long, default_value_t = 250)]
+        log_interval_ms: u64,
+        #[arg(long)]
+        output: Option<std::path::PathBuf>,
+    },
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -116,6 +132,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             commands::analyze::run(&summary_file, top_n)?;
             return Ok(());
         }
+        Some(Commands::WhiddenStats {
+            list_file,
+            max_instances,
+            show_instances,
+            format,
+            progress,
+            log_interval_ms,
+            output,
+        }) => {
+            commands::whidden_stats::run(
+                &list_file,
+                max_instances,
+                show_instances,
+                format,
+                progress,
+                log_interval_ms,
+                output,
+            )?;
+            return Ok(());
+        }
+
         _ => {
             let stdin = io::stdin();
             let reader = BufReader::new(stdin.lock());

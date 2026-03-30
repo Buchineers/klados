@@ -8,10 +8,13 @@
 //!   3. Case 2: pair matches in T2 → contract (free)
 //!   4. Case 3: optional BB prune check, then 3-way branch (k-1 each)
 
+use std::time::Instant;
+
 use klados_core::tree::{Label, NodeId, Tree, NONE};
 use klados_core::{Instance, SolverStats};
 
 use super::forest::{TwinForest, T1, T2};
+use super::stats::{WhiddenProgressUpdate, WhiddenRuleStats};
 use super::undo::{self, UndoMachine};
 use crate::lower_bound::maf_bounds;
 
@@ -85,13 +88,13 @@ impl Default for BBConfig {
             bb: true,
             cut_one_b: true,
             reverse_cut_one_b: true,
-            reverse_cut_one_b_3: true,
+            reverse_cut_one_b_3: false,
             cut_two_b: true,
             cut_all_b: true,
             cut_ac_separate_components: true,
             edge_protection: true,
             edge_protection_two_b: true,
-            deepest_protected_order: true,
+            deepest_protected_order: false,
             deepest_order: true,
             near_preorder_sibling_pairs: true,
             leaf_reduction: true,
@@ -147,14 +150,50 @@ impl BBConfig {
 // ---------------------------------------------------------------------------
 
 pub fn solve(instance: &Instance, stats: &mut SolverStats) -> Option<Vec<Tree>> {
-    solve_with_config(instance, stats, &BBConfig::default())
+    let mut rule_stats = WhiddenRuleStats::default();
+    solve_with_config(instance, stats, &mut rule_stats, &BBConfig::default())
+}
+
+pub fn solve_with_rule_stats(
+    instance: &Instance,
+    stats: &mut SolverStats,
+    rule_stats: &mut WhiddenRuleStats,
+) -> Option<Vec<Tree>> {
+    solve_with_config(instance, stats, rule_stats, &BBConfig::default())
+}
+
+pub fn solve_with_rule_stats_and_progress<F>(
+    instance: &Instance,
+    stats: &mut SolverStats,
+    rule_stats: &mut WhiddenRuleStats,
+    config: &BBConfig,
+    progress: Option<&mut F>,
+) -> Option<Vec<Tree>>
+where
+    F: FnMut(WhiddenProgressUpdate) + ?Sized,
+{
+    solve_with_config_and_progress(instance, stats, rule_stats, config, progress)
 }
 
 pub fn solve_with_config(
     instance: &Instance,
     stats: &mut SolverStats,
+    rule_stats: &mut WhiddenRuleStats,
     config: &BBConfig,
 ) -> Option<Vec<Tree>> {
+    solve_with_config_and_progress::<fn(WhiddenProgressUpdate)>(instance, stats, rule_stats, config, None)
+}
+
+fn solve_with_config_and_progress<F>(
+    instance: &Instance,
+    stats: &mut SolverStats,
+    rule_stats: &mut WhiddenRuleStats,
+    config: &BBConfig,
+    mut progress: Option<&mut F>,
+) -> Option<Vec<Tree>>
+where
+    F: FnMut(WhiddenProgressUpdate) + ?Sized,
+{
     debug_assert!(instance.num_trees() == 2);
     let n = instance.num_leaves;
     if n <= 1 {
@@ -169,23 +208,60 @@ pub fn solve_with_config(
 
     let lb_k = lb.saturating_sub(1);
     let ub_k = ub.saturating_sub(1);
+    rule_stats.lb_k = lb_k;
+    rule_stats.ub_k = ub_k;
 
     // Build once; reuse across k iterations (undo rewinds to initial state).
     let mut tf = TwinForest::from_trees(&instance.trees[0], &instance.trees[1], n);
     let mut um = UndoMachine::new();
 
     for k in lb_k..=ub_k {
+        rule_stats.current_k = Some(k);
+        rule_stats.k_attempts += 1;
+        let k_start = Instant::now();
+
+        if let Some(cb) = progress.as_mut() {
+            cb(WhiddenProgressUpdate {
+                current_k: k,
+                lb_k,
+                ub_k,
+                k_attempts: rule_stats.k_attempts,
+                k_elapsed_ms: 0.0,
+                nodes_explored: stats.nodes_explored,
+                solved: false,
+            });
+        }
+
         let cp = um.checkpoint();
-        let result = branch_and_bound(&mut tf, k as i32, &mut um, stats, config);
+        let result = branch_and_bound(&mut tf, k as i32, &mut um, stats, rule_stats, config);
+        let k_elapsed_ms = k_start.elapsed().as_secs_f64() * 1000.0;
+        rule_stats.k_last_elapsed_ms = k_elapsed_ms;
+        rule_stats.k_total_elapsed_ms += k_elapsed_ms;
+
+        if let Some(cb) = progress.as_mut() {
+            cb(WhiddenProgressUpdate {
+                current_k: k,
+                lb_k,
+                ub_k,
+                k_attempts: rule_stats.k_attempts,
+                k_elapsed_ms,
+                nodes_explored: stats.nodes_explored,
+                solved: result >= 0,
+            });
+        }
 
         if result >= 0 {
+            rule_stats.k_success = Some(k);
+            rule_stats.current_k = None;
             return Some(extract_components(&tf));
         }
         um.undo_to(cp, &mut tf);
     }
 
+    rule_stats.current_k = None;
     None
 }
+
 
 // ---------------------------------------------------------------------------
 // Branch-and-bound
@@ -196,9 +272,10 @@ fn branch_and_bound(
     mut k: i32,
     um: &mut UndoMachine,
     stats: &mut SolverStats,
+    rule_stats: &mut WhiddenRuleStats,
     config: &BBConfig,
 ) -> i32 {
-    bb_inner(tf, &mut k, um, stats, config, None)
+    bb_inner(tf, &mut k, um, stats, rule_stats, config, None)
 }
 
 /// Inner B&B with optional forced pair (from CUT_ALL_B).
@@ -208,6 +285,7 @@ fn bb_inner(
     k: &mut i32,
     um: &mut UndoMachine,
     stats: &mut SolverStats,
+    rule_stats: &mut WhiddenRuleStats,
     config: &BBConfig,
     forced_pair: Option<(NodeId, NodeId)>,
 ) -> i32 {
@@ -217,7 +295,7 @@ fn bb_inner(
     // CAB: if we have a forced pair from a previous B-cut, try it first.
     if let Some((t1_a, t1_c)) = forced_pair {
         // Process singletons first (some may have been created by the B-cut)
-        if !process_singletons(tf, k, um) {
+        if !process_singletons(tf, k, um, rule_stats) {
             return -1;
         }
         // Check if the forced pair is still valid (both still siblings in T1)
@@ -230,19 +308,25 @@ fn bb_inner(
                 match result {
                     PairResult::Case2 { t1_parent, t2_parent } => {
                         do_case2_contract(tf, t1_parent, t2_parent, um);
+                        rule_stats.forced_pair_case2 += 1;
+                        rule_stats.action_case2_contracts += 1;
                         // Fall through to normal loop
                     }
                     PairResult::Case3 { t1_a, t1_c, t2_a, t2_b, t2_c,
                                           path_length, .. } => {
+                        rule_stats.forced_pair_attempts += 1;
+                        rule_stats.forced_pair_case3 += 1;
                         if *k <= 0 {
+                            rule_stats.prune_k_exhausted += 1;
                             return -1;
                         }
                         if config.bb && approx_3(tf, um) > 3 * *k {
+                            rule_stats.prune_bb_approx += 1;
                             return -1;
                         }
                         // Force cut_b_only for the CAB forced pair
                         return do_case3_branch(
-                            tf, *k, um, stats, config,
+                            tf, *k, um, stats, rule_stats, config,
                             t1_a, t1_c, t2_a, t2_b, t2_c,
                             true, false, false, path_length,
                         );
@@ -250,35 +334,43 @@ fn bb_inner(
                     _ => {}
                 }
             }
+        } else {
+            rule_stats.forced_pair_attempts += 1;
+            rule_stats.forced_pair_invalidated += 1;
         }
         // Forced pair no longer valid — fall through to normal B&B
     }
 
     loop {
         // --- Phase 1: Process singletons ---
-        if !process_singletons(tf, k, um) {
+        if !process_singletons(tf, k, um, rule_stats) {
             return -1; // k went negative
         }
 
         // --- Phase 2: Find sibling pair in T1 ---
-        match find_sibling_pair(tf, config) {
+        match find_sibling_pair(tf, config, rule_stats) {
             PairResult::NoPairs => {
+                rule_stats.action_done += 1;
                 return *k;
             }
             PairResult::Case2 { t1_parent, t2_parent } => {
                 do_case2_contract(tf, t1_parent, t2_parent, um);
+                rule_stats.action_case2_contracts += 1;
                 continue;
             }
             PairResult::Case3 { t1_a, t1_c, t2_a, t2_b, t2_c,
                                   cut_b_only, cut_c_only, cut_a_only, path_length } => {
+                rule_stats.action_case3_branches += 1;
                 if *k <= 0 {
+                    rule_stats.prune_k_exhausted += 1;
                     return -1;
                 }
                 if config.bb && approx_3(tf, um) > 3 * *k {
+                    rule_stats.prune_bb_approx += 1;
                     return -1;
                 }
                 return do_case3_branch(
-                    tf, *k, um, stats, config,
+                    tf, *k, um, stats, rule_stats, config,
                     t1_a, t1_c, t2_a, t2_b, t2_c,
                     cut_b_only, cut_a_only, cut_c_only, path_length,
                 );
@@ -296,6 +388,7 @@ fn process_singletons(
     tf: &mut TwinForest,
     _k: &mut i32, // reserved for future singleton-charging optimizations
     um: &mut UndoMachine,
+    rule_stats: &mut WhiddenRuleStats,
 ) -> bool {
     loop {
         let singleton = find_singleton(tf);
@@ -312,7 +405,7 @@ fn process_singletons(
             continue;
         }
 
-        // Cut T1_a from its parent → T1_a becomes a new component
+        rule_stats.action_singleton_cuts += 1;
         undo::cut_parent(tf, T1, t1_node, um);
         undo::add_component(tf, T1, t1_node, um);
 
@@ -364,13 +457,13 @@ enum PairResult {
 /// With `prefer_nonbranching`: prefers Case 2 or COB (1-branch) pairs over
 /// full 3-way Case 3 pairs. With `deepest_order`: among Case 3 pairs, picks
 /// the deepest (most constrained → prunes faster).
-fn find_sibling_pair(tf: &TwinForest, config: &BBConfig) -> PairResult {
+fn find_sibling_pair(tf: &TwinForest, config: &BBConfig, rule_stats: &mut WhiddenRuleStats) -> PairResult {
     if config.prefer_nonbranching || config.deepest_order {
         let mut fallback = PairResult::NoPairs;
         let mut best_depth = (0u16, 0u16);
         for &root in &tf.components[T1] {
             let result = find_preferred_pair(
-                tf, root, config, &mut fallback, &mut best_depth,
+                tf, root, config, rule_stats, &mut fallback, &mut best_depth,
             );
             if !matches!(result, PairResult::NoPairs) {
                 return result; // found a non-branching pair
@@ -422,6 +515,7 @@ fn find_preferred_pair(
     tf: &TwinForest,
     node: NodeId,
     config: &BBConfig,
+    rule_stats: &mut WhiddenRuleStats,
     fallback: &mut PairResult,
     best_depth: &mut (u16, u16),
 ) -> PairResult {
@@ -436,6 +530,9 @@ fn find_preferred_pair(
                 PairResult::Case2 { .. } => return result,
                 PairResult::Case3 { t2_a, t2_c, cut_b_only, cut_a_only, cut_c_only, .. } => {
                     if *cut_b_only || *cut_a_only || *cut_c_only {
+                        if config.prefer_nonbranching {
+                            rule_stats.prefer_nonbranching_hits += 1;
+                        }
                         return result; // 1-way branching
                     }
                     if config.deepest_order {
@@ -462,11 +559,11 @@ fn find_preferred_pair(
     }
 
     if lc != NONE {
-        let r = find_preferred_pair(tf, lc, config, fallback, best_depth);
+        let r = find_preferred_pair(tf, lc, config, rule_stats, fallback, best_depth);
         if !matches!(r, PairResult::NoPairs) { return r; }
     }
     if rc != NONE {
-        let r = find_preferred_pair(tf, rc, config, fallback, best_depth);
+        let r = find_preferred_pair(tf, rc, config, rule_stats, fallback, best_depth);
         if !matches!(r, PairResult::NoPairs) { return r; }
     }
     PairResult::NoPairs
@@ -659,7 +756,8 @@ fn approx_3(tf: &mut TwinForest, um: &mut UndoMachine) -> i32 {
 
         // Find a sibling pair in T1 (no preference in approx — just take first)
         let approx_config = BBConfig::noopt();
-        match find_sibling_pair(tf, &approx_config) {
+        let mut dummy_stats = WhiddenRuleStats::default();
+        match find_sibling_pair(tf, &approx_config, &mut dummy_stats) {
             PairResult::NoPairs => break,
             PairResult::Case2 { t1_parent, t2_parent } => {
                 do_case2_contract(tf, t1_parent, t2_parent, um);
@@ -774,6 +872,7 @@ fn do_case3_branch(
     k: i32,
     um: &mut UndoMachine,
     stats: &mut SolverStats,
+    rule_stats: &mut WhiddenRuleStats,
     config: &BBConfig,
     t1_a: NodeId,
     t1_c: NodeId,
@@ -792,6 +891,19 @@ fn do_case3_branch(
     let rcob_a = config.reverse_cut_one_b && cut_a_only && !cob;
     let rcob_c = config.reverse_cut_one_b && cut_c_only && !cob;
 
+    let t2_a_parent = tf.parent[T2][t2_a as usize];
+    let t2_c_parent = tf.parent[T2][t2_c as usize];
+    let cob_structural = t2_a_parent != NONE && {
+        let t2_ab_parent = tf.parent[T2][t2_a_parent as usize];
+        t2_ab_parent != NONE && t2_ab_parent == t2_c_parent
+    };
+    if cob { rule_stats.rule_cob_fired += 1; }
+    if rcob_a { rule_stats.rule_rcob_a_fired += 1; }
+    if rcob_c { rule_stats.rule_rcob_c_fired += 1; }
+    if config.cut_two_b && cut_b_only && !cob_structural {
+        rule_stats.rule_cut_two_b_fired += 1;
+    }
+
     // SC: if T2_a and T2_c are in different components, cutting B can't help.
     let separate_components = config.cut_ac_separate_components
         && !cob && !rcob_a && !rcob_c
@@ -807,6 +919,23 @@ fn do_case3_branch(
     let skip_b = rcob_a || rcob_c || separate_components || ep_skip_b;
     let skip_c = cob || rcob_a || ep_skip_c;
 
+    if cob {
+        rule_stats.skip_a_cob += 1;
+        rule_stats.skip_c_cob += 1;
+    }
+    if rcob_c {
+        rule_stats.skip_a_rcob_c += 1;
+        rule_stats.skip_b_rcob_c += 1;
+    }
+    if rcob_a {
+        rule_stats.skip_b_rcob_a += 1;
+        rule_stats.skip_c_rcob_a += 1;
+    }
+    if ep_skip_a { rule_stats.skip_a_ep_protected += 1; }
+    if ep_skip_b { rule_stats.skip_b_ep_protected += 1; }
+    if ep_skip_c { rule_stats.skip_c_ep_protected += 1; }
+    if separate_components { rule_stats.skip_b_separate_components += 1; }
+
     // --- Branch A: cut T2_a ---
     if !skip_a {
         let cp = um.checkpoint();
@@ -818,22 +947,17 @@ fn do_case3_branch(
         }
 
         // EP_TWO_B: when T2_c is protected and path_length==4, protect T2_b and T2_b2.
-        // This restricts future branching on these edges, improving pruning.
         if config.edge_protection_two_b && tf.protected[t2_c as usize]
             && !cut_a_only && path_length == 4
         {
-            // balanced: T2_a and T2_c share the same grandparent (before cuts)
-            // Since T2_a was just cut, use t2_a_parent (saved before cut) to check.
             let balanced = t2_a_parent != NONE
                 && tf.parent[T2][t2_a_parent as usize] != NONE
                 && tf.parent[T2][t2_a_parent as usize]
                     == tf.parent[T2][tf.parent[T2][t2_c as usize] as usize];
             undo::protect_edge(tf, t2_b, um);
             let t2_b2 = if balanced {
-                // T2_b2 = sibling of T2_c
                 tf.sibling(T2, t2_c)
             } else {
-                // T2_b2 = sibling of T2_b's parent
                 let bp = tf.parent[T2][t2_b as usize];
                 if bp != NONE { tf.sibling(T2, bp) } else { NONE }
             };
@@ -842,8 +966,12 @@ fn do_case3_branch(
             }
         }
 
-        let result = branch_and_bound(tf, k - 1, um, stats, config);
-        if result >= 0 { return result; }
+        rule_stats.branch_a_attempts += 1;
+        let result = branch_and_bound(tf, k - 1, um, stats, rule_stats, config);
+        if result >= 0 {
+            rule_stats.branch_a_successes += 1;
+            return result;
+        }
         um.undo_to(cp, tf);
     }
 
@@ -857,15 +985,18 @@ fn do_case3_branch(
             undo::contract(tf, T2, t2_b_parent, um);
         }
 
-        // CAB: after cutting B, the T1 pair (a,c) is still valid — force it
-        // to be re-evaluated with cut_b_only in the next level.
         let mut k_b = k - 1;
+        rule_stats.branch_b_attempts += 1;
         let result = if config.cut_all_b {
-            bb_inner(tf, &mut k_b, um, stats, config, Some((t1_a, t1_c)))
+            rule_stats.rule_cut_all_b_forced += 1;
+            bb_inner(tf, &mut k_b, um, stats, rule_stats, config, Some((t1_a, t1_c)))
         } else {
-            branch_and_bound(tf, k - 1, um, stats, config)
+            branch_and_bound(tf, k - 1, um, stats, rule_stats, config)
         };
-        if result >= 0 { return result; }
+        if result >= 0 {
+            rule_stats.branch_b_successes += 1;
+            return result;
+        }
         um.undo_to(cp, tf);
     }
 
@@ -879,14 +1010,21 @@ fn do_case3_branch(
             undo::contract(tf, T2, t2_c_parent, um);
         }
 
-        // EP: after cutting C, protect T2_a — it must be resolved via B-cuts.
         if ep && !cut_c_only {
             undo::protect_edge(tf, t2_a, um);
         }
 
-        let result = branch_and_bound(tf, k - 1, um, stats, config);
-        if result >= 0 { return result; }
+        rule_stats.branch_c_attempts += 1;
+        let result = branch_and_bound(tf, k - 1, um, stats, rule_stats, config);
+        if result >= 0 {
+            rule_stats.branch_c_successes += 1;
+            return result;
+        }
         um.undo_to(cp, tf);
+    }
+
+    if skip_a && skip_b && skip_c {
+        rule_stats.prune_no_enabled_branches += 1;
     }
 
     -1
