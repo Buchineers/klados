@@ -1111,3 +1111,25 @@ fn tree_from_original(tf: &TwinForest) -> Tree {
     t.subtree_size = vec![0; tf.num_nodes[T1]];
     t
 }
+
+// ---------------------------------------------------------------------------
+// Public accessor for the 2-approx dual lower bound (for testing/comparison)
+// ---------------------------------------------------------------------------
+
+/// Compute the Olver 2-approximation dual lower bound on an instance's
+/// rSPR distance. Builds a TwinForest and calls `approx_2_lb`.
+///
+/// Returns D such that D ≤ OPT (rSPR distance).
+pub fn approx_2_lb_for_instance(t1: &Tree, t2: &Tree, num_leaves: u32) -> i32 {
+    let tf = TwinForest::from_trees(t1, t2, num_leaves);
+    super::approx2::approx_2_lb(&tf)
+}
+
+/// Compute the 3-approximation value on an instance's rSPR distance.
+/// Builds a TwinForest+UndoMachine, runs `approx_3`, and returns the raw
+/// 3-approximation value (NOT divided by 3).
+pub fn approx_3_for_instance(t1: &Tree, t2: &Tree, num_leaves: u32) -> i32 {
+    let mut tf = TwinForest::from_trees(t1, t2, num_leaves);
+    let mut um = UndoMachine::new();
+    approx_3(&mut tf, &mut um)
+}

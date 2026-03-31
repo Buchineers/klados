@@ -7,9 +7,12 @@
 mod forest;
 mod undo;
 mod algorithm;
+mod approx2;
 mod stats;
 
 pub use algorithm::BBConfig;
+pub use algorithm::approx_2_lb_for_instance;
+pub use algorithm::approx_3_for_instance;
 pub use stats::{WhiddenProgressUpdate, WhiddenRuleStats, WhiddenRunStats};
 
 use std::time::Instant;
