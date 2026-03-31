@@ -82,6 +82,13 @@ enum Commands {
         #[arg(long, default_value = "50")]
         max_leaves: u32,
     },
+    /// Compare LB algorithms (red-blue dual, Olver TF, 3-approx) on 2-tree instances.
+    CompareLb {
+        #[arg(value_name = "FILE")]
+        scores_file: std::path::PathBuf,
+        #[arg(long, default_value = "4294967295")]
+        max_leaves: u32,
+    },
     AnalyzeRun {
         #[arg(value_name = "FILE")]
         summary_file: std::path::PathBuf,
@@ -123,6 +130,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_leaves,
         }) => {
             commands::compare::run(&scores_file, max_leaves)?;
+            return Ok(());
+        }
+        Some(Commands::CompareLb {
+            scores_file,
+            max_leaves,
+        }) => {
+            commands::compare_lb::run(&scores_file, max_leaves)?;
             return Ok(());
         }
         Some(Commands::AnalyzeRun {
