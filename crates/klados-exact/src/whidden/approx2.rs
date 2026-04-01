@@ -17,8 +17,18 @@ fn pw_lca(tf: &TwinForest, ti: usize, depth: &[u16], mut a: NodeId, mut b: NodeI
     if a == NONE || b == NONE { return NONE; }
     let mut da = depth[a as usize];
     let mut db = depth[b as usize];
-    while da > db { a = tf.parent[ti][a as usize]; da -= 1; }
-    while db > da { b = tf.parent[ti][b as usize]; db -= 1; }
+    
+    // Protect against NONE (u32::MAX) array indexing panics!
+    while da > db { 
+        if a == NONE { break; }
+        a = tf.parent[ti][a as usize]; 
+        da -= 1; 
+    }
+    while db > da { 
+        if b == NONE { break; }
+        b = tf.parent[ti][b as usize]; 
+        db -= 1; 
+    }
     while a != b {
         if a == NONE || b == NONE { return NONE; }
         a = tf.parent[ti][a as usize];
@@ -36,8 +46,12 @@ fn pw_lca_of_mask(tf: &TwinForest, ti: usize, depth: &[u16], mask: u128) -> Node
         let bit = m.trailing_zeros() as u32;
         m &= m - 1;
         let node = tf.label_to_node[ti][(bit + 1) as usize];
-        if result == NONE { result = node; }
-        else { result = pw_lca(tf, ti, depth, result, node); }
+        if result == NONE { 
+            result = node; 
+        } else { 
+            result = pw_lca(tf, ti, depth, result, node); 
+            if result == NONE { return NONE; }
+        }
     }
     result
 }
@@ -53,11 +67,19 @@ struct Partition {
 }
 
 impl Partition {
-    fn new_single(n: u32) -> Self {
-        let mut comp = vec![0u32; n as usize + 1];
-        let mut mask: u128 = 0;
-        for l in 1..=n { comp[l as usize] = 0; mask |= 1u128 << (l - 1); }
-        Self { comp, masks: vec![mask], next_id: 1 }
+    fn new_empty(max_label: u32) -> Self {
+        Self {
+            comp: vec![0u32; max_label as usize + 1],
+            masks: vec![0],
+            next_id: 1,
+        }
+    }
+
+    fn insert_leaf(&mut self, lbl: u32) {
+        if lbl > 0 {
+            self.comp[lbl as usize] = 0;
+            self.masks[0] |= 1u128 << (lbl - 1);
+        }
     }
 
     #[inline] fn count_components(&self) -> usize { self.masks.iter().filter(|&&m| m != 0).count() }
@@ -86,35 +108,39 @@ impl Partition {
 // Precomputation (leaf masks + depth + post-order in one pass)
 // ---------------------------------------------------------------------------
 
+#[derive(Default)]
 struct TreeInfo {
     post_order: Vec<NodeId>,
     leaf_masks: Vec<u128>,
     depth: Vec<u16>,
 }
 
-fn build_tree_info(tf: &TwinForest, ti: usize) -> TreeInfo {
+fn build_tree_info_ws(tf: &TwinForest, ti: usize, info: &mut TreeInfo, stack: &mut Vec<(NodeId, u16, bool)>) {
     let n = tf.num_nodes[ti];
-    let mut post_order = Vec::with_capacity(n);
-    let mut leaf_masks = vec![0u128; n];
-    let mut depth = vec![0u16; n];
+    info.post_order.clear();
+    info.leaf_masks.clear();
+    info.leaf_masks.resize(n, 0);
+    info.depth.clear();
+    info.depth.resize(n, 0);
 
     for &root in &tf.components[ti] {
-        let mut stack: Vec<(NodeId, u16, bool)> = vec![(root, 0, false)];
+        stack.clear();
+        stack.push((root, 0, false));
         while let Some((node, d, visited)) = stack.pop() {
             if node == NONE { continue; }
             if visited {
-                post_order.push(node);
+                info.post_order.push(node);
                 // Propagate leaf masks from children
                 let lc = tf.left[ti][node as usize];
                 let rc = tf.right[ti][node as usize];
-                if lc != NONE { leaf_masks[node as usize] |= leaf_masks[lc as usize]; }
-                if rc != NONE { leaf_masks[node as usize] |= leaf_masks[rc as usize]; }
+                if lc != NONE { info.leaf_masks[node as usize] |= info.leaf_masks[lc as usize]; }
+                if rc != NONE { info.leaf_masks[node as usize] |= info.leaf_masks[rc as usize]; }
             } else {
-                depth[node as usize] = d;
+                info.depth[node as usize] = d;
                 if tf.is_leaf(ti, node) {
                     let lbl = tf.label[ti][node as usize];
-                    if lbl != 0 { leaf_masks[node as usize] = 1u128 << (lbl - 1); }
-                    post_order.push(node);
+                    if lbl != 0 { info.leaf_masks[node as usize] = 1u128 << (lbl - 1); }
+                    info.post_order.push(node);
                 } else {
                     stack.push((node, d, true));
                     let rc = tf.right[ti][node as usize];
@@ -125,7 +151,6 @@ fn build_tree_info(tf: &TwinForest, ti: usize) -> TreeInfo {
             }
         }
     }
-    TreeInfo { post_order, leaf_masks, depth }
 }
 
 // ---------------------------------------------------------------------------
@@ -288,27 +313,11 @@ fn make_rub_compatible(
             if !overlap { continue; }
 
             // Walk down from lca(R∪B) to find deepest node with both red and blue
-            let mut u_hat = pw_lca_of_mask(tf, T2, t2d, rub);
-            if u_hat == NONE { continue; }
+            let rub_lca = pw_lca_of_mask(tf, T2, t2d, rub);
+            if rub_lca == NONE { continue; }
 
-            loop {
-                let lc = tf.left[T2][u_hat as usize];
-                let rc = tf.right[T2][u_hat as usize];
-                let mut moved = false;
-                if lc != NONE {
-                    let lc_leaves = t2_leaf_masks[lc as usize] & a_mask;
-                    if (lc_leaves & red) != 0 && (lc_leaves & blue) != 0 {
-                        u_hat = lc; moved = true;
-                    }
-                }
-                if !moved && rc != NONE {
-                    let rc_leaves = t2_leaf_masks[rc as usize] & a_mask;
-                    if (rc_leaves & red) != 0 && (rc_leaves & blue) != 0 {
-                        u_hat = rc; moved = true;
-                    }
-                }
-                if !moved { break; }
-            }
+            // Use stack-based traversal to check BOTH branches for the absolute maximum depth
+            let u_hat = walk_down_deepest(tf, t2d, t2_leaf_masks, rub_lca, in_r, in_b);
 
             let split_mask = t2_leaf_masks[u_hat as usize] & a_mask;
             if split_mask != 0 && split_mask != a_mask {
@@ -431,6 +440,48 @@ fn make_splittable(
 }
 
 // ---------------------------------------------------------------------------
+// Exact Fallback for Triple Compatibility Edge Cases
+// ---------------------------------------------------------------------------
+
+fn has_compatible_tricolored_triple(tf: &TwinForest, t2d: &[u16], a_r: u128, a_b: u128, a_w: u128) -> bool {
+    let mut r_mask = a_r;
+    while r_mask != 0 {
+        let r_bit = r_mask.trailing_zeros();
+        r_mask &= r_mask - 1;
+        let r_node = tf.label_to_node[T2][(r_bit + 1) as usize];
+        if r_node == NONE { continue; }
+
+        let mut b_mask = a_b;
+        while b_mask != 0 {
+            let b_bit = b_mask.trailing_zeros();
+            b_mask &= b_mask - 1;
+            let b_node = tf.label_to_node[T2][(b_bit + 1) as usize];
+            if b_node == NONE { continue; }
+
+            let lca_rb = pw_lca(tf, T2, t2d, r_node, b_node);
+            if lca_rb == NONE { return true; } // Completely separated component implies compatibility
+            let depth_rb = t2d[lca_rb as usize];
+
+            let mut w_mask = a_w;
+            while w_mask != 0 {
+                let w_bit = w_mask.trailing_zeros();
+                w_mask &= w_mask - 1;
+                let w_node = tf.label_to_node[T2][(w_bit + 1) as usize];
+                if w_node == NONE { continue; }
+
+                let lca_rw = pw_lca(tf, T2, t2d, r_node, w_node);
+                if lca_rw == NONE { return true; }
+
+                if depth_rb > t2d[lca_rw as usize] {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
 // Split procedure
 // ---------------------------------------------------------------------------
 
@@ -465,36 +516,42 @@ fn split_procedure(
 
         // Tricolored — check for special-split via T2 topology
         let rub_lca = pw_lca_of_mask(tf, T2, t2d, a_r | a_b);
-        if rub_lca != NONE {
-            let under_rub = t2_leaf_masks[rub_lca as usize] & a;
-            let w_in = under_rub & a_w;
-            let w_out = a_w & !under_rub;
+        
+        // If R and B are in entirely disconnected components of the forest, 
+        // they form incompatible triples. Aggressively split and decrement y.
+        if rub_lca == NONE {
+            y_decrements += 1;
+            partition.split_off(a_r);
+            partition.split_off(a_b);
+            cid += 1;
+            continue;
+        }
 
-            let all_compat = w_in == 0;
-            let has_compat = w_out != 0;
+        let under_rub = t2_leaf_masks[rub_lca as usize] & a;
+        let w_in = under_rub & a_w;
+        let w_out = a_w & !under_rub;
+        
+        let all_compat = w_in == 0;
+        let has_compat = w_out != 0 || has_compatible_tricolored_triple(tf, t2d, a_r, a_b, w_in);
 
-            if has_compat {
-                if all_compat {
-                    partition.split_off(a_r);
-                    cid += 1;
-                } else {
-                    y_decrements += 1;
-                    let a_outside = a & !under_rub;
-                    if a_outside != 0 { partition.split_off(a_outside); }
-
-                    let a_inside = partition.masks[cid];
-                    let a_r_in = a_inside & red;
-                    let a_b_in = a_inside & blue;
-                    if a_r_in != 0 { partition.split_off(a_r_in); }
-                    if a_b_in != 0 { partition.split_off(a_b_in); }
-                    cid += 1;
-                }
-            } else {
+        if has_compat {
+            if all_compat {
                 partition.split_off(a_r);
-                if a_b != 0 && a_w != 0 { partition.split_off(a_b); }
+                cid += 1;
+            } else {
+                y_decrements += 1;
+                let a_outside = a & !under_rub;
+                if a_outside != 0 { partition.split_off(a_outside); }
+
+                let a_inside = partition.masks[cid];
+                let a_r_in = a_inside & red;
+                let a_b_in = a_inside & blue;
+                if a_r_in != 0 { partition.split_off(a_r_in); }
+                if a_b_in != 0 { partition.split_off(a_b_in); }
                 cid += 1;
             }
         } else {
+            // No compatible triples at all. Standard split, NO y penalty.
             partition.split_off(a_r);
             if a_b != 0 && a_w != 0 { partition.split_off(a_b); }
             cid += 1;
@@ -504,52 +561,108 @@ fn split_procedure(
 }
 
 // ---------------------------------------------------------------------------
-// Main entry point
+// Main entry point (Zero-Allocation Workspace)
 // ---------------------------------------------------------------------------
+
+use std::cell::RefCell;
+
+struct Workspace {
+    t1_info: TreeInfo,
+    t2_info: TreeInfo,
+    partition: Partition,
+    is_roi_arr: Vec<bool>,
+    cover_owner: Vec<u32>,
+    cover_gen: Vec<u32>,
+    stack: Vec<(NodeId, u16, bool)>,
+}
+
+thread_local! {
+    static WS: RefCell<Workspace> = RefCell::new(Workspace {
+        t1_info: TreeInfo::default(),
+        t2_info: TreeInfo::default(),
+        partition: Partition { comp: vec![], masks: vec![], next_id: 1 },
+        is_roi_arr: vec![],
+        cover_owner: vec![],
+        cover_gen: vec![],
+        stack: vec![],
+    });
+}
 
 pub fn approx_2_lb(tf: &TwinForest) -> i32 {
     let n = tf.num_leaves;
     if n <= 1 { return 0; }
 
-    let t1_info = build_tree_info(tf, T1);
-    let t2_info = build_tree_info(tf, T2);
+    WS.with(|ws| {
+        let w = &mut *ws.borrow_mut();
+        
+        // 1. Reset and Build TreeInfo without allocating
+        build_tree_info_ws(tf, T1, &mut w.t1_info, &mut w.stack);
+        build_tree_info_ws(tf, T2, &mut w.t2_info, &mut w.stack);
 
-    let mut partition = Partition::new_single(n);
-    let mut y_decrements: usize = 0;
+        // 2. Clear and Reuse Partition memory
+        let mut max_label = 0;
+        for &u in &w.t1_info.post_order {
+            if tf.is_leaf(T1, u) {
+                let lbl = tf.label[T1][u as usize];
+                if lbl > max_label { max_label = lbl; }
+            }
+        }
+        
+        w.partition.comp.clear();
+        w.partition.comp.resize(max_label as usize + 1, 0);
+        w.partition.masks.clear();
+        w.partition.masks.push(0);
+        w.partition.next_id = 1;
 
-    let mut is_roi_arr = vec![false; tf.num_nodes[T1]];
-    let mut cover_owner = vec![0u32; tf.num_nodes[T1]];
-    let mut cover_gen = vec![0u32; tf.num_nodes[T1]];
-    let mut gen_ctr: u32 = 0;
+        let mut all_leaves = 0u128;
+        for &u in &w.t1_info.post_order {
+            if tf.is_leaf(T1, u) {
+                let lbl = tf.label[T1][u as usize];
+                if lbl > 0 {
+                    w.partition.comp[lbl as usize] = 0;
+                    w.partition.masks[0] |= 1u128 << (lbl - 1);
+                    all_leaves |= 1u128 << (lbl - 1);
+                }
+            }
+        }
 
-    let max_iterations = 4 * n as usize;
-    for _iter in 0..max_iterations {
-        let u = match find_lowest_roi(
-            tf, &partition, &t1_info.depth, &t2_info.depth,
-            &t1_info.post_order, &t1_info.leaf_masks, &t2_info.leaf_masks,
-            &mut is_roi_arr, &mut cover_owner, &mut cover_gen, &mut gen_ctr,
-        ) {
-            Some(u) => u,
-            None => break,
-        };
+        // 3. Clear and Reuse Tracking Arrays
+        let t1_nodes = tf.num_nodes[T1];
+        w.is_roi_arr.clear(); w.is_roi_arr.resize(t1_nodes, false);
+        w.cover_owner.clear(); w.cover_owner.resize(t1_nodes, 0);
+        w.cover_gen.clear(); w.cover_gen.resize(t1_nodes, 0);
+        let mut gen_ctr: u32 = 0;
 
-        y_decrements += 1;
+        let mut y_decrements: usize = 0;
+        let max_iterations = 4 * n as usize;
+        
+        for _iter in 0..max_iterations {
+            let u = match find_lowest_roi(
+                tf, &w.partition, &w.t1_info.depth, &w.t2_info.depth,
+                &w.t1_info.post_order, &w.t1_info.leaf_masks, &w.t2_info.leaf_masks,
+                &mut w.is_roi_arr, &mut w.cover_owner, &mut w.cover_gen, &mut gen_ctr,
+            ) {
+                Some(u) => u,
+                None => break,
+            };
 
-        let lc = tf.left[T1][u as usize];
-        let rc = tf.right[T1][u as usize];
-        if lc == NONE || rc == NONE { continue; }
+            y_decrements += 1;
 
-        let red = t1_info.leaf_masks[rc as usize];
-        let blue = t1_info.leaf_masks[lc as usize];
-        let all: u128 = (1u128 << n) - 1;
-        let white = all & !(red | blue);
+            let lc = tf.left[T1][u as usize];
+            let rc = tf.right[T1][u as usize];
+            if lc == NONE || rc == NONE { continue; }
 
-        y_decrements += make_rub_compatible(tf, &mut partition, &t2_info.depth, &t2_info.leaf_masks, red, blue);
-        y_decrements += make_splittable(tf, &mut partition, &t2_info.depth, &t2_info.leaf_masks, red, blue, white);
-        y_decrements += split_procedure(tf, &mut partition, &t2_info.depth, &t2_info.leaf_masks, red, blue, white);
-    }
+            let red = w.t1_info.leaf_masks[rc as usize];
+            let blue = w.t1_info.leaf_masks[lc as usize];
+            let white = all_leaves & !(red | blue);
 
-    let p = partition.count_components();
-    let d = (p as i32) - 1 - (y_decrements as i32);
-    d.max(0)
+            y_decrements += make_rub_compatible(tf, &mut w.partition, &w.t2_info.depth, &w.t2_info.leaf_masks, red, blue);
+            y_decrements += make_splittable(tf, &mut w.partition, &w.t2_info.depth, &w.t2_info.leaf_masks, red, blue, white);
+            y_decrements += split_procedure(tf, &mut w.partition, &w.t2_info.depth, &w.t2_info.leaf_masks, red, blue, white);
+        }
+
+        let p = w.partition.count_components();
+        let d = (p as i32) - 1 - (y_decrements as i32);
+        d.max(0)
+    })
 }

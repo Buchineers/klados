@@ -110,6 +110,9 @@ enum Commands {
         log_interval_ms: u64,
         #[arg(long)]
         output: Option<std::path::PathBuf>,
+        /// Use Olver 2-approx dual LB for BB pruning instead of 3-approx.
+        #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+        bb_2approx: bool,
     },
 }
 
@@ -154,6 +157,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             progress,
             log_interval_ms,
             output,
+            bb_2approx,
         }) => {
             commands::whidden_stats::run(
                 &list_file,
@@ -163,6 +167,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 progress,
                 log_interval_ms,
                 output,
+                bb_2approx,
             )?;
             return Ok(());
         }

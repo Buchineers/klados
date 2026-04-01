@@ -31,6 +31,9 @@ pub struct BBConfig {
     // --- Approximation-based pruning ---
     /// BB: prune branches where 3-approx > 3k (rspr's `BB` flag).
     pub bb: bool,
+    /// BB2: use Olver 2-approx dual LB instead of 3-approx for BB pruning.
+    /// Prune when approx_2_lb(tf) > k (strictly tighter than approx_3 > 3k).
+    pub bb_2approx: bool,
 
     // --- Branching reductions (reduce 3-way to fewer branches) ---
     /// COB: "cut one B" — skip branch A when T2_ab and T2_c are siblings.
@@ -86,6 +89,7 @@ impl Default for BBConfig {
     fn default() -> Self {
         Self {
             bb: true,
+            bb_2approx: false,
             cut_one_b: true,
             reverse_cut_one_b: true,
             reverse_cut_one_b_3: false,
@@ -114,6 +118,7 @@ impl BBConfig {
     pub fn noopt() -> Self {
         Self {
             bb: false,
+            bb_2approx: false,
             cut_one_b: false,
             reverse_cut_one_b: false,
             reverse_cut_one_b_3: false,
@@ -320,7 +325,7 @@ fn bb_inner(
                             rule_stats.prune_k_exhausted += 1;
                             return -1;
                         }
-                        if config.bb && approx_3(tf, um) > 3 * *k {
+                        if config.bb && bb_should_prune(tf, um, *k, config) {
                             rule_stats.prune_bb_approx += 1;
                             return -1;
                         }
@@ -365,7 +370,7 @@ fn bb_inner(
                     rule_stats.prune_k_exhausted += 1;
                     return -1;
                 }
-                if config.bb && approx_3(tf, um) > 3 * *k {
+                if config.bb && bb_should_prune(tf, um, *k, config) {
                     rule_stats.prune_bb_approx += 1;
                     return -1;
                 }
@@ -726,6 +731,32 @@ fn find_root(tf: &TwinForest, ti: usize, mut node: NodeId) -> NodeId {
 // ---------------------------------------------------------------------------
 // 3-approximation lower bound (rspr's BB pruning)
 // ---------------------------------------------------------------------------
+
+/// BB pruning decision: returns true if the current residual problem
+/// provably has OPT > k, so this branch can be abandoned.
+#[inline]
+fn bb_should_prune(tf: &mut TwinForest, um: &mut UndoMachine, k: i32, config: &BBConfig) -> bool {
+    let mut val3 = 0;
+
+    // 1. Fast Primal Bound O(n)
+    if config.bb {
+        val3 = approx_3(tf, um);
+        if val3 > 3 * k {
+            return true;
+        }
+    }
+
+    // 2. Heavy Dual Bound O(n^2) - Gated for maximum ROI
+    // Only run if we are high enough in the tree (k >= 3)
+    // AND the 3-approx was on the verge of pruning (val3 > 3 * (k - 1))
+    if config.bb_2approx && k >= 3 && val3 > 3 * (k - 1) {
+        if super::approx2::approx_2_lb(tf) > k {
+            return true;
+        }
+    }
+
+    false
+}
 
 /// Greedy 3-approximation of rSPR distance on the current forest state.
 /// Faithful port of rspr's `rSPR_worse_3_approx_binary_hlpr`.

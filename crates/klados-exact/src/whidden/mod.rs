@@ -24,6 +24,7 @@ use crate::kernelize::{self, KernelizeConfig};
 pub struct WhiddenSolver {
     stats: SolverStats,
     rule_stats: WhiddenRuleStats,
+    bb_config: BBConfig,
 }
 
 impl Default for WhiddenSolver {
@@ -37,7 +38,13 @@ impl WhiddenSolver {
         Self {
             stats: SolverStats::default(),
             rule_stats: WhiddenRuleStats::default(),
+            bb_config: BBConfig::default(),
         }
+    }
+
+    pub fn with_bb_2approx(mut self, enabled: bool) -> Self {
+        self.bb_config.bb_2approx = enabled;
+        self
     }
 
     fn merge_subsolver_stats(&mut self, sub: &WhiddenSolver) {
@@ -115,7 +122,7 @@ impl WhiddenSolver {
             reduced,
             &mut self.stats,
             &mut self.rule_stats,
-            &algorithm::BBConfig::default(),
+            &self.bb_config,
             cb,
         );
         self.rule_stats.k_total_elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;

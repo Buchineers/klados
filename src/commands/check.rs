@@ -112,11 +112,23 @@ pub fn run(list_file: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         let n_kern = reduced.num_leaves;
         let param_red = kern.param_reduction;
 
-        // Compute bounds on the reduced instance
+        // Compute UB on the reduced instance using the old bounds algorithm
         let bounds = maf_bounds(&reduced.trees, reduced.num_leaves);
 
+        // Compute LB using the newly optimized approx2 algorithm for m=2
+        let lb_components = if m == 2 {
+            let dist = klados_exact::whidden::approx_2_lb_for_instance(
+                &reduced.trees[0],
+                &reduced.trees[1],
+                reduced.num_leaves,
+            );
+            dist as usize + 1
+        } else {
+            bounds.lower
+        };
+
         // Adjust for parameter reduction from 3-2 chain
-        let lb = bounds.lower + param_red;
+        let lb = lb_components + param_red;
         let ub = bounds.upper + param_red;
 
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
