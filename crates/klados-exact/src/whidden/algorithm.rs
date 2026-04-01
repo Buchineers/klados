@@ -13,10 +13,10 @@ use std::time::Instant;
 use klados_core::tree::{Label, NodeId, Tree, NONE};
 use klados_core::{Instance, SolverStats};
 
-use super::forest::{TwinForest, T1, T2};
+use klados_core::twin_tree::{TwinForest, T1, T2, UndoMachine};
+use klados_core::twin_tree::{undo, approx2};
+use klados_core::lower_bound::cherry_reduce_ub;
 use super::stats::{WhiddenProgressUpdate, WhiddenRuleStats};
-use super::undo::{self, UndoMachine};
-use crate::lower_bound::maf_bounds;
 
 // ---------------------------------------------------------------------------
 // Configuration — maps to rspr's optimization flags
@@ -205,9 +205,19 @@ where
         return Some(vec![instance.trees[0].clone()]);
     }
 
-    let bounds = maf_bounds(&instance.trees, n);
-    let lb = bounds.lower;
-    let ub = bounds.upper.min(n as usize);
+    // Build TwinForest first — needed for both bounds and B&B.
+    let mut tf = TwinForest::from_trees(&instance.trees[0], &instance.trees[1], n);
+    let mut um = UndoMachine::new();
+
+    // LB: Olver 2-approx dual on TwinForest (0.009ms, 69.9% tight).
+    // This is the iterative deepening floor — skips k=0 through k=D-1.
+    let lb_cuts = approx2::approx_2_lb(&tf).max(0) as usize;
+    let lb = lb_cuts + 1; // components space
+
+    // UB: cherry reduction (cheap for 2-tree, tighter than approx_3).
+    let ub_cuts = cherry_reduce_ub(&instance.trees[0], &instance.trees[1]);
+    let ub = (ub_cuts + 1).min(n as usize);
+
     stats.lower_bound = lb;
     stats.upper_bound = Some(ub);
 
@@ -215,10 +225,6 @@ where
     let ub_k = ub.saturating_sub(1);
     rule_stats.lb_k = lb_k;
     rule_stats.ub_k = ub_k;
-
-    // Build once; reuse across k iterations (undo rewinds to initial state).
-    let mut tf = TwinForest::from_trees(&instance.trees[0], &instance.trees[1], n);
-    let mut um = UndoMachine::new();
 
     for k in lb_k..=ub_k {
         rule_stats.current_k = Some(k);
@@ -750,7 +756,7 @@ fn bb_should_prune(tf: &mut TwinForest, um: &mut UndoMachine, k: i32, config: &B
     // Only run if we are high enough in the tree (k >= 3)
     // AND the 3-approx was on the verge of pruning (val3 > 3 * (k - 1))
     if config.bb_2approx && k >= 3 && val3 > 3 * (k - 1) {
-        if super::approx2::approx_2_lb(tf) > k {
+        if approx2::approx_2_lb(tf) > k {
             return true;
         }
     }
@@ -1153,7 +1159,7 @@ fn tree_from_original(tf: &TwinForest) -> Tree {
 /// Returns D such that D ≤ OPT (rSPR distance).
 pub fn approx_2_lb_for_instance(t1: &Tree, t2: &Tree, num_leaves: u32) -> i32 {
     let tf = TwinForest::from_trees(t1, t2, num_leaves);
-    super::approx2::approx_2_lb(&tf)
+    approx2::approx_2_lb(&tf)
 }
 
 /// Compute the 3-approximation value on an instance's rSPR distance.

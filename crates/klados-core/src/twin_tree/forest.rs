@@ -7,7 +7,7 @@
 //! Optimized for the 2-tree case: no generic tree indexing,
 //! twin lookups are O(1) array access.
 
-use klados_core::tree::{Label, Tree, NONE, NodeId};
+use crate::tree::{Label, Tree, NONE, NodeId};
 
 /// Index into the tree pair: T1 = 0, T2 = 1.
 pub const T1: usize = 0;
