@@ -4,10 +4,7 @@
 //! tree mutations (matching rspr's cut_parent / contract semantics).
 //! Restricted to m=2 (two input trees).
 
-mod forest;
-mod undo;
 mod algorithm;
-mod approx2;
 mod stats;
 
 pub use algorithm::BBConfig;

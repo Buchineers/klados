@@ -5,7 +5,7 @@
 //!
 //! UndoOp is 12 bytes (idx: u16 keeps ReplaceComponent small).
 
-use klados_core::tree::{NodeId, NONE};
+use crate::tree::{NodeId, NONE};
 use super::forest::TwinForest;
 
 #[derive(Clone, Copy)]

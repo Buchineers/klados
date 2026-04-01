@@ -6,7 +6,7 @@
 //! Returns D = |P| - 1 - y_decrements, a valid lower bound on OPT.
 
 use super::forest::{TwinForest, T1, T2};
-use klados_core::tree::{Label, NodeId, NONE};
+use crate::tree::{NodeId, NONE};
 
 // ---------------------------------------------------------------------------
 // Parent-walk LCA — O(depth) per query, zero setup
@@ -17,17 +17,17 @@ fn pw_lca(tf: &TwinForest, ti: usize, depth: &[u16], mut a: NodeId, mut b: NodeI
     if a == NONE || b == NONE { return NONE; }
     let mut da = depth[a as usize];
     let mut db = depth[b as usize];
-    
+
     // Protect against NONE (u32::MAX) array indexing panics!
-    while da > db { 
+    while da > db {
         if a == NONE { break; }
-        a = tf.parent[ti][a as usize]; 
-        da -= 1; 
+        a = tf.parent[ti][a as usize];
+        da -= 1;
     }
-    while db > da { 
+    while db > da {
         if b == NONE { break; }
-        b = tf.parent[ti][b as usize]; 
-        db -= 1; 
+        b = tf.parent[ti][b as usize];
+        db -= 1;
     }
     while a != b {
         if a == NONE || b == NONE { return NONE; }
@@ -46,10 +46,10 @@ fn pw_lca_of_mask(tf: &TwinForest, ti: usize, depth: &[u16], mask: u128) -> Node
         let bit = m.trailing_zeros() as u32;
         m &= m - 1;
         let node = tf.label_to_node[ti][(bit + 1) as usize];
-        if result == NONE { 
-            result = node; 
-        } else { 
-            result = pw_lca(tf, ti, depth, result, node); 
+        if result == NONE {
+            result = node;
+        } else {
+            result = pw_lca(tf, ti, depth, result, node);
             if result == NONE { return NONE; }
         }
     }
@@ -344,9 +344,8 @@ fn walk_down_deepest(tf: &TwinForest, t2d: &[u16], t2_leaf_masks: &[u128], start
     let mut best_depth = t2d[start as usize];
     // Fixed-size stack avoids heap allocation; depth <= 128 for bitmask approach.
     let mut stack_buf = [NONE; 128];
-    let mut sp = 0usize;
     stack_buf[0] = start;
-    sp = 1;
+    let mut sp = 1usize;
     while sp > 0 {
         sp -= 1;
         let v = stack_buf[sp];
@@ -516,8 +515,8 @@ fn split_procedure(
 
         // Tricolored — check for special-split via T2 topology
         let rub_lca = pw_lca_of_mask(tf, T2, t2d, a_r | a_b);
-        
-        // If R and B are in entirely disconnected components of the forest, 
+
+        // If R and B are in entirely disconnected components of the forest,
         // they form incompatible triples. Aggressively split and decrement y.
         if rub_lca == NONE {
             y_decrements += 1;
@@ -530,7 +529,7 @@ fn split_procedure(
         let under_rub = t2_leaf_masks[rub_lca as usize] & a;
         let w_in = under_rub & a_w;
         let w_out = a_w & !under_rub;
-        
+
         let all_compat = w_in == 0;
         let has_compat = w_out != 0 || has_compatible_tricolored_triple(tf, t2d, a_r, a_b, w_in);
 
@@ -594,7 +593,7 @@ pub fn approx_2_lb(tf: &TwinForest) -> i32 {
 
     WS.with(|ws| {
         let w = &mut *ws.borrow_mut();
-        
+
         // 1. Reset and Build TreeInfo without allocating
         build_tree_info_ws(tf, T1, &mut w.t1_info, &mut w.stack);
         build_tree_info_ws(tf, T2, &mut w.t2_info, &mut w.stack);
@@ -607,7 +606,7 @@ pub fn approx_2_lb(tf: &TwinForest) -> i32 {
                 if lbl > max_label { max_label = lbl; }
             }
         }
-        
+
         w.partition.comp.clear();
         w.partition.comp.resize(max_label as usize + 1, 0);
         w.partition.masks.clear();
@@ -635,7 +634,7 @@ pub fn approx_2_lb(tf: &TwinForest) -> i32 {
 
         let mut y_decrements: usize = 0;
         let max_iterations = 4 * n as usize;
-        
+
         for _iter in 0..max_iterations {
             let u = match find_lowest_roi(
                 tf, &w.partition, &w.t1_info.depth, &w.t2_info.depth,
