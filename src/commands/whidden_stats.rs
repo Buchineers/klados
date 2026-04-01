@@ -96,6 +96,7 @@ pub fn run(
     progress: ProgressMode,
     log_interval_ms: u64,
     output: Option<PathBuf>,
+    bb_2approx: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let content = fs::read_to_string(list_file)?;
     let lines: Vec<&str> = content.lines().collect();
@@ -230,7 +231,7 @@ pub fn run(
             .collect();
         let instance = Instance::new(trees, num_leaves);
 
-        let mut solver = WhiddenSolver::new();
+        let mut solver = WhiddenSolver::new().with_bb_2approx(bb_2approx);
         let start = Instant::now();
         let mut last_log_mark = 0.0_f64;
         let digest_short = digest[..16.min(digest.len())].to_string();
