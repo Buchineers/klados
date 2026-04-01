@@ -8,6 +8,7 @@
 //! twin lookups are O(1) array access.
 
 use crate::tree::{Label, Tree, NONE, NodeId};
+use super::zobrist::{self, ZobristSalts};
 
 /// Index into the tree pair: T1 = 0, T2 = 1.
 pub const T1: usize = 0;
@@ -46,6 +47,10 @@ pub struct TwinForest {
     // --- Edge protection (T2 only, for branch pruning) ---
     pub protected: Vec<bool>,
 
+    // --- Zobrist hash (topology-only, incremental) ---
+    pub state_hash: u64,
+    pub zobrist_salts: ZobristSalts,
+
     // --- Metadata ---
     pub num_nodes: [usize; 2],
     pub root:      [NodeId; 2],
@@ -58,10 +63,18 @@ impl TwinForest {
         let n1 = t1.num_nodes();
         let n2 = t2.num_nodes();
 
+        let max_nodes = n1.max(n2);
+        let salts = ZobristSalts::new(max_nodes);
+
+        let parent = [t1.parent.clone(), t2.parent.clone()];
+        let left = [t1.left.clone(), t2.left.clone()];
+        let right = [t1.right.clone(), t2.right.clone()];
+        let state_hash = zobrist::compute_full_hash(&parent, &left, &right, &salts);
+
         let mut tf = Self {
-            parent: [t1.parent.clone(), t2.parent.clone()],
-            left:   [t1.left.clone(),   t2.left.clone()],
-            right:  [t1.right.clone(),  t2.right.clone()],
+            parent,
+            left,
+            right,
             label:         [t1.label.clone(),         t2.label.clone()],
             label_to_node: [t1.label_to_node.clone(), t2.label_to_node.clone()],
             twin: [vec![NONE; n1], vec![NONE; n2]],
@@ -73,6 +86,8 @@ impl TwinForest {
             orig_label:  t1.label.clone(),
             t2_depth: vec![0; n2],
             protected: vec![false; n2],
+            state_hash,
+            zobrist_salts: salts,
             num_nodes: [n1, n2],
             root: [t1.root, t2.root],
             num_leaves,

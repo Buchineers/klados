@@ -3,10 +3,15 @@
 //! Every physical mutation to the twin forest is recorded as an UndoOp.
 //! `undo_to(checkpoint)` replays ops in reverse to restore state.
 //!
+//! Search-critical mutations (parent/left/right) maintain the Zobrist hash
+//! incrementally. Non-search mutations (label, twin, collapsed, protected)
+//! do not touch the hash.
+//!
 //! UndoOp is 12 bytes (idx: u16 keeps ReplaceComponent small).
 
 use crate::tree::{NodeId, NONE};
 use super::forest::TwinForest;
+use super::zobrist::hash_update;
 
 #[derive(Clone, Copy)]
 pub enum UndoOp {
@@ -40,12 +45,24 @@ impl UndoMachine {
     pub fn undo_to(&mut self, cp: usize, tf: &mut TwinForest) {
         while self.ops.len() > cp {
             match self.ops.pop().unwrap() {
-                UndoOp::SetParent { ti, node, old } =>
-                    tf.parent[ti as usize][node as usize] = old,
-                UndoOp::SetLeft { ti, node, old } =>
-                    tf.left[ti as usize][node as usize] = old,
-                UndoOp::SetRight { ti, node, old } =>
-                    tf.right[ti as usize][node as usize] = old,
+                UndoOp::SetParent { ti, node, old } => {
+                    let ti = ti as usize;
+                    let current = tf.parent[ti][node as usize];
+                    hash_update(&mut tf.state_hash, tf.zobrist_salts.parent(ti, node), current, old);
+                    tf.parent[ti][node as usize] = old;
+                }
+                UndoOp::SetLeft { ti, node, old } => {
+                    let ti = ti as usize;
+                    let current = tf.left[ti][node as usize];
+                    hash_update(&mut tf.state_hash, tf.zobrist_salts.left(ti, node), current, old);
+                    tf.left[ti][node as usize] = old;
+                }
+                UndoOp::SetRight { ti, node, old } => {
+                    let ti = ti as usize;
+                    let current = tf.right[ti][node as usize];
+                    hash_update(&mut tf.state_hash, tf.zobrist_salts.right(ti, node), current, old);
+                    tf.right[ti][node as usize] = old;
+                }
                 UndoOp::SetLabel { ti, node, old } =>
                     tf.label[ti as usize][node as usize] = old,
                 UndoOp::SetLabelToNode { ti, label, old } =>
@@ -81,15 +98,18 @@ pub fn cut_parent(tf: &mut TwinForest, ti: usize, node: NodeId, um: &mut UndoMac
 
     // Remove from parent's children
     if tf.left[ti][p as usize] == node {
+        hash_update(&mut tf.state_hash, tf.zobrist_salts.left(ti, p), node, NONE);
         um.push(UndoOp::SetLeft { ti: ti as u8, node: p, old: node });
         tf.left[ti][p as usize] = NONE;
     } else {
         debug_assert_eq!(tf.right[ti][p as usize], node);
+        hash_update(&mut tf.state_hash, tf.zobrist_salts.right(ti, p), node, NONE);
         um.push(UndoOp::SetRight { ti: ti as u8, node: p, old: node });
         tf.right[ti][p as usize] = NONE;
     }
 
     // Detach
+    hash_update(&mut tf.state_hash, tf.zobrist_salts.parent(ti, node), p, NONE);
     um.push(UndoOp::SetParent { ti: ti as u8, node, old: p });
     tf.parent[ti][node as usize] = NONE;
 }
@@ -101,13 +121,40 @@ pub fn add_component(tf: &mut TwinForest, ti: usize, node: NodeId, um: &mut Undo
     um.push(UndoOp::AddComponent { ti: ti as u8 });
 }
 
+/// Canonicalize a dead node so unreachable topology does not affect TT hashing.
+#[inline]
+fn clear_dead_node(tf: &mut TwinForest, ti: usize, node: NodeId, um: &mut UndoMachine) {
+    let ti8 = ti as u8;
+
+    let parent = tf.parent[ti][node as usize];
+    if parent != NONE {
+        hash_update(&mut tf.state_hash, tf.zobrist_salts.parent(ti, node), parent, NONE);
+        um.push(UndoOp::SetParent { ti: ti8, node, old: parent });
+        tf.parent[ti][node as usize] = NONE;
+    }
+
+    let left = tf.left[ti][node as usize];
+    if left != NONE {
+        hash_update(&mut tf.state_hash, tf.zobrist_salts.left(ti, node), left, NONE);
+        um.push(UndoOp::SetLeft { ti: ti8, node, old: left });
+        tf.left[ti][node as usize] = NONE;
+    }
+
+    let right = tf.right[ti][node as usize];
+    if right != NONE {
+        hash_update(&mut tf.state_hash, tf.zobrist_salts.right(ti, node), right, NONE);
+        um.push(UndoOp::SetRight { ti: ti8, node, old: right });
+        tf.right[ti][node as usize] = NONE;
+    }
+}
+
 /// Contract degree-1 node: splice it out, child takes its place.
 /// Iterates up the tree while ancestors remain degree-1.
 /// Returns the final node that ended the chain (the surviving replacement).
 ///
 /// Matches rspr's `Node::contract()` for binary trees.
-/// Dead node's own pointers are NOT zeroed — callers walk from component
-/// roots, so dead nodes are unreachable. This saves 1-3 undo ops per contract.
+/// Dead nodes are canonicalized to all-NONE so unreachable topology does not
+/// perturb the transposition-table hash.
 pub fn contract(tf: &mut TwinForest, ti: usize, mut node: NodeId, um: &mut UndoMachine) -> NodeId {
     let ti8 = ti as u8;
 
@@ -123,21 +170,27 @@ pub fn contract(tf: &mut TwinForest, ti: usize, mut node: NodeId, um: &mut UndoM
         if gp != NONE {
             // Splice: replace node with child in grandparent
             if tf.left[ti][gp as usize] == node {
+                hash_update(&mut tf.state_hash, tf.zobrist_salts.left(ti, gp), node, child);
                 um.push(UndoOp::SetLeft { ti: ti8, node: gp, old: node });
                 tf.left[ti][gp as usize] = child;
             } else {
+                hash_update(&mut tf.state_hash, tf.zobrist_salts.right(ti, gp), node, child);
                 um.push(UndoOp::SetRight { ti: ti8, node: gp, old: node });
                 tf.right[ti][gp as usize] = child;
             }
+            hash_update(&mut tf.state_hash, tf.zobrist_salts.parent(ti, child), node, gp);
             um.push(UndoOp::SetParent { ti: ti8, node: child, old: node });
             tf.parent[ti][child as usize] = gp;
+            clear_dead_node(tf, ti, node, um);
 
             // Continue: grandparent might now be degree-1 too
             node = gp;
         } else {
             // Node is a component root — child becomes root
+            hash_update(&mut tf.state_hash, tf.zobrist_salts.parent(ti, child), node, NONE);
             um.push(UndoOp::SetParent { ti: ti8, node: child, old: node });
             tf.parent[ti][child as usize] = NONE;
+            clear_dead_node(tf, ti, node, um);
 
             if let Some(idx) = tf.components[ti].iter().position(|&c| c == node) {
                 um.push(UndoOp::ReplaceComponent { ti: ti8, idx: idx as u16, old: node });
@@ -162,40 +215,44 @@ pub fn contract_sibling_pair(tf: &mut TwinForest, ti: usize, parent: NodeId, um:
     let ti8 = ti as u8;
 
     // Detach right child
+    hash_update(&mut tf.state_hash, tf.zobrist_salts.right(ti, parent), rc, NONE);
     um.push(UndoOp::SetRight { ti: ti8, node: parent, old: rc });
     tf.right[ti][parent as usize] = NONE;
+    hash_update(&mut tf.state_hash, tf.zobrist_salts.parent(ti, rc), parent, NONE);
     um.push(UndoOp::SetParent { ti: ti8, node: rc, old: parent });
     tf.parent[ti][rc as usize] = NONE;
 
     // Detach left child
+    hash_update(&mut tf.state_hash, tf.zobrist_salts.left(ti, parent), lc, NONE);
     um.push(UndoOp::SetLeft { ti: ti8, node: parent, old: lc });
     tf.left[ti][parent as usize] = NONE;
+    hash_update(&mut tf.state_hash, tf.zobrist_salts.parent(ti, lc), parent, NONE);
     um.push(UndoOp::SetParent { ti: ti8, node: lc, old: parent });
     tf.parent[ti][lc as usize] = NONE;
 }
 
-/// Set twin pointer with undo.
+/// Set twin pointer with undo. (Non-search — no hash update.)
 #[inline]
 pub fn set_twin(tf: &mut TwinForest, ti: usize, node: NodeId, twin: NodeId, um: &mut UndoMachine) {
     um.push(UndoOp::SetTwin { ti: ti as u8, node, old: tf.twin[ti][node as usize] });
     tf.twin[ti][node as usize] = twin;
 }
 
-/// Set label with undo.
+/// Set label with undo. (Non-search — no hash update.)
 #[inline]
 pub fn set_label(tf: &mut TwinForest, ti: usize, node: NodeId, label: u32, um: &mut UndoMachine) {
     um.push(UndoOp::SetLabel { ti: ti as u8, node, old: tf.label[ti][node as usize] });
     tf.label[ti][node as usize] = label;
 }
 
-/// Set collapsed_into with undo (T1 only).
+/// Set collapsed_into with undo (T1 only). (Non-search — no hash update.)
 #[inline]
 pub fn set_collapsed(tf: &mut TwinForest, label: u32, target: u32, um: &mut UndoMachine) {
     um.push(UndoOp::SetCollapsed { label, old: tf.collapsed_into[label as usize] });
     tf.collapsed_into[label as usize] = target;
 }
 
-/// Set label_to_node with undo.
+/// Set label_to_node with undo. (Non-search — no hash update.)
 #[inline]
 pub fn set_label_to_node(tf: &mut TwinForest, ti: usize, label: u32, node: NodeId, um: &mut UndoMachine) {
     um.push(UndoOp::SetLabelToNode { ti: ti as u8, label, old: tf.label_to_node[ti][label as usize] });
@@ -203,10 +260,29 @@ pub fn set_label_to_node(tf: &mut TwinForest, ti: usize, label: u32, node: NodeI
 }
 
 /// Protect a T2 edge with undo. No-op if already protected.
+/// (Non-search — no hash update; EP is a proven safe heuristic.)
 #[inline]
 pub fn protect_edge(tf: &mut TwinForest, node: NodeId, um: &mut UndoMachine) {
     if !tf.protected[node as usize] {
         um.push(UndoOp::SetProtected { node });
         tf.protected[node as usize] = true;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Debug verification
+// ---------------------------------------------------------------------------
+
+/// Verify the incremental hash matches a from-scratch computation.
+/// Only used in debug builds / testing.
+#[allow(dead_code)]
+pub fn debug_verify_hash(tf: &TwinForest) {
+    let expected = super::zobrist::compute_full_hash(
+        &tf.parent, &tf.left, &tf.right, &tf.zobrist_salts,
+    );
+    debug_assert_eq!(
+        tf.state_hash, expected,
+        "Zobrist hash mismatch: incremental={:#018x}, from_scratch={:#018x}",
+        tf.state_hash, expected,
+    );
 }

@@ -82,6 +82,14 @@ pub struct BBConfig {
     pub prefer_rho: bool,
     /// Prefer non-branching sibling pairs (Case 2 over Case 3).
     pub prefer_nonbranching: bool,
+
+    // --- Transposition table ---
+    /// TT: allocate and maintain transposition table.
+    pub tt_enabled: bool,
+    /// TT_PRUNE: actually prune on TT hit (vs observe-only).
+    pub tt_prune: bool,
+    /// TT size as power of 2 (default: 23 = 8M entries ≈ 96MB).
+    pub tt_size_log2: u8,
 }
 
 impl Default for BBConfig {
@@ -108,6 +116,9 @@ impl Default for BBConfig {
             approx_reverse_cut_one_b: true,
             prefer_rho: true,
             prefer_nonbranching: true,
+            tt_enabled: true,
+            tt_prune: false, // observe-only initially
+            tt_size_log2: 23,
         }
     }
 }
@@ -137,6 +148,9 @@ impl BBConfig {
             approx_reverse_cut_one_b: false,
             prefer_rho: false,
             prefer_nonbranching: false,
+            tt_enabled: false,
+            tt_prune: false,
+            tt_size_log2: 23,
         }
     }
 
@@ -146,6 +160,57 @@ impl BBConfig {
         Self {
             bb: true,
             ..Self::noopt()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Transposition table
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+struct TTEntry {
+    hash: u64,
+    required_k_min: i16,
+}
+
+struct TranspositionTable {
+    entries: Vec<TTEntry>,
+    mask: usize,
+}
+
+impl TranspositionTable {
+    fn new(size_log2: u8) -> Self {
+        let size = 1usize << size_log2;
+        Self {
+            entries: vec![TTEntry { hash: 0, required_k_min: i16::MIN }; size],
+            mask: size - 1,
+        }
+    }
+
+    /// Probe the TT. Returns true if the state provably fails at budget k.
+    #[inline]
+    fn probe(&self, hash: u64, k: i32) -> bool {
+        let idx = (hash as usize) & self.mask;
+        let entry = &self.entries[idx];
+        entry.hash == hash && k < entry.required_k_min as i32
+    }
+
+    /// Store a proven failure: state with this hash needs at least k+1 cuts.
+    #[inline]
+    fn store(&mut self, hash: u64, k: i32, rule_stats: &mut WhiddenRuleStats) {
+        let idx = (hash as usize) & self.mask;
+        let entry = &mut self.entries[idx];
+        let new_min = (k + 1) as i16;
+        if entry.hash == hash {
+            if new_min > entry.required_k_min {
+                entry.required_k_min = new_min;
+                rule_stats.tt_overwrites += 1;
+            }
+        } else {
+            entry.hash = hash;
+            entry.required_k_min = new_min;
+            rule_stats.tt_stores += 1;
         }
     }
 }
@@ -226,6 +291,13 @@ where
     rule_stats.lb_k = lb_k;
     rule_stats.ub_k = ub_k;
 
+    // Allocate transposition table (persists across k iterations for cross-k reuse).
+    let mut tt = if config.tt_enabled {
+        Some(TranspositionTable::new(config.tt_size_log2))
+    } else {
+        None
+    };
+
     for k in lb_k..=ub_k {
         rule_stats.current_k = Some(k);
         rule_stats.k_attempts += 1;
@@ -244,7 +316,7 @@ where
         }
 
         let cp = um.checkpoint();
-        let result = branch_and_bound(&mut tf, k as i32, &mut um, stats, rule_stats, config);
+        let result = branch_and_bound(&mut tf, k as i32, &mut um, stats, rule_stats, config, &mut tt);
         let k_elapsed_ms = k_start.elapsed().as_secs_f64() * 1000.0;
         rule_stats.k_last_elapsed_ms = k_elapsed_ms;
         rule_stats.k_total_elapsed_ms += k_elapsed_ms;
@@ -285,8 +357,9 @@ fn branch_and_bound(
     stats: &mut SolverStats,
     rule_stats: &mut WhiddenRuleStats,
     config: &BBConfig,
+    tt: &mut Option<TranspositionTable>,
 ) -> i32 {
-    bb_inner(tf, &mut k, um, stats, rule_stats, config, None)
+    bb_inner(tf, &mut k, um, stats, rule_stats, config, tt, None)
 }
 
 /// Inner B&B with optional forced pair (from CUT_ALL_B).
@@ -298,15 +371,24 @@ fn bb_inner(
     stats: &mut SolverStats,
     rule_stats: &mut WhiddenRuleStats,
     config: &BBConfig,
+    tt: &mut Option<TranspositionTable>,
     forced_pair: Option<(NodeId, NodeId)>,
 ) -> i32 {
 
     stats.nodes_explored += 1;
 
+    // Macro for TT store on failure.
+    macro_rules! tt_store_fail {
+        ($tt:expr, $tf:expr, $k:expr, $rs:expr) => {
+            if let Some(t) = $tt.as_mut() { t.store($tf.state_hash, $k, $rs); }
+        };
+    }
+
     // CAB: if we have a forced pair from a previous B-cut, try it first.
     if let Some((t1_a, t1_c)) = forced_pair {
         // Process singletons first (some may have been created by the B-cut)
         if !process_singletons(tf, k, um, rule_stats) {
+            tt_store_fail!(tt, tf, *k, rule_stats);
             return -1;
         }
         // Check if the forced pair is still valid (both still siblings in T1)
@@ -329,18 +411,22 @@ fn bb_inner(
                         rule_stats.forced_pair_case3 += 1;
                         if *k <= 0 {
                             rule_stats.prune_k_exhausted += 1;
+                            tt_store_fail!(tt, tf, *k, rule_stats);
                             return -1;
                         }
                         if config.bb && bb_should_prune(tf, um, *k, config) {
                             rule_stats.prune_bb_approx += 1;
+                            tt_store_fail!(tt, tf, *k, rule_stats);
                             return -1;
                         }
                         // Force cut_b_only for the CAB forced pair
-                        return do_case3_branch(
-                            tf, *k, um, stats, rule_stats, config,
+                        let result = do_case3_branch(
+                            tf, *k, um, stats, rule_stats, config, tt,
                             t1_a, t1_c, t2_a, t2_b, t2_c,
                             true, false, false, path_length,
                         );
+                        if result < 0 { tt_store_fail!(tt, tf, *k, rule_stats); }
+                        return result;
                     }
                     _ => {}
                 }
@@ -355,7 +441,20 @@ fn bb_inner(
     loop {
         // --- Phase 1: Process singletons ---
         if !process_singletons(tf, k, um, rule_stats) {
+            tt_store_fail!(tt, tf, *k, rule_stats);
             return -1; // k went negative
+        }
+
+        // --- TT probe: after singletons, state is canonical ---
+        if let Some(t) = tt.as_ref() {
+            rule_stats.tt_lookups += 1;
+            if t.probe(tf.state_hash, *k) {
+                rule_stats.tt_hits += 1;
+                if config.tt_prune {
+                    rule_stats.tt_prunes += 1;
+                    return -1; // no store needed: already in TT
+                }
+            }
         }
 
         // --- Phase 2: Find sibling pair in T1 ---
@@ -374,17 +473,21 @@ fn bb_inner(
                 rule_stats.action_case3_branches += 1;
                 if *k <= 0 {
                     rule_stats.prune_k_exhausted += 1;
+                    tt_store_fail!(tt, tf, *k, rule_stats);
                     return -1;
                 }
                 if config.bb && bb_should_prune(tf, um, *k, config) {
                     rule_stats.prune_bb_approx += 1;
+                    tt_store_fail!(tt, tf, *k, rule_stats);
                     return -1;
                 }
-                return do_case3_branch(
-                    tf, *k, um, stats, rule_stats, config,
+                let result = do_case3_branch(
+                    tf, *k, um, stats, rule_stats, config, tt,
                     t1_a, t1_c, t2_a, t2_b, t2_c,
                     cut_b_only, cut_a_only, cut_c_only, path_length,
                 );
+                if result < 0 { tt_store_fail!(tt, tf, *k, rule_stats); }
+                return result;
             }
         }
     }
@@ -911,6 +1014,7 @@ fn do_case3_branch(
     stats: &mut SolverStats,
     rule_stats: &mut WhiddenRuleStats,
     config: &BBConfig,
+    tt: &mut Option<TranspositionTable>,
     t1_a: NodeId,
     t1_c: NodeId,
     t2_a: NodeId,
@@ -1004,7 +1108,7 @@ fn do_case3_branch(
         }
 
         rule_stats.branch_a_attempts += 1;
-        let result = branch_and_bound(tf, k - 1, um, stats, rule_stats, config);
+        let result = branch_and_bound(tf, k - 1, um, stats, rule_stats, config, tt);
         if result >= 0 {
             rule_stats.branch_a_successes += 1;
             return result;
@@ -1026,9 +1130,9 @@ fn do_case3_branch(
         rule_stats.branch_b_attempts += 1;
         let result = if config.cut_all_b {
             rule_stats.rule_cut_all_b_forced += 1;
-            bb_inner(tf, &mut k_b, um, stats, rule_stats, config, Some((t1_a, t1_c)))
+            bb_inner(tf, &mut k_b, um, stats, rule_stats, config, tt, Some((t1_a, t1_c)))
         } else {
-            branch_and_bound(tf, k - 1, um, stats, rule_stats, config)
+            branch_and_bound(tf, k - 1, um, stats, rule_stats, config, tt)
         };
         if result >= 0 {
             rule_stats.branch_b_successes += 1;
@@ -1052,7 +1156,7 @@ fn do_case3_branch(
         }
 
         rule_stats.branch_c_attempts += 1;
-        let result = branch_and_bound(tf, k - 1, um, stats, rule_stats, config);
+        let result = branch_and_bound(tf, k - 1, um, stats, rule_stats, config, tt);
         if result >= 0 {
             rule_stats.branch_c_successes += 1;
             return result;

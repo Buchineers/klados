@@ -58,6 +58,11 @@ struct RuleSnapshot {
     prune_k_exhausted: u64,
     prune_bb_approx: u64,
     prune_no_enabled_branches: u64,
+    tt_lookups: u64,
+    tt_hits: u64,
+    tt_prunes: u64,
+    tt_stores: u64,
+    tt_overwrites: u64,
     skip_a_cob: u64,
     skip_a_rcob_c: u64,
     skip_a_ep_protected: u64,
@@ -97,6 +102,9 @@ pub fn run(
     log_interval_ms: u64,
     output: Option<PathBuf>,
     bb_2approx: bool,
+    tt_enabled: bool,
+    tt_prune: bool,
+    tt_size_log2: u8,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let content = fs::read_to_string(list_file)?;
     let lines: Vec<&str> = content.lines().collect();
@@ -231,7 +239,11 @@ pub fn run(
             .collect();
         let instance = Instance::new(trees, num_leaves);
 
-        let mut solver = WhiddenSolver::new().with_bb_2approx(bb_2approx);
+        let mut solver = WhiddenSolver::new()
+            .with_bb_2approx(bb_2approx)
+            .with_tt_enabled(tt_enabled)
+            .with_tt_prune(tt_prune)
+            .with_tt_size_log2(tt_size_log2);
         let start = Instant::now();
         let mut last_log_mark = 0.0_f64;
         let digest_short = digest[..16.min(digest.len())].to_string();
@@ -297,6 +309,11 @@ pub fn run(
                 prune_k_exhausted: rs.prune_k_exhausted,
                 prune_bb_approx: rs.prune_bb_approx,
                 prune_no_enabled_branches: rs.prune_no_enabled_branches,
+                tt_lookups: rs.tt_lookups,
+                tt_hits: rs.tt_hits,
+                tt_prunes: rs.tt_prunes,
+                tt_stores: rs.tt_stores,
+                tt_overwrites: rs.tt_overwrites,
                 skip_a_cob: rs.skip_a_cob,
                 skip_a_rcob_c: rs.skip_a_rcob_c,
                 skip_a_ep_protected: rs.skip_a_ep_protected,
@@ -335,6 +352,11 @@ pub fn run(
         agg.totals.prune_k_exhausted += row.rules.prune_k_exhausted;
         agg.totals.prune_bb_approx += row.rules.prune_bb_approx;
         agg.totals.prune_no_enabled_branches += row.rules.prune_no_enabled_branches;
+        agg.totals.tt_lookups += row.rules.tt_lookups;
+        agg.totals.tt_hits += row.rules.tt_hits;
+        agg.totals.tt_prunes += row.rules.tt_prunes;
+        agg.totals.tt_stores += row.rules.tt_stores;
+        agg.totals.tt_overwrites += row.rules.tt_overwrites;
         agg.totals.skip_a_cob += row.rules.skip_a_cob;
         agg.totals.skip_a_rcob_c += row.rules.skip_a_rcob_c;
         agg.totals.skip_a_ep_protected += row.rules.skip_a_ep_protected;
@@ -528,6 +550,17 @@ fn render_human(agg: &AggregateStats, rows: &[InstanceStatsRow], show_instances:
         ));
     }
     out.push_str("\n");
+
+    out.push_str("-- Transposition Table --\n");
+    out.push_str(&format!(
+        "lookups={} hits={} ({}) prunes={} stores={} overwrites={}\n\n",
+        agg.totals.tt_lookups,
+        agg.totals.tt_hits,
+        pct_str(agg.totals.tt_hits, agg.totals.tt_lookups),
+        agg.totals.tt_prunes,
+        agg.totals.tt_stores,
+        agg.totals.tt_overwrites,
+    ));
 
     let mut skip_ranking: Vec<(&str, u64)> = vec![
         ("skip_a_cob", agg.totals.skip_a_cob),

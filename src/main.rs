@@ -113,6 +113,15 @@ enum Commands {
         /// Use Olver 2-approx dual LB for BB pruning instead of 3-approx.
         #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
         bb_2approx: bool,
+        /// Enable the Whidden transposition table.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        tt_enabled: bool,
+        /// Prune on TT hits instead of observe-only accounting.
+        #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+        tt_prune: bool,
+        /// TT size as log2(entry_count).
+        #[arg(long, default_value_t = 23)]
+        tt_size_log2: u8,
     },
 }
 
@@ -158,6 +167,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             log_interval_ms,
             output,
             bb_2approx,
+            tt_enabled,
+            tt_prune,
+            tt_size_log2,
         }) => {
             commands::whidden_stats::run(
                 &list_file,
@@ -168,6 +180,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 log_interval_ms,
                 output,
                 bb_2approx,
+                tt_enabled,
+                tt_prune,
+                tt_size_log2,
             )?;
             return Ok(());
         }

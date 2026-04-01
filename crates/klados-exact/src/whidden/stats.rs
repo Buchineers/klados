@@ -58,6 +58,13 @@ pub struct WhiddenRuleStats {
     pub prune_k_exhausted: u64,
     pub prune_bb_approx: u64,
     pub prune_no_enabled_branches: u64,
+
+    // Transposition table
+    pub tt_lookups: u64,
+    pub tt_hits: u64,
+    pub tt_prunes: u64,
+    pub tt_stores: u64,
+    pub tt_overwrites: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -117,6 +124,12 @@ impl AddAssign<&WhiddenRuleStats> for WhiddenRuleStats {
         self.prune_k_exhausted += rhs.prune_k_exhausted;
         self.prune_bb_approx += rhs.prune_bb_approx;
         self.prune_no_enabled_branches += rhs.prune_no_enabled_branches;
+
+        self.tt_lookups += rhs.tt_lookups;
+        self.tt_hits += rhs.tt_hits;
+        self.tt_prunes += rhs.tt_prunes;
+        self.tt_stores += rhs.tt_stores;
+        self.tt_overwrites += rhs.tt_overwrites;
     }
 }
 
