@@ -10,6 +10,7 @@
 pub mod forest;
 pub mod undo;
 pub mod approx2;
+pub mod zobrist;
 
 pub use forest::{TwinForest, T1, T2};
 pub use undo::UndoMachine;

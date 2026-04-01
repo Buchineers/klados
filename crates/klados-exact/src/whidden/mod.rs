@@ -44,6 +44,21 @@ impl WhiddenSolver {
         self
     }
 
+    pub fn with_tt_enabled(mut self, enabled: bool) -> Self {
+        self.bb_config.tt_enabled = enabled;
+        self
+    }
+
+    pub fn with_tt_prune(mut self, enabled: bool) -> Self {
+        self.bb_config.tt_prune = enabled;
+        self
+    }
+
+    pub fn with_tt_size_log2(mut self, size_log2: u8) -> Self {
+        self.bb_config.tt_size_log2 = size_log2;
+        self
+    }
+
     fn merge_subsolver_stats(&mut self, sub: &WhiddenSolver) {
         self.stats.nodes_explored += sub.stats.nodes_explored;
         self.stats.branches_pruned += sub.stats.branches_pruned;
@@ -97,7 +112,11 @@ impl WhiddenSolver {
 
         // Try cluster decomposition on the reduced instance.
         match crate::cluster_reduction::try_cluster_reduction(reduced, &mut |subinstance| {
-            let mut sub_solver = WhiddenSolver::new();
+            let mut sub_solver = WhiddenSolver {
+                stats: SolverStats::default(),
+                rule_stats: WhiddenRuleStats::default(),
+                bb_config: self.bb_config.clone(),
+            };
             let out = WhiddenSolver::solve(&mut sub_solver, subinstance);
             self.merge_subsolver_stats(&sub_solver);
             out
@@ -149,4 +168,3 @@ impl super::ExactSolver for WhiddenSolver {
         &self.stats
     }
 }
-
