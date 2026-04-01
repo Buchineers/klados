@@ -63,6 +63,13 @@ struct RuleSnapshot {
     tt_prunes: u64,
     tt_stores: u64,
     tt_overwrites: u64,
+    bc_lookups: u64,
+    bc_hits: u64,
+    bc_stores: u64,
+    bb_skipped_by_parent: u64,
+    bb_approx3_calls: u64,
+    bb_approx2_calls: u64,
+    bb_approx2_prunes: u64,
     skip_a_cob: u64,
     skip_a_rcob_c: u64,
     skip_a_ep_protected: u64,
@@ -101,10 +108,13 @@ pub fn run(
     progress: ProgressMode,
     log_interval_ms: u64,
     output: Option<PathBuf>,
+    bb: bool,
     bb_2approx: bool,
     tt_enabled: bool,
     tt_prune: bool,
     tt_size_log2: u8,
+    bound_cache_enabled: bool,
+    bound_cache_size_log2: u8,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let content = fs::read_to_string(list_file)?;
     let lines: Vec<&str> = content.lines().collect();
@@ -240,10 +250,13 @@ pub fn run(
         let instance = Instance::new(trees, num_leaves);
 
         let mut solver = WhiddenSolver::new()
+            .with_bb(bb)
             .with_bb_2approx(bb_2approx)
             .with_tt_enabled(tt_enabled)
             .with_tt_prune(tt_prune)
-            .with_tt_size_log2(tt_size_log2);
+            .with_tt_size_log2(tt_size_log2)
+            .with_bound_cache_enabled(bound_cache_enabled)
+            .with_bound_cache_size_log2(bound_cache_size_log2);
         let start = Instant::now();
         let mut last_log_mark = 0.0_f64;
         let digest_short = digest[..16.min(digest.len())].to_string();
@@ -314,6 +327,13 @@ pub fn run(
                 tt_prunes: rs.tt_prunes,
                 tt_stores: rs.tt_stores,
                 tt_overwrites: rs.tt_overwrites,
+                bc_lookups: rs.bc_lookups,
+                bc_hits: rs.bc_hits,
+                bc_stores: rs.bc_stores,
+                bb_skipped_by_parent: rs.bb_skipped_by_parent,
+                bb_approx3_calls: rs.bb_approx3_calls,
+                bb_approx2_calls: rs.bb_approx2_calls,
+                bb_approx2_prunes: rs.bb_approx2_prunes,
                 skip_a_cob: rs.skip_a_cob,
                 skip_a_rcob_c: rs.skip_a_rcob_c,
                 skip_a_ep_protected: rs.skip_a_ep_protected,
@@ -357,6 +377,13 @@ pub fn run(
         agg.totals.tt_prunes += row.rules.tt_prunes;
         agg.totals.tt_stores += row.rules.tt_stores;
         agg.totals.tt_overwrites += row.rules.tt_overwrites;
+        agg.totals.bc_lookups += row.rules.bc_lookups;
+        agg.totals.bc_hits += row.rules.bc_hits;
+        agg.totals.bc_stores += row.rules.bc_stores;
+        agg.totals.bb_skipped_by_parent += row.rules.bb_skipped_by_parent;
+        agg.totals.bb_approx3_calls += row.rules.bb_approx3_calls;
+        agg.totals.bb_approx2_calls += row.rules.bb_approx2_calls;
+        agg.totals.bb_approx2_prunes += row.rules.bb_approx2_prunes;
         agg.totals.skip_a_cob += row.rules.skip_a_cob;
         agg.totals.skip_a_rcob_c += row.rules.skip_a_rcob_c;
         agg.totals.skip_a_ep_protected += row.rules.skip_a_ep_protected;
@@ -560,6 +587,22 @@ fn render_human(agg: &AggregateStats, rows: &[InstanceStatsRow], show_instances:
         agg.totals.tt_prunes,
         agg.totals.tt_stores,
         agg.totals.tt_overwrites,
+    ));
+
+    out.push_str("-- Bound Cache & Propagation --\n");
+    out.push_str(&format!(
+        "bc: lookups={} hits={} ({}) stores={}\n",
+        agg.totals.bc_lookups,
+        agg.totals.bc_hits,
+        pct_str(agg.totals.bc_hits, agg.totals.bc_lookups),
+        agg.totals.bc_stores,
+    ));
+    out.push_str(&format!(
+        "bb: skipped_by_parent={} approx3_calls={} approx2_calls={} approx2_prunes={}\n\n",
+        agg.totals.bb_skipped_by_parent,
+        agg.totals.bb_approx3_calls,
+        agg.totals.bb_approx2_calls,
+        agg.totals.bb_approx2_prunes,
     ));
 
     let mut skip_ranking: Vec<(&str, u64)> = vec![

@@ -18,6 +18,8 @@ pub enum UndoOp {
     SetParent      { ti: u8, node: NodeId, old: NodeId },
     SetLeft        { ti: u8, node: NodeId, old: NodeId },
     SetRight       { ti: u8, node: NodeId, old: NodeId },
+    /// Hash-only canonicalization of a dead node. On undo, restore hash atoms.
+    HashClearDead  { ti: u8, node: NodeId },
     SetLabel       { ti: u8, node: NodeId, old: u32 },
     SetLabelToNode { ti: u8, label: u32, old: NodeId },
     SetTwin        { ti: u8, node: NodeId, old: NodeId },
@@ -80,6 +82,10 @@ impl UndoMachine {
                 UndoOp::SetProtected { node } => {
                     tf.protected[node as usize] = false;
                 }
+                UndoOp::HashClearDead { ti, node } => {
+                    // Node is about to be revived — restore its hash atoms
+                    restore_dead_node_hash(tf, ti as usize, node);
+                }
             }
         }
     }
@@ -121,30 +127,42 @@ pub fn add_component(tf: &mut TwinForest, ti: usize, node: NodeId, um: &mut Undo
     um.push(UndoOp::AddComponent { ti: ti as u8 });
 }
 
-/// Canonicalize a dead node so unreachable topology does not affect TT hashing.
+/// Hash-canonicalize a dead node so unreachable topology does not affect TT.
+/// Only updates the Zobrist hash — does NOT zero the physical arrays, because
+/// zeroing dead-node pointers triggers a correctness regression in the B&B
+/// (some code paths read stale pointers on dead nodes and depend on the
+/// original values surviving until undo restores the live topology).
 #[inline]
-fn clear_dead_node(tf: &mut TwinForest, ti: usize, node: NodeId, um: &mut UndoMachine) {
-    let ti8 = ti as u8;
-
+fn clear_dead_node_hash(tf: &mut TwinForest, ti: usize, node: NodeId) {
     let parent = tf.parent[ti][node as usize];
     if parent != NONE {
         hash_update(&mut tf.state_hash, tf.zobrist_salts.parent(ti, node), parent, NONE);
-        um.push(UndoOp::SetParent { ti: ti8, node, old: parent });
-        tf.parent[ti][node as usize] = NONE;
     }
-
     let left = tf.left[ti][node as usize];
     if left != NONE {
         hash_update(&mut tf.state_hash, tf.zobrist_salts.left(ti, node), left, NONE);
-        um.push(UndoOp::SetLeft { ti: ti8, node, old: left });
-        tf.left[ti][node as usize] = NONE;
     }
-
     let right = tf.right[ti][node as usize];
     if right != NONE {
         hash_update(&mut tf.state_hash, tf.zobrist_salts.right(ti, node), right, NONE);
-        um.push(UndoOp::SetRight { ti: ti8, node, old: right });
-        tf.right[ti][node as usize] = NONE;
+    }
+}
+
+/// Reverse of clear_dead_node_hash: restore hash atoms for a node being revived.
+/// Called during undo when the node's stale pointers are about to become live again.
+#[inline]
+fn restore_dead_node_hash(tf: &mut TwinForest, ti: usize, node: NodeId) {
+    let parent = tf.parent[ti][node as usize];
+    if parent != NONE {
+        hash_update(&mut tf.state_hash, tf.zobrist_salts.parent(ti, node), NONE, parent);
+    }
+    let left = tf.left[ti][node as usize];
+    if left != NONE {
+        hash_update(&mut tf.state_hash, tf.zobrist_salts.left(ti, node), NONE, left);
+    }
+    let right = tf.right[ti][node as usize];
+    if right != NONE {
+        hash_update(&mut tf.state_hash, tf.zobrist_salts.right(ti, node), NONE, right);
     }
 }
 
@@ -181,7 +199,10 @@ pub fn contract(tf: &mut TwinForest, ti: usize, mut node: NodeId, um: &mut UndoM
             hash_update(&mut tf.state_hash, tf.zobrist_salts.parent(ti, child), node, gp);
             um.push(UndoOp::SetParent { ti: ti8, node: child, old: node });
             tf.parent[ti][child as usize] = gp;
-            clear_dead_node(tf, ti, node, um);
+            // Hash-only clear: remove dead node's stale atoms from hash
+            // but leave the physical arrays intact (zeroing them breaks B&B).
+            clear_dead_node_hash(tf, ti, node);
+            um.push(UndoOp::HashClearDead { ti: ti8, node });
 
             // Continue: grandparent might now be degree-1 too
             node = gp;
@@ -190,7 +211,8 @@ pub fn contract(tf: &mut TwinForest, ti: usize, mut node: NodeId, um: &mut UndoM
             hash_update(&mut tf.state_hash, tf.zobrist_salts.parent(ti, child), node, NONE);
             um.push(UndoOp::SetParent { ti: ti8, node: child, old: node });
             tf.parent[ti][child as usize] = NONE;
-            clear_dead_node(tf, ti, node, um);
+            clear_dead_node_hash(tf, ti, node);
+            um.push(UndoOp::HashClearDead { ti: ti8, node });
 
             if let Some(idx) = tf.components[ti].iter().position(|&c| c == node) {
                 um.push(UndoOp::ReplaceComponent { ti: ti8, idx: idx as u16, old: node });

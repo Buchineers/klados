@@ -65,6 +65,15 @@ pub struct WhiddenRuleStats {
     pub tt_prunes: u64,
     pub tt_stores: u64,
     pub tt_overwrites: u64,
+
+    // Bound cache & propagation
+    pub bc_lookups: u64,
+    pub bc_hits: u64,
+    pub bc_stores: u64,
+    pub bb_skipped_by_parent: u64,
+    pub bb_approx3_calls: u64,
+    pub bb_approx2_calls: u64,
+    pub bb_approx2_prunes: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -130,6 +139,14 @@ impl AddAssign<&WhiddenRuleStats> for WhiddenRuleStats {
         self.tt_prunes += rhs.tt_prunes;
         self.tt_stores += rhs.tt_stores;
         self.tt_overwrites += rhs.tt_overwrites;
+
+        self.bc_lookups += rhs.bc_lookups;
+        self.bc_hits += rhs.bc_hits;
+        self.bc_stores += rhs.bc_stores;
+        self.bb_skipped_by_parent += rhs.bb_skipped_by_parent;
+        self.bb_approx3_calls += rhs.bb_approx3_calls;
+        self.bb_approx2_calls += rhs.bb_approx2_calls;
+        self.bb_approx2_prunes += rhs.bb_approx2_prunes;
     }
 }
 
