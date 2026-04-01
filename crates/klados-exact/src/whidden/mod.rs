@@ -44,6 +44,11 @@ impl WhiddenSolver {
         self
     }
 
+    pub fn with_bb(mut self, enabled: bool) -> Self {
+        self.bb_config.bb = enabled;
+        self
+    }
+
     pub fn with_tt_enabled(mut self, enabled: bool) -> Self {
         self.bb_config.tt_enabled = enabled;
         self
@@ -56,6 +61,16 @@ impl WhiddenSolver {
 
     pub fn with_tt_size_log2(mut self, size_log2: u8) -> Self {
         self.bb_config.tt_size_log2 = size_log2;
+        self
+    }
+
+    pub fn with_bound_cache_enabled(mut self, enabled: bool) -> Self {
+        self.bb_config.bound_cache_enabled = enabled;
+        self
+    }
+
+    pub fn with_bound_cache_size_log2(mut self, size_log2: u8) -> Self {
+        self.bb_config.bound_cache_size_log2 = size_log2;
         self
     }
 

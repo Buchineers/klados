@@ -90,13 +90,20 @@ pub struct BBConfig {
     pub tt_prune: bool,
     /// TT size as power of 2 (default: 23 = 8M entries ≈ 96MB).
     pub tt_size_log2: u8,
+
+    // --- Exact bound cache ---
+    /// Cache exact approx_3 / approx_2_lb values by state hash.
+    pub bound_cache_enabled: bool,
+    /// Bound-cache size as power of 2.
+    pub bound_cache_size_log2: u8,
 }
 
 impl Default for BBConfig {
-    /// rspr's DEFAULT_OPTIMIZATIONS + DEFAULT_ALGORITHM.
+    /// Fastest currently-observed default on hard 2-tree instances:
+    /// keep structural reductions on, but leave BB pruning off.
     fn default() -> Self {
         Self {
-            bb: true,
+            bb: false,
             bb_2approx: false,
             cut_one_b: true,
             reverse_cut_one_b: true,
@@ -116,9 +123,11 @@ impl Default for BBConfig {
             approx_reverse_cut_one_b: true,
             prefer_rho: true,
             prefer_nonbranching: true,
-            tt_enabled: true,
-            tt_prune: false, // observe-only initially
+            tt_enabled: false,
+            tt_prune: false,
             tt_size_log2: 23,
+            bound_cache_enabled: false,
+            bound_cache_size_log2: 20,
         }
     }
 }
@@ -151,6 +160,8 @@ impl BBConfig {
             tt_enabled: false,
             tt_prune: false,
             tt_size_log2: 23,
+            bound_cache_enabled: false,
+            bound_cache_size_log2: 20,
         }
     }
 
@@ -214,6 +225,103 @@ impl TranspositionTable {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Bound cache — caches val3 and approx_2_lb per state hash
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+struct BoundEntry {
+    hash: u64,
+    val3: i16,       // -1 = not cached
+    approx2_lb: i16, // -1 = not cached
+}
+
+struct BoundCache {
+    entries: Vec<BoundEntry>,
+    mask: usize,
+}
+
+impl BoundCache {
+    fn new(size_log2: u8) -> Self {
+        let size = 1usize << size_log2;
+        Self {
+            entries: vec![BoundEntry { hash: 0, val3: -1, approx2_lb: -1 }; size],
+            mask: size - 1,
+        }
+    }
+
+    /// Probe for cached val3. Returns Some(val3) on hit.
+    #[inline]
+    fn probe_val3(&self, hash: u64) -> Option<i32> {
+        let idx = (hash as usize) & self.mask;
+        let e = &self.entries[idx];
+        if e.hash == hash && e.val3 >= 0 {
+            Some(e.val3 as i32)
+        } else {
+            None
+        }
+    }
+
+    /// Probe for cached approx_2_lb. Returns Some(lb) on hit.
+    #[inline]
+    fn probe_approx2(&self, hash: u64) -> Option<i32> {
+        let idx = (hash as usize) & self.mask;
+        let e = &self.entries[idx];
+        if e.hash == hash && e.approx2_lb >= 0 {
+            Some(e.approx2_lb as i32)
+        } else {
+            None
+        }
+    }
+
+    /// Store val3 for a state.
+    #[inline]
+    fn store_val3(&mut self, hash: u64, val3: i32) {
+        let idx = (hash as usize) & self.mask;
+        let e = &mut self.entries[idx];
+        if e.hash != hash {
+            // New entry — evict old
+            e.hash = hash;
+            e.val3 = val3 as i16;
+            e.approx2_lb = -1; // clear stale approx2
+        } else {
+            e.val3 = val3 as i16;
+        }
+    }
+
+    /// Store approx_2_lb for a state (hash must already match from store_val3).
+    #[inline]
+    fn store_approx2(&mut self, hash: u64, lb: i32) {
+        let idx = (hash as usize) & self.mask;
+        let e = &mut self.entries[idx];
+        if e.hash == hash {
+            e.approx2_lb = lb as i16;
+        }
+    }
+}
+
+/// Propagated bound info from parent to child.
+#[derive(Clone, Copy)]
+struct ParentBounds {
+    val3: i32,       // parent's val3 (-1 = unknown)
+    approx2_lb: i32, // parent's approx_2_lb (-1 = unknown)
+}
+
+impl Default for ParentBounds {
+    fn default() -> Self {
+        Self { val3: -1, approx2_lb: -1 }
+    }
+}
+
+/// Margin for parent val3 propagation.
+/// Skip approx_3 if parent_val3 + MARGIN ≤ 3*k.
+/// Value of 6 allows for up to 2 cascading greedy changes.
+const VAL3_SKIP_MARGIN: i32 = 6;
+
+/// Margin for parent approx_2_lb propagation.
+/// Skip approx_2_lb if parent_2lb + MARGIN ≤ k.
+const APPROX2_SKIP_MARGIN: i32 = 2;
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -298,6 +406,13 @@ where
         None
     };
 
+    // Bound cache: persists across k iterations for cross-k reuse of val3/approx2_lb.
+    let mut bc = if config.bound_cache_enabled {
+        Some(BoundCache::new(config.bound_cache_size_log2))
+    } else {
+        None
+    };
+
     for k in lb_k..=ub_k {
         rule_stats.current_k = Some(k);
         rule_stats.k_attempts += 1;
@@ -316,7 +431,7 @@ where
         }
 
         let cp = um.checkpoint();
-        let result = branch_and_bound(&mut tf, k as i32, &mut um, stats, rule_stats, config, &mut tt);
+        let result = branch_and_bound(&mut tf, k as i32, &mut um, stats, rule_stats, config, &mut tt, &mut bc, ParentBounds::default());
         let k_elapsed_ms = k_start.elapsed().as_secs_f64() * 1000.0;
         rule_stats.k_last_elapsed_ms = k_elapsed_ms;
         rule_stats.k_total_elapsed_ms += k_elapsed_ms;
@@ -358,8 +473,10 @@ fn branch_and_bound(
     rule_stats: &mut WhiddenRuleStats,
     config: &BBConfig,
     tt: &mut Option<TranspositionTable>,
+    bc: &mut Option<BoundCache>,
+    parent_bounds: ParentBounds,
 ) -> i32 {
-    bb_inner(tf, &mut k, um, stats, rule_stats, config, tt, None)
+    bb_inner(tf, &mut k, um, stats, rule_stats, config, tt, bc, parent_bounds, None)
 }
 
 /// Inner B&B with optional forced pair (from CUT_ALL_B).
@@ -372,6 +489,8 @@ fn bb_inner(
     rule_stats: &mut WhiddenRuleStats,
     config: &BBConfig,
     tt: &mut Option<TranspositionTable>,
+    bc: &mut Option<BoundCache>,
+    parent_bounds: ParentBounds,
     forced_pair: Option<(NodeId, NodeId)>,
 ) -> i32 {
 
@@ -414,14 +533,15 @@ fn bb_inner(
                             tt_store_fail!(tt, tf, *k, rule_stats);
                             return -1;
                         }
-                        if config.bb && bb_should_prune(tf, um, *k, config) {
+                        let (should_prune, bounds) = bb_should_prune(tf, um, *k, config, bc, parent_bounds, rule_stats);
+                        if should_prune {
                             rule_stats.prune_bb_approx += 1;
                             tt_store_fail!(tt, tf, *k, rule_stats);
                             return -1;
                         }
                         // Force cut_b_only for the CAB forced pair
                         let result = do_case3_branch(
-                            tf, *k, um, stats, rule_stats, config, tt,
+                            tf, *k, um, stats, rule_stats, config, tt, bc, bounds,
                             t1_a, t1_c, t2_a, t2_b, t2_c,
                             true, false, false, path_length,
                         );
@@ -476,13 +596,14 @@ fn bb_inner(
                     tt_store_fail!(tt, tf, *k, rule_stats);
                     return -1;
                 }
-                if config.bb && bb_should_prune(tf, um, *k, config) {
+                let (should_prune, bounds) = bb_should_prune(tf, um, *k, config, bc, parent_bounds, rule_stats);
+                if should_prune {
                     rule_stats.prune_bb_approx += 1;
                     tt_store_fail!(tt, tf, *k, rule_stats);
                     return -1;
                 }
                 let result = do_case3_branch(
-                    tf, *k, um, stats, rule_stats, config, tt,
+                    tf, *k, um, stats, rule_stats, config, tt, bc, bounds,
                     t1_a, t1_c, t2_a, t2_b, t2_c,
                     cut_b_only, cut_a_only, cut_c_only, path_length,
                 );
@@ -844,27 +965,93 @@ fn find_root(tf: &TwinForest, ti: usize, mut node: NodeId) -> NodeId {
 /// BB pruning decision: returns true if the current residual problem
 /// provably has OPT > k, so this branch can be abandoned.
 #[inline]
-fn bb_should_prune(tf: &mut TwinForest, um: &mut UndoMachine, k: i32, config: &BBConfig) -> bool {
-    let mut val3 = 0;
+/// Compute bounds and decide whether to prune.
+/// Returns (should_prune, bounds_for_children).
+fn bb_should_prune(
+    tf: &mut TwinForest,
+    um: &mut UndoMachine,
+    k: i32,
+    config: &BBConfig,
+    bc: &mut Option<BoundCache>,
+    parent: ParentBounds,
+    rule_stats: &mut WhiddenRuleStats,
+) -> (bool, ParentBounds) {
+    let mut bounds = ParentBounds { val3: -1, approx2_lb: -1 };
 
-    // 1. Fast Primal Bound O(n)
-    if config.bb {
+    if !config.bb {
+        return (false, bounds);
+    }
+
+    // --- Phase 1: Parent-propagated skip for val3 ---
+    // DISABLED: val3 can increase by more than MARGIN after one cut,
+    // causing missed prunes that lead to incorrect results.
+    // TODO: find a sound bound for val3 change per cut.
+    // if parent.val3 >= 0 && parent.val3 + VAL3_SKIP_MARGIN <= 3 * k {
+    //     rule_stats.bb_skipped_by_parent += 1;
+    //     bounds.val3 = parent.val3;
+    //     return (false, bounds);
+    // }
+
+    // --- Phase 2: Compute val3 (with optional bound cache) ---
+    let hash = tf.state_hash;
+    let val3;
+    // TODO: bound cache disabled pending correctness investigation
+    if let Some(bc) = bc.as_mut() {
+        rule_stats.bc_lookups += 1;
+        if let Some(cached) = bc.probe_val3(hash) {
+            rule_stats.bc_hits += 1;
+            val3 = cached;
+        } else {
+            rule_stats.bb_approx3_calls += 1;
+            val3 = approx_3(tf, um);
+            bc.store_val3(hash, val3);
+            rule_stats.bc_stores += 1;
+        }
+    } else {
+        rule_stats.bb_approx3_calls += 1;
         val3 = approx_3(tf, um);
-        if val3 > 3 * k {
-            return true;
-        }
+    }
+    bounds.val3 = val3;
+
+    if val3 > 3 * k {
+        return (true, bounds);
     }
 
-    // 2. Heavy Dual Bound O(n^2) - Gated for maximum ROI
-    // Only run if we are high enough in the tree (k >= 3)
-    // AND the 3-approx was on the verge of pruning (val3 > 3 * (k - 1))
+    // --- Phase 3: Selective 2-approx (only near the pruning frontier) ---
+    // Gate: val3 must be in the "gray zone" (close to 3k but not over)
+    // AND parent's approx_2_lb must suggest we might prune
     if config.bb_2approx && k >= 3 && val3 > 3 * (k - 1) {
-        if approx2::approx_2_lb(tf) > k {
-            return true;
+        // Parent skip: if parent's 2-approx was far from threshold, skip
+        if parent.approx2_lb >= 0 && parent.approx2_lb + APPROX2_SKIP_MARGIN <= k {
+            bounds.approx2_lb = parent.approx2_lb;
+            return (false, bounds);
+        }
+
+        let lb2 = if let Some(bc) = bc.as_mut() {
+            rule_stats.bc_lookups += 1;
+            if let Some(cached) = bc.probe_approx2(hash) {
+                rule_stats.bc_hits += 1;
+                cached
+            } else {
+                rule_stats.bb_approx2_calls += 1;
+                let lb2 = approx2::approx_2_lb(tf);
+                bc.store_approx2(hash, lb2);
+                rule_stats.bc_stores += 1;
+                lb2
+            }
+        } else {
+            rule_stats.bb_approx2_calls += 1;
+            approx2::approx_2_lb(tf)
+        };
+        bounds.approx2_lb = lb2;
+
+        if lb2 > k {
+            rule_stats.bb_approx2_prunes += 1;
+            return (true, bounds);
         }
     }
 
-    false
+    (false, bounds)
 }
 
 /// Greedy 3-approximation of rSPR distance on the current forest state.
@@ -1015,6 +1202,8 @@ fn do_case3_branch(
     rule_stats: &mut WhiddenRuleStats,
     config: &BBConfig,
     tt: &mut Option<TranspositionTable>,
+    bc: &mut Option<BoundCache>,
+    bounds: ParentBounds,
     t1_a: NodeId,
     t1_c: NodeId,
     t2_a: NodeId,
@@ -1108,7 +1297,7 @@ fn do_case3_branch(
         }
 
         rule_stats.branch_a_attempts += 1;
-        let result = branch_and_bound(tf, k - 1, um, stats, rule_stats, config, tt);
+        let result = branch_and_bound(tf, k - 1, um, stats, rule_stats, config, tt, bc, bounds);
         if result >= 0 {
             rule_stats.branch_a_successes += 1;
             return result;
@@ -1130,9 +1319,9 @@ fn do_case3_branch(
         rule_stats.branch_b_attempts += 1;
         let result = if config.cut_all_b {
             rule_stats.rule_cut_all_b_forced += 1;
-            bb_inner(tf, &mut k_b, um, stats, rule_stats, config, tt, Some((t1_a, t1_c)))
+            bb_inner(tf, &mut k_b, um, stats, rule_stats, config, tt, bc, bounds, Some((t1_a, t1_c)))
         } else {
-            branch_and_bound(tf, k - 1, um, stats, rule_stats, config, tt)
+            branch_and_bound(tf, k - 1, um, stats, rule_stats, config, tt, bc, bounds)
         };
         if result >= 0 {
             rule_stats.branch_b_successes += 1;
@@ -1156,7 +1345,7 @@ fn do_case3_branch(
         }
 
         rule_stats.branch_c_attempts += 1;
-        let result = branch_and_bound(tf, k - 1, um, stats, rule_stats, config, tt);
+        let result = branch_and_bound(tf, k - 1, um, stats, rule_stats, config, tt, bc, bounds);
         if result >= 0 {
             rule_stats.branch_c_successes += 1;
             return result;

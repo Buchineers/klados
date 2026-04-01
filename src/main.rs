@@ -110,6 +110,9 @@ enum Commands {
         log_interval_ms: u64,
         #[arg(long)]
         output: Option<std::path::PathBuf>,
+        /// Enable BB pruning via approx_3.
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        bb: bool,
         /// Use Olver 2-approx dual LB for BB pruning instead of 3-approx.
         #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
         bb_2approx: bool,
@@ -122,6 +125,12 @@ enum Commands {
         /// TT size as log2(entry_count).
         #[arg(long, default_value_t = 23)]
         tt_size_log2: u8,
+        /// Enable exact bound-cache reuse for approx_3 / approx_2_lb.
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        bound_cache_enabled: bool,
+        /// Bound-cache size as log2(entry_count).
+        #[arg(long, default_value_t = 20)]
+        bound_cache_size_log2: u8,
     },
 }
 
@@ -166,10 +175,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             progress,
             log_interval_ms,
             output,
+            bb,
             bb_2approx,
             tt_enabled,
             tt_prune,
             tt_size_log2,
+            bound_cache_enabled,
+            bound_cache_size_log2,
         }) => {
             commands::whidden_stats::run(
                 &list_file,
@@ -179,10 +191,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 progress,
                 log_interval_ms,
                 output,
+                bb,
                 bb_2approx,
                 tt_enabled,
                 tt_prune,
                 tt_size_log2,
+                bound_cache_enabled,
+                bound_cache_size_log2,
             )?;
             return Ok(());
         }
