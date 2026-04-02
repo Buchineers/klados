@@ -125,6 +125,9 @@ enum Commands {
         /// TT size as log2(entry_count).
         #[arg(long, default_value_t = 23)]
         tt_size_log2: u8,
+        /// Enable the narrow rooted Mestel rule-6 rescue.
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        mestel_rule6: bool,
         /// Enable exact bound-cache reuse for approx_3 / approx_2_lb.
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
         bound_cache_enabled: bool,
@@ -180,6 +183,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             tt_enabled,
             tt_prune,
             tt_size_log2,
+            mestel_rule6,
             bound_cache_enabled,
             bound_cache_size_log2,
         }) => {
@@ -196,6 +200,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tt_enabled,
                 tt_prune,
                 tt_size_log2,
+                mestel_rule6,
                 bound_cache_enabled,
                 bound_cache_size_log2,
             )?;

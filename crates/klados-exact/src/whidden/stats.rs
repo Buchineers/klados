@@ -31,6 +31,7 @@ pub struct WhiddenRuleStats {
     pub rule_rcob_c_fired: u64,
     pub rule_cut_two_b_fired: u64,
     pub rule_cut_all_b_forced: u64,
+    pub rule_mestel6_forced: u64,
 
     // Branch skips by reason
     pub skip_a_cob: u64,
@@ -65,6 +66,9 @@ pub struct WhiddenRuleStats {
     pub tt_prunes: u64,
     pub tt_stores: u64,
     pub tt_overwrites: u64,
+
+    // Experimental rooted split-or-decompose rescue
+    pub mestel6_checks: u64,
 
     // Bound cache & propagation
     pub bc_lookups: u64,
@@ -109,6 +113,7 @@ impl AddAssign<&WhiddenRuleStats> for WhiddenRuleStats {
         self.rule_rcob_c_fired += rhs.rule_rcob_c_fired;
         self.rule_cut_two_b_fired += rhs.rule_cut_two_b_fired;
         self.rule_cut_all_b_forced += rhs.rule_cut_all_b_forced;
+        self.rule_mestel6_forced += rhs.rule_mestel6_forced;
 
         self.skip_a_cob += rhs.skip_a_cob;
         self.skip_a_rcob_c += rhs.skip_a_rcob_c;
@@ -139,6 +144,7 @@ impl AddAssign<&WhiddenRuleStats> for WhiddenRuleStats {
         self.tt_prunes += rhs.tt_prunes;
         self.tt_stores += rhs.tt_stores;
         self.tt_overwrites += rhs.tt_overwrites;
+        self.mestel6_checks += rhs.mestel6_checks;
 
         self.bc_lookups += rhs.bc_lookups;
         self.bc_hits += rhs.bc_hits;
