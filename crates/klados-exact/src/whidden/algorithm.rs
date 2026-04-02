@@ -10,12 +10,13 @@
 
 use std::time::Instant;
 
+use fixedbitset::FixedBitSet;
 use klados_core::tree::{Label, NodeId, Tree, NONE};
 use klados_core::{Instance, SolverStats};
 
 use klados_core::twin_tree::{TwinForest, T1, T2, UndoMachine};
 use klados_core::twin_tree::{undo, approx2};
-use klados_core::lower_bound::cherry_reduce_ub;
+use klados_core::lower_bound::{cherry_reduce_ub, red_blue_approx_detailed};
 use super::stats::{WhiddenProgressUpdate, WhiddenRuleStats};
 
 // ---------------------------------------------------------------------------
@@ -96,6 +97,11 @@ pub struct BBConfig {
     pub bound_cache_enabled: bool,
     /// Bound-cache size as power of 2.
     pub bound_cache_size_log2: u8,
+
+    // --- Experimental rooted split-or-decompose rescue ---
+    /// Apply a narrow version of Mestel et al. branching rule 6 when the
+    /// current 3-component state matches its rooted overlap pattern.
+    pub mestel_rule6: bool,
 }
 
 impl Default for BBConfig {
@@ -128,6 +134,7 @@ impl Default for BBConfig {
             tt_size_log2: 23,
             bound_cache_enabled: false,
             bound_cache_size_log2: 20,
+            mestel_rule6: false,
         }
     }
 }
@@ -162,6 +169,7 @@ impl BBConfig {
             tt_size_log2: 23,
             bound_cache_enabled: false,
             bound_cache_size_log2: 20,
+            mestel_rule6: false,
         }
     }
 
@@ -384,7 +392,14 @@ where
 
     // LB: Olver 2-approx dual on TwinForest (0.009ms, 69.9% tight).
     // This is the iterative deepening floor — skips k=0 through k=D-1.
-    let lb_cuts = approx2::approx_2_lb(&tf).max(0) as usize;
+    let lb_cuts = if n <= 128 {
+        approx2::approx_2_lb(&tf).max(0) as usize
+    } else {
+        // The optimized TwinForest 2-approx uses u128 leaf masks internally.
+        // Above 128 leaves, fall back to the original dynamic-bitset red/blue
+        // lower bound on the reduced input trees.
+        red_blue_approx_detailed(&instance.trees[0], &instance.trees[1]).dual_lb
+    };
     let lb = lb_cuts + 1; // components space
 
     // UB: cherry reduction (cheap for 2-tree, tighter than approx_3).
@@ -510,6 +525,19 @@ fn bb_inner(
             tt_store_fail!(tt, tf, *k, rule_stats);
             return -1;
         }
+        if config.mestel_rule6 {
+            match try_mestel_rule6(tf, k, um, rule_stats) {
+                MestelRule6Result::Applied => {
+                    return bb_inner(tf, k, um, stats, rule_stats, config, tt, bc, parent_bounds, forced_pair);
+                }
+                MestelRule6Result::ExhaustedBudget => {
+                    rule_stats.prune_k_exhausted += 1;
+                    tt_store_fail!(tt, tf, *k, rule_stats);
+                    return -1;
+                }
+                MestelRule6Result::NotApplicable => {}
+            }
+        }
         // Check if the forced pair is still valid (both still siblings in T1)
         let p_a = tf.parent[T1][t1_a as usize];
         let p_c = tf.parent[T1][t1_c as usize];
@@ -563,6 +591,18 @@ fn bb_inner(
         if !process_singletons(tf, k, um, rule_stats) {
             tt_store_fail!(tt, tf, *k, rule_stats);
             return -1; // k went negative
+        }
+
+        if config.mestel_rule6 {
+            match try_mestel_rule6(tf, k, um, rule_stats) {
+                MestelRule6Result::Applied => continue,
+                MestelRule6Result::ExhaustedBudget => {
+                    rule_stats.prune_k_exhausted += 1;
+                    tt_store_fail!(tt, tf, *k, rule_stats);
+                    return -1;
+                }
+                MestelRule6Result::NotApplicable => {}
+            }
         }
 
         // --- TT probe: after singletons, state is canonical ---
@@ -956,6 +996,367 @@ fn find_root(tf: &TwinForest, ti: usize, mut node: NodeId) -> NodeId {
         if p == NONE { return node; }
         node = p;
     }
+}
+
+#[derive(Clone)]
+struct ComponentShape {
+    t2_root: NodeId,
+    leafset: FixedBitSet,
+    homeomorphic: bool,
+    t1_edges: Vec<NodeId>,
+}
+
+#[inline]
+fn leafset_capacity(tf: &TwinForest) -> usize {
+    tf.num_leaves as usize + 1
+}
+
+fn collect_leafset_under(
+    tf: &TwinForest,
+    ti: usize,
+    root: NodeId,
+    restrict: Option<&FixedBitSet>,
+) -> FixedBitSet {
+    let mut out = FixedBitSet::with_capacity(leafset_capacity(tf));
+    if root == NONE {
+        return out;
+    }
+
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if tf.is_leaf(ti, node) {
+            let lbl = tf.label[ti][node as usize];
+            if lbl != 0 && match restrict {
+                Some(keep) => keep.contains(lbl as usize),
+                None => true,
+            } {
+                out.insert(lbl as usize);
+            }
+            continue;
+        }
+
+        let rc = tf.right[ti][node as usize];
+        if rc != NONE {
+            stack.push(rc);
+        }
+        let lc = tf.left[ti][node as usize];
+        if lc != NONE {
+            stack.push(lc);
+        }
+    }
+
+    out
+}
+
+fn common_root_for_leafset(tf: &TwinForest, ti: usize, leafset: &FixedBitSet) -> Option<NodeId> {
+    let mut root: Option<NodeId> = None;
+    for lbl in leafset.ones() {
+        let node = tf.label_to_node[ti][lbl];
+        if node == NONE {
+            return None;
+        }
+        let this_root = find_root(tf, ti, node);
+        match root {
+            None => root = Some(this_root),
+            Some(prev) if prev == this_root => {}
+            Some(_) => return None,
+        }
+    }
+    root
+}
+
+fn current_tree_canonical_for_labels(
+    tf: &TwinForest,
+    ti: usize,
+    root: NodeId,
+    labels: &FixedBitSet,
+) -> u64 {
+    fn build(tf: &TwinForest, ti: usize, node: NodeId, labels: &FixedBitSet) -> Option<u64> {
+        if tf.is_leaf(ti, node) {
+            let lbl = tf.label[ti][node as usize];
+            if lbl != 0 && labels.contains(lbl as usize) {
+                let mut h = lbl as u64;
+                h = h.wrapping_mul(0x9e3779b97f4a7c15);
+                h ^= h >> 30;
+                Some(h)
+            } else {
+                None
+            }
+        } else {
+            let lc = tf.left[ti][node as usize];
+            let rc = tf.right[ti][node as usize];
+            let left = if lc != NONE { build(tf, ti, lc, labels) } else { None };
+            let right = if rc != NONE { build(tf, ti, rc, labels) } else { None };
+            match (left, right) {
+                (Some(a), Some(b)) => {
+                    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                    let mut h = lo;
+                    h = h.wrapping_mul(0xbf58476d1ce4e5b9);
+                    h ^= hi;
+                    h = h.wrapping_mul(0x94d049bb133111eb);
+                    h ^= h >> 31;
+                    Some(h)
+                }
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            }
+        }
+    }
+
+    if root == NONE {
+        0
+    } else {
+        build(tf, ti, root, labels).unwrap_or(0)
+    }
+}
+
+fn collect_induced_edges(
+    tf: &TwinForest,
+    ti: usize,
+    root: NodeId,
+    labels: &FixedBitSet,
+) -> Vec<NodeId> {
+    fn dfs(
+        tf: &TwinForest,
+        ti: usize,
+        node: NodeId,
+        labels: &FixedBitSet,
+        total: usize,
+        out: &mut Vec<NodeId>,
+    ) -> usize {
+        if tf.is_leaf(ti, node) {
+            let lbl = tf.label[ti][node as usize];
+            return usize::from(lbl != 0 && labels.contains(lbl as usize));
+        }
+
+        let mut count = 0usize;
+        let lc = tf.left[ti][node as usize];
+        if lc != NONE {
+            let left_count = dfs(tf, ti, lc, labels, total, out);
+            if left_count > 0 && left_count < total {
+                out.push(lc);
+            }
+            count += left_count;
+        }
+        let rc = tf.right[ti][node as usize];
+        if rc != NONE {
+            let right_count = dfs(tf, ti, rc, labels, total, out);
+            if right_count > 0 && right_count < total {
+                out.push(rc);
+            }
+            count += right_count;
+        }
+        count
+    }
+
+    let total = labels.count_ones(..);
+    let mut out = Vec::new();
+    if root != NONE && total >= 2 {
+        dfs(tf, ti, root, labels, total, &mut out);
+        out.sort_unstable();
+    }
+    out
+}
+
+fn shared_single_edge(a: &[NodeId], b: &[NodeId]) -> Option<NodeId> {
+    let mut i = 0usize;
+    let mut j = 0usize;
+    let mut found = None;
+
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(a[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+
+    found
+}
+
+fn have_shared_edge(a: &[NodeId], b: &[NodeId]) -> bool {
+    let mut i = 0usize;
+    let mut j = 0usize;
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => return true,
+        }
+    }
+    false
+}
+
+fn collect_component_shapes(tf: &TwinForest) -> Vec<ComponentShape> {
+    tf.components[T2]
+        .iter()
+        .copied()
+        .map(|t2_root| {
+            let leafset = collect_leafset_under(tf, T2, t2_root, None);
+            let t2_hash = current_tree_canonical_for_labels(tf, T2, t2_root, &leafset);
+            let t1_root = common_root_for_leafset(tf, T1, &leafset);
+            let t1_hash = t1_root.map(|root| current_tree_canonical_for_labels(tf, T1, root, &leafset));
+            let homeomorphic = t1_hash == Some(t2_hash);
+            let t1_edges = t1_root
+                .map(|root| collect_induced_edges(tf, T1, root, &leafset))
+                .unwrap_or_default();
+
+            ComponentShape {
+                t2_root,
+                leafset,
+                homeomorphic,
+                t1_edges,
+            }
+        })
+        .collect()
+}
+
+fn find_edge_with_descendant_leafset(
+    tf: &TwinForest,
+    ti: usize,
+    root: NodeId,
+    target: &FixedBitSet,
+) -> Option<NodeId> {
+    fn dfs(
+        tf: &TwinForest,
+        ti: usize,
+        node: NodeId,
+        target: &FixedBitSet,
+        cap: usize,
+        found: &mut Option<NodeId>,
+    ) -> FixedBitSet {
+        if tf.is_leaf(ti, node) {
+            let mut out = FixedBitSet::with_capacity(cap);
+            let lbl = tf.label[ti][node as usize];
+            if lbl != 0 {
+                out.insert(lbl as usize);
+            }
+            return out;
+        }
+
+        let mut out = FixedBitSet::with_capacity(cap);
+        let lc = tf.left[ti][node as usize];
+        if lc != NONE {
+            let left = dfs(tf, ti, lc, target, cap, found);
+            if *found == None && &left == target {
+                *found = Some(lc);
+            }
+            out.union_with(&left);
+        }
+        let rc = tf.right[ti][node as usize];
+        if rc != NONE {
+            let right = dfs(tf, ti, rc, target, cap, found);
+            if *found == None && &right == target {
+                *found = Some(rc);
+            }
+            out.union_with(&right);
+        }
+        out
+    }
+
+    let mut found = None;
+    if root != NONE && target.count_ones(..) > 0 {
+        let _ = dfs(tf, ti, root, target, leafset_capacity(tf), &mut found);
+    }
+    found
+}
+
+fn find_mestel_rule6_cut(tf: &TwinForest) -> Option<NodeId> {
+    let shapes = collect_component_shapes(tf);
+    if shapes.len() != 3 {
+        return None;
+    }
+
+    for c in 0..3 {
+        let others = match c {
+            0 => [1usize, 2usize],
+            1 => [0usize, 2usize],
+            _ => [0usize, 1usize],
+        };
+
+        for (a, b) in [(others[0], others[1]), (others[1], others[0])] {
+            let shape_a = &shapes[a];
+            let shape_b = &shapes[b];
+            let shape_c = &shapes[c];
+
+            if !shape_a.homeomorphic || shape_b.homeomorphic || !shape_c.homeomorphic {
+                continue;
+            }
+            if have_shared_edge(&shape_c.t1_edges, &shape_a.t1_edges)
+                || have_shared_edge(&shape_c.t1_edges, &shape_b.t1_edges)
+            {
+                continue;
+            }
+
+            let Some(overlap_edge) = shared_single_edge(&shape_a.t1_edges, &shape_b.t1_edges) else {
+                continue;
+            };
+
+            let below = collect_leafset_under(tf, T1, overlap_edge, Some(&shape_b.leafset));
+            if below.count_ones(..) == 0 || below == shape_b.leafset {
+                continue;
+            }
+
+            if let Some(cut_node) = find_edge_with_descendant_leafset(tf, T2, shape_b.t2_root, &below) {
+                return Some(cut_node);
+            }
+
+            let mut rest = shape_b.leafset.clone();
+            rest.difference_with(&below);
+            if let Some(cut_node) = find_edge_with_descendant_leafset(tf, T2, shape_b.t2_root, &rest) {
+                return Some(cut_node);
+            }
+        }
+    }
+
+    None
+}
+
+enum MestelRule6Result {
+    NotApplicable,
+    Applied,
+    ExhaustedBudget,
+}
+
+fn try_mestel_rule6(
+    tf: &mut TwinForest,
+    k: &mut i32,
+    um: &mut UndoMachine,
+    rule_stats: &mut WhiddenRuleStats,
+) -> MestelRule6Result {
+    if tf.components[T2].len() != 3 {
+        return MestelRule6Result::NotApplicable;
+    }
+
+    rule_stats.mestel6_checks += 1;
+
+    let Some(cut_node) = find_mestel_rule6_cut(tf) else {
+        return MestelRule6Result::NotApplicable;
+    };
+
+    if *k <= 0 {
+        return MestelRule6Result::ExhaustedBudget;
+    }
+
+    let parent = tf.parent[T2][cut_node as usize];
+    if parent == NONE {
+        return MestelRule6Result::NotApplicable;
+    }
+
+    *k -= 1;
+    undo::cut_parent(tf, T2, cut_node, um);
+    undo::add_component(tf, T2, cut_node, um);
+    undo::contract(tf, T2, parent, um);
+    rule_stats.rule_mestel6_forced += 1;
+    MestelRule6Result::Applied
 }
 
 // ---------------------------------------------------------------------------

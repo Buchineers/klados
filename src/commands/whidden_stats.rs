@@ -48,6 +48,7 @@ struct RuleSnapshot {
     rule_rcob_c_fired: u64,
     rule_cut_two_b_fired: u64,
     rule_cut_all_b_forced: u64,
+    rule_mestel6_forced: u64,
     prefer_nonbranching_hits: u64,
     branch_a_attempts: u64,
     branch_a_successes: u64,
@@ -63,6 +64,7 @@ struct RuleSnapshot {
     tt_prunes: u64,
     tt_stores: u64,
     tt_overwrites: u64,
+    mestel6_checks: u64,
     bc_lookups: u64,
     bc_hits: u64,
     bc_stores: u64,
@@ -113,6 +115,7 @@ pub fn run(
     tt_enabled: bool,
     tt_prune: bool,
     tt_size_log2: u8,
+    mestel_rule6: bool,
     bound_cache_enabled: bool,
     bound_cache_size_log2: u8,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -255,6 +258,7 @@ pub fn run(
             .with_tt_enabled(tt_enabled)
             .with_tt_prune(tt_prune)
             .with_tt_size_log2(tt_size_log2)
+            .with_mestel_rule6(mestel_rule6)
             .with_bound_cache_enabled(bound_cache_enabled)
             .with_bound_cache_size_log2(bound_cache_size_log2);
         let start = Instant::now();
@@ -312,6 +316,7 @@ pub fn run(
                 rule_rcob_c_fired: rs.rule_rcob_c_fired,
                 rule_cut_two_b_fired: rs.rule_cut_two_b_fired,
                 rule_cut_all_b_forced: rs.rule_cut_all_b_forced,
+                rule_mestel6_forced: rs.rule_mestel6_forced,
                 prefer_nonbranching_hits: rs.prefer_nonbranching_hits,
                 branch_a_attempts: rs.branch_a_attempts,
                 branch_a_successes: rs.branch_a_successes,
@@ -327,6 +332,7 @@ pub fn run(
                 tt_prunes: rs.tt_prunes,
                 tt_stores: rs.tt_stores,
                 tt_overwrites: rs.tt_overwrites,
+                mestel6_checks: rs.mestel6_checks,
                 bc_lookups: rs.bc_lookups,
                 bc_hits: rs.bc_hits,
                 bc_stores: rs.bc_stores,
@@ -362,6 +368,7 @@ pub fn run(
         agg.totals.rule_rcob_c_fired += row.rules.rule_rcob_c_fired;
         agg.totals.rule_cut_two_b_fired += row.rules.rule_cut_two_b_fired;
         agg.totals.rule_cut_all_b_forced += row.rules.rule_cut_all_b_forced;
+        agg.totals.rule_mestel6_forced += row.rules.rule_mestel6_forced;
         agg.totals.prefer_nonbranching_hits += row.rules.prefer_nonbranching_hits;
         agg.totals.branch_a_attempts += row.rules.branch_a_attempts;
         agg.totals.branch_a_successes += row.rules.branch_a_successes;
@@ -377,6 +384,7 @@ pub fn run(
         agg.totals.tt_prunes += row.rules.tt_prunes;
         agg.totals.tt_stores += row.rules.tt_stores;
         agg.totals.tt_overwrites += row.rules.tt_overwrites;
+        agg.totals.mestel6_checks += row.rules.mestel6_checks;
         agg.totals.bc_lookups += row.rules.bc_lookups;
         agg.totals.bc_hits += row.rules.bc_hits;
         agg.totals.bc_stores += row.rules.bc_stores;
@@ -515,6 +523,7 @@ fn render_human(agg: &AggregateStats, rows: &[InstanceStatsRow], show_instances:
 
     let mut rule_ranking: Vec<(&str, u64)> = vec![
         ("CUT_ALL_B forced", agg.totals.rule_cut_all_b_forced),
+        ("MESTEL6 forced", agg.totals.rule_mestel6_forced),
         ("COB", agg.totals.rule_cob_fired),
         ("CUT_TWO_B", agg.totals.rule_cut_two_b_fired),
         ("Prefer nonbranching", agg.totals.prefer_nonbranching_hits),
@@ -590,6 +599,11 @@ fn render_human(agg: &AggregateStats, rows: &[InstanceStatsRow], show_instances:
     ));
 
     out.push_str("-- Bound Cache & Propagation --\n");
+    out.push_str(&format!(
+        "mestel6: checks={} forced={}\n",
+        agg.totals.mestel6_checks,
+        agg.totals.rule_mestel6_forced,
+    ));
     out.push_str(&format!(
         "bc: lookups={} hits={} ({}) stores={}\n",
         agg.totals.bc_lookups,

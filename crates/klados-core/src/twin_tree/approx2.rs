@@ -590,6 +590,10 @@ thread_local! {
 pub fn approx_2_lb(tf: &TwinForest) -> i32 {
     let n = tf.num_leaves;
     if n <= 1 { return 0; }
+    // This implementation relies on u128 leaf masks, so it is only valid
+    // up to 128 leaves. For larger instances, skip the bound instead of
+    // letting the mask arithmetic misbehave and blow up memory.
+    if n > 128 { return 0; }
 
     WS.with(|ws| {
         let w = &mut *ws.borrow_mut();

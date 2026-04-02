@@ -74,6 +74,11 @@ impl WhiddenSolver {
         self
     }
 
+    pub fn with_mestel_rule6(mut self, enabled: bool) -> Self {
+        self.bb_config.mestel_rule6 = enabled;
+        self
+    }
+
     fn merge_subsolver_stats(&mut self, sub: &WhiddenSolver) {
         self.stats.nodes_explored += sub.stats.nodes_explored;
         self.stats.branches_pruned += sub.stats.branches_pruned;
