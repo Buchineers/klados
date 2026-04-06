@@ -102,8 +102,12 @@ impl WhiddenSolver {
         instance: &Instance,
         mut progress: Option<&mut dyn FnMut(WhiddenProgressUpdate)>,
     ) -> Option<Vec<Tree>> {
-        assert_eq!(instance.num_trees(), 2,
-            "Whidden solver requires exactly 2 trees, got {}", instance.num_trees());
+        assert_eq!(
+            instance.num_trees(),
+            2,
+            "Whidden solver requires exactly 2 trees, got {}",
+            instance.num_trees()
+        );
 
         if instance.num_leaves <= 1 {
             return Some(vec![instance.trees[0].clone()]);
@@ -164,16 +168,10 @@ impl WhiddenSolver {
         self.rule_stats.k_total_elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
 
         reduced_result.map(|components| {
-            kernelize::expand_solution(
-                components,
-                &kern,
-                &instance.trees[0],
-                instance.num_leaves,
-            )
+            kernelize::expand_solution(components, &kern, &instance.trees[0], instance.num_leaves)
         })
     }
 }
-
 
 impl super::ExactSolver for WhiddenSolver {
     fn name(&self) -> &'static str {

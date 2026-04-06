@@ -19,10 +19,13 @@ pub fn run(list_file: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let lines: Vec<&str> = content.lines().collect();
     let base_dir = list_file.parent().unwrap_or(std::path::Path::new("."));
 
-    let total_instances = lines.iter().filter(|l| {
-        let l = l.trim();
-        !l.is_empty() && !l.starts_with('#')
-    }).count();
+    let total_instances = lines
+        .iter()
+        .filter(|l| {
+            let l = l.trim();
+            !l.is_empty() && !l.starts_with('#')
+        })
+        .count();
 
     eprintln!(
         "Checking bounds on {} instances from {}\n",

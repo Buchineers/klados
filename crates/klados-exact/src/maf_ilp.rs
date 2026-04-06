@@ -616,7 +616,10 @@ pub fn solve_olver_lp(instance: &Instance) -> Option<f64> {
                 }
                 let s_idx = pair_to_idx(i1, i2_s);
                 if is_strictly_below(r_idx, s_idx) {
-                    u1_arcs.push(Arc { from: r_idx, to: s_idx });
+                    u1_arcs.push(Arc {
+                        from: r_idx,
+                        to: s_idx,
+                    });
                 }
             }
         }
@@ -632,7 +635,10 @@ pub fn solve_olver_lp(instance: &Instance) -> Option<f64> {
                 }
                 let s_idx = pair_to_idx(i1_s, i2);
                 if is_strictly_below(r_idx, s_idx) {
-                    u2_arcs.push(Arc { from: r_idx, to: s_idx });
+                    u2_arcs.push(Arc {
+                        from: r_idx,
+                        to: s_idx,
+                    });
                 }
             }
         }

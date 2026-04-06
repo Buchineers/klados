@@ -1,13 +1,16 @@
 //! Delete a specific leaf from an instance and output the reduced instance.
 
-use std::io::{self, Write};
 use klados_core::Instance;
 use klados_exact::kernelize;
 use pace26io::newick::NewickWriter;
+use std::io::{self, Write};
 
 pub fn run(instance: &Instance, leaf: u32) -> Result<(), Box<dyn std::error::Error>> {
     if leaf < 1 || leaf > instance.num_leaves {
-        eprintln!("ERROR: leaf {} out of range [1, {}]", leaf, instance.num_leaves);
+        eprintln!(
+            "ERROR: leaf {} out of range [1, {}]",
+            leaf, instance.num_leaves
+        );
         return Ok(());
     }
 
@@ -30,15 +33,19 @@ pub fn run(instance: &Instance, leaf: u32) -> Result<(), Box<dyn std::error::Err
         reverse_map[new_lbl as usize] = old_lbl;
     }
 
-    let trees: Vec<klados_core::Tree> = instance.trees.iter().map(|t| {
-        // Prune and relabel
-        let mut keep_set = fixedbitset::FixedBitSet::with_capacity(n + 1);
-        for &l in &keep_labels {
-            keep_set.insert(l as usize);
-        }
-        let pruned = t.prune_to_leafset(&keep_set);
-        pruned.relabel(&label_map, new_n)
-    }).collect();
+    let trees: Vec<klados_core::Tree> = instance
+        .trees
+        .iter()
+        .map(|t| {
+            // Prune and relabel
+            let mut keep_set = fixedbitset::FixedBitSet::with_capacity(n + 1);
+            for &l in &keep_labels {
+                keep_set.insert(l as usize);
+            }
+            let pruned = t.prune_to_leafset(&keep_set);
+            pruned.relabel(&label_map, new_n)
+        })
+        .collect();
 
     let reduced = Instance::new(trees, new_n);
 

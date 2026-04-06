@@ -7,8 +7,8 @@
 //! Optimized for the 2-tree case: no generic tree indexing,
 //! twin lookups are O(1) array access.
 
-use crate::tree::{Label, Tree, NONE, NodeId};
 use super::zobrist::{self, ZobristSalts};
+use crate::tree::{Label, NONE, NodeId, Tree};
 
 /// Index into the tree pair: T1 = 0, T2 = 1.
 pub const T1: usize = 0;
@@ -19,11 +19,11 @@ pub const T2: usize = 1;
 pub struct TwinForest {
     // --- Topology (mutable via undo) ---
     pub parent: [Vec<NodeId>; 2],
-    pub left:   [Vec<NodeId>; 2],
-    pub right:  [Vec<NodeId>; 2],
+    pub left: [Vec<NodeId>; 2],
+    pub right: [Vec<NodeId>; 2],
 
     // --- Labels ---
-    pub label:         [Vec<Label>; 2],
+    pub label: [Vec<Label>; 2],
     pub label_to_node: [Vec<NodeId>; 2],
 
     // --- Twin pointers: twin[T1][node] → T2 node, twin[T2][node] → T1 node ---
@@ -37,9 +37,9 @@ pub struct TwinForest {
 
     // --- Immutable T1 original (for solution extraction) ---
     pub orig_parent: Vec<NodeId>,
-    pub orig_left:   Vec<NodeId>,
-    pub orig_right:  Vec<NodeId>,
-    pub orig_label:  Vec<Label>,
+    pub orig_left: Vec<NodeId>,
+    pub orig_right: Vec<NodeId>,
+    pub orig_label: Vec<Label>,
 
     // --- Precomputed T2 depth (immutable, for Case 3 orientation) ---
     pub t2_depth: Vec<u16>,
@@ -53,7 +53,7 @@ pub struct TwinForest {
 
     // --- Metadata ---
     pub num_nodes: [usize; 2],
-    pub root:      [NodeId; 2],
+    pub root: [NodeId; 2],
     pub num_leaves: u32,
 }
 
@@ -75,15 +75,15 @@ impl TwinForest {
             parent,
             left,
             right,
-            label:         [t1.label.clone(),         t2.label.clone()],
+            label: [t1.label.clone(), t2.label.clone()],
             label_to_node: [t1.label_to_node.clone(), t2.label_to_node.clone()],
             twin: [vec![NONE; n1], vec![NONE; n2]],
             components: [vec![t1.root], vec![t2.root]],
             collapsed_into: (0..=num_leaves).collect(),
             orig_parent: t1.parent.clone(),
-            orig_left:   t1.left.clone(),
-            orig_right:  t1.right.clone(),
-            orig_label:  t1.label.clone(),
+            orig_left: t1.left.clone(),
+            orig_right: t1.right.clone(),
+            orig_label: t1.label.clone(),
             t2_depth: vec![0; n2],
             protected: vec![false; n2],
             state_hash,
@@ -115,9 +115,13 @@ impl TwinForest {
         while let Some((node, d)) = stack.pop() {
             depth[node as usize] = d;
             let rc = right[node as usize];
-            if rc != NONE { stack.push((rc, d + 1)); }
+            if rc != NONE {
+                stack.push((rc, d + 1));
+            }
             let lc = left[node as usize];
-            if lc != NONE { stack.push((lc, d + 1)); }
+            if lc != NONE {
+                stack.push((lc, d + 1));
+            }
         }
     }
 
@@ -133,8 +137,7 @@ impl TwinForest {
     pub fn is_sibling_pair(&self, ti: usize, node: NodeId) -> bool {
         let lc = self.left[ti][node as usize];
         let rc = self.right[ti][node as usize];
-        lc != NONE && rc != NONE
-            && self.is_leaf(ti, lc) && self.is_leaf(ti, rc)
+        lc != NONE && rc != NONE && self.is_leaf(ti, lc) && self.is_leaf(ti, rc)
     }
 
     // --- Navigation ---
@@ -142,20 +145,29 @@ impl TwinForest {
     #[inline]
     pub fn sibling(&self, ti: usize, node: NodeId) -> NodeId {
         let p = self.parent[ti][node as usize];
-        if p == NONE { return NONE; }
+        if p == NONE {
+            return NONE;
+        }
         let l = self.left[ti][p as usize];
-        if l == node { self.right[ti][p as usize] } else { l }
+        if l == node {
+            self.right[ti][p as usize]
+        } else {
+            l
+        }
     }
 
     #[inline]
     pub fn num_children(&self, ti: usize, node: NodeId) -> u8 {
-        (self.left[ti][node as usize] != NONE) as u8
-            + (self.right[ti][node as usize] != NONE) as u8
+        (self.left[ti][node as usize] != NONE) as u8 + (self.right[ti][node as usize] != NONE) as u8
     }
 
     #[inline]
     pub fn only_child(&self, ti: usize, node: NodeId) -> NodeId {
         let lc = self.left[ti][node as usize];
-        if lc != NONE { lc } else { self.right[ti][node as usize] }
+        if lc != NONE {
+            lc
+        } else {
+            self.right[ti][node as usize]
+        }
     }
 }
