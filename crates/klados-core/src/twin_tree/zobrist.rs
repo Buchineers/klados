@@ -60,7 +60,10 @@ impl ZobristSalts {
             state = state.wrapping_add(0x9E3779B97F4A7C15);
             data.push(splitmix64(state));
         }
-        Self { data, stride: NUM_FIELDS }
+        Self {
+            data,
+            stride: NUM_FIELDS,
+        }
     }
 
     #[inline(always)]
@@ -70,17 +73,38 @@ impl ZobristSalts {
 
     #[inline(always)]
     pub fn parent(&self, ti: usize, node: NodeId) -> u64 {
-        self.salt(if ti == 0 { FIELD_PARENT_T1 } else { FIELD_PARENT_T2 }, node)
+        self.salt(
+            if ti == 0 {
+                FIELD_PARENT_T1
+            } else {
+                FIELD_PARENT_T2
+            },
+            node,
+        )
     }
 
     #[inline(always)]
     pub fn left(&self, ti: usize, node: NodeId) -> u64 {
-        self.salt(if ti == 0 { FIELD_LEFT_T1 } else { FIELD_LEFT_T2 }, node)
+        self.salt(
+            if ti == 0 {
+                FIELD_LEFT_T1
+            } else {
+                FIELD_LEFT_T2
+            },
+            node,
+        )
     }
 
     #[inline(always)]
     pub fn right(&self, ti: usize, node: NodeId) -> u64 {
-        self.salt(if ti == 0 { FIELD_RIGHT_T1 } else { FIELD_RIGHT_T2 }, node)
+        self.salt(
+            if ti == 0 {
+                FIELD_RIGHT_T1
+            } else {
+                FIELD_RIGHT_T2
+            },
+            node,
+        )
     }
 }
 

@@ -708,6 +708,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "fixedbitset",
+ "highs",
  "indicatif",
  "klados-core",
  "klados-exact",
@@ -745,6 +746,9 @@ dependencies = [
 name = "klados-heuristic"
 version = "0.1.0"
 dependencies = [
+ "fixedbitset",
+ "fxhash",
+ "highs",
  "klados-core",
  "libc",
  "pace26io",

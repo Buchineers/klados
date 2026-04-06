@@ -131,9 +131,7 @@ pub fn run(scores_file: &PathBuf, max_leaves: u32) -> Result<(), Box<dyn std::er
         entries
     } else {
         let all: HashMap<String, ScoreEntry> = serde_json::from_str(&content)?;
-        all.into_iter()
-            .filter(|(_, e)| e.trees == 2)
-            .collect()
+        all.into_iter().filter(|(_, e)| e.trees == 2).collect()
     };
 
     let base_dir = scores_file.parent().unwrap_or(std::path::Path::new("."));
@@ -166,15 +164,15 @@ pub fn run(scores_file: &PathBuf, max_leaves: u32) -> Result<(), Box<dyn std::er
     let mut total_olv_ms = 0.0f64;
     let mut total_a3_ms = 0.0f64;
 
-    let mut olv_gt_rb = 0usize;     // Olver strictly > red-blue dual
-    let mut olv_lt_rb = 0usize;     // Olver strictly < red-blue dual
+    let mut olv_gt_rb = 0usize; // Olver strictly > red-blue dual
+    let mut olv_lt_rb = 0usize; // Olver strictly < red-blue dual
     let mut olv_eq_rb = 0usize;
 
-    let mut olv_gt_a3 = 0usize;     // Olver strictly > approx3/3
+    let mut olv_gt_a3 = 0usize; // Olver strictly > approx3/3
     let mut olv_lt_a3 = 0usize;
     let mut olv_eq_a3 = 0usize;
 
-    let mut rb_violations = 0usize;  // rb dual > best_known
+    let mut rb_violations = 0usize; // rb dual > best_known
     let mut olv_violations = 0usize; // olver lb > best_known
 
     let mut rb_sum = 0i64;
@@ -268,13 +266,21 @@ pub fn run(scores_file: &PathBuf, max_leaves: u32) -> Result<(), Box<dyn std::er
         olv_minus_rb.push(d_olv_rb);
         olv_minus_a3.push(d_olv_a3);
 
-        if olv_lb > rb_dual { olv_gt_rb += 1; }
-        else if olv_lb < rb_dual { olv_lt_rb += 1; }
-        else { olv_eq_rb += 1; }
+        if olv_lb > rb_dual {
+            olv_gt_rb += 1;
+        } else if olv_lb < rb_dual {
+            olv_lt_rb += 1;
+        } else {
+            olv_eq_rb += 1;
+        }
 
-        if olv_lb > a3_lb { olv_gt_a3 += 1; }
-        else if olv_lb < a3_lb { olv_lt_a3 += 1; }
-        else { olv_eq_a3 += 1; }
+        if olv_lb > a3_lb {
+            olv_gt_a3 += 1;
+        } else if olv_lb < a3_lb {
+            olv_lt_a3 += 1;
+        } else {
+            olv_eq_a3 += 1;
+        }
 
         total_rb_ms += rb_ms;
         total_olv_ms += olv_ms;
@@ -288,10 +294,26 @@ pub fn run(scores_file: &PathBuf, max_leaves: u32) -> Result<(), Box<dyn std::er
         processed += 1;
 
         // Markers for improvements
-        let olv_rb_mark = if olv_lb > rb_dual { "+" } else if olv_lb < rb_dual { "-" } else { "" };
-        let olv_a3_mark = if olv_lb > a3_lb { "+" } else if olv_lb < a3_lb { "-" } else { "" };
+        let olv_rb_mark = if olv_lb > rb_dual {
+            "+"
+        } else if olv_lb < rb_dual {
+            "-"
+        } else {
+            ""
+        };
+        let olv_a3_mark = if olv_lb > a3_lb {
+            "+"
+        } else if olv_lb < a3_lb {
+            "-"
+        } else {
+            ""
+        };
 
-        let short_name = if digest.len() >= 12 { &digest[..12] } else { digest.as_str() };
+        let short_name = if digest.len() >= 12 {
+            &digest[..12]
+        } else {
+            digest.as_str()
+        };
 
         println!(
             "{:<12} {:>5} {:>5} {:>6} {:>6} {:>6} {:>7.2} {:>7.2} {:>7.2} {:>5} {:>5}",
@@ -317,47 +339,98 @@ pub fn run(scores_file: &PathBuf, max_leaves: u32) -> Result<(), Box<dyn std::er
     }
 
     // === SUMMARY ===
-    println!("\n=== SUMMARY ({} instances, {} errors) ===", processed, errors);
+    println!(
+        "\n=== SUMMARY ({} instances, {} errors) ===",
+        processed, errors
+    );
 
     println!("\n--- Correctness ---");
     println!("RB dual violations (> best):    {}", rb_violations);
     println!("Olver TF violations (> best):   {}", olv_violations);
     if olv_violations > 0 {
-        println!("WARNING: Olver LB exceeds best_known on {} instances!", olv_violations);
+        println!(
+            "WARNING: Olver LB exceeds best_known on {} instances!",
+            olv_violations
+        );
     } else {
         println!("OK: Olver LB never exceeds best_known");
     }
 
     println!("\n--- Quality: Olver vs Red-Blue Dual ---");
-    println!("Olver > RB dual:  {:>6} ({:.1}%)", olv_gt_rb, 100.0 * olv_gt_rb as f64 / processed as f64);
-    println!("Olver = RB dual:  {:>6} ({:.1}%)", olv_eq_rb, 100.0 * olv_eq_rb as f64 / processed as f64);
-    println!("Olver < RB dual:  {:>6} ({:.1}%)", olv_lt_rb, 100.0 * olv_lt_rb as f64 / processed as f64);
+    println!(
+        "Olver > RB dual:  {:>6} ({:.1}%)",
+        olv_gt_rb,
+        100.0 * olv_gt_rb as f64 / processed as f64
+    );
+    println!(
+        "Olver = RB dual:  {:>6} ({:.1}%)",
+        olv_eq_rb,
+        100.0 * olv_eq_rb as f64 / processed as f64
+    );
+    println!(
+        "Olver < RB dual:  {:>6} ({:.1}%)",
+        olv_lt_rb,
+        100.0 * olv_lt_rb as f64 / processed as f64
+    );
     println!("Mean RB dual:     {:.2}", rb_sum as f64 / processed as f64);
     println!("Mean Olver LB:    {:.2}", olv_sum as f64 / processed as f64);
-    println!("Mean best_known:  {:.2}", best_sum as f64 / processed as f64);
+    println!(
+        "Mean best_known:  {:.2}",
+        best_sum as f64 / processed as f64
+    );
 
     olv_minus_rb.sort();
     let olv_rb_median = olv_minus_rb[processed / 2];
     let olv_rb_mean = olv_minus_rb.iter().map(|&x| x as f64).sum::<f64>() / processed as f64;
     let olv_rb_total: i64 = olv_minus_rb.iter().map(|&x| x as i64).sum();
-    println!("Delta (Olv-RB):   total={} mean={:.2} median={}", olv_rb_total, olv_rb_mean, olv_rb_median);
+    println!(
+        "Delta (Olv-RB):   total={} mean={:.2} median={}",
+        olv_rb_total, olv_rb_mean, olv_rb_median
+    );
 
     println!("\n--- Quality: Olver vs 3-Approx/3 ---");
-    println!("Olver > A3/3:     {:>6} ({:.1}%)", olv_gt_a3, 100.0 * olv_gt_a3 as f64 / processed as f64);
-    println!("Olver = A3/3:     {:>6} ({:.1}%)", olv_eq_a3, 100.0 * olv_eq_a3 as f64 / processed as f64);
-    println!("Olver < A3/3:     {:>6} ({:.1}%)", olv_lt_a3, 100.0 * olv_lt_a3 as f64 / processed as f64);
+    println!(
+        "Olver > A3/3:     {:>6} ({:.1}%)",
+        olv_gt_a3,
+        100.0 * olv_gt_a3 as f64 / processed as f64
+    );
+    println!(
+        "Olver = A3/3:     {:>6} ({:.1}%)",
+        olv_eq_a3,
+        100.0 * olv_eq_a3 as f64 / processed as f64
+    );
+    println!(
+        "Olver < A3/3:     {:>6} ({:.1}%)",
+        olv_lt_a3,
+        100.0 * olv_lt_a3 as f64 / processed as f64
+    );
     println!("Mean A3/3 LB:     {:.2}", a3_sum as f64 / processed as f64);
 
     olv_minus_a3.sort();
     let olv_a3_median = olv_minus_a3[processed / 2];
     let olv_a3_mean = olv_minus_a3.iter().map(|&x| x as f64).sum::<f64>() / processed as f64;
     let olv_a3_total: i64 = olv_minus_a3.iter().map(|&x| x as i64).sum();
-    println!("Delta (Olv-A3/3): total={} mean={:.2} median={}", olv_a3_total, olv_a3_mean, olv_a3_median);
+    println!(
+        "Delta (Olv-A3/3): total={} mean={:.2} median={}",
+        olv_a3_total, olv_a3_mean, olv_a3_median
+    );
 
     println!("\n--- Performance ---");
-    println!("Total RB time:    {:.1} ms ({:.3} ms/inst)", total_rb_ms, total_rb_ms / processed as f64);
-    println!("Total Olver time: {:.1} ms ({:.3} ms/inst)", total_olv_ms, total_olv_ms / processed as f64);
-    println!("Total A3 time:    {:.1} ms ({:.3} ms/inst)", total_a3_ms, total_a3_ms / processed as f64);
+    println!(
+        "Total RB time:    {:.1} ms ({:.3} ms/inst)",
+        total_rb_ms,
+        total_rb_ms / processed as f64
+    );
+    println!(
+        "Total Olver time: {:.1} ms ({:.3} ms/inst)",
+        total_olv_ms,
+        total_olv_ms / processed as f64
+    );
+    println!(
+        "Total A3 time:    {:.1} ms ({:.3} ms/inst)",
+        total_a3_ms,
+        total_a3_ms / processed as f64
+    );
     let speedup_rb = total_rb_ms / total_olv_ms;
     let speedup_a3 = total_a3_ms / total_olv_ms;
     println!("RB/Olver ratio:   {:.2}x", speedup_rb);
@@ -365,13 +438,24 @@ pub fn run(scores_file: &PathBuf, max_leaves: u32) -> Result<(), Box<dyn std::er
 
     // Tightness vs best_known
     println!("\n--- Tightness (LB / best_known) ---");
-    let rb_tightness = if best_sum > 0 { rb_sum as f64 / best_sum as f64 * 100.0 } else { 0.0 };
-    let olv_tightness = if best_sum > 0 { olv_sum as f64 / best_sum as f64 * 100.0 } else { 0.0 };
-    let a3_tightness = if best_sum > 0 { a3_sum as f64 / best_sum as f64 * 100.0 } else { 0.0 };
+    let rb_tightness = if best_sum > 0 {
+        rb_sum as f64 / best_sum as f64 * 100.0
+    } else {
+        0.0
+    };
+    let olv_tightness = if best_sum > 0 {
+        olv_sum as f64 / best_sum as f64 * 100.0
+    } else {
+        0.0
+    };
+    let a3_tightness = if best_sum > 0 {
+        a3_sum as f64 / best_sum as f64 * 100.0
+    } else {
+        0.0
+    };
     println!("RB dual:          {:.1}%", rb_tightness);
     println!("Olver TF:         {:.1}%", olv_tightness);
     println!("A3/3:             {:.1}%", a3_tightness);
 
     Ok(())
 }
-

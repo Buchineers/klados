@@ -7,11 +7,11 @@
 //! Algorithms:
 //! - `approx2::approx_2_lb`: Olver et al. 2-approximation dual lower bound (O(n²))
 
+pub mod approx2;
 pub mod forest;
 pub mod undo;
-pub mod approx2;
 pub mod zobrist;
 
-pub use forest::{TwinForest, T1, T2};
-pub use undo::UndoMachine;
 pub use approx2::approx_2_lb;
+pub use forest::{T1, T2, TwinForest};
+pub use undo::UndoMachine;

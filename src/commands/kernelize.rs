@@ -46,21 +46,36 @@ pub fn run(
     // Always print timing
     let total_us = total_duration.as_micros();
     if total_us > 1000 {
-        eprintln!("// Time: {:.2} ms ({} rule applications)", total_us as f64 / 1000.0, result.trace.len());
+        eprintln!(
+            "// Time: {:.2} ms ({} rule applications)",
+            total_us as f64 / 1000.0,
+            result.trace.len()
+        );
     } else {
-        eprintln!("// Time: {} us ({} rule applications)", total_us, result.trace.len());
+        eprintln!(
+            "// Time: {} us ({} rule applications)",
+            total_us,
+            result.trace.len()
+        );
     }
 
     // Per-rule timing breakdown
     if !result.trace.is_empty() {
-        let mut rule_times: std::collections::BTreeMap<&str, (u128, usize)> = std::collections::BTreeMap::new();
+        let mut rule_times: std::collections::BTreeMap<&str, (u128, usize)> =
+            std::collections::BTreeMap::new();
         for event in &result.trace {
             let entry = rule_times.entry(event.rule_name).or_default();
             entry.0 += event.duration.as_micros();
             entry.1 += 1;
         }
         for (name, (us, count)) in &rule_times {
-            eprintln!("//   {}: {} us ({} calls, {:.1} us/call)", name, us, count, *us as f64 / *count as f64);
+            eprintln!(
+                "//   {}: {} us ({} calls, {:.1} us/call)",
+                name,
+                us,
+                count,
+                *us as f64 / *count as f64
+            );
         }
     }
 

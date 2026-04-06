@@ -1,10 +1,10 @@
 //! Tests for the kernelization pipeline and individual rules.
 
-use crate::{Instance, Tree};
-use super::*;
-use super::rule::{RuleContext, VictimStrategy};
-use super::cherry::CherryRule;
 use super::chain32::Chain32Rule;
+use super::cherry::CherryRule;
+use super::rule::{RuleContext, VictimStrategy};
+use super::*;
+use crate::{Instance, Tree};
 
 /// Build an Instance from Newick strings (without trailing semicolons).
 /// Uses PACE format parsing internally.
@@ -60,7 +60,10 @@ fn cherry_finds_common_cherry() {
     let ctx = make_ctx(&inst, &rev);
     let rule = CherryRule;
     let action = rule.find(&ctx);
-    assert!(matches!(action, Some(ReductionAction::Collapse { keep: 1, remove: 2 })));
+    assert!(matches!(
+        action,
+        Some(ReductionAction::Collapse { keep: 1, remove: 2 })
+    ));
 }
 
 #[test]
@@ -80,13 +83,13 @@ fn cherry_no_match_when_different() {
 fn chain32_finds_interceptor() {
     // tiny01: (((5,6),(3,4)),(1,2)) and (((((4,2),1),5),3),6)
     // The 3-2 rule should find a victim to delete.
-    let inst = instance_from_newick(&[
-        "(((5,6),(3,4)),(1,2))",
-        "(((((4,2),1),5),3),6)",
-    ]);
+    let inst = instance_from_newick(&["(((5,6),(3,4)),(1,2))", "(((((4,2),1),5),3),6)"]);
     let rev: Vec<u32> = (0..=inst.num_leaves).collect();
     let ctx = make_ctx(&inst, &rev);
-    let rule = Chain32Rule { allow_multi: false, max_partners: usize::MAX };
+    let rule = Chain32Rule {
+        allow_multi: false,
+        max_partners: usize::MAX,
+    };
     let action = rule.find(&ctx);
     assert!(matches!(action, Some(ReductionAction::Delete { .. })));
 }
@@ -97,10 +100,7 @@ fn chain32_finds_interceptor() {
 
 #[test]
 fn tiny01_kernelizes_to_4_leaves() {
-    let inst = instance_from_newick(&[
-        "(((5,6),(3,4)),(1,2))",
-        "(((((4,2),1),5),3),6)",
-    ]);
+    let inst = instance_from_newick(&["(((5,6),(3,4)),(1,2))", "(((((4,2),1),5),3),6)"]);
     let config = KernelizeConfig::default();
     let result = kernelize(&inst, &config);
     assert_eq!(result.stats.original_leaves, 6);
@@ -112,10 +112,7 @@ fn tiny01_kernelizes_to_4_leaves() {
 
 #[test]
 fn tiny05_no_reduction() {
-    let inst = instance_from_newick(&[
-        "((1,2),(3,4))",
-        "((1,4),(2,3))",
-    ]);
+    let inst = instance_from_newick(&["((1,2),(3,4))", "((1,4),(2,3))"]);
     let config = KernelizeConfig::default();
     let result = kernelize(&inst, &config);
     assert_eq!(result.stats.original_leaves, 4);
@@ -126,10 +123,7 @@ fn tiny05_no_reduction() {
 
 #[test]
 fn disabled_rules_are_skipped() {
-    let inst = instance_from_newick(&[
-        "(((5,6),(3,4)),(1,2))",
-        "(((((4,2),1),5),3),6)",
-    ]);
+    let inst = instance_from_newick(&["(((5,6),(3,4)),(1,2))", "(((((4,2),1),5),3),6)"]);
     let config = KernelizeConfig {
         subtree: false,
         chain: false,
@@ -145,10 +139,7 @@ fn disabled_rules_are_skipped() {
 
 #[test]
 fn only_chain32_disabled() {
-    let inst = instance_from_newick(&[
-        "(((5,6),(3,4)),(1,2))",
-        "(((((4,2),1),5),3),6)",
-    ]);
+    let inst = instance_from_newick(&["(((5,6),(3,4)),(1,2))", "(((((4,2),1),5),3),6)"]);
     let config = KernelizeConfig {
         chain32: false,
         chain32_multi: false,

@@ -138,8 +138,9 @@ pub fn run(
         .unwrap_or(total_candidates);
 
     let is_tty = std::io::stderr().is_terminal();
+    let line_logging = progress == ProgressMode::On && !is_tty;
     let progress_enabled = match progress {
-        ProgressMode::On => true,
+        ProgressMode::On => is_tty,
         ProgressMode::Off => false,
         ProgressMode::Auto => is_tty,
     };
@@ -183,7 +184,10 @@ pub fn run(
             if p.exists() {
                 p
             } else {
-                let p2 = list_file.parent().unwrap_or(std::path::Path::new(".")).join(&rel);
+                let p2 = list_file
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."))
+                    .join(&rel);
                 if p2.exists() {
                     p2
                 } else {
@@ -202,10 +206,7 @@ pub fn run(
             agg.processed += 1;
             if let Some(pb) = &progress_bar {
                 pb.inc(1);
-                pb.set_message(format!(
-                    "{} missing",
-                    short_digest(&digest)
-                ));
+                pb.set_message(format!("{} missing", short_digest(&digest)));
             }
             continue;
         }
@@ -217,10 +218,7 @@ pub fn run(
                 agg.processed += 1;
                 if let Some(pb) = &progress_bar {
                     pb.inc(1);
-                    pb.set_message(format!(
-                    "{} read error",
-                    short_digest(&digest)
-                ));
+                    pb.set_message(format!("{} read error", short_digest(&digest)));
                 }
                 continue;
             }
@@ -235,10 +233,7 @@ pub fn run(
                 agg.processed += 1;
                 if let Some(pb) = &progress_bar {
                     pb.inc(1);
-                    pb.set_message(format!(
-                    "{} parse error",
-                    short_digest(&digest)
-                ));
+                    pb.set_message(format!("{} parse error", short_digest(&digest)));
                 }
                 continue;
             }
@@ -276,7 +271,7 @@ pub fn run(
                     fmt_ms(u.k_elapsed_ms),
                     if u.solved { " | solved" } else { "" }
                 ));
-            } else if progress == ProgressMode::On && elapsed - last_log_mark >= interval {
+            } else if line_logging && elapsed - last_log_mark >= interval {
                 eprintln!(
                     "[whidden-stats] {}/{} {} | {} | try {:>3} | nodes {:>7} | k-step {:>8}",
                     agg.processed + 1,
@@ -408,7 +403,9 @@ pub fn run(
             pb.set_message(format!(
                 "{} | done | score {:>4} | elapsed {:>8} | nodes {:>7}",
                 short_digest(&row.digest),
-                row.score.map(|s| s.to_string()).unwrap_or_else(|| "ERR".to_string()),
+                row.score
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "ERR".to_string()),
                 fmt_ms(row.elapsed_ms),
                 fmt_nodes(row.nodes_explored),
             ));
@@ -483,7 +480,11 @@ fn fmt_ms(ms: f64) -> String {
 }
 
 fn pct(num: u64, den: u64) -> f64 {
-    if den == 0 { 0.0 } else { 100.0 * (num as f64) / (den as f64) }
+    if den == 0 {
+        0.0
+    } else {
+        100.0 * (num as f64) / (den as f64)
+    }
 }
 
 fn pct_str(num: u64, den: u64) -> String {
@@ -512,13 +513,25 @@ fn render_human(agg: &AggregateStats, rows: &[InstanceStatsRow], show_instances:
         agg.solved,
         agg.errors,
         agg.total_elapsed_ms,
-        if agg.processed > 0 { agg.total_elapsed_ms / agg.processed as f64 } else { 0.0 },
-        if agg.processed > 0 { agg.total_nodes_explored as f64 / agg.processed as f64 } else { 0.0 },
+        if agg.processed > 0 {
+            agg.total_elapsed_ms / agg.processed as f64
+        } else {
+            0.0
+        },
+        if agg.processed > 0 {
+            agg.total_nodes_explored as f64 / agg.processed as f64
+        } else {
+            0.0
+        },
     ));
     out.push_str(&format!(
         "k_total_ms={:.1} avg_k_ms_per_instance={:.1}\n\n",
         agg.total_k_elapsed_ms,
-        if agg.processed > 0 { agg.total_k_elapsed_ms / agg.processed as f64 } else { 0.0 },
+        if agg.processed > 0 {
+            agg.total_k_elapsed_ms / agg.processed as f64
+        } else {
+            0.0
+        },
     ));
 
     let mut rule_ranking: Vec<(&str, u64)> = vec![
@@ -534,7 +547,10 @@ fn render_human(agg: &AggregateStats, rows: &[InstanceStatsRow], show_instances:
     let rule_total: u64 = rule_ranking.iter().map(|(_, c)| *c).sum();
 
     out.push_str("-- Rule Fire Ranking --\n");
-    out.push_str(&format!("{:<3} {:<20} {:>14} {:>10}\n", "#", "rule", "count", "share"));
+    out.push_str(&format!(
+        "{:<3} {:<20} {:>14} {:>10}\n",
+        "#", "rule", "count", "share"
+    ));
     out.push_str(&format!("{}\n", "-".repeat(54)));
     for (idx, (name, count)) in rule_ranking.iter().enumerate() {
         out.push_str(&format!(
@@ -547,7 +563,8 @@ fn render_human(agg: &AggregateStats, rows: &[InstanceStatsRow], show_instances:
     }
     out.push_str("\n");
 
-    let attempts_total = agg.totals.branch_a_attempts + agg.totals.branch_b_attempts + agg.totals.branch_c_attempts;
+    let attempts_total =
+        agg.totals.branch_a_attempts + agg.totals.branch_b_attempts + agg.totals.branch_c_attempts;
     out.push_str("-- Branch Outcomes --\n");
     out.push_str(&format!(
         "A: {} | share of attempts={}\n",
@@ -574,7 +591,10 @@ fn render_human(agg: &AggregateStats, rows: &[InstanceStatsRow], show_instances:
     let prune_total: u64 = prune_ranking.iter().map(|(_, c)| *c).sum();
 
     out.push_str("-- Pruning Ranking --\n");
-    out.push_str(&format!("{:<3} {:<20} {:>14} {:>10}\n", "#", "reason", "count", "share"));
+    out.push_str(&format!(
+        "{:<3} {:<20} {:>14} {:>10}\n",
+        "#", "reason", "count", "share"
+    ));
     out.push_str(&format!("{}\n", "-".repeat(54)));
     for (idx, (name, count)) in prune_ranking.iter().enumerate() {
         out.push_str(&format!(
@@ -601,8 +621,7 @@ fn render_human(agg: &AggregateStats, rows: &[InstanceStatsRow], show_instances:
     out.push_str("-- Bound Cache & Propagation --\n");
     out.push_str(&format!(
         "mestel6: checks={} forced={}\n",
-        agg.totals.mestel6_checks,
-        agg.totals.rule_mestel6_forced,
+        agg.totals.mestel6_checks, agg.totals.rule_mestel6_forced,
     ));
     out.push_str(&format!(
         "bc: lookups={} hits={} ({}) stores={}\n",
@@ -635,7 +654,10 @@ fn render_human(agg: &AggregateStats, rows: &[InstanceStatsRow], show_instances:
     let skip_total: u64 = skip_ranking.iter().map(|(_, c)| *c).sum();
 
     out.push_str("-- Branch Skip Reasons --\n");
-    out.push_str(&format!("{:<3} {:<20} {:>14} {:>10}\n", "#", "reason", "count", "share"));
+    out.push_str(&format!(
+        "{:<3} {:<20} {:>14} {:>10}\n",
+        "#", "reason", "count", "share"
+    ));
     out.push_str(&format!("{}\n", "-".repeat(54)));
     for (idx, (name, count)) in skip_ranking.iter().enumerate() {
         out.push_str(&format!(
@@ -650,7 +672,10 @@ fn render_human(agg: &AggregateStats, rows: &[InstanceStatsRow], show_instances:
 
     if show_instances {
         out.push_str("-- Instances --\n");
-        out.push_str(&format!("{:<16} {:>3} {:>6} {:>6} {:>8} {:>10} {:>6} {:>8}\n", "digest", "m", "n", "score", "ms", "nodes", "k_try", "k_ms"));
+        out.push_str(&format!(
+            "{:<16} {:>3} {:>6} {:>6} {:>8} {:>10} {:>6} {:>8}\n",
+            "digest", "m", "n", "score", "ms", "nodes", "k_try", "k_ms"
+        ));
         out.push_str(&format!("{}\n", "-".repeat(88)));
         for row in rows {
             out.push_str(&format!(
@@ -658,7 +683,9 @@ fn render_human(agg: &AggregateStats, rows: &[InstanceStatsRow], show_instances:
                 &row.digest[..16.min(row.digest.len())],
                 row.num_trees,
                 row.num_leaves,
-                row.score.map(|x| x.to_string()).unwrap_or_else(|| "ERR".to_string()),
+                row.score
+                    .map(|x| x.to_string())
+                    .unwrap_or_else(|| "ERR".to_string()),
                 row.elapsed_ms,
                 row.nodes_explored,
                 row.k_attempts,

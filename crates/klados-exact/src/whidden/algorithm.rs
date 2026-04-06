@@ -11,13 +11,13 @@
 use std::time::Instant;
 
 use fixedbitset::FixedBitSet;
-use klados_core::tree::{Label, NodeId, Tree, NONE};
+use klados_core::tree::{Label, NONE, NodeId, Tree};
 use klados_core::{Instance, SolverStats};
 
-use klados_core::twin_tree::{TwinForest, T1, T2, UndoMachine};
-use klados_core::twin_tree::{undo, approx2};
-use klados_core::lower_bound::{cherry_reduce_ub, red_blue_approx_detailed};
 use super::stats::{WhiddenProgressUpdate, WhiddenRuleStats};
+use klados_core::lower_bound::{cherry_reduce_ub, red_blue_approx_detailed};
+use klados_core::twin_tree::{T1, T2, TwinForest, UndoMachine};
+use klados_core::twin_tree::{approx2, undo};
 
 // ---------------------------------------------------------------------------
 // Configuration — maps to rspr's optimization flags
@@ -202,7 +202,13 @@ impl TranspositionTable {
     fn new(size_log2: u8) -> Self {
         let size = 1usize << size_log2;
         Self {
-            entries: vec![TTEntry { hash: 0, required_k_min: i16::MIN }; size],
+            entries: vec![
+                TTEntry {
+                    hash: 0,
+                    required_k_min: i16::MIN
+                };
+                size
+            ],
             mask: size - 1,
         }
     }
@@ -254,7 +260,14 @@ impl BoundCache {
     fn new(size_log2: u8) -> Self {
         let size = 1usize << size_log2;
         Self {
-            entries: vec![BoundEntry { hash: 0, val3: -1, approx2_lb: -1 }; size],
+            entries: vec![
+                BoundEntry {
+                    hash: 0,
+                    val3: -1,
+                    approx2_lb: -1
+                };
+                size
+            ],
             mask: size - 1,
         }
     }
@@ -318,7 +331,10 @@ struct ParentBounds {
 
 impl Default for ParentBounds {
     fn default() -> Self {
-        Self { val3: -1, approx2_lb: -1 }
+        Self {
+            val3: -1,
+            approx2_lb: -1,
+        }
     }
 }
 
@@ -367,7 +383,9 @@ pub fn solve_with_config(
     rule_stats: &mut WhiddenRuleStats,
     config: &BBConfig,
 ) -> Option<Vec<Tree>> {
-    solve_with_config_and_progress::<fn(WhiddenProgressUpdate)>(instance, stats, rule_stats, config, None)
+    solve_with_config_and_progress::<fn(WhiddenProgressUpdate)>(
+        instance, stats, rule_stats, config, None,
+    )
 }
 
 fn solve_with_config_and_progress<F>(
@@ -446,7 +464,17 @@ where
         }
 
         let cp = um.checkpoint();
-        let result = branch_and_bound(&mut tf, k as i32, &mut um, stats, rule_stats, config, &mut tt, &mut bc, ParentBounds::default());
+        let result = branch_and_bound(
+            &mut tf,
+            k as i32,
+            &mut um,
+            stats,
+            rule_stats,
+            config,
+            &mut tt,
+            &mut bc,
+            ParentBounds::default(),
+        );
         let k_elapsed_ms = k_start.elapsed().as_secs_f64() * 1000.0;
         rule_stats.k_last_elapsed_ms = k_elapsed_ms;
         rule_stats.k_total_elapsed_ms += k_elapsed_ms;
@@ -475,7 +503,6 @@ where
     None
 }
 
-
 // ---------------------------------------------------------------------------
 // Branch-and-bound
 // ---------------------------------------------------------------------------
@@ -491,7 +518,18 @@ fn branch_and_bound(
     bc: &mut Option<BoundCache>,
     parent_bounds: ParentBounds,
 ) -> i32 {
-    bb_inner(tf, &mut k, um, stats, rule_stats, config, tt, bc, parent_bounds, None)
+    bb_inner(
+        tf,
+        &mut k,
+        um,
+        stats,
+        rule_stats,
+        config,
+        tt,
+        bc,
+        parent_bounds,
+        None,
+    )
 }
 
 /// Inner B&B with optional forced pair (from CUT_ALL_B).
@@ -508,13 +546,14 @@ fn bb_inner(
     parent_bounds: ParentBounds,
     forced_pair: Option<(NodeId, NodeId)>,
 ) -> i32 {
-
     stats.nodes_explored += 1;
 
     // Macro for TT store on failure.
     macro_rules! tt_store_fail {
         ($tt:expr, $tf:expr, $k:expr, $rs:expr) => {
-            if let Some(t) = $tt.as_mut() { t.store($tf.state_hash, $k, $rs); }
+            if let Some(t) = $tt.as_mut() {
+                t.store($tf.state_hash, $k, $rs);
+            }
         };
     }
 
@@ -528,7 +567,18 @@ fn bb_inner(
         if config.mestel_rule6 {
             match try_mestel_rule6(tf, k, um, rule_stats) {
                 MestelRule6Result::Applied => {
-                    return bb_inner(tf, k, um, stats, rule_stats, config, tt, bc, parent_bounds, forced_pair);
+                    return bb_inner(
+                        tf,
+                        k,
+                        um,
+                        stats,
+                        rule_stats,
+                        config,
+                        tt,
+                        bc,
+                        parent_bounds,
+                        forced_pair,
+                    );
                 }
                 MestelRule6Result::ExhaustedBudget => {
                     rule_stats.prune_k_exhausted += 1;
@@ -541,19 +591,27 @@ fn bb_inner(
         // Check if the forced pair is still valid (both still siblings in T1)
         let p_a = tf.parent[T1][t1_a as usize];
         let p_c = tf.parent[T1][t1_c as usize];
-        if p_a != NONE && p_a == p_c
-            && tf.is_leaf(T1, t1_a) && tf.is_leaf(T1, t1_c)
-        {
+        if p_a != NONE && p_a == p_c && tf.is_leaf(T1, t1_a) && tf.is_leaf(T1, t1_c) {
             if let Some(result) = classify_pair(tf, p_a, t1_a, t1_c, config) {
                 match result {
-                    PairResult::Case2 { t1_parent, t2_parent } => {
+                    PairResult::Case2 {
+                        t1_parent,
+                        t2_parent,
+                    } => {
                         do_case2_contract(tf, t1_parent, t2_parent, um);
                         rule_stats.forced_pair_case2 += 1;
                         rule_stats.action_case2_contracts += 1;
                         // Fall through to normal loop
                     }
-                    PairResult::Case3 { t1_a, t1_c, t2_a, t2_b, t2_c,
-                                          path_length, .. } => {
+                    PairResult::Case3 {
+                        t1_a,
+                        t1_c,
+                        t2_a,
+                        t2_b,
+                        t2_c,
+                        path_length,
+                        ..
+                    } => {
                         rule_stats.forced_pair_attempts += 1;
                         rule_stats.forced_pair_case3 += 1;
                         if *k <= 0 {
@@ -561,7 +619,8 @@ fn bb_inner(
                             tt_store_fail!(tt, tf, *k, rule_stats);
                             return -1;
                         }
-                        let (should_prune, bounds) = bb_should_prune(tf, um, *k, config, bc, parent_bounds, rule_stats);
+                        let (should_prune, bounds) =
+                            bb_should_prune(tf, um, *k, config, bc, parent_bounds, rule_stats);
                         if should_prune {
                             rule_stats.prune_bb_approx += 1;
                             tt_store_fail!(tt, tf, *k, rule_stats);
@@ -569,11 +628,28 @@ fn bb_inner(
                         }
                         // Force cut_b_only for the CAB forced pair
                         let result = do_case3_branch(
-                            tf, *k, um, stats, rule_stats, config, tt, bc, bounds,
-                            t1_a, t1_c, t2_a, t2_b, t2_c,
-                            true, false, false, path_length,
+                            tf,
+                            *k,
+                            um,
+                            stats,
+                            rule_stats,
+                            config,
+                            tt,
+                            bc,
+                            bounds,
+                            t1_a,
+                            t1_c,
+                            t2_a,
+                            t2_b,
+                            t2_c,
+                            true,
+                            false,
+                            false,
+                            path_length,
                         );
-                        if result < 0 { tt_store_fail!(tt, tf, *k, rule_stats); }
+                        if result < 0 {
+                            tt_store_fail!(tt, tf, *k, rule_stats);
+                        }
                         return result;
                     }
                     _ => {}
@@ -623,31 +699,61 @@ fn bb_inner(
                 rule_stats.action_done += 1;
                 return *k;
             }
-            PairResult::Case2 { t1_parent, t2_parent } => {
+            PairResult::Case2 {
+                t1_parent,
+                t2_parent,
+            } => {
                 do_case2_contract(tf, t1_parent, t2_parent, um);
                 rule_stats.action_case2_contracts += 1;
                 continue;
             }
-            PairResult::Case3 { t1_a, t1_c, t2_a, t2_b, t2_c,
-                                  cut_b_only, cut_c_only, cut_a_only, path_length } => {
+            PairResult::Case3 {
+                t1_a,
+                t1_c,
+                t2_a,
+                t2_b,
+                t2_c,
+                cut_b_only,
+                cut_c_only,
+                cut_a_only,
+                path_length,
+            } => {
                 rule_stats.action_case3_branches += 1;
                 if *k <= 0 {
                     rule_stats.prune_k_exhausted += 1;
                     tt_store_fail!(tt, tf, *k, rule_stats);
                     return -1;
                 }
-                let (should_prune, bounds) = bb_should_prune(tf, um, *k, config, bc, parent_bounds, rule_stats);
+                let (should_prune, bounds) =
+                    bb_should_prune(tf, um, *k, config, bc, parent_bounds, rule_stats);
                 if should_prune {
                     rule_stats.prune_bb_approx += 1;
                     tt_store_fail!(tt, tf, *k, rule_stats);
                     return -1;
                 }
                 let result = do_case3_branch(
-                    tf, *k, um, stats, rule_stats, config, tt, bc, bounds,
-                    t1_a, t1_c, t2_a, t2_b, t2_c,
-                    cut_b_only, cut_a_only, cut_c_only, path_length,
+                    tf,
+                    *k,
+                    um,
+                    stats,
+                    rule_stats,
+                    config,
+                    tt,
+                    bc,
+                    bounds,
+                    t1_a,
+                    t1_c,
+                    t2_a,
+                    t2_b,
+                    t2_c,
+                    cut_b_only,
+                    cut_a_only,
+                    cut_c_only,
+                    path_length,
                 );
-                if result < 0 { tt_store_fail!(tt, tf, *k, rule_stats); }
+                if result < 0 {
+                    tt_store_fail!(tt, tf, *k, rule_stats);
+                }
                 return result;
             }
         }
@@ -667,12 +773,16 @@ fn process_singletons(
 ) -> bool {
     loop {
         let singleton = find_singleton(tf);
-        if singleton == NONE { return true; }
+        if singleton == NONE {
+            return true;
+        }
 
         // singleton is a T2 leaf that is a component root (singleton in T2)
         let t2_node = singleton;
         let t1_node = tf.twin[T2][t2_node as usize];
-        if t1_node == NONE { continue; }
+        if t1_node == NONE {
+            continue;
+        }
 
         let t1_parent = tf.parent[T1][t1_node as usize];
         if t1_parent == NONE {
@@ -711,10 +821,16 @@ fn find_singleton(tf: &TwinForest) -> NodeId {
 #[derive(Clone)]
 enum PairResult {
     NoPairs,
-    Case2 { t1_parent: NodeId, t2_parent: NodeId },
+    Case2 {
+        t1_parent: NodeId,
+        t2_parent: NodeId,
+    },
     Case3 {
-        t1_a: NodeId, t1_c: NodeId,
-        t2_a: NodeId, t2_b: NodeId, t2_c: NodeId,
+        t1_a: NodeId,
+        t1_c: NodeId,
+        t2_a: NodeId,
+        t2_b: NodeId,
+        t2_c: NodeId,
         /// COB: T2_ab and T2_c are siblings → only branch B needed.
         cut_b_only: bool,
         /// RCOB: uncle's twin is sibling of T2_a → only branch C needed.
@@ -732,14 +848,17 @@ enum PairResult {
 /// With `prefer_nonbranching`: prefers Case 2 or COB (1-branch) pairs over
 /// full 3-way Case 3 pairs. With `deepest_order`: among Case 3 pairs, picks
 /// the deepest (most constrained → prunes faster).
-fn find_sibling_pair(tf: &TwinForest, config: &BBConfig, rule_stats: &mut WhiddenRuleStats) -> PairResult {
+fn find_sibling_pair(
+    tf: &TwinForest,
+    config: &BBConfig,
+    rule_stats: &mut WhiddenRuleStats,
+) -> PairResult {
     if config.prefer_nonbranching || config.deepest_order {
         let mut fallback = PairResult::NoPairs;
         let mut best_depth = (0u16, 0u16);
         for &root in &tf.components[T1] {
-            let result = find_preferred_pair(
-                tf, root, config, rule_stats, &mut fallback, &mut best_depth,
-            );
+            let result =
+                find_preferred_pair(tf, root, config, rule_stats, &mut fallback, &mut best_depth);
             if !matches!(result, PairResult::NoPairs) {
                 return result; // found a non-branching pair
             }
@@ -762,7 +881,9 @@ fn find_any_pair(tf: &TwinForest, node: NodeId, config: &BBConfig) -> PairResult
     let lc = tf.left[T1][node as usize];
     let rc = tf.right[T1][node as usize];
 
-    if lc == NONE { return PairResult::NoPairs; }
+    if lc == NONE {
+        return PairResult::NoPairs;
+    }
 
     if rc != NONE && tf.is_leaf(T1, lc) && tf.is_leaf(T1, rc) {
         if let Some(result) = classify_pair(tf, node, lc, rc, config) {
@@ -772,11 +893,15 @@ fn find_any_pair(tf: &TwinForest, node: NodeId, config: &BBConfig) -> PairResult
 
     if lc != NONE {
         let r = find_any_pair(tf, lc, config);
-        if !matches!(r, PairResult::NoPairs) { return r; }
+        if !matches!(r, PairResult::NoPairs) {
+            return r;
+        }
     }
     if rc != NONE {
         let r = find_any_pair(tf, rc, config);
-        if !matches!(r, PairResult::NoPairs) { return r; }
+        if !matches!(r, PairResult::NoPairs) {
+            return r;
+        }
     }
     PairResult::NoPairs
 }
@@ -797,13 +922,22 @@ fn find_preferred_pair(
     let lc = tf.left[T1][node as usize];
     let rc = tf.right[T1][node as usize];
 
-    if lc == NONE { return PairResult::NoPairs; }
+    if lc == NONE {
+        return PairResult::NoPairs;
+    }
 
     if rc != NONE && tf.is_leaf(T1, lc) && tf.is_leaf(T1, rc) {
         if let Some(result) = classify_pair(tf, node, lc, rc, config) {
             match &result {
                 PairResult::Case2 { .. } => return result,
-                PairResult::Case3 { t2_a, t2_c, cut_b_only, cut_a_only, cut_c_only, .. } => {
+                PairResult::Case3 {
+                    t2_a,
+                    t2_c,
+                    cut_b_only,
+                    cut_a_only,
+                    cut_c_only,
+                    ..
+                } => {
                     if *cut_b_only || *cut_a_only || *cut_c_only {
                         if config.prefer_nonbranching {
                             rule_stats.prefer_nonbranching_hits += 1;
@@ -835,11 +969,15 @@ fn find_preferred_pair(
 
     if lc != NONE {
         let r = find_preferred_pair(tf, lc, config, rule_stats, fallback, best_depth);
-        if !matches!(r, PairResult::NoPairs) { return r; }
+        if !matches!(r, PairResult::NoPairs) {
+            return r;
+        }
     }
     if rc != NONE {
         let r = find_preferred_pair(tf, rc, config, rule_stats, fallback, best_depth);
-        if !matches!(r, PairResult::NoPairs) { return r; }
+        if !matches!(r, PairResult::NoPairs) {
+            return r;
+        }
     }
     PairResult::NoPairs
 }
@@ -854,7 +992,9 @@ fn classify_pair(
 ) -> Option<PairResult> {
     let t2_a = tf.twin[T1][t1_a as usize];
     let t2_c = tf.twin[T1][t1_c as usize];
-    if t2_a == NONE || t2_c == NONE { return None; }
+    if t2_a == NONE || t2_c == NONE {
+        return None;
+    }
 
     // Case 2: T2_a and T2_c share a parent in T2
     let t2_a_parent = tf.parent[T2][t2_a as usize];
@@ -876,7 +1016,9 @@ fn classify_pair(
     };
 
     let t2_b = tf.sibling(T2, t2_a);
-    if t2_b == NONE { return None; }
+    if t2_b == NONE {
+        return None;
+    }
 
     // COB detection: T2_a.parent.parent == T2_c.parent means T2_ab and T2_c
     // are siblings, so only cutting B can resolve the pair.
@@ -929,9 +1071,7 @@ fn classify_pair(
                     if t2_l != NONE {
                         // Subcase 1: path_length 4 (balanced)
                         // T2_c.parent.parent == T2_l
-                        if t2_c_parent != NONE
-                            && tf.parent[T2][t2_c_parent as usize] == t2_l
-                        {
+                        if t2_c_parent != NONE && tf.parent[T2][t2_c_parent as usize] == t2_l {
                             if tf.sibling(T2, t2_l) == t2_s {
                                 cut_b_only = true;
                             }
@@ -955,7 +1095,17 @@ fn classify_pair(
     // Path length: walk T2_a and T2_c up to their LCA, counting steps.
     let path_length = compute_path_length(tf, T2, t2_a, t2_c);
 
-    Some(PairResult::Case3 { t1_a, t1_c, t2_a, t2_b, t2_c, cut_b_only, cut_c_only, cut_a_only, path_length })
+    Some(PairResult::Case3 {
+        t1_a,
+        t1_c,
+        t2_a,
+        t2_b,
+        t2_c,
+        cut_b_only,
+        cut_c_only,
+        cut_a_only,
+        path_length,
+    })
 }
 
 /// Distance from node to its component root (via parent pointers).
@@ -963,7 +1113,9 @@ fn depth_to_root(tf: &TwinForest, ti: usize, mut node: NodeId) -> u16 {
     let mut d: u16 = 0;
     loop {
         let p = tf.parent[ti][node as usize];
-        if p == NONE { return d; }
+        if p == NONE {
+            return d;
+        }
         d += 1;
         node = p;
     }
@@ -977,8 +1129,16 @@ fn compute_path_length(tf: &TwinForest, ti: usize, mut a: NodeId, mut b: NodeId)
     // Level both to same depth
     let mut a_depth = da;
     let mut b_depth = db;
-    while a_depth > b_depth { a = tf.parent[ti][a as usize]; a_depth -= 1; len += 1; }
-    while b_depth > a_depth { b = tf.parent[ti][b as usize]; b_depth -= 1; len += 1; }
+    while a_depth > b_depth {
+        a = tf.parent[ti][a as usize];
+        a_depth -= 1;
+        len += 1;
+    }
+    while b_depth > a_depth {
+        b = tf.parent[ti][b as usize];
+        b_depth -= 1;
+        len += 1;
+    }
     // Walk both up until they meet
     while a != b {
         a = tf.parent[ti][a as usize];
@@ -993,7 +1153,9 @@ fn compute_path_length(tf: &TwinForest, ti: usize, mut a: NodeId, mut b: NodeId)
 fn find_root(tf: &TwinForest, ti: usize, mut node: NodeId) -> NodeId {
     loop {
         let p = tf.parent[ti][node as usize];
-        if p == NONE { return node; }
+        if p == NONE {
+            return node;
+        }
         node = p;
     }
 }
@@ -1026,10 +1188,12 @@ fn collect_leafset_under(
     while let Some(node) = stack.pop() {
         if tf.is_leaf(ti, node) {
             let lbl = tf.label[ti][node as usize];
-            if lbl != 0 && match restrict {
-                Some(keep) => keep.contains(lbl as usize),
-                None => true,
-            } {
+            if lbl != 0
+                && match restrict {
+                    Some(keep) => keep.contains(lbl as usize),
+                    None => true,
+                }
+            {
                 out.insert(lbl as usize);
             }
             continue;
@@ -1085,8 +1249,16 @@ fn current_tree_canonical_for_labels(
         } else {
             let lc = tf.left[ti][node as usize];
             let rc = tf.right[ti][node as usize];
-            let left = if lc != NONE { build(tf, ti, lc, labels) } else { None };
-            let right = if rc != NONE { build(tf, ti, rc, labels) } else { None };
+            let left = if lc != NONE {
+                build(tf, ti, lc, labels)
+            } else {
+                None
+            };
+            let right = if rc != NONE {
+                build(tf, ti, rc, labels)
+            } else {
+                None
+            };
             match (left, right) {
                 (Some(a), Some(b)) => {
                     let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
@@ -1203,7 +1375,8 @@ fn collect_component_shapes(tf: &TwinForest) -> Vec<ComponentShape> {
             let leafset = collect_leafset_under(tf, T2, t2_root, None);
             let t2_hash = current_tree_canonical_for_labels(tf, T2, t2_root, &leafset);
             let t1_root = common_root_for_leafset(tf, T1, &leafset);
-            let t1_hash = t1_root.map(|root| current_tree_canonical_for_labels(tf, T1, root, &leafset));
+            let t1_hash =
+                t1_root.map(|root| current_tree_canonical_for_labels(tf, T1, root, &leafset));
             let homeomorphic = t1_hash == Some(t2_hash);
             let t1_edges = t1_root
                 .map(|root| collect_induced_edges(tf, T1, root, &leafset))
@@ -1296,7 +1469,8 @@ fn find_mestel_rule6_cut(tf: &TwinForest) -> Option<NodeId> {
                 continue;
             }
 
-            let Some(overlap_edge) = shared_single_edge(&shape_a.t1_edges, &shape_b.t1_edges) else {
+            let Some(overlap_edge) = shared_single_edge(&shape_a.t1_edges, &shape_b.t1_edges)
+            else {
                 continue;
             };
 
@@ -1305,13 +1479,17 @@ fn find_mestel_rule6_cut(tf: &TwinForest) -> Option<NodeId> {
                 continue;
             }
 
-            if let Some(cut_node) = find_edge_with_descendant_leafset(tf, T2, shape_b.t2_root, &below) {
+            if let Some(cut_node) =
+                find_edge_with_descendant_leafset(tf, T2, shape_b.t2_root, &below)
+            {
                 return Some(cut_node);
             }
 
             let mut rest = shape_b.leafset.clone();
             rest.difference_with(&below);
-            if let Some(cut_node) = find_edge_with_descendant_leafset(tf, T2, shape_b.t2_root, &rest) {
+            if let Some(cut_node) =
+                find_edge_with_descendant_leafset(tf, T2, shape_b.t2_root, &rest)
+            {
                 return Some(cut_node);
             }
         }
@@ -1377,7 +1555,10 @@ fn bb_should_prune(
     parent: ParentBounds,
     rule_stats: &mut WhiddenRuleStats,
 ) -> (bool, ParentBounds) {
-    let mut bounds = ParentBounds { val3: -1, approx2_lb: -1 };
+    let mut bounds = ParentBounds {
+        val3: -1,
+        approx2_lb: -1,
+    };
 
     if !config.bb {
         return (false, bounds);
@@ -1471,12 +1652,18 @@ fn approx_3(tf: &mut TwinForest, um: &mut UndoMachine) -> i32 {
         // Process singletons (free — no contribution to num_cut)
         loop {
             let singleton = find_singleton(tf);
-            if singleton == NONE { break; }
+            if singleton == NONE {
+                break;
+            }
             let t2_node = singleton;
             let t1_node = tf.twin[T2][t2_node as usize];
-            if t1_node == NONE { continue; }
+            if t1_node == NONE {
+                continue;
+            }
             let t1_parent = tf.parent[T1][t1_node as usize];
-            if t1_parent == NONE { continue; }
+            if t1_parent == NONE {
+                continue;
+            }
             undo::cut_parent(tf, T1, t1_node, um);
             undo::add_component(tf, T1, t1_node, um);
             undo::contract(tf, T1, t1_parent, um);
@@ -1487,10 +1674,21 @@ fn approx_3(tf: &mut TwinForest, um: &mut UndoMachine) -> i32 {
         let mut dummy_stats = WhiddenRuleStats::default();
         match find_sibling_pair(tf, &approx_config, &mut dummy_stats) {
             PairResult::NoPairs => break,
-            PairResult::Case2 { t1_parent, t2_parent } => {
+            PairResult::Case2 {
+                t1_parent,
+                t2_parent,
+            } => {
                 do_case2_contract(tf, t1_parent, t2_parent, um);
             }
-            PairResult::Case3 { t1_a, t1_c, t2_a, t2_b: _, t2_c, cut_b_only, .. } => {
+            PairResult::Case3 {
+                t1_a,
+                t1_c,
+                t2_a,
+                t2_b: _,
+                t2_c,
+                cut_b_only,
+                ..
+            } => {
                 let t1_parent = tf.parent[T1][t1_a as usize];
                 let t2_a_parent = tf.parent[T2][t2_a as usize];
                 let mut case_cuts: i32 = 0;
@@ -1628,16 +1826,24 @@ fn do_case3_branch(
         let t2_ab_parent = tf.parent[T2][t2_a_parent as usize];
         t2_ab_parent != NONE && t2_ab_parent == t2_c_parent
     };
-    if cob { rule_stats.rule_cob_fired += 1; }
-    if rcob_a { rule_stats.rule_rcob_a_fired += 1; }
-    if rcob_c { rule_stats.rule_rcob_c_fired += 1; }
+    if cob {
+        rule_stats.rule_cob_fired += 1;
+    }
+    if rcob_a {
+        rule_stats.rule_rcob_a_fired += 1;
+    }
+    if rcob_c {
+        rule_stats.rule_rcob_c_fired += 1;
+    }
     if config.cut_two_b && cut_b_only && !cob_structural {
         rule_stats.rule_cut_two_b_fired += 1;
     }
 
     // SC: if T2_a and T2_c are in different components, cutting B can't help.
     let separate_components = config.cut_ac_separate_components
-        && !cob && !rcob_a && !rcob_c
+        && !cob
+        && !rcob_a
+        && !rcob_c
         && find_root(tf, T2, t2_a) != find_root(tf, T2, t2_c);
 
     // EP: edge protection gates
@@ -1662,10 +1868,18 @@ fn do_case3_branch(
         rule_stats.skip_b_rcob_a += 1;
         rule_stats.skip_c_rcob_a += 1;
     }
-    if ep_skip_a { rule_stats.skip_a_ep_protected += 1; }
-    if ep_skip_b { rule_stats.skip_b_ep_protected += 1; }
-    if ep_skip_c { rule_stats.skip_c_ep_protected += 1; }
-    if separate_components { rule_stats.skip_b_separate_components += 1; }
+    if ep_skip_a {
+        rule_stats.skip_a_ep_protected += 1;
+    }
+    if ep_skip_b {
+        rule_stats.skip_b_ep_protected += 1;
+    }
+    if ep_skip_c {
+        rule_stats.skip_c_ep_protected += 1;
+    }
+    if separate_components {
+        rule_stats.skip_b_separate_components += 1;
+    }
 
     // --- Branch A: cut T2_a ---
     if !skip_a {
@@ -1678,8 +1892,10 @@ fn do_case3_branch(
         }
 
         // EP_TWO_B: when T2_c is protected and path_length==4, protect T2_b and T2_b2.
-        if config.edge_protection_two_b && tf.protected[t2_c as usize]
-            && !cut_a_only && path_length == 4
+        if config.edge_protection_two_b
+            && tf.protected[t2_c as usize]
+            && !cut_a_only
+            && path_length == 4
         {
             let balanced = t2_a_parent != NONE
                 && tf.parent[T2][t2_a_parent as usize] != NONE
@@ -1720,7 +1936,18 @@ fn do_case3_branch(
         rule_stats.branch_b_attempts += 1;
         let result = if config.cut_all_b {
             rule_stats.rule_cut_all_b_forced += 1;
-            bb_inner(tf, &mut k_b, um, stats, rule_stats, config, tt, bc, bounds, Some((t1_a, t1_c)))
+            bb_inner(
+                tf,
+                &mut k_b,
+                um,
+                stats,
+                rule_stats,
+                config,
+                tt,
+                bc,
+                bounds,
+                Some((t1_a, t1_c)),
+            )
         } else {
             branch_and_bound(tf, k - 1, um, stats, rule_stats, config, tt, bc, bounds)
         };
@@ -1780,7 +2007,9 @@ fn extract_components(tf: &TwinForest) -> Vec<Tree> {
                 changed = true;
             }
         }
-        if !changed { break; }
+        if !changed {
+            break;
+        }
     }
 
     // Collect label sets per component
@@ -1789,7 +2018,9 @@ fn extract_components(tf: &TwinForest) -> Vec<Tree> {
     for &root in &tf.components[T1] {
         let mut current_labels = Vec::new();
         collect_labels(tf, root, &mut current_labels);
-        if current_labels.is_empty() { continue; }
+        if current_labels.is_empty() {
+            continue;
+        }
 
         // Expand: find all original labels whose representative is in this component
         let mut leafset = fixedbitset::FixedBitSet::with_capacity(n as usize + 1);
@@ -1817,10 +2048,13 @@ fn collect_labels(tf: &TwinForest, node: NodeId, out: &mut Vec<Label>) {
     }
     let lc = tf.left[T1][node as usize];
     let rc = tf.right[T1][node as usize];
-    if lc != NONE { collect_labels(tf, lc, out); }
-    if rc != NONE { collect_labels(tf, rc, out); }
+    if lc != NONE {
+        collect_labels(tf, lc, out);
+    }
+    if rc != NONE {
+        collect_labels(tf, rc, out);
+    }
 }
-
 
 /// Reconstruct original Tree from TwinForest's immutable orig_* arrays.
 fn tree_from_original(tf: &TwinForest) -> Tree {

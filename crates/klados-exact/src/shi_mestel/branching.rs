@@ -342,7 +342,11 @@ fn check_cut_one_b(state: &SearchState, a: u32, b: u32) -> Option<CutInfo> {
                 if sib_a_r != NONE && !fr.is_cut(sib_a_r) {
                     super::trace!(
                         "CUT_ONE_B: sibling pair ({},{}) in forest {}, cut sib_a={} in forest {}",
-                        a, b, q, sib_a_r, r
+                        a,
+                        b,
+                        q,
+                        sib_a_r,
+                        r
                     );
                     return Some(CutInfo {
                         forest_idx: r,
@@ -363,7 +367,11 @@ fn check_cut_one_b(state: &SearchState, a: u32, b: u32) -> Option<CutInfo> {
                 if sib_b_r != NONE && !fr.is_cut(sib_b_r) {
                     super::trace!(
                         "CUT_ONE_B: sibling pair ({},{}) in forest {}, cut sib_b={} in forest {}",
-                        a, b, q, sib_b_r, r
+                        a,
+                        b,
+                        q,
+                        sib_b_r,
+                        r
                     );
                     return Some(CutInfo {
                         forest_idx: r,
@@ -395,7 +403,12 @@ fn check_cut_one_b(state: &SearchState, a: u32, b: u32) -> Option<CutInfo> {
                                     if !fr.is_cut(b_node_r2) {
                                         super::trace!(
                                             "REVERSE_CUT_ONE_B: ({},{}) forest {}, s={} shares parent with a in forest {} → cut b={}",
-                                            a, b, q, s_label, r, b_node_r2
+                                            a,
+                                            b,
+                                            q,
+                                            s_label,
+                                            r,
+                                            b_node_r2
                                         );
                                         return Some(CutInfo {
                                             forest_idx: r,
@@ -409,7 +422,12 @@ fn check_cut_one_b(state: &SearchState, a: u32, b: u32) -> Option<CutInfo> {
                                     if !fr.is_cut(a_node_r2) {
                                         super::trace!(
                                             "REVERSE_CUT_ONE_B: ({},{}) forest {}, s={} shares parent with b in forest {} → cut a={}",
-                                            a, b, q, s_label, r, a_node_r2
+                                            a,
+                                            b,
+                                            q,
+                                            s_label,
+                                            r,
+                                            a_node_r2
                                         );
                                         return Some(CutInfo {
                                             forest_idx: r,
@@ -429,22 +447,29 @@ fn check_cut_one_b(state: &SearchState, a: u32, b: u32) -> Option<CutInfo> {
                                     let l_r = grandparent_a_r2;
                                     let l_parent_r = fr.tree.parent[l_r as usize];
                                     if l_parent_r != NONE {
-                                        let l_sibling_r = if fr.tree.left[l_parent_r as usize] == l_r {
-                                            fr.tree.right[l_parent_r as usize]
-                                        } else {
-                                            fr.tree.left[l_parent_r as usize]
-                                        };
+                                        let l_sibling_r =
+                                            if fr.tree.left[l_parent_r as usize] == l_r {
+                                                fr.tree.right[l_parent_r as usize]
+                                            } else {
+                                                fr.tree.left[l_parent_r as usize]
+                                            };
                                         if l_sibling_r != NONE && l_sibling_r == s_node_r {
                                             // Cut sibling of a in r
-                                            let sib_a_r = if fr.tree.left[parent_a_r as usize] == a_node_r {
-                                                fr.tree.right[parent_a_r as usize]
-                                            } else {
-                                                fr.tree.left[parent_a_r as usize]
-                                            };
+                                            let sib_a_r =
+                                                if fr.tree.left[parent_a_r as usize] == a_node_r {
+                                                    fr.tree.right[parent_a_r as usize]
+                                                } else {
+                                                    fr.tree.left[parent_a_r as usize]
+                                                };
                                             if sib_a_r != NONE && !fr.is_cut(sib_a_r) {
                                                 super::trace!(
                                                     "CUT_TWO_B: ({},{}) forest {}, s={} is sibling of l in forest {} → cut sib_a={}",
-                                                    a, b, q, s_label, r, sib_a_r
+                                                    a,
+                                                    b,
+                                                    q,
+                                                    s_label,
+                                                    r,
+                                                    sib_a_r
                                                 );
                                                 return Some(CutInfo {
                                                     forest_idx: r,
@@ -518,7 +543,9 @@ pub fn apply_case_2_branching(
                     stats.branches_pruned += 1;
                     super::trace!(
                         "BB prune: approx={}, lb_comps={}, target_s={}",
-                        approx, approx_lb_comps, target_s
+                        approx,
+                        approx_lb_comps,
+                        target_s
                     );
                     return None;
                 }
