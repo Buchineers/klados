@@ -750,6 +750,7 @@ dependencies = [
  "fxhash",
  "highs",
  "klados-core",
+ "klados-exact",
  "libc",
  "pace26io",
 ]
