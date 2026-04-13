@@ -642,7 +642,7 @@ impl NodeRmp {
         self.model
             .as_mut()
             .expect("node RMP model present")
-            .add_col(1.0, 0.0..=1.0, rows);
+            .add_col(1.0, 0.0.., rows);
         self.active_global_cols.push(global_ci);
     }
 
@@ -768,7 +768,7 @@ fn solve_rmp_lp(
 
     // One variable per column in the current node LP relaxation.
     // Branching is enforced exactly as in the reference implementation:
-    // a compatible column remains 0 <= a_Y <= 1, and incompatible columns are excluded.
+    // a compatible column remains a_Y >= 0 (no upper bound per Formulation 4), and incompatible columns are excluded.
     let vars: Vec<Col> = columns
         .iter()
         .enumerate()
@@ -776,7 +776,7 @@ fn solve_rmp_lp(
             if !column_respects_branchings(columns, ci, fixed_to_one, fixed_to_zero) {
                 pb.add_column(1.0, 0.0..=0.0) // branch-incompatible
             } else {
-                pb.add_column(1.0, 0.0..=1.0)
+                pb.add_column(1.0, 0.0..)
             }
         })
         .collect();
