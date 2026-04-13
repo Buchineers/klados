@@ -102,12 +102,17 @@ impl WhiddenSolver {
         instance: &Instance,
         mut progress: Option<&mut dyn FnMut(WhiddenProgressUpdate)>,
     ) -> Option<Vec<Tree>> {
-        assert_eq!(
-            instance.num_trees(),
-            2,
-            "Whidden solver requires exactly 2 trees, got {}",
-            instance.num_trees()
-        );
+        // Whidden is 2-tree only; fall back to SAT solver for multi-tree instances.
+        if instance.num_trees() != 2 {
+            eprintln!(
+                "[whidden] m={}, falling back to maf-sat",
+                instance.num_trees()
+            );
+            let mut sat = crate::maf_sat::MafSatSolver::new();
+            let result = crate::ExactSolver::solve(&mut sat, instance);
+            self.stats = crate::ExactSolver::stats(&sat).clone();
+            return result;
+        }
 
         if instance.num_leaves <= 1 {
             return Some(vec![instance.trees[0].clone()]);
