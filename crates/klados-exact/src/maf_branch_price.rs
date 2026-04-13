@@ -14,7 +14,8 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use fixedbitset::FixedBitSet;
-use highs::{Col, ColProblem, HighsModelStatus, Model, Row, RowProblem, Sense};
+use highs::{Col, ColProblem, HighsModelStatus, Model, Row};
+use klados_core::lower_bound::maf_bounds;
 use klados_core::{Instance, SolverStats, Tree};
 
 use crate::kernelize::{self, KernelizeConfig};
@@ -158,10 +159,14 @@ fn solve_branch_price(instance: &Instance, stats: &mut SolverStats) -> Option<Ve
         .collect();
     let seen: HashSet<Vec<u32>> = columns.iter().map(|c| c.labels.clone()).collect();
 
+    // Compute greedy UB for tighter initial bound (enables more B&B pruning).
+    let bounds = maf_bounds(trees, reduced.num_leaves);
+    let initial_ub = bounds.upper.min(n + 1);
+
     let mut state = BpState {
         columns,
         seen,
-        best_ub: n + 1, // trivial UB: all singletons = n components
+        best_ub: initial_ub,
         best_solution: None,
         nodes_explored: 0,
         cg_iterations_total: 0,
@@ -255,6 +260,12 @@ fn solve_bp_node(
     num_leaves: usize,
 ) -> NodeResult {
     state.nodes_explored += 1;
+
+    // Forced-one columns each contribute 1 to the objective; prune hopeless nodes early.
+    if node.fixed_to_one.len() >= state.best_ub {
+        return NodeResult::Pruned;
+    }
+
     let mut blocked_leaves = vec![false; num_leaves + 1];
     for &forced_ci in &node.fixed_to_one {
         for &label in &state.columns[forced_ci].labels {
@@ -266,6 +277,11 @@ fn solve_bp_node(
         .iter()
         .map(|&ci| state.columns[ci].labels.clone())
         .collect::<HashSet<_>>();
+    // Forbidden labels for this node = globally seen columns ∪ branch-fixed-to-zero columns.
+    // We keep this set incrementally updated to avoid cloning state.seen on every CG iteration.
+    let mut forbidden_labels = state.seen.clone();
+    forbidden_labels.extend(banned_zero_labels.iter().cloned());
+
     let mut node_rmp = match NodeRmp::build(
         &state.columns,
         trees,
@@ -287,6 +303,7 @@ fn solve_bp_node(
     };
     // Column generation loop
     let mut cg_iters_this_node = 0usize;
+    let mut final_lp: Option<RmpLpResult> = None;
     loop {
         let lp = match node_rmp.solve(state.columns.len()) {
             Ok(lp) => lp,
@@ -301,102 +318,47 @@ fn solve_bp_node(
             }
         };
 
-        // Dual verification: check that no in-pool compatible column has negative reduced cost
-        if cg_iters_this_node == 0 || cg_iters_this_node % 20 == 0 {
-            let mut worst_rc = f64::INFINITY;
-            let mut worst_ci = 0;
-            for (ci, col) in state.columns.iter().enumerate() {
-                if !column_respects_branchings(
-                    &state.columns,
-                    ci,
-                    &node.fixed_to_one,
-                    &node.fixed_to_zero,
+        // Fast path for rooted instances: run the standard pricer first.
+        // Only when the best unconstrained label-set is forbidden at this node
+        // do we pay for constrained unseen-column separation.
+        let priced = match run_rooted_paper_pricer(
+            &trees[0],
+            &trees[1],
+            &alpha,
+            &beta,
+            &blocked_leaves,
+        ) {
+            Ok(Some((score, labels))) if score > 1.0 + 1e-8 && forbidden_labels.contains(&labels) => {
+                match price_best_new_compatible_column(
+                    &trees[0],
+                    &trees[1],
+                    &alpha,
+                    &beta,
+                    &blocked_leaves,
+                    &forbidden_labels,
                 ) {
-                    continue;
-                }
-                let score = column_pricing_score(col, &alpha, &beta, trees);
-                let rc = 1.0 - score;
-                if rc < worst_rc {
-                    worst_rc = rc;
-                    worst_ci = ci;
-                }
-            }
-            if worst_rc < -1e-4 {
-                eprintln!(
-                    "[maf-bp]   DUAL BUG: col {} has rc={:.6} (score={:.6}), LP={:.6}, val={:.6}",
-                    worst_ci,
-                    worst_rc,
-                    1.0 - worst_rc,
-                    lp.objective,
-                    lp.column_values[worst_ci],
-                );
-            }
-        }
-
-        // Price columns paper-faithfully over the admissible set.
-        // At the root we keep a faster shortcut. At every branched node we solve
-        // the exact unseen-column separation problem over the current admissible
-        // column set. This matches the branch-aware theory much more closely and
-        // avoids branch-dependent termination bugs.
-        let priced = if node.depth == 0 {
-            match run_rooted_paper_pricer(
-                &trees[0],
-                &trees[1],
-                &alpha,
-                &beta,
-                &blocked_leaves,
-            ) {
-                Ok(Some((score, labels))) if score > 1.0 + 1e-8 && state.seen.contains(&labels) => {
-                    match price_best_new_compatible_column(
-                        &trees[0],
-                        &trees[1],
-                        &alpha,
-                        &beta,
-                        &blocked_leaves,
-                        &state.seen,
-                    ) {
-                        Ok(Some((alt_score, alt_labels))) => (alt_score, alt_labels),
-                        Ok(None) => {
-                            eprintln!(
-                                "[maf-bp]   CG@depth={}: no priced column, LP={:.6}, iters={}",
-                                node.depth, lp.objective, cg_iters_this_node,
-                            );
-                            break;
-                        }
-                        Err(_) => break,
+                    Ok(Some((alt_score, alt_labels))) => (alt_score, alt_labels),
+                    Ok(None) => {
+                        eprintln!(
+                            "[maf-bp]   CG@depth={}: no priced column, LP={:.6}, iters={}",
+                            node.depth, lp.objective, cg_iters_this_node,
+                        );
+                        final_lp = Some(lp);
+                        break;
                     }
+                    Err(_) => break,
                 }
-                Ok(Some((score, labels))) => (score, labels),
-                Ok(None) => {
-                    eprintln!(
-                        "[maf-bp]   CG@depth={}: no priced column, LP={:.6}, iters={}",
-                        node.depth, lp.objective, cg_iters_this_node,
-                    );
-                    break;
-                }
-                Err(_) => break,
             }
-        } else {
-            let mut forbidden = state.seen.clone();
-            forbidden.extend(banned_zero_labels.iter().cloned());
-            match price_best_new_compatible_column(
-                &trees[0],
-                &trees[1],
-                &alpha,
-                &beta,
-                &blocked_leaves,
-                &forbidden,
-            ) {
-                Ok(Some((score, labels))) => (score, labels),
-                Ok(None) => {
-                    eprintln!(
-                        "[maf-bp]   CG@depth={}: no priced column, LP={:.6}, iters={}",
-                        node.depth, lp.objective, cg_iters_this_node,
-                    );
-                    break;
-                }
-                Err(_) => break,
+            Ok(Some((score, labels))) => (score, labels),
+            Ok(None) => {
+                eprintln!(
+                    "[maf-bp]   CG@depth={}: no priced column, LP={:.6}, iters={}",
+                    node.depth, lp.objective, cg_iters_this_node,
+                );
+                final_lp = Some(lp);
+                break;
             }
+            Err(_) => break,
         };
 
         let (score, labels) = priced;
@@ -405,12 +367,12 @@ fn solve_bp_node(
                 "[maf-bp]   CG@depth={}: score={:.6} <= 1, LP={:.6}, iters={}",
                 node.depth, score, lp.objective, cg_iters_this_node,
             );
+            final_lp = Some(lp);
             break; // CG converged: no improving column
         }
 
-        if labels.len() >= 2 && !is_set_compatible_all(trees, &labels) {
-            continue;
-        }
+        // For rooted trees, the WMAST DP guarantees the priced column is
+        // a valid agreement subtree — no triplet post-check needed.
 
         let inserted = state.seen.insert(labels.clone());
         if !inserted {
@@ -420,6 +382,7 @@ fn solve_bp_node(
             );
             break;
         }
+        forbidden_labels.insert(labels.clone());
         let new_ci = state.columns.len();
         state.columns.push(make_bp_column(labels.clone(), trees));
         node_rmp.add_column(new_ci, &state.columns[new_ci], trees);
@@ -433,10 +396,13 @@ fn solve_bp_node(
         cg_iters_this_node += 1;
     }
 
-    // Final LP solve at this node
-    let lp = match node_rmp.solve(state.columns.len()) {
-        Ok(lp) => lp,
-        Err(_) => return NodeResult::Pruned,
+    // Final LP solve at this node (reuse the terminal LP if we already have it).
+    let lp = match final_lp {
+        Some(lp) => lp,
+        None => match node_rmp.solve(state.columns.len()) {
+            Ok(lp) => lp,
+            Err(_) => return NodeResult::Pruned,
+        },
     };
 
     if lp.objective.ceil() as usize >= state.best_ub {
@@ -757,164 +723,6 @@ impl NodeDual {
     }
 }
 
-fn solve_rmp_lp(
-    columns: &[BpColumn],
-    trees: &[Tree],
-    num_leaves: usize,
-    fixed_to_one: &[usize],
-    fixed_to_zero: &[usize],
-) -> Result<RmpLpResult, String> {
-    let mut pb = RowProblem::default();
-
-    // One variable per column in the current node LP relaxation.
-    // Branching is enforced exactly as in the reference implementation:
-    // a compatible column remains a_Y >= 0 (no upper bound per Formulation 4), and incompatible columns are excluded.
-    let vars: Vec<Col> = columns
-        .iter()
-        .enumerate()
-        .map(|(ci, _)| {
-            if !column_respects_branchings(columns, ci, fixed_to_one, fixed_to_zero) {
-                pb.add_column(1.0, 0.0..=0.0) // branch-incompatible
-            } else {
-                pb.add_column(1.0, 0.0..)
-            }
-        })
-        .collect();
-
-    // Covering constraints: Σ_{Y: x∈Y} a_Y = 1 for each leaf (exact partition)
-    let leaf_to_cols = build_leaf_to_cols(columns, num_leaves);
-    for leaf in 1..=num_leaves {
-        let cols: Vec<(Col, f64)> = leaf_to_cols[leaf]
-            .iter()
-            .map(|&ci| (vars[ci], 1.0))
-            .collect();
-        pb.add_row(1.0..=1.0, &cols);
-    }
-
-    // Packing constraints: Σ_{Y: v∈V_q[Y]} a_Y ≤ 1 for each internal node
-    let node_to_cols = build_node_to_cols(columns, trees);
-    for (ti, tree) in trees.iter().enumerate() {
-        for node in 0..tree.num_nodes() as u32 {
-            if tree.is_leaf(node) {
-                continue;
-            }
-            let cols: Vec<(Col, f64)> = node_to_cols[ti][node as usize]
-                .iter()
-                .map(|&ci| (vars[ci], 1.0))
-                .collect();
-            if cols.len() >= 2 {
-                pb.add_row(..=1.0, &cols);
-            }
-        }
-    }
-
-    let mut model = pb.optimise(Sense::Minimise);
-    model.make_quiet();
-    model.set_option("threads", 1_i32);
-    model.set_option("presolve", "on");
-    model.set_option("solver", "simplex");
-    let solved = model.solve();
-    if solved.status() != HighsModelStatus::Optimal {
-        return Err(format!("LP status: {:?}", solved.status()));
-    }
-
-    let solution = solved.get_solution();
-    let column_values = solution.columns().to_vec();
-
-    Ok(RmpLpResult {
-        objective: solved.objective_value(),
-        column_values,
-    })
-}
-
-fn solve_stabilized_dual(
-    columns: &[BpColumn],
-    trees: &[Tree],
-    fixed_to_one: &[usize],
-    fixed_to_zero: &[usize],
-) -> Result<(Vec<f64>, Vec<Vec<f64>>), String> {
-    const BETA_COST_SCALE: f64 = 10_000.0;
-    const MAX_BETA_COST: f64 = 1.0;
-
-    let num_leaves = trees
-        .first()
-        .map(|tree| tree.num_leaves as usize)
-        .unwrap_or(0);
-
-    let active_multi_leaf_cols = columns
-        .iter()
-        .enumerate()
-        .filter(|(ci, col)| {
-            col.labels.len() > 1
-                && column_respects_branchings(columns, *ci, fixed_to_one, fixed_to_zero)
-        })
-        .count();
-
-    if active_multi_leaf_cols == 0 {
-        return Ok((
-            (0..=num_leaves)
-                .map(|leaf| if leaf == 0 { 0.0 } else { 1.0 })
-                .collect(),
-            trees.iter()
-                .map(|tree| vec![0.0; tree.num_nodes()])
-                .collect::<Vec<_>>(),
-        ));
-    }
-
-    let mut dual_model = Model::new(ColProblem::default());
-    dual_model.make_quiet();
-    dual_model.set_option("threads", 1_i32);
-    dual_model.set_option("presolve", "on");
-    dual_model.set_option("solver", "simplex");
-
-    let mut penalty_vars: Vec<Vec<Option<Col>>> = trees
-        .iter()
-        .map(|tree| vec![None; tree.num_nodes()])
-        .collect();
-    for (ti, tree) in trees.iter().enumerate() {
-        for node in 0..tree.num_nodes() as u32 {
-            if tree.is_leaf(node) {
-                continue;
-            }
-            penalty_vars[ti][node as usize] = Some(dual_model.add_col(BETA_COST_SCALE, 0.0.., Vec::new()));
-        }
-    }
-
-    for (ci, col) in columns.iter().enumerate() {
-        if col.labels.len() <= 1 || !column_respects_branchings(columns, ci, fixed_to_one, fixed_to_zero) {
-            continue;
-        }
-        add_column_to_stabilized_dual_model(
-            &mut dual_model,
-            &penalty_vars,
-            col,
-            trees,
-            MAX_BETA_COST,
-        );
-    }
-
-    let solved = dual_model.solve();
-    if solved.status() != HighsModelStatus::Optimal {
-        return Err(format!("stabilized dual LP status: {:?}", solved.status()));
-    }
-
-    let solution = solved.get_solution();
-    let alpha = (0..=num_leaves)
-        .map(|leaf| if leaf == 0 { 0.0 } else { 1.0 })
-        .collect::<Vec<_>>();
-    let mut beta = trees
-        .iter()
-        .map(|tree| vec![0.0; tree.num_nodes()])
-        .collect::<Vec<_>>();
-    for (ti, tree) in trees.iter().enumerate() {
-        for node in 0..tree.num_nodes() {
-            if let Some(var) = penalty_vars[ti][node] {
-                beta[ti][node] = clean_dual(solution[var]);
-            }
-        }
-    }
-    Ok((alpha, beta))
-}
 
 fn add_column_to_stabilized_dual_model(
     dual_model: &mut Model,
@@ -1052,54 +860,12 @@ fn column_respects_branchings(
     true
 }
 
-fn build_leaf_to_cols(columns: &[BpColumn], num_leaves: usize) -> Vec<Vec<usize>> {
-    let mut l2c = vec![Vec::new(); num_leaves + 1];
-    for (ci, col) in columns.iter().enumerate() {
-        for &label in &col.labels {
-            l2c[label as usize].push(ci);
-        }
-    }
-    l2c
-}
-
-fn build_node_to_cols(columns: &[BpColumn], trees: &[Tree]) -> Vec<Vec<Vec<usize>>> {
-    let mut n2c: Vec<Vec<Vec<usize>>> = trees
-        .iter()
-        .map(|tree| vec![Vec::new(); tree.num_nodes()])
-        .collect();
-    for (ci, col) in columns.iter().enumerate() {
-        if col.labels.len() < 2 {
-            continue;
-        }
-        for (ti, covered_nodes) in col.covered_internal_nodes.iter().enumerate() {
-            for &node in covered_nodes {
-                n2c[ti][node].push(ci);
-            }
-        }
-    }
-    n2c
-}
-
 fn make_leafset(labels: &[u32], num_leaves: u32) -> FixedBitSet {
     let mut bits = FixedBitSet::with_capacity(num_leaves as usize + 1);
     for &label in labels {
         bits.insert(label as usize);
     }
     bits
-}
-
-/// Compute the pricing score (Σ α_x - Σ β_{q,v}) for a column.
-fn column_pricing_score(col: &BpColumn, alpha: &[f64], beta: &[Vec<f64>], _trees: &[Tree]) -> f64 {
-    let leaf_sum: f64 = col.labels.iter().map(|&l| alpha[l as usize]).sum();
-    let mut node_sum = 0.0f64;
-    if col.labels.len() >= 2 {
-        for (ti, covered_nodes) in col.covered_internal_nodes.iter().enumerate() {
-            for &node in covered_nodes {
-                node_sum += beta[ti][node];
-            }
-        }
-    }
-    leaf_sum - node_sum
 }
 
 fn clean_dual(value: f64) -> f64 {
@@ -1292,46 +1058,6 @@ fn mark_component_nodes(tree: &Tree, labels: &[u32]) -> FixedBitSet {
         }
     }
     bits
-}
-
-fn triplet_topology(tree: &Tree, x: u32, y: u32, z: u32) -> u8 {
-    let nx = tree.node_by_label(x);
-    let ny = tree.node_by_label(y);
-    let nz = tree.node_by_label(z);
-    let lxy = tree.nearest_common_ancestor(nx, ny);
-    let lxz = tree.nearest_common_ancestor(nx, nz);
-    let lyz = tree.nearest_common_ancestor(ny, nz);
-    let dxy = tree.depth[lxy as usize];
-    let dxz = tree.depth[lxz as usize];
-    let dyz = tree.depth[lyz as usize];
-    if dxy > dxz && dxy > dyz {
-        0
-    } else if dxz > dxy && dxz > dyz {
-        1
-    } else {
-        2
-    }
-}
-
-fn is_set_compatible_all(trees: &[Tree], labels: &[u32]) -> bool {
-    if labels.len() <= 2 {
-        return true;
-    }
-    for i in 0..labels.len() {
-        for j in (i + 1)..labels.len() {
-            for k in (j + 1)..labels.len() {
-                let (a, b, c) = (labels[i], labels[j], labels[k]);
-                let topo0 = triplet_topology(&trees[0], a, b, c);
-                if trees[1..]
-                    .iter()
-                    .any(|tree| triplet_topology(tree, a, b, c) != topo0)
-                {
-                    return false;
-                }
-            }
-        }
-    }
-    true
 }
 
 // ---------------------------------------------------------------------------
