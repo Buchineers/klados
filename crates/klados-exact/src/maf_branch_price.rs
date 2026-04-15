@@ -963,18 +963,7 @@ fn price_best_new_compatible_column(
         frontier.push(root);
     }
 
-    // Iteration limit to prevent exponential worst-case behavior.
-    // If we can't find a new column within this many iterations, the current
-    // LP solution is likely already optimal for the restricted problem.
-    let max_iterations = 1000;
-    let mut iterations = 0;
-
     while let Some(candidate) = frontier.pop() {
-        iterations += 1;
-        if iterations > max_iterations {
-            break;
-        }
-
         if !forbidden.contains(&candidate.labels) {
             return Ok(Some((candidate.score, candidate.labels)));
         }
