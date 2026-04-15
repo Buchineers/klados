@@ -4,6 +4,7 @@ use klados_core::Instance;
 use klados_core::lower_bound::{
     cherry_reduce_ub, maf_bounds, red_blue_approx, red_blue_approx_detailed,
 };
+use klados_exact::whidden::approx_2_lb_for_instance;
 
 pub fn run(instance: &Instance) -> Result<(), Box<dyn std::error::Error>> {
     let n = instance.num_leaves;
@@ -30,6 +31,11 @@ pub fn run(instance: &Instance) -> Result<(), Box<dyn std::error::Error>> {
             "Red-Blue:      UB={} LB_half={} LB_dual={} ({:.1}ms)",
             rb.ub, lb_half, rb.dual_lb, rb_ms
         );
+
+        let t0 = std::time::Instant::now();
+        let a2_lb = approx_2_lb_for_instance(&instance.trees[0], &instance.trees[1], n);
+        let a2_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("Olver-TF LB:   {} ({:.1}ms)", a2_lb, a2_ms);
 
         let t0 = std::time::Instant::now();
         let cherry_ub = cherry_reduce_ub(&instance.trees[0], &instance.trees[1]);

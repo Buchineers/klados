@@ -9,6 +9,7 @@ pub mod instance;
 pub mod kernelize;
 pub mod lower_bound;
 pub mod tree;
+pub mod twin_tree;
 pub mod xforest;
 
 pub use instance::Instance;

@@ -47,16 +47,10 @@ pub fn active_children_xf(forest: &XForest, node: NodeId) -> Children {
     let tree = &forest.tree;
     let mut out = Children::new();
     if let Some((left, right)) = tree.children(node) {
-        if left != NONE
-            && !forest.is_cut(left)
-            && forest.live_leaf_count[left as usize] > 0
-        {
+        if left != NONE && !forest.is_cut(left) && forest.live_leaf_count[left as usize] > 0 {
             out.push(left);
         }
-        if right != NONE
-            && !forest.is_cut(right)
-            && forest.live_leaf_count[right as usize] > 0
-        {
+        if right != NONE && !forest.is_cut(right) && forest.live_leaf_count[right as usize] > 0 {
             out.push(right);
         }
     }
@@ -66,16 +60,10 @@ pub fn active_children_xf(forest: &XForest, node: NodeId) -> Children {
 pub fn forest_children(forest: &XForest, node: NodeId) -> Children {
     let mut out = Children::new();
     if let Some((left, right)) = forest.tree.children(node) {
-        if left != NONE
-            && !forest.is_cut(left)
-            && forest.live_leaf_count[left as usize] > 0
-        {
+        if left != NONE && !forest.is_cut(left) && forest.live_leaf_count[left as usize] > 0 {
             out.push(descend_to_effective(forest, left));
         }
-        if right != NONE
-            && !forest.is_cut(right)
-            && forest.live_leaf_count[right as usize] > 0
-        {
+        if right != NONE && !forest.is_cut(right) && forest.live_leaf_count[right as usize] > 0 {
             out.push(descend_to_effective(forest, right));
         }
     }

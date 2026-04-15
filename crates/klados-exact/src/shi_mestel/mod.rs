@@ -69,8 +69,9 @@ impl ShiMestelSolver {
         let kern = kernelize::kernelize_best(instance, &config);
 
         if kern.stats.reduced_leaves < instance.num_leaves {
-            let total =
-                kern.stats.subtree_removed() + kern.stats.chain_removed() + kern.stats.chain32_removed();
+            let total = kern.stats.subtree_removed()
+                + kern.stats.chain_removed()
+                + kern.stats.chain32_removed();
             trace!(
                 "kernelized: {} → {} leaves ({} removed: {} subtree, {} chain, {} 3-2)",
                 instance.num_leaves,
@@ -93,9 +94,7 @@ impl ShiMestelSolver {
             crate::cluster_reduction::ClusterReductionResult::Solved(solution) => {
                 trace!(
                     "cluster decomposition: {} = {} + {}",
-                    reduced.num_leaves,
-                    solution.cluster_size,
-                    solution.rest_size
+                    reduced.num_leaves, solution.cluster_size, solution.rest_size
                 );
                 return Some(kernelize::expand_solution(
                     solution.components,
@@ -108,12 +107,7 @@ impl ShiMestelSolver {
 
         let reduced_result = self.solve_inner(reduced);
         reduced_result.map(|components| {
-            kernelize::expand_solution(
-                components,
-                &kern,
-                &instance.trees[0],
-                instance.num_leaves,
-            )
+            kernelize::expand_solution(components, &kern, &instance.trees[0], instance.num_leaves)
         })
     }
 
