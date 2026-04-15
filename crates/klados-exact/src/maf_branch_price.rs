@@ -1114,6 +1114,9 @@ struct PricerWorkspace {
     leaves2: Vec<u32>,
     internal1: Vec<u32>,
     internal2: Vec<u32>,
+    // Scratch buffers (reused, not reallocated)
+    live1: Vec<u32>,  // unblocked leaf count per node in t1
+    live2: Vec<u32>,  // unblocked leaf count per node in t2
     n2: usize,
     table_size: usize,
 }
@@ -1155,6 +1158,8 @@ impl PricerWorkspace {
             leaves2,
             internal1,
             internal2,
+            live1: vec![0; t1.num_nodes()],
+            live2: vec![0; t2.num_nodes()],
             n2,
             table_size,
         }
@@ -1177,6 +1182,30 @@ impl PricerWorkspace {
     #[inline(always)]
     fn idx(&self, u: u32, v: u32) -> usize {
         u as usize * self.n2 + v as usize
+    }
+
+    /// Recompute live-leaf counts for the current blocked set.
+    /// Returns true if the root pair has any live leaves at all.
+    fn compute_live_counts(&mut self, t1: &Tree, t2: &Tree, blocked: &[bool]) -> bool {
+        // t1: leaves first (already in post-order, leaves come before internals)
+        for &u in &self.leaves1 {
+            let lbl = t1.label[u as usize];
+            self.live1[u as usize] = if blocked.get(lbl as usize).copied().unwrap_or(false) { 0 } else { 1 };
+        }
+        for &u in &self.internal1 {
+            let (ul, ur) = t1.children_pair(u);
+            self.live1[u as usize] = self.live1[ul as usize] + self.live1[ur as usize];
+        }
+        // t2
+        for &v in &self.leaves2 {
+            let lbl = t2.label[v as usize];
+            self.live2[v as usize] = if blocked.get(lbl as usize).copied().unwrap_or(false) { 0 } else { 1 };
+        }
+        for &v in &self.internal2 {
+            let (vl, vr) = t2.children_pair(v);
+            self.live2[v as usize] = self.live2[vl as usize] + self.live2[vr as usize];
+        }
+        self.live1[t1.root as usize] > 0 && self.live2[t2.root as usize] > 0
     }
 }
 
@@ -1225,6 +1254,12 @@ fn run_rooted_paper_pricer(
 ) -> Result<Option<(f64, Vec<u32>)>, Box<dyn std::error::Error>> {
     ws.reset_scores();
 
+    // Phase 0: compute live-leaf counts for the current blocked set.
+    // If no live leaves remain in either tree, bail out immediately.
+    if !ws.compute_live_counts(t1, t2, blocked_leaves) {
+        return Ok(None);
+    }
+
     let idx = |u: u32, v: u32| -> usize { u as usize * ws.n2 + v as usize };
 
     // Phase 1: leaf vs leaf — only matching labels produce non-trivial scores
@@ -1255,6 +1290,10 @@ fn run_rooted_paper_pricer(
         let blocked = blocked_leaves.get(lbl as usize).copied().unwrap_or(false);
         for &v in &ws.internal2 {
             let pair = idx(u, v);
+            // Skip if t2 subtree has no live leaves
+            if ws.live2[v as usize] == 0 {
+                continue;
+            }
             let (vl, vr) = t2.children_pair(v);
             let beta_v = beta[1][v as usize];
 
@@ -1282,16 +1321,15 @@ fn run_rooted_paper_pricer(
                 ws.m_score[pair] = 0.0;
                 ws.m_choice[pair] = MChoice::None;
             }
-
-            // If this leaf is unblocked and labels match, also consider leaf match
-            if !blocked && t2.label[v as usize] == 0 {
-                // v is internal, no direct label match possible
-            }
         }
     }
 
     // Phase 3: internal vs leaf — symmetric to phase 2
     for &u in &ws.internal1 {
+        // Skip if t1 subtree has no live leaves
+        if ws.live1[u as usize] == 0 {
+            continue;
+        }
         let beta_u = beta[0][u as usize];
         for &v in &ws.leaves2 {
             let pair = idx(u, v);
@@ -1328,9 +1366,17 @@ fn run_rooted_paper_pricer(
 
     // Phase 4: internal vs internal — the heavy part with straight/cross splits
     for &u in &ws.internal1 {
+        // Skip entire row if t1 subtree has no live leaves
+        if ws.live1[u as usize] == 0 {
+            continue;
+        }
         let beta_u = beta[0][u as usize];
         let (ul, ur) = t1.children_pair(u);
         for &v in &ws.internal2 {
+            // Skip if t2 subtree has no live leaves
+            if ws.live2[v as usize] == 0 {
+                continue;
+            }
             let pair = idx(u, v);
             let (vl, vr) = t2.children_pair(v);
             let beta_v = beta[1][v as usize];
