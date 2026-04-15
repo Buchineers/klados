@@ -937,6 +937,18 @@ fn price_best_new_compatible_column(
     blocked_leaves: &[bool],
     forbidden: &HashSet<Vec<u32>>,
 ) -> Result<Option<(f64, Vec<u32>)>, Box<dyn std::error::Error>> {
+    // Fast path: run the base DP once. If the best column is not forbidden, return it.
+    // This avoids the entire prefix search in the common case (no forbidden columns
+    // or best column is valid).
+    let base_priced = run_rooted_paper_pricer(pricer_ws, t1, t2, alpha, beta, blocked_leaves)?;
+    let Some((base_score, base_labels)) = base_priced else {
+        return Ok(None);
+    };
+    if !forbidden.contains(&base_labels) {
+        return Ok(Some((base_score, base_labels)));
+    }
+
+    // The best column is forbidden. Prepare for prefix search.
     let free_labels = (1..=t1.num_leaves)
         .filter(|&label| !blocked_leaves[label as usize])
         .collect::<Vec<_>>();
@@ -948,6 +960,34 @@ fn price_best_new_compatible_column(
         .sum::<f64>();
     let required_bonus = ordinary_upper + beta_sum + 1.0;
 
+    // Single-flip heuristic: force the first free label in/out and run the
+    // constrained DP. This is a cheap 2-call heuristic that often finds an
+    // improving column before the full prefix search.
+    if !free_labels.is_empty() {
+        // Force label IN
+        if let Some(node) = solve_pricing_prefix_subproblem(
+            pricer_ws,
+            t1, t2, alpha, beta, blocked_leaves,
+            &free_labels, &[true], required_bonus,
+        )? {
+            if !forbidden.contains(&node.labels) {
+                return Ok(Some((node.score, node.labels)));
+            }
+        }
+        // Force label OUT
+        if let Some(node) = solve_pricing_prefix_subproblem(
+            pricer_ws,
+            t1, t2, alpha, beta, blocked_leaves,
+            &free_labels, &[false], required_bonus,
+        )? {
+            if !forbidden.contains(&node.labels) {
+                return Ok(Some((node.score, node.labels)));
+            }
+        }
+    }
+
+    // Heuristics exhausted. Fall back to exact prefix search to certify
+    // that no improving column exists (or find one).
     let mut frontier = BinaryHeap::new();
     if let Some(root) = solve_pricing_prefix_subproblem(
         pricer_ws,
