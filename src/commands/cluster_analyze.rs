@@ -1,9 +1,9 @@
 //! Analyze cluster decomposition potential (Kelk common-cluster + rspr-style).
 
+use klados_core::Instance;
 use klados_core::cluster_decomposition;
 use klados_core::cluster_reduction;
 use klados_core::kernelize::{self, KernelizeConfig};
-use klados_core::Instance;
 
 pub fn run(instance: &Instance) -> Result<(), Box<dyn std::error::Error>> {
     let m = instance.num_trees();
@@ -63,10 +63,7 @@ pub fn run(instance: &Instance) -> Result<(), Box<dyn std::error::Error>> {
 
     // Verbose output to stderr.
     eprintln!("Instance: m={} n={}", m, n);
-    eprintln!(
-        "Kernelized: {} → {} ({} removed)",
-        n, n_red, kern_removed
-    );
+    eprintln!("Kernelized: {} → {} ({} removed)", n, n_red, kern_removed);
     eprintln!(
         "Kelk common-cluster: {} (size={}) in {:.1}ms",
         if kelk_found { "FOUND" } else { "none" },

@@ -111,7 +111,9 @@ pub fn alg_maf(
         if result.len() > target_s {
             super::trace!(
                 "BUG: extraction produced {} components but target_s={}, all_comps={}",
-                result.len(), target_s, all_comps.len()
+                result.len(),
+                target_s,
+                all_comps.len()
             );
             // Extraction disagrees with search state — reject this solution.
             state.rollback();
@@ -166,7 +168,9 @@ pub fn alg_maf(
             }
 
             // Build restricted sub-forests for this component.
-            let sub_forests: Vec<XForest> = state.forests.iter()
+            let sub_forests: Vec<XForest> = state
+                .forests
+                .iter()
                 .map(|f| {
                     let pruned = f.tree.prune_to_leafset(comp_ls);
                     XForest::from_tree(pruned)
@@ -180,7 +184,9 @@ pub fn alg_maf(
             // minimum cost of all other components.
             // Total non-iso budget = remaining + non_iso_comps.len() (since each
             // component contributes at least 1 to the count, already subtracted).
-            let other_min: usize = min_costs.iter().enumerate()
+            let other_min: usize = min_costs
+                .iter()
+                .enumerate()
                 .filter(|&(i, _)| i != idx)
                 .map(|(_, &c)| c)
                 .sum();
@@ -222,16 +228,25 @@ pub fn alg_maf(
         // Isomorphic components from the current search state.
         let collapsed_into = super::extraction::build_collapsed_into(&state.collapses, num_leaves);
         for comp_ls in &all_comps {
-            let is_non_iso = non_iso_comps.iter().any(|c| c.as_slice() == comp_ls.as_slice());
+            let is_non_iso = non_iso_comps
+                .iter()
+                .any(|c| c.as_slice() == comp_ls.as_slice());
             if is_non_iso {
                 continue;
             }
             if comp_ls.count_ones(..) == 0 {
                 continue;
             }
-            let expanded = super::extraction::expand_leafset(comp_ls, &collapsed_into, num_leaves, label_space);
+            let expanded = super::extraction::expand_leafset(
+                comp_ls,
+                &collapsed_into,
+                num_leaves,
+                label_space,
+            );
             result_trees.push(super::extraction::build_component_tree(
-                &expanded, &state.forests[0].tree, num_leaves,
+                &expanded,
+                &state.forests[0].tree,
+                num_leaves,
             ));
         }
 
@@ -251,10 +266,15 @@ pub fn alg_maf(
                 }
                 // Expand through outer collapses and build from reference tree.
                 let expanded = super::extraction::expand_leafset(
-                    &sub_ls, &collapsed_into, num_leaves, label_space,
+                    &sub_ls,
+                    &collapsed_into,
+                    num_leaves,
+                    label_space,
                 );
                 result_trees.push(super::extraction::build_component_tree(
-                    &expanded, &state.forests[0].tree, num_leaves,
+                    &expanded,
+                    &state.forests[0].tree,
+                    num_leaves,
                 ));
             }
         }
@@ -263,7 +283,8 @@ pub fn alg_maf(
         if result_trees.len() > target_s {
             super::trace!(
                 "decomposition produced {} components but target_s={}",
-                result_trees.len(), target_s
+                result_trees.len(),
+                target_s
             );
             tt_insert(tt, tt_hash, target_s);
             state.rollback();
@@ -327,7 +348,11 @@ pub fn solve_inner(instance: &Instance, stats: &mut SolverStats) -> Option<Vec<T
             &mut |pair| crate::maf_sat::solve_pair_sat(pair),
         );
         if exact_lb > bounds.lower {
-            super::trace!("exact_pairwise_lb tightened: {} → {}", bounds.lower, exact_lb);
+            super::trace!(
+                "exact_pairwise_lb tightened: {} → {}",
+                bounds.lower,
+                exact_lb
+            );
         }
         exact_lb
     } else {

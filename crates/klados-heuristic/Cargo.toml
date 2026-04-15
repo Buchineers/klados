@@ -7,9 +7,9 @@ license = "GPL-3.0-or-later"
 
 [dependencies]
 klados-core = { workspace = true }
+klados-exact = { workspace = true }
 pace26io = { workspace = true }
-thiserror = { workspace = true }
 fixedbitset = { workspace = true }
-fxhash = { workspace = true }
 highs = { workspace = true }
+fxhash = { workspace = true }
 libc = "0.2"

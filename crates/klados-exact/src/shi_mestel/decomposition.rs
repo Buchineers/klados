@@ -42,14 +42,9 @@ where
 
     // 1. Collect isomorphic components directly — they are already agreement
     //    subtrees (same topology in every tree).
-    let non_iso_slices: Vec<&[usize]> = non_iso_comps
-        .iter()
-        .map(|c| c.as_slice())
-        .collect();
+    let non_iso_slices: Vec<&[usize]> = non_iso_comps.iter().map(|c| c.as_slice()).collect();
     for comp_ls in all_comps {
-        let is_non_iso = non_iso_slices
-            .iter()
-            .any(|&s| s == comp_ls.as_slice());
+        let is_non_iso = non_iso_slices.iter().any(|&s| s == comp_ls.as_slice());
         if is_non_iso {
             continue;
         }

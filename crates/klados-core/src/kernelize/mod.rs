@@ -24,12 +24,12 @@ mod stats;
 #[cfg(test)]
 mod tests;
 
-use std::collections::BTreeMap;
-use fixedbitset::FixedBitSet;
 use crate::Instance;
+use fixedbitset::FixedBitSet;
+use std::collections::BTreeMap;
 
-pub use expansion::{expand_solution, build_rep_to_all};
-pub use instance_ops::{reduce_instance, restrict_instance_simple, compose_reverse_maps};
+pub use expansion::{build_rep_to_all, expand_solution};
+pub use instance_ops::{compose_reverse_maps, reduce_instance, restrict_instance_simple};
 pub use rule::{ReductionAction, ReductionRule, RuleContext, RuleEvent, VictimStrategy};
 pub use stats::{KernelizeStats, build_surviving_taxa, print_stats, print_taxa_detail};
 
@@ -64,7 +64,7 @@ impl Default for KernelizeConfig {
             chain32_multi: true,
             protected_labels: Vec::new(),
             victim_strategy: VictimStrategy::First,
-            max_partners: 2,  // SAFETY: only 2-partner 3-2 is proven correct
+            max_partners: 2, // SAFETY: only 2-partner 3-2 is proven correct
         }
     }
 }
@@ -161,9 +161,8 @@ pub fn kernelize(instance: &Instance, config: &KernelizeConfig) -> KernelizeResu
                         let orig_remove = original_labels[1];
                         all_collapses_original.push((orig_keep, vec![orig_remove]));
 
-                        let mut keep_set = FixedBitSet::with_capacity(
-                            reduced.num_leaves as usize + 1,
-                        );
+                        let mut keep_set =
+                            FixedBitSet::with_capacity(reduced.num_leaves as usize + 1);
                         for lbl in 1..=reduced.num_leaves {
                             keep_set.insert(lbl as usize);
                         }
@@ -175,9 +174,8 @@ pub fn kernelize(instance: &Instance, config: &KernelizeConfig) -> KernelizeResu
                     ReductionAction::Delete { victim } => {
                         deleted_labels_original.push(original_labels[0]);
 
-                        let mut keep_set = FixedBitSet::with_capacity(
-                            reduced.num_leaves as usize + 1,
-                        );
+                        let mut keep_set =
+                            FixedBitSet::with_capacity(reduced.num_leaves as usize + 1);
                         for lbl in 1..=reduced.num_leaves {
                             keep_set.insert(lbl as usize);
                         }
@@ -192,14 +190,16 @@ pub fn kernelize(instance: &Instance, config: &KernelizeConfig) -> KernelizeResu
                     rule_name: rule.name(),
                     action: match &trace.last() {
                         // Re-derive action with original labels for the trace
-                        _ => if original_labels.len() == 2 {
-                            ReductionAction::Collapse {
-                                keep: original_labels[0],
-                                remove: original_labels[1],
-                            }
-                        } else {
-                            ReductionAction::Delete {
-                                victim: original_labels[0],
+                        _ => {
+                            if original_labels.len() == 2 {
+                                ReductionAction::Collapse {
+                                    keep: original_labels[0],
+                                    remove: original_labels[1],
+                                }
+                            } else {
+                                ReductionAction::Delete {
+                                    victim: original_labels[0],
+                                }
                             }
                         }
                     },
@@ -250,7 +250,11 @@ pub fn kernelize_best(instance: &Instance, config: &KernelizeConfig) -> Kerneliz
         return kernelize(instance, config);
     }
 
-    let strategies = [VictimStrategy::First, VictimStrategy::Last, VictimStrategy::MaxCascade];
+    let strategies = [
+        VictimStrategy::First,
+        VictimStrategy::Last,
+        VictimStrategy::MaxCascade,
+    ];
     let mut best: Option<KernelizeResult> = None;
 
     for &strategy in &strategies {

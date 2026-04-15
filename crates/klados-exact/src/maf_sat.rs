@@ -6,11 +6,54 @@ use rustsat::instances::{BasicVarManager, ManageVars};
 use rustsat::solvers::{PhaseLit, Solve, SolveIncremental, SolverResult};
 use rustsat::types::{Clause, Lit, TernaryVal, Var};
 use rustsat_cadical::CaDiCaL;
+use std::collections::BTreeMap;
 
+use crate::ExactSolver;
 use crate::cluster_reduction::{self, ClusterReductionResult};
 use crate::kernelize::{self, KernelizeConfig};
 use crate::lower_bound::maf_bounds;
-use crate::ExactSolver;
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum H4Mode {
+    Full,
+    Lazy,
+    SeededLazy,
+    Staged,
+}
+
+impl H4Mode {
+    fn from_env() -> Self {
+        match std::env::var("KLADOS_MAF_SAT_H4") {
+            Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+                "full" => Self::Full,
+                "lazy" => Self::Lazy,
+                "seeded" | "seeded-lazy" | "seeded_lazy" => Self::SeededLazy,
+                "staged" => Self::Staged,
+                other => {
+                    eprintln!(
+                        "[sat] Unknown KLADOS_MAF_SAT_H4='{}'; expected full|lazy|seeded|staged. Falling back to full.",
+                        other
+                    );
+                    Self::Full
+                }
+            },
+            Err(_) => Self::Full,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Lazy => "lazy",
+            Self::SeededLazy => "seeded-lazy",
+            Self::Staged => "staged",
+        }
+    }
+
+    fn uses_lazy_cegar(self) -> bool {
+        matches!(self, Self::Lazy | Self::SeededLazy | Self::Staged)
+    }
+}
 
 #[derive(Default)]
 struct SolveProfile {
@@ -160,7 +203,10 @@ impl ExactSolver for MafSatOlverSolver {
             return Some(instance.trees[0..1].to_vec());
         }
         if instance.num_trees() != 2 {
-            eprintln!("[olver] Olver encoding requires exactly 2 trees, got {}", instance.num_trees());
+            eprintln!(
+                "[olver] Olver encoding requires exactly 2 trees, got {}",
+                instance.num_trees()
+            );
             return None;
         }
         solve_sat_olver(instance, &mut self.stats)
@@ -232,8 +278,254 @@ impl NcaData {
     }
 }
 
+struct TripleIndex {
+    base_ab: Vec<Vec<usize>>,
+}
+
+impl TripleIndex {
+    fn new(n: usize) -> Self {
+        let mut base_a = vec![0usize; n];
+        let mut total = 0usize;
+        for (a, slot) in base_a.iter_mut().enumerate() {
+            *slot = total;
+            if n > a + 2 {
+                total += (n - a - 1) * (n - a - 2) / 2;
+            }
+        }
+
+        let mut base_ab = vec![vec![0usize; n]; n];
+        for a in 0..n {
+            let mut offset = 0usize;
+            for b in (a + 1)..n {
+                base_ab[a][b] = base_a[a] + offset;
+                if n > b + 1 {
+                    offset += n - b - 1;
+                }
+            }
+        }
+        Self { base_ab }
+    }
+
+    fn capacity(n: usize) -> usize {
+        if n < 3 { 0 } else { n * (n - 1) * (n - 2) / 6 }
+    }
+
+    #[inline]
+    fn index(&self, a: usize, b: usize, c: usize) -> usize {
+        debug_assert!(a < b && b < c);
+        self.base_ab[a][b] + (c - b - 1)
+    }
+}
+
 fn add_clause(solver: &mut CaDiCaL, lits: &[Lit]) {
     solver.add_clause(Clause::from(lits)).unwrap();
+}
+
+fn add_h4_triple_clauses(
+    solver: &mut CaDiCaL,
+    conn: &[Vec<Option<Var>>],
+    a: usize,
+    b: usize,
+    c: usize,
+) {
+    add_clause(
+        solver,
+        &[conn[a][b].unwrap().neg_lit(), conn[a][c].unwrap().neg_lit()],
+    );
+    add_clause(
+        solver,
+        &[conn[a][b].unwrap().neg_lit(), conn[b][c].unwrap().neg_lit()],
+    );
+    add_clause(
+        solver,
+        &[conn[a][c].unwrap().neg_lit(), conn[b][c].unwrap().neg_lit()],
+    );
+}
+
+fn extract_components_from_model(
+    solver: &CaDiCaL,
+    conn: &[Vec<Option<Var>>],
+    n: usize,
+) -> Vec<Vec<usize>> {
+    fn uf_find(p: &mut [usize], x: usize) -> usize {
+        if p[x] != x {
+            p[x] = uf_find(p, p[x]);
+        }
+        p[x]
+    }
+
+    let mut uf: Vec<usize> = (0..n).collect();
+    for a in 0..n {
+        for b in (a + 1)..n {
+            if solver.var_val(conn[a][b].unwrap()).unwrap() == TernaryVal::True {
+                let ra = uf_find(&mut uf, a);
+                let rb = uf_find(&mut uf, b);
+                if ra != rb {
+                    uf[ra] = rb;
+                }
+            }
+        }
+    }
+
+    let mut comp_map: fxhash::FxHashMap<usize, Vec<usize>> = fxhash::FxHashMap::default();
+    for j in 0..n {
+        let r = uf_find(&mut uf, j);
+        comp_map.entry(r).or_default().push(j);
+    }
+    comp_map.into_values().collect()
+}
+
+fn log_component_summary(
+    k_bound: usize,
+    comps: &[Vec<usize>],
+    verbose_components: bool,
+    label_map_to_original: Option<&[u32]>,
+) {
+    let mut hist: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut top_sizes: Vec<usize> = comps.iter().map(|c| c.len()).collect();
+    let total_savings: usize = top_sizes.iter().map(|&sz| sz.saturating_sub(1)).sum();
+    for &size in &top_sizes {
+        *hist.entry(size).or_default() += 1;
+    }
+    top_sizes.sort_unstable_by(|a, b| b.cmp(a));
+    top_sizes.truncate(8);
+    let hist_str = hist
+        .iter()
+        .map(|(size, count)| format!("{}x{}", size, count))
+        .collect::<Vec<_>>()
+        .join(",");
+    eprintln!(
+        "[cut] k={} component-summary savings={} hist=[{}] top_sizes={:?}",
+        k_bound, total_savings, hist_str, top_sizes
+    );
+    if verbose_components {
+        let mut nontrivial: Vec<Vec<usize>> = comps
+            .iter()
+            .filter(|comp| comp.len() > 1)
+            .map(|comp| {
+                comp.iter()
+                    .map(|&leaf| {
+                        let reduced_label = (leaf + 1) as u32;
+                        label_map_to_original
+                            .and_then(|map| map.get(reduced_label as usize).copied())
+                            .unwrap_or(reduced_label) as usize
+                    })
+                    .collect()
+            })
+            .collect();
+        nontrivial.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        eprintln!("[cut] k={} nontrivial-components={:?}", k_bound, nontrivial);
+    }
+}
+
+fn sorted3(a: usize, b: usize, c: usize) -> (usize, usize, usize) {
+    let mut x = a;
+    let mut y = b;
+    let mut z = c;
+    if x > y {
+        std::mem::swap(&mut x, &mut y);
+    }
+    if y > z {
+        std::mem::swap(&mut y, &mut z);
+    }
+    if x > y {
+        std::mem::swap(&mut x, &mut y);
+    }
+    (x, y, z)
+}
+
+fn build_h4_seed_pairs(instance: &Instance, n: usize) -> Vec<(usize, usize)> {
+    let mut seen = vec![vec![false; n]; n];
+    let mut pairs = Vec::new();
+
+    for tree in &instance.trees {
+        for v in 0..tree.num_nodes() {
+            let left = tree.left[v];
+            let right = tree.right[v];
+            if left == klados_core::tree::NONE || right == klados_core::tree::NONE {
+                continue;
+            }
+            if !tree.is_leaf(left) || !tree.is_leaf(right) {
+                continue;
+            }
+
+            let mut a = (tree.label[left as usize] - 1) as usize;
+            let mut b = (tree.label[right as usize] - 1) as usize;
+            if a > b {
+                std::mem::swap(&mut a, &mut b);
+            }
+            if !seen[a][b] {
+                seen[a][b] = true;
+                pairs.push((a, b));
+            }
+        }
+    }
+
+    pairs
+}
+
+fn collect_h4_violated_triples(
+    components: &[Vec<usize>],
+    nca_data: &NcaData,
+    triple_index: &TripleIndex,
+    added_h4: &FixedBitSet,
+) -> Vec<(usize, usize, usize)> {
+    let mut violations = Vec::new();
+
+    for comp in components {
+        if comp.len() < 3 {
+            continue;
+        }
+        for i in 0..comp.len() {
+            let a = comp[i];
+            for j in (i + 1)..comp.len() {
+                let b = comp[j];
+                for k in (j + 1)..comp.len() {
+                    let c = comp[k];
+                    let idx = triple_index.index(a, b, c);
+                    if added_h4.contains(idx) {
+                        continue;
+                    }
+                    if nca_data.is_incompatible(a, b, c) {
+                        violations.push((a, b, c));
+                    }
+                }
+            }
+        }
+    }
+
+    violations
+}
+
+fn add_remaining_h4_clauses(
+    solver: &mut CaDiCaL,
+    conn: &[Vec<Option<Var>>],
+    nca_data: &NcaData,
+    triple_index: &TripleIndex,
+    added_h4: &mut FixedBitSet,
+    n: usize,
+) -> (usize, usize) {
+    let mut added_triples = 0usize;
+    let mut added_clauses = 0usize;
+
+    for a in 0..n {
+        for b in (a + 1)..n {
+            for c in (b + 1)..n {
+                let idx = triple_index.index(a, b, c);
+                if added_h4.contains(idx) {
+                    continue;
+                }
+                if nca_data.is_incompatible(a, b, c) {
+                    add_h4_triple_clauses(solver, conn, a, b, c);
+                    added_h4.insert(idx);
+                    added_triples += 1;
+                    added_clauses += 3;
+                }
+            }
+        }
+    }
+
+    (added_triples, added_clauses)
 }
 
 fn components_to_trees(components: &[Vec<usize>], ref_tree: &Tree, num_leaves: u32) -> Vec<Tree> {
@@ -453,6 +745,8 @@ fn sat_solve_maf_cut(
     lb_components: usize,
     profile: &mut SolveProfile,
     use_cegar: bool,
+    h4_mode: H4Mode,
+    label_map_to_original: Option<&[u32]>,
 ) -> Option<Vec<Tree>> {
     let n = instance.num_leaves as usize;
     let m = instance.num_trees();
@@ -460,6 +754,7 @@ fn sat_solve_maf_cut(
     profile.n_reduced = n;
     profile.k = k_max;
     profile.m = m;
+    eprintln!("[cut] H4 mode: {}", h4_mode.label());
 
     // Precompute NCA data for H4 incompatible triple detection.
     let nca_data = NcaData::build(instance, n);
@@ -503,7 +798,10 @@ fn sat_solve_maf_cut(
                 .collect()
         })
         .collect();
-    let del_count: usize = del.iter().map(|d| d.iter().filter(|v| v.is_some()).count()).sum();
+    let del_count: usize = del
+        .iter()
+        .map(|d| d.iter().filter(|v| v.is_some()).count())
+        .sum();
 
     // conn[a][b]: leaves a and b are in the same component (single set, not per-tree).
     // Cross-tree consistency is enforced via backward clauses on ALL trees' del vars.
@@ -519,7 +817,10 @@ fn sat_solve_maf_cut(
 
     eprintln!(
         "[cut] Variables: {} del + {} conn = {} (path precomp {:.1}ms)",
-        del_count, conn_count, vm.n_used(), path_ms
+        del_count,
+        conn_count,
+        vm.n_used(),
+        path_ms
     );
 
     // --- Clauses ---
@@ -527,6 +828,24 @@ fn sat_solve_maf_cut(
     let mut backward_count = 0usize;
     let mut forward_count = 0usize;
     let mut h4_count = 0usize;
+    let mut h4_lazy_rounds = 0usize;
+    let mut h4_lazy_triples = 0usize;
+    let mut h4_lazy_clauses = 0usize;
+    let staged_promote_ms = std::env::var("KLADOS_MAF_SAT_H4_PROMOTE_MS")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(2000.0);
+    let mut h4_promoted = false;
+    let mut added_h4_triples = if h4_mode.uses_lazy_cegar() {
+        FixedBitSet::with_capacity(TripleIndex::capacity(n))
+    } else {
+        FixedBitSet::new()
+    };
+    let triple_index = if h4_mode.uses_lazy_cegar() {
+        Some(TripleIndex::new(n))
+    } else {
+        None
+    };
 
     // 1. Backward for ALL trees: conn[a][b] → ¬del[q][v].
     //    Can be deferred via CEGAR (use_cegar=true) to reduce initial formula size,
@@ -537,10 +856,7 @@ fn sat_solve_maf_cut(
                 for b in (a + 1)..n {
                     for &v in &paths[q][a][b] {
                         if let Some(dv) = del[q][v as usize] {
-                            add_clause(
-                                &mut solver,
-                                &[conn[a][b].unwrap().neg_lit(), dv.neg_lit()],
-                            );
+                            add_clause(&mut solver, &[conn[a][b].unwrap().neg_lit(), dv.neg_lit()]);
                             backward_count += 1;
                         }
                     }
@@ -566,29 +882,80 @@ fn sat_solve_maf_cut(
         }
     }
 
-    // 3. H4: incompatible triples — all 3 binary clauses per triple.
-    //    For integer solutions, at most one pair from an incompatible triple can
-    //    be in the same component (s(a,b) + s(a,c) + s(b,c) ≤ 1).
-    //    All 3 binary clauses maximize unit propagation in CaDiCaL.
-    for a in 0..n {
-        for b in (a + 1)..n {
-            for c in (b + 1)..n {
-                if nca_data.is_incompatible(a, b, c) {
-                    add_clause(
-                        &mut solver,
-                        &[conn[a][b].unwrap().neg_lit(), conn[a][c].unwrap().neg_lit()],
-                    );
-                    add_clause(
-                        &mut solver,
-                        &[conn[a][b].unwrap().neg_lit(), conn[b][c].unwrap().neg_lit()],
-                    );
-                    add_clause(
-                        &mut solver,
-                        &[conn[a][c].unwrap().neg_lit(), conn[b][c].unwrap().neg_lit()],
-                    );
-                    h4_count += 3;
+    // 3. H4: incompatible triples.
+    //    full: eagerly add all 3 binary clauses per incompatible triple.
+    //    lazy: add none upfront and separate violated triples after SAT models.
+    //    seeded-lazy: add a cheap local subset upfront based on sibling-pair seeds.
+    match h4_mode {
+        H4Mode::Full => {
+            for a in 0..n {
+                for b in (a + 1)..n {
+                    for c in (b + 1)..n {
+                        if nca_data.is_incompatible(a, b, c) {
+                            add_h4_triple_clauses(&mut solver, &conn, a, b, c);
+                            h4_count += 3;
+                        }
+                    }
                 }
             }
+        }
+        H4Mode::Lazy => {}
+        H4Mode::SeededLazy => {
+            let triple_index = triple_index.as_ref().unwrap();
+            let seed_pairs = build_h4_seed_pairs(instance, n);
+            let mut seeded_triples = 0usize;
+            for (a, b) in seed_pairs {
+                for c in 0..n {
+                    if c == a || c == b {
+                        continue;
+                    }
+                    let (x, y, z) = sorted3(a, b, c);
+                    let idx = triple_index.index(x, y, z);
+                    if added_h4_triples.contains(idx) {
+                        continue;
+                    }
+                    if nca_data.is_incompatible(x, y, z) {
+                        add_h4_triple_clauses(&mut solver, &conn, x, y, z);
+                        added_h4_triples.insert(idx);
+                        h4_count += 3;
+                        seeded_triples += 1;
+                    }
+                }
+            }
+            eprintln!(
+                "[cut] H4 seeded upfront: {} triples -> {} clauses",
+                seeded_triples,
+                seeded_triples * 3
+            );
+        }
+        H4Mode::Staged => {
+            let triple_index = triple_index.as_ref().unwrap();
+            let seed_pairs = build_h4_seed_pairs(instance, n);
+            let mut seeded_triples = 0usize;
+            for (a, b) in seed_pairs {
+                for c in 0..n {
+                    if c == a || c == b {
+                        continue;
+                    }
+                    let (x, y, z) = sorted3(a, b, c);
+                    let idx = triple_index.index(x, y, z);
+                    if added_h4_triples.contains(idx) {
+                        continue;
+                    }
+                    if nca_data.is_incompatible(x, y, z) {
+                        add_h4_triple_clauses(&mut solver, &conn, x, y, z);
+                        added_h4_triples.insert(idx);
+                        h4_count += 3;
+                        seeded_triples += 1;
+                    }
+                }
+            }
+            eprintln!(
+                "[cut] H4 staged upfront: {} triples -> {} clauses, promote at {:.0}ms",
+                seeded_triples,
+                seeded_triples * 3,
+                staged_promote_ms
+            );
         }
     }
 
@@ -607,7 +974,11 @@ fn sat_solve_maf_cut(
     for lit in del_0_lits {
         totalizer.extend([lit]);
     }
-    let lb_cuts = if lb_components > 0 { lb_components - 1 } else { 0 };
+    let lb_cuts = if lb_components > 0 {
+        lb_components - 1
+    } else {
+        0
+    };
     let ub_cuts = k_max - 1;
     totalizer
         .encode_ub(lb_cuts..=ub_cuts, &mut solver, &mut vm)
@@ -628,16 +999,9 @@ fn sat_solve_maf_cut(
         profile.num_vars, total_clauses, del_0_count
     );
 
-    // --- Descent with CEGAR for backward clauses ---
+    // --- Descent with CEGAR for backward and/or H4 clauses ---
     let t_total_solve = std::time::Instant::now();
     let mut best_components: Option<Vec<Vec<usize>>> = None;
-
-    fn uf_find(p: &mut [usize], x: usize) -> usize {
-        if p[x] != x {
-            p[x] = uf_find(p, p[x]);
-        }
-        p[x]
-    }
 
     for cuts_bound in (lb_cuts..=ub_cuts).rev() {
         let k_bound = cuts_bound + 1;
@@ -654,12 +1018,44 @@ fn sat_solve_maf_cut(
 
             match result {
                 SolverResult::Sat => {
-                    // CEGAR: check for backward constraint violations (only when enabled).
+                    if h4_mode == H4Mode::Staged
+                        && !h4_promoted
+                        && t_total_solve.elapsed().as_secs_f64() * 1000.0 >= staged_promote_ms
+                    {
+                        let t_promote = std::time::Instant::now();
+                        let (added_triples, added_clauses) = add_remaining_h4_clauses(
+                            &mut solver,
+                            &conn,
+                            &nca_data,
+                            triple_index.as_ref().unwrap(),
+                            &mut added_h4_triples,
+                            n,
+                        );
+                        let promote_ms = t_promote.elapsed().as_secs_f64() * 1000.0;
+                        h4_promoted = true;
+                        h4_lazy_triples += added_triples;
+                        h4_lazy_clauses += added_clauses;
+                        profile.cegar_violations += added_clauses;
+                        eprintln!(
+                            "[cut] k={} H4 promote +{} clauses ({} triples, detect {:.1}ms, cum {:.1}s)",
+                            k_bound, added_clauses, added_triples, promote_ms, cum_s
+                        );
+                        continue;
+                    }
+
+                    // CEGAR: check deferred backward clauses and/or lazy H4 violations.
+                    let mut components_cache: Option<Vec<Vec<usize>>> = None;
+                    let t_cegar = std::time::Instant::now();
+                    let mut added_backward = 0usize;
+                    let mut added_h4_now = 0usize;
+                    let mut added_h4_triples_now = 0usize;
+
                     if use_cegar {
                         let mut violated_clauses: Vec<[Lit; 2]> = Vec::new();
                         for a in 0..n {
                             for b in (a + 1)..n {
-                                if solver.var_val(conn[a][b].unwrap()).unwrap() != TernaryVal::True {
+                                if solver.var_val(conn[a][b].unwrap()).unwrap() != TernaryVal::True
+                                {
                                     continue;
                                 }
                                 for q in 0..m {
@@ -677,46 +1073,76 @@ fn sat_solve_maf_cut(
                             }
                         }
                         if !violated_clauses.is_empty() {
-                            let violations = violated_clauses.len();
                             for clause in &violated_clauses {
                                 add_clause(&mut solver, clause);
                             }
-                            backward_count += violations;
-                            profile.cegar_violations += violations;
-                            eprintln!(
-                                "[cut] k={} CEGAR +{} backward clauses (total={}) {:.1}ms (cum {:.1}s)",
-                                k_bound, violations, backward_count, solve_ms, cum_s
-                            );
-                            continue; // Re-solve with new clauses.
+                            added_backward = violated_clauses.len();
+                            backward_count += added_backward;
+                            profile.cegar_violations += added_backward;
                         }
                     }
 
-                    // No violations — valid solution.
-                    let mut uf: Vec<usize> = (0..n).collect();
-                    for a in 0..n {
-                        for b in (a + 1)..n {
-                            if solver.var_val(conn[a][b].unwrap()).unwrap() == TernaryVal::True {
-                                let ra = uf_find(&mut uf, a);
-                                let rb = uf_find(&mut uf, b);
-                                if ra != rb {
-                                    uf[ra] = rb;
-                                }
+                    if h4_mode.uses_lazy_cegar() && !(h4_mode == H4Mode::Staged && h4_promoted) {
+                        let comps = extract_components_from_model(&solver, &conn, n);
+                        let violated_triples = collect_h4_violated_triples(
+                            &comps,
+                            &nca_data,
+                            triple_index.as_ref().unwrap(),
+                            &added_h4_triples,
+                        );
+                        if !violated_triples.is_empty() {
+                            for &(a, b, c) in &violated_triples {
+                                add_h4_triple_clauses(&mut solver, &conn, a, b, c);
+                                let idx = triple_index.as_ref().unwrap().index(a, b, c);
+                                added_h4_triples.insert(idx);
                             }
+                            added_h4_triples_now = violated_triples.len();
+                            added_h4_now = violated_triples.len() * 3;
+                            h4_lazy_rounds += 1;
+                            h4_lazy_triples += added_h4_triples_now;
+                            h4_lazy_clauses += added_h4_now;
+                            profile.cegar_violations += added_h4_now;
+                        } else {
+                            components_cache = Some(comps);
                         }
                     }
-                    let mut comp_map: fxhash::FxHashMap<usize, Vec<usize>> =
-                        fxhash::FxHashMap::default();
-                    for j in 0..n {
-                        let r = uf_find(&mut uf, j);
-                        comp_map.entry(r).or_default().push(j);
+
+                    let cegar_ms = t_cegar.elapsed().as_secs_f64() * 1000.0;
+                    profile.cegar_ms += cegar_ms;
+                    if added_backward > 0 || added_h4_now > 0 {
+                        eprintln!(
+                            "[cut] k={} CEGAR +{} backward (total {}) +{} H4 clauses ({} triples, total {}, detect {:.1}ms, cum {:.1}s)",
+                            k_bound,
+                            added_backward,
+                            backward_count,
+                            added_h4_now,
+                            added_h4_triples_now,
+                            h4_count + h4_lazy_clauses,
+                            cegar_ms,
+                            cum_s
+                        );
+                        continue; // Re-solve with new clauses.
                     }
-                    let comps: Vec<Vec<usize>> = comp_map.into_values().collect();
+
+                    // No violations — valid solution.
+                    let comps = components_cache
+                        .unwrap_or_else(|| extract_components_from_model(&solver, &conn, n));
                     let num_comps = comps.len();
                     let max_sz = comps.iter().map(|c| c.len()).max().unwrap_or(0);
                     eprintln!(
                         "[cut] k={} SAT {:.1}ms (cum {:.1}s) comps={} max_size={}",
                         k_bound, solve_ms, cum_s, num_comps, max_sz
                     );
+                    if let Ok(trace_mode) = std::env::var("KLADOS_MAF_SAT_COMPONENT_TRACE") {
+                        if trace_mode == "1" || trace_mode.eq_ignore_ascii_case("full") {
+                            log_component_summary(
+                                k_bound,
+                                &comps,
+                                trace_mode.eq_ignore_ascii_case("full"),
+                                label_map_to_original,
+                            );
+                        }
+                    }
                     best_components = Some(comps);
 
                     // Phase hints for next k.
@@ -731,6 +1157,8 @@ fn sat_solve_maf_cut(
                             }
                         }
                     }
+
+                    // Phase hints for next k.
                     for q in 0..m {
                         for v in 0..num_nodes[q] {
                             if let Some(dv) = del[q][v] {
@@ -748,25 +1176,38 @@ fn sat_solve_maf_cut(
                 SolverResult::Unsat => {
                     eprintln!(
                         "[cut] k={} UNSAT {:.1}ms (cum {:.1}s) — optimal={}",
-                        k_bound, solve_ms, cum_s, k_bound + 1
+                        k_bound,
+                        solve_ms,
+                        cum_s,
+                        k_bound + 1
                     );
-                    profile.optimal_k =
-                        best_components.as_ref().map(|c| c.len()).unwrap_or(k_max);
+                    profile.optimal_k = best_components.as_ref().map(|c| c.len()).unwrap_or(k_max);
                     profile.report();
-                    return best_components.map(|c| {
-                        components_to_trees(&c, &instance.trees[0], instance.num_leaves)
-                    });
+                    return best_components
+                        .map(|c| components_to_trees(&c, &instance.trees[0], instance.num_leaves));
                 }
                 SolverResult::Interrupted => {
                     profile.report();
-                    return best_components.map(|c| {
-                        components_to_trees(&c, &instance.trees[0], instance.num_leaves)
-                    });
+                    return best_components
+                        .map(|c| components_to_trees(&c, &instance.trees[0], instance.num_leaves));
                 }
             }
         }
     }
 
+    if h4_mode.uses_lazy_cegar() {
+        eprintln!(
+            "[cut] H4 lazy summary: rounds={} triples={} clauses={}{}",
+            h4_lazy_rounds,
+            h4_lazy_triples,
+            h4_lazy_clauses,
+            if h4_mode == H4Mode::Staged && h4_promoted {
+                " promoted=true"
+            } else {
+                ""
+            }
+        );
+    }
     profile.optimal_k = best_components.as_ref().map(|c| c.len()).unwrap_or(k_max);
     profile.report();
     best_components.map(|c| components_to_trees(&c, &instance.trees[0], instance.num_leaves))
@@ -801,7 +1242,11 @@ fn sat_solve_maf_olver(
     profile: &mut SolveProfile,
 ) -> Option<Vec<Tree>> {
     let n = instance.num_leaves as usize;
-    assert!(instance.num_trees() == 2, "Olver encoding requires exactly 2 trees");
+    assert_eq!(
+        instance.num_trees(),
+        2,
+        "Olver encoding requires exactly 2 trees"
+    );
 
     profile.n_reduced = n;
     profile.k = k_max;
@@ -881,7 +1326,10 @@ fn sat_solve_maf_olver(
                 }
                 let s_idx = pair_to_idx(a, b_s);
                 if is_strictly_below(r_idx, s_idx) {
-                    u1_arcs.push(OlverArc { from: r_idx, to: s_idx });
+                    u1_arcs.push(OlverArc {
+                        from: r_idx,
+                        to: s_idx,
+                    });
                 }
             }
         }
@@ -897,7 +1345,10 @@ fn sat_solve_maf_olver(
                 }
                 let s_idx = pair_to_idx(a_s, b);
                 if is_strictly_below(r_idx, s_idx) {
-                    u2_arcs.push(OlverArc { from: r_idx, to: s_idx });
+                    u2_arcs.push(OlverArc {
+                        from: r_idx,
+                        to: s_idx,
+                    });
                 }
             }
         }
@@ -1268,7 +1719,12 @@ fn sat_solve_maf_olver(
     profile.num_vars = vm.n_used() as usize;
     profile.encode_ms = encode_ms;
 
-    let root_clauses = clause_count - balance_clauses - conservation_clauses - leaf_clauses - capacity_clauses - path_block_clauses;
+    let root_clauses = clause_count
+        - balance_clauses
+        - conservation_clauses
+        - leaf_clauses
+        - capacity_clauses
+        - path_block_clauses;
     eprintln!(
         "[olver] Clauses: {} total (balance={} conserv={} leaf={} capacity={} pathblock={} root={})",
         clause_count,
@@ -1378,20 +1834,20 @@ fn sat_solve_maf_olver(
             SolverResult::Unsat => {
                 eprintln!(
                     "[olver] k={} UNSAT {:.1}ms (cum {:.1}s) — optimal={}",
-                    comp_bound, solve_ms, cum_s, comp_bound + 1
+                    comp_bound,
+                    solve_ms,
+                    cum_s,
+                    comp_bound + 1
                 );
-                profile.optimal_k =
-                    best_components.as_ref().map(|c| c.len()).unwrap_or(k_max);
+                profile.optimal_k = best_components.as_ref().map(|c| c.len()).unwrap_or(k_max);
                 profile.report();
-                return best_components.map(|c| {
-                    components_to_trees(&c, &instance.trees[0], instance.num_leaves)
-                });
+                return best_components
+                    .map(|c| components_to_trees(&c, &instance.trees[0], instance.num_leaves));
             }
             SolverResult::Interrupted => {
                 profile.report();
-                return best_components.map(|c| {
-                    components_to_trees(&c, &instance.trees[0], instance.num_leaves)
-                });
+                return best_components
+                    .map(|c| components_to_trees(&c, &instance.trees[0], instance.num_leaves));
             }
         }
     }
@@ -1431,6 +1887,7 @@ fn solve_sat_inner_impl(
     let n = instance.num_leaves as usize;
     let mut profile = SolveProfile::default();
     profile.n = n;
+    let h4_mode = H4Mode::from_env();
 
     let kern_config = KernelizeConfig {
         protected_labels: preferred_singleton_labels.clone(),
@@ -1442,8 +1899,9 @@ fn solve_sat_inner_impl(
 
     let n_reduced = reduced.num_leaves as usize;
     if kern.stats.reduced_leaves < instance.num_leaves {
-        let total =
-            kern.stats.subtree_removed() + kern.stats.chain_removed() + kern.stats.chain32_removed();
+        let total = kern.stats.subtree_removed()
+            + kern.stats.chain_removed()
+            + kern.stats.chain32_removed();
         eprintln!(
             "[sat] Kernelized: {} → {} leaves ({} removed: {} subtree, {} chain, {} 3-2)",
             n,
@@ -1495,15 +1953,13 @@ fn solve_sat_inner_impl(
         }
 
         // Try rspr-style cluster decomposition (any m, more general than Kelk).
-        if let Some(components) =
-            klados_core::cluster_decomposition::try_rspr_cluster_decomposition(
-                reduced,
-                &mut |subinstance| {
-                    let mut sub_stats = SolverStats::default();
-                    solve_sat_inner(subinstance, &mut sub_stats, vec![])
-                },
-            )
-        {
+        if let Some(components) = klados_core::cluster_decomposition::try_rspr_cluster_decomposition(
+            reduced,
+            &mut |subinstance| {
+                let mut sub_stats = SolverStats::default();
+                solve_sat_inner(subinstance, &mut sub_stats, vec![])
+            },
+        ) {
             eprintln!(
                 "[sat] rspr cluster decomposition: {} → {} components",
                 n_reduced,
@@ -1534,7 +1990,11 @@ fn solve_sat_inner_impl(
     let bounds_ms = t_bounds.elapsed().as_secs_f64() * 1000.0;
     eprintln!(
         "[sat] Greedy bounds: LB={}, UB={} in {:.1}ms (n'={}, m={})",
-        bounds.lower, ub_components, bounds_ms, n_reduced, reduced.num_trees()
+        bounds.lower,
+        ub_components,
+        bounds_ms,
+        n_reduced,
+        reduced.num_trees()
     );
 
     // For multi-tree instances, try to tighten LB via exact pairwise distances + additive formula.
@@ -1564,7 +2024,9 @@ fn solve_sat_inner_impl(
 
     eprintln!(
         "[sat] Final bounds: LB={}, UB={}, gap={}",
-        lb_components, ub_components, ub_components - lb_components
+        lb_components,
+        ub_components,
+        ub_components - lb_components
     );
 
     // Translate all preferred singleton labels into 0-based indices in the fully-reduced instance.
@@ -1605,12 +2067,7 @@ fn solve_sat_inner_impl(
 
     // Choose encoding: Olver LP* formulation for 2-tree instances, or cut-based encoding.
     let components = if use_olver && reduced.num_trees() == 2 {
-        sat_solve_maf_olver(
-            reduced,
-            ub_components,
-            lb_components,
-            &mut profile,
-        )?
+        sat_solve_maf_olver(reduced, ub_components, lb_components, &mut profile)?
     } else {
         sat_solve_maf_cut(
             reduced,
@@ -1618,6 +2075,8 @@ fn solve_sat_inner_impl(
             lb_components,
             &mut profile,
             false, // use_cegar: disabled by default (overhead > benefit on most instances)
+            h4_mode,
+            Some(&kern.reverse_map),
         )?
     };
 
@@ -1743,6 +2202,41 @@ mod tests {
         assert!(result.is_some());
         let components = result.unwrap();
         assert_eq!(components.len(), 3);
+    }
+
+    #[test]
+    fn test_cut_encoding_h4_modes_conflicting_trees() {
+        let instance = make_test_instance();
+
+        for mode in [
+            H4Mode::Full,
+            H4Mode::Lazy,
+            H4Mode::SeededLazy,
+            H4Mode::Staged,
+        ] {
+            let mut profile = SolveProfile::default();
+            let result = sat_solve_maf_cut(&instance, 4, 1, &mut profile, false, mode);
+            assert!(result.is_some(), "mode {:?} returned no solution", mode);
+            assert_eq!(result.unwrap().len(), 3, "mode {:?}", mode);
+        }
+    }
+
+    #[test]
+    fn test_cut_encoding_h4_modes_identical_trees() {
+        let t = make_tree_1234_cherry12_34();
+        let instance = Instance::new(vec![t.clone(), t], 4);
+
+        for mode in [
+            H4Mode::Full,
+            H4Mode::Lazy,
+            H4Mode::SeededLazy,
+            H4Mode::Staged,
+        ] {
+            let mut profile = SolveProfile::default();
+            let result = sat_solve_maf_cut(&instance, 4, 1, &mut profile, false, mode);
+            assert!(result.is_some(), "mode {:?} returned no solution", mode);
+            assert_eq!(result.unwrap().len(), 1, "mode {:?}", mode);
+        }
     }
 
     #[test]

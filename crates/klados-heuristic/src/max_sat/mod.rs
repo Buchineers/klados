@@ -60,7 +60,10 @@ impl MaxSatSolver {
         let k = bounds.upper.max(1);
         let m = reduced.num_trees();
 
-        println!("c Kernelized: {}→{} leaves, LB={}, UB={}", instance.num_leaves, n, bounds.lower, k);
+        println!(
+            "c Kernelized: {}→{} leaves, LB={}, UB={}",
+            instance.num_leaves, n, bounds.lower, k
+        );
 
         let mut msp = MaxSatProblem::new();
 
