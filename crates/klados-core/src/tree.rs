@@ -132,6 +132,13 @@ impl Tree {
         }
     }
 
+    /// Get children of an internal node directly (no Option check).
+    /// Caller must ensure the node is internal (not a leaf).
+    #[inline]
+    pub fn children_pair(&self, node: NodeId) -> (NodeId, NodeId) {
+        (self.left[node as usize], self.right[node as usize])
+    }
+
     /// Get the label of a leaf node
     #[inline]
     pub fn leaf_label(&self, node: NodeId) -> Option<Label> {
