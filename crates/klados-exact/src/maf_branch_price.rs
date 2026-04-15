@@ -1,12 +1,18 @@
-//! Exact Branch & Price solver for 2-tree Maximum Agreement Forest.
+//! Rooted Branch & Price solver for 2-tree Maximum Agreement Forest.
 //!
-//! Implements the full algorithm from Frohn 2025 "Branch & Price":
+//! Implements the rooted specialization of Frohn 2025 "Branch & Price":
 //! - Set cover master problem (Formulation 1): min components subject to
 //!   leaf covering (equality) and internal-node packing (≤ 1).
-//! - Pricing via O(n²) Weighted MAST DP (V/M/W recurrences).
+//!   NOTE: leaf cover uses =1 (exact cover) vs paper's ≥1 — stronger LP.
+//! - Pricing via O(n²) rooted WMAST DP (V/M/W recurrences).
+//!   Rooted simplification: discards paper's Eq. 6 edge-cut maximization.
 //! - Integrality check at each B&B node (~99% solved at root per paper).
-//! - SIZE branching strategy on fractional columns when LP is not integral.
+//! - RATIO branching strategy (default), SIZE available via env var.
 //! - Column generation re-run at every B&B node with branching fixings.
+//!
+//! Deviations from paper:
+//! - No epsilon stabilization (Formulation 3/4) — leaves degeneracy on table.
+//! - Constrained unseen-column search is heuristic (1000-iter cap).
 //!
 //! Restricted to m = 2 trees; falls back to maf-sat for multi-tree instances.
 
@@ -85,8 +91,9 @@ impl ExactSolver for MafBranchPriceSolver {
 // ---------------------------------------------------------------------------
 
 struct BpColumn {
-    labels: Vec<u32>, // sorted leaf labels in this block
+    labels: Vec<u32>,            // sorted leaf labels in this block
     covered_internal_nodes: Vec<Vec<usize>>,
+    total_internal_count: usize, // cached sum of covered internal nodes across trees
 }
 
 // ---------------------------------------------------------------------------
@@ -275,9 +282,10 @@ fn solve_branch_price(instance: &Instance, stats: &mut SolverStats) -> Option<Ve
     };
 
     // DFS branch-and-bound
+    let mut pricer_ws = PricerWorkspace::new(&trees[0], &trees[1]);
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        let result = solve_bp_node(&mut state, &node, trees, n);
+        let result = solve_bp_node(&mut state, &node, trees, n, &mut pricer_ws);
         match result {
             NodeResult::Integral(obj, values) => {
                 if obj < state.best_ub {
@@ -356,6 +364,7 @@ fn solve_bp_node(
     node: &BpNode,
     trees: &[Tree],
     num_leaves: usize,
+    pricer_ws: &mut PricerWorkspace,
 ) -> NodeResult {
     state.nodes_explored += 1;
 
@@ -409,6 +418,7 @@ fn solve_bp_node(
         // Only when the best unconstrained label-set is forbidden at this node
         // do we pay for constrained unseen-column separation.
         let priced = match run_rooted_paper_pricer(
+            pricer_ws,
             &trees[0],
             &trees[1],
             &alpha,
@@ -417,6 +427,7 @@ fn solve_bp_node(
         ) {
             Ok(Some((score, labels))) if score > 1.0 + 1e-8 && forbidden_labels.contains(&labels) => {
                 match price_best_new_compatible_column(
+                    pricer_ws,
                     &trees[0],
                     &trees[1],
                     &alpha,
@@ -550,11 +561,7 @@ fn select_branch_column(columns: &[BpColumn], values: &[f64], num_leaves: usize)
             continue;
         }
         let size = columns[ci].labels.len() as f64;
-        let total_internal = columns[ci]
-            .covered_internal_nodes
-            .iter()
-            .map(|nodes| nodes.len())
-            .sum::<usize>() as f64;
+        let total_internal = columns[ci].total_internal_count as f64;
         let score = match strategy {
             BranchStrategy::Size => size,
             // In the paper, RATIO is defined as |Y| / |V[Y]|.
@@ -889,9 +896,11 @@ fn make_bp_column(labels: Vec<u32>, trees: &[Tree]) -> BpColumn {
             .map(|_| Vec::new())
             .collect::<Vec<_>>()
     };
+    let total_internal_count = covered_internal_nodes.iter().map(|n| n.len()).sum();
     BpColumn {
         labels,
         covered_internal_nodes,
+        total_internal_count,
     }
 }
 
@@ -920,6 +929,7 @@ impl Ord for PricingPrefixNode {
 }
 
 fn price_best_new_compatible_column(
+    pricer_ws: &mut PricerWorkspace,
     t1: &Tree,
     t2: &Tree,
     alpha: &[f64],
@@ -940,6 +950,7 @@ fn price_best_new_compatible_column(
 
     let mut frontier = BinaryHeap::new();
     if let Some(root) = solve_pricing_prefix_subproblem(
+        pricer_ws,
         t1,
         t2,
         alpha,
@@ -975,6 +986,7 @@ fn price_best_new_compatible_column(
             child_prefix.extend_from_slice(&membership[fixed_prefix_len..split_idx]);
             child_prefix.push(!membership[split_idx]);
             if let Some(child) = solve_pricing_prefix_subproblem(
+                pricer_ws,
                 t1,
                 t2,
                 alpha,
@@ -993,6 +1005,7 @@ fn price_best_new_compatible_column(
 }
 
 fn solve_pricing_prefix_subproblem(
+    pricer_ws: &mut PricerWorkspace,
     t1: &Tree,
     t2: &Tree,
     alpha: &[f64],
@@ -1016,7 +1029,7 @@ fn solve_pricing_prefix_subproblem(
         }
     }
 
-    let priced = run_rooted_paper_pricer(t1, t2, &alpha_mod, beta, &blocked)?;
+    let priced = run_rooted_paper_pricer(pricer_ws, t1, t2, &alpha_mod, beta, &blocked)?;
     let Some((score_with_bonus, labels)) = priced else {
         return Ok(None);
     };
@@ -1081,7 +1094,94 @@ fn mark_component_nodes(tree: &Tree, labels: &[u32]) -> FixedBitSet {
 }
 
 // ---------------------------------------------------------------------------
-// WMAST pricer: O(n²) DP (Frohn 2025 pricing problem 5)
+// PricerWorkspace: reusable DP tables + structural metadata
+// ---------------------------------------------------------------------------
+// Cache structure, not scores. Dual values (alpha/beta) change every LP solve,
+// so full DP value caching across iterations is useless. But post-order lists,
+// node type classification, and the DP table buffers themselves are stable.
+
+const NEG_INF: f64 = -1.0e100;
+
+struct PricerWorkspace {
+    // DP tables (flat, indexed as u * n2 + v)
+    v_score: Vec<f64>,
+    v_choice: Vec<VChoice>,
+    m_score: Vec<f64>,
+    m_choice: Vec<MChoice>,
+    split_choice: Vec<SplitChoice>,
+    // Structural metadata (computed once, reused)
+    leaves1: Vec<u32>,
+    leaves2: Vec<u32>,
+    internal1: Vec<u32>,
+    internal2: Vec<u32>,
+    n2: usize,
+    table_size: usize,
+}
+
+impl PricerWorkspace {
+    fn new(t1: &Tree, t2: &Tree) -> Self {
+        let n2 = t2.num_nodes();
+        let table_size = t1.num_nodes() * n2;
+        let post1 = t1.post_order_vec();
+        let post2 = t2.post_order_vec();
+
+        // Segregate nodes by type for branchless DP phases
+        let mut leaves1 = Vec::new();
+        let mut internal1 = Vec::new();
+        for &u in &post1 {
+            if t1.is_leaf(u) {
+                leaves1.push(u);
+            } else {
+                internal1.push(u);
+            }
+        }
+        let mut leaves2 = Vec::new();
+        let mut internal2 = Vec::new();
+        for &v in &post2 {
+            if t2.is_leaf(v) {
+                leaves2.push(v);
+            } else {
+                internal2.push(v);
+            }
+        }
+
+        Self {
+            v_score: vec![NEG_INF; table_size],
+            v_choice: vec![VChoice::None; table_size],
+            m_score: vec![0.0; table_size],
+            m_choice: vec![MChoice::None; table_size],
+            split_choice: vec![SplitChoice::None; table_size],
+            leaves1,
+            leaves2,
+            internal1,
+            internal2,
+            n2,
+            table_size,
+        }
+    }
+
+    /// Reset score tables before a fresh DP fill. Only touches the region we use.
+    #[inline(always)]
+    fn reset_scores(&mut self) {
+        for s in &mut self.v_score[..self.table_size] {
+            *s = NEG_INF;
+        }
+        for s in &mut self.m_score[..self.table_size] {
+            *s = 0.0;
+        }
+        for c in &mut self.split_choice[..self.table_size] {
+            *c = SplitChoice::None;
+        }
+    }
+
+    #[inline(always)]
+    fn idx(&self, u: u32, v: u32) -> usize {
+        u as usize * self.n2 + v as usize
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WMAST pricer: O(n²) DP with workspace reuse + segregated loops
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
@@ -1113,173 +1213,219 @@ enum MChoice {
     SkipRightV,
 }
 
+/// Run the rooted WMAST pricer using a reusable workspace.
+/// The workspace avoids re-allocating O(n²) tables on every call.
 fn run_rooted_paper_pricer(
+    ws: &mut PricerWorkspace,
     t1: &Tree,
     t2: &Tree,
     alpha: &[f64],
     beta: &[Vec<f64>],
     blocked_leaves: &[bool],
 ) -> Result<Option<(f64, Vec<u32>)>, Box<dyn std::error::Error>> {
-    const NEG_INF: f64 = -1.0e100;
+    ws.reset_scores();
 
-    let n2 = t2.num_nodes();
-    let idx = |u: u32, v: u32| -> usize { u as usize * n2 + v as usize };
-    let mut v_score = vec![NEG_INF; t1.num_nodes() * n2];
-    let mut v_choice = vec![VChoice::None; t1.num_nodes() * n2];
-    let mut m_score = vec![0.0; t1.num_nodes() * n2];
-    let mut m_choice = vec![MChoice::None; t1.num_nodes() * n2];
-    let mut split_choice = vec![SplitChoice::None; t1.num_nodes() * n2];
-    let post1 = t1.post_order_vec();
-    let post2 = t2.post_order_vec();
+    let idx = |u: u32, v: u32| -> usize { u as usize * ws.n2 + v as usize };
 
-    for &u in &post1 {
-        for &v in &post2 {
+    // Phase 1: leaf vs leaf — only matching labels produce non-trivial scores
+    for &u in &ws.leaves1 {
+        let lbl = t1.label[u as usize];
+        let blocked = blocked_leaves.get(lbl as usize).copied().unwrap_or(false);
+        for &v in &ws.leaves2 {
             let pair = idx(u, v);
-            match (t1.children(u), t2.children(v)) {
-                (None, None) => {
-                    if t1.label[u as usize] == t2.label[v as usize] {
-                        let lbl = t1.label[u as usize];
-                        if blocked_leaves.get(lbl as usize).copied().unwrap_or(false) {
-                            v_score[pair] = NEG_INF;
-                            v_choice[pair] = VChoice::None;
-                            m_score[pair] = 0.0;
-                            m_choice[pair] = MChoice::None;
-                        } else {
-                            let score = alpha[lbl as usize];
-                            v_score[pair] = score;
-                            v_choice[pair] = VChoice::LeafMatch(lbl);
-                            m_score[pair] = score.max(0.0);
-                            m_choice[pair] = if score > 0.0 {
-                                MChoice::LeafMatch(lbl)
-                            } else {
-                                MChoice::None
-                            };
-                        }
-                    } else {
-                        v_score[pair] = NEG_INF;
-                        m_score[pair] = 0.0;
-                    }
-                }
-                (Some((ul, ur)), None) => {
-                    let left = -beta[0][u as usize] + v_score[idx(ul, v)];
-                    let right = -beta[0][u as usize] + v_score[idx(ur, v)];
-                    if left >= right {
-                        v_score[pair] = left;
-                        v_choice[pair] = VChoice::SkipLeftU;
-                    } else {
-                        v_score[pair] = right;
-                        v_choice[pair] = VChoice::SkipRightU;
-                    }
-                    let ml = m_score[idx(ul, v)];
-                    let mr = m_score[idx(ur, v)];
-                    if ml >= mr && ml > 0.0 {
-                        m_score[pair] = ml;
-                        m_choice[pair] = m_choice[idx(ul, v)];
-                    } else if mr > 0.0 {
-                        m_score[pair] = mr;
-                        m_choice[pair] = m_choice[idx(ur, v)];
-                    } else {
-                        m_score[pair] = 0.0;
-                        m_choice[pair] = MChoice::None;
-                    }
-                }
-                (None, Some((vl, vr))) => {
-                    let left = -beta[1][v as usize] + v_score[idx(u, vl)];
-                    let right = -beta[1][v as usize] + v_score[idx(u, vr)];
-                    if left >= right {
-                        v_score[pair] = left;
-                        v_choice[pair] = VChoice::SkipLeftV;
-                    } else {
-                        v_score[pair] = right;
-                        v_choice[pair] = VChoice::SkipRightV;
-                    }
-                    let ml = m_score[idx(u, vl)];
-                    let mr = m_score[idx(u, vr)];
-                    if ml >= mr && ml > 0.0 {
-                        m_score[pair] = ml;
-                        m_choice[pair] = m_choice[idx(u, vl)];
-                    } else if mr > 0.0 {
-                        m_score[pair] = mr;
-                        m_choice[pair] = m_choice[idx(u, vr)];
-                    } else {
-                        m_score[pair] = 0.0;
-                        m_choice[pair] = MChoice::None;
-                    }
-                }
-                (Some((ul, ur)), Some((vl, vr))) => {
-                    let straight = v_score[idx(ul, vl)] + v_score[idx(ur, vr)];
-                    let cross = v_score[idx(ul, vr)] + v_score[idx(ur, vl)];
-                    let (best_split, split_pick) = if straight >= cross {
-                        (straight, SplitChoice::Straight)
-                    } else {
-                        (cross, SplitChoice::Cross)
-                    };
-                    split_choice[pair] = if best_split > NEG_INF / 2.0 {
-                        split_pick
-                    } else {
-                        SplitChoice::None
-                    };
+            if t2.label[v as usize] != lbl || blocked {
+                // v_score stays NEG_INF, m_score stays 0.0
+                continue;
+            }
+            let score = alpha[lbl as usize];
+            ws.v_score[pair] = score;
+            ws.v_choice[pair] = VChoice::LeafMatch(lbl);
+            ws.m_score[pair] = score.max(0.0);
+            ws.m_choice[pair] = if score > 0.0 {
+                MChoice::LeafMatch(lbl)
+            } else {
+                MChoice::None
+            };
+        }
+    }
 
-                    let rooted = if best_split > NEG_INF / 2.0 {
-                        -beta[0][u as usize] - beta[1][v as usize] + best_split
-                    } else {
-                        NEG_INF
-                    };
+    // Phase 2: leaf vs internal — skip-left/skip-right for V, max-propagation for M
+    for &u in &ws.leaves1 {
+        let lbl = t1.label[u as usize];
+        let blocked = blocked_leaves.get(lbl as usize).copied().unwrap_or(false);
+        for &v in &ws.internal2 {
+            let pair = idx(u, v);
+            let (vl, vr) = t2.children_pair(v);
+            let beta_v = beta[1][v as usize];
 
-                    let mut best_v = rooted;
-                    let mut best_v_choice = VChoice::UseRooted;
-                    for (cand, branch_pick) in [
-                        (
-                            -beta[0][u as usize] + v_score[idx(ul, v)],
-                            VChoice::SkipLeftU,
-                        ),
-                        (
-                            -beta[0][u as usize] + v_score[idx(ur, v)],
-                            VChoice::SkipRightU,
-                        ),
-                        (
-                            -beta[1][v as usize] + v_score[idx(u, vl)],
-                            VChoice::SkipLeftV,
-                        ),
-                        (
-                            -beta[1][v as usize] + v_score[idx(u, vr)],
-                            VChoice::SkipRightV,
-                        ),
-                    ] {
-                        if cand > best_v {
-                            best_v = cand;
-                            best_v_choice = branch_pick;
-                        }
-                    }
-                    v_score[pair] = best_v;
-                    v_choice[pair] = if best_v > NEG_INF / 2.0 {
-                        best_v_choice
-                    } else {
-                        VChoice::None
-                    };
+            // V: can only skip in t2 (t1 is a leaf, can't split)
+            let left = -beta_v + ws.v_score[idx(u, vl)];
+            let right = -beta_v + ws.v_score[idx(u, vr)];
+            if left >= right {
+                ws.v_score[pair] = left;
+                ws.v_choice[pair] = VChoice::SkipLeftV;
+            } else {
+                ws.v_score[pair] = right;
+                ws.v_choice[pair] = VChoice::SkipRightV;
+            }
 
-                    let mut best_m = 0.0;
-                    let mut best_m_choice = MChoice::None;
-                    for (cand, branch_pick) in [
-                        (rooted, MChoice::UseRooted),
-                        (m_score[idx(ul, v)], MChoice::SkipLeftU),
-                        (m_score[idx(ur, v)], MChoice::SkipRightU),
-                        (m_score[idx(u, vl)], MChoice::SkipLeftV),
-                        (m_score[idx(u, vr)], MChoice::SkipRightV),
-                    ] {
-                        if cand > best_m {
-                            best_m = cand;
-                            best_m_choice = branch_pick;
-                        }
-                    }
-                    m_score[pair] = best_m;
-                    m_choice[pair] = best_m_choice;
-                }
+            // M: propagate best from children (no rooted option since t1 is leaf)
+            let ml = ws.m_score[idx(u, vl)];
+            let mr = ws.m_score[idx(u, vr)];
+            if ml >= mr && ml > 0.0 {
+                ws.m_score[pair] = ml;
+                ws.m_choice[pair] = ws.m_choice[idx(u, vl)];
+            } else if mr > 0.0 {
+                ws.m_score[pair] = mr;
+                ws.m_choice[pair] = ws.m_choice[idx(u, vr)];
+            } else {
+                ws.m_score[pair] = 0.0;
+                ws.m_choice[pair] = MChoice::None;
+            }
+
+            // If this leaf is unblocked and labels match, also consider leaf match
+            if !blocked && t2.label[v as usize] == 0 {
+                // v is internal, no direct label match possible
             }
         }
     }
 
-    let root_score = m_score[idx(t1.root, t2.root)];
+    // Phase 3: internal vs leaf — symmetric to phase 2
+    for &u in &ws.internal1 {
+        let beta_u = beta[0][u as usize];
+        for &v in &ws.leaves2 {
+            let pair = idx(u, v);
+            let (ul, ur) = t1.children_pair(u);
+            let lbl = t2.label[v as usize];
+            let blocked = blocked_leaves.get(lbl as usize).copied().unwrap_or(false);
+
+            // V: can only skip in t1
+            let left = -beta_u + ws.v_score[idx(ul, v)];
+            let right = -beta_u + ws.v_score[idx(ur, v)];
+            if left >= right {
+                ws.v_score[pair] = left;
+                ws.v_choice[pair] = VChoice::SkipLeftU;
+            } else {
+                ws.v_score[pair] = right;
+                ws.v_choice[pair] = VChoice::SkipRightU;
+            }
+
+            // M: propagate best from children
+            let ml = ws.m_score[idx(ul, v)];
+            let mr = ws.m_score[idx(ur, v)];
+            if ml >= mr && ml > 0.0 {
+                ws.m_score[pair] = ml;
+                ws.m_choice[pair] = ws.m_choice[idx(ul, v)];
+            } else if mr > 0.0 {
+                ws.m_score[pair] = mr;
+                ws.m_choice[pair] = ws.m_choice[idx(ur, v)];
+            } else {
+                ws.m_score[pair] = 0.0;
+                ws.m_choice[pair] = MChoice::None;
+            }
+        }
+    }
+
+    // Phase 4: internal vs internal — the heavy part with straight/cross splits
+    for &u in &ws.internal1 {
+        let beta_u = beta[0][u as usize];
+        let (ul, ur) = t1.children_pair(u);
+        for &v in &ws.internal2 {
+            let pair = idx(u, v);
+            let (vl, vr) = t2.children_pair(v);
+            let beta_v = beta[1][v as usize];
+
+            // W: straight vs cross split
+            let straight = ws.v_score[idx(ul, vl)] + ws.v_score[idx(ur, vr)];
+            let cross = ws.v_score[idx(ul, vr)] + ws.v_score[idx(ur, vl)];
+            let (best_split, split_pick) = if straight >= cross {
+                (straight, SplitChoice::Straight)
+            } else {
+                (cross, SplitChoice::Cross)
+            };
+            ws.split_choice[pair] = if best_split > NEG_INF / 2.0 {
+                split_pick
+            } else {
+                SplitChoice::None
+            };
+
+            // V: rooted split + skip candidates
+            let rooted = if best_split > NEG_INF / 2.0 {
+                -beta_u - beta_v + best_split
+            } else {
+                NEG_INF
+            };
+
+            let mut best_v = rooted;
+            let mut best_v_choice = VChoice::UseRooted;
+
+            let skip_left_u = -beta_u + ws.v_score[idx(ul, v)];
+            if skip_left_u > best_v {
+                best_v = skip_left_u;
+                best_v_choice = VChoice::SkipLeftU;
+            }
+            let skip_right_u = -beta_u + ws.v_score[idx(ur, v)];
+            if skip_right_u > best_v {
+                best_v = skip_right_u;
+                best_v_choice = VChoice::SkipRightU;
+            }
+            let skip_left_v = -beta_v + ws.v_score[idx(u, vl)];
+            if skip_left_v > best_v {
+                best_v = skip_left_v;
+                best_v_choice = VChoice::SkipLeftV;
+            }
+            let skip_right_v = -beta_v + ws.v_score[idx(u, vr)];
+            if skip_right_v > best_v {
+                best_v = skip_right_v;
+                best_v_choice = VChoice::SkipRightV;
+            }
+
+            ws.v_score[pair] = best_v;
+            ws.v_choice[pair] = if best_v > NEG_INF / 2.0 {
+                best_v_choice
+            } else {
+                VChoice::None
+            };
+
+            // M: rooted split + skip candidates (no beta penalty)
+            let mut best_m = 0.0;
+            let mut best_m_choice = MChoice::None;
+
+            if rooted > best_m {
+                best_m = rooted;
+                best_m_choice = MChoice::UseRooted;
+            }
+            let ml_u = ws.m_score[idx(ul, v)];
+            if ml_u > best_m {
+                best_m = ml_u;
+                best_m_choice = MChoice::SkipLeftU;
+            }
+            let mr_u = ws.m_score[idx(ur, v)];
+            if mr_u > best_m {
+                best_m = mr_u;
+                best_m_choice = MChoice::SkipRightU;
+            }
+            let ml_v = ws.m_score[idx(u, vl)];
+            if ml_v > best_m {
+                best_m = ml_v;
+                best_m_choice = MChoice::SkipLeftV;
+            }
+            let mr_v = ws.m_score[idx(u, vr)];
+            if mr_v > best_m {
+                best_m = mr_v;
+                best_m_choice = MChoice::SkipRightV;
+            }
+
+            ws.m_score[pair] = best_m;
+            ws.m_choice[pair] = best_m_choice;
+        }
+    }
+
+    let root_score = ws.m_score[idx(t1.root, t2.root)];
+    // NOTE: Paper Proposition 1 adds max(0, Σ_{v∈P1(ρ)∪P2(ρ)} w(v)) to M(root,root).
+    // We omit this because our column model (mark_component_nodes) only charges nodes
+    // from selected leaves up to their LCA — the path above the component root is
+    // intentionally excluded. M(root,root) directly gives the rooted component score.
     if root_score <= 1e-9 {
         return Ok(None);
     }
@@ -1288,9 +1434,9 @@ fn run_rooted_paper_pricer(
     collect_m_labels(
         t1,
         t2,
-        &m_choice,
-        &v_choice,
-        &split_choice,
+        &ws.m_choice,
+        &ws.v_choice,
+        &ws.split_choice,
         t1.root,
         t2.root,
         &mut labels,
