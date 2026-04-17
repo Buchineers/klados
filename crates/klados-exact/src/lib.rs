@@ -7,6 +7,7 @@ pub use klados_core::cluster_reduction;
 pub use klados_core::kernelize;
 pub use klados_core::lower_bound;
 pub mod maf_branch_price;
+pub mod maf_branch_price_multi;
 pub mod maf_ilp;
 pub mod maf_sat;
 pub mod shi_mestel;
@@ -33,6 +34,7 @@ pub fn available_solvers() -> Vec<Box<dyn ExactSolver>> {
         Box::new(maf_sat::MafSatOlverSolver::new()),
         Box::new(whidden::WhiddenSolver::new()),
         Box::new(maf_branch_price::MafBranchPriceSolver::new()),
+        Box::new(maf_branch_price_multi::MafBranchPriceMultiSolver::new()),
     ]
 }
 
@@ -75,6 +77,12 @@ mod tests {
     #[test]
     fn test_registry_has_maf_bp() {
         let solver = solver_by_name("maf-bp");
+        assert!(solver.is_some());
+    }
+
+    #[test]
+    fn test_registry_has_maf_bp_multi() {
+        let solver = solver_by_name("maf-bp-multi");
         assert!(solver.is_some());
     }
 }
