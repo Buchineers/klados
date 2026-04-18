@@ -49,6 +49,35 @@ fn pairdp_batch_size() -> usize {
     })
 }
 
+fn force_multi_on_two_trees() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("KLADOS_BP_MULTI_FORCE_2TREE")
+            .ok()
+            .as_deref()
+            == Some("1")
+    })
+}
+
+fn dual_stabilization_enabled() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var("KLADOS_BP_MULTI_STABILIZE").ok().as_deref() == Some("1"))
+}
+
+fn dual_stabilization_weight() -> f64 {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<f64> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("KLADOS_BP_MULTI_STABILIZE_WEIGHT")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .map(|v| v.clamp(0.0, 1.0))
+            .unwrap_or(0.5)
+    })
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PricingBackend {
     Native,
@@ -105,7 +134,7 @@ impl ExactSolver for MafBranchPriceMultiSolver {
         if instance.num_trees() == 1 {
             return Some(instance.trees.clone());
         }
-        if instance.num_trees() == 2 {
+        if instance.num_trees() == 2 && !force_multi_on_two_trees() {
             let mut solver = MafBranchPriceSolver::new();
             let result = solver.solve(instance);
             self.stats = solver.stats().clone();
@@ -357,6 +386,115 @@ fn solve_branch_price_multi(instance: &Instance, stats: &mut SolverStats) -> Opt
     Some(components)
 }
 
+fn price_columns_for_duals(
+    pricer_ws: &mut MultiPricerWorkspace,
+    trees: &[Tree],
+    num_leaves: usize,
+    alpha: &[f64],
+    beta: &[Vec<f64>],
+    blocked_leaves: &[bool],
+    seen: &HashSet<Vec<u32>>,
+    forbidden: &ForbiddenColumns,
+) -> Vec<(f64, Vec<u32>)> {
+    match pricing_backend() {
+        PricingBackend::Native => price_best_new_exact_column(
+            pricer_ws,
+            trees,
+            num_leaves,
+            alpha,
+            beta,
+            blocked_leaves,
+            seen,
+            forbidden,
+        )
+        .into_iter()
+        .collect::<Vec<_>>(),
+        PricingBackend::PairDp => price_best_new_pairdp_columns(
+            pricer_ws,
+            trees,
+            num_leaves,
+            alpha,
+            beta,
+            blocked_leaves,
+            seen,
+            forbidden,
+        ),
+        PricingBackend::IlpGlobal | PricingBackend::IlpHybrid => price_best_new_ilp_column(
+            pricer_ws,
+            trees,
+            num_leaves,
+            alpha,
+            beta,
+            blocked_leaves,
+            seen,
+            forbidden,
+        )
+        .into_iter()
+        .collect::<Vec<_>>(),
+    }
+}
+
+fn blend_duals(current: &[f64], center: &[f64], weight: f64) -> Vec<f64> {
+    current
+        .iter()
+        .zip(center.iter())
+        .map(|(&cur, &ctr)| weight * cur + (1.0 - weight) * ctr)
+        .collect()
+}
+
+fn blend_dual_rows(current: &[Vec<f64>], center: &[Vec<f64>], weight: f64) -> Vec<Vec<f64>> {
+    current
+        .iter()
+        .zip(center.iter())
+        .map(|(cur_row, ctr_row)| blend_duals(cur_row, ctr_row, weight))
+        .collect()
+}
+
+fn rescore_profitable_columns(
+    candidates: Vec<(f64, Vec<u32>)>,
+    trees: &[Tree],
+    alpha: &[f64],
+    beta: &[Vec<f64>],
+) -> Vec<(f64, Vec<u32>)> {
+    let mut dedup: FxHashMap<Vec<u32>, f64> = FxHashMap::default();
+    for (_, labels) in candidates {
+        let score = column_score(&labels, trees, alpha, beta);
+        if score <= 1.0 + 1.0e-8 {
+            continue;
+        }
+        dedup
+            .entry(labels)
+            .and_modify(|best| *best = best.max(score))
+            .or_insert(score);
+    }
+    let mut out = dedup
+        .into_iter()
+        .map(|(labels, score)| (score, labels))
+        .collect::<Vec<_>>();
+    out.sort_unstable_by(|lhs, rhs| {
+        rhs.0
+            .total_cmp(&lhs.0)
+            .then_with(|| rhs.1.len().cmp(&lhs.1.len()))
+            .then_with(|| lhs.1.cmp(&rhs.1))
+    });
+    out
+}
+
+fn update_stability_center(
+    center: &mut Option<(Vec<f64>, Vec<Vec<f64>>)>,
+    alpha: &[f64],
+    beta: &[Vec<f64>],
+    weight: f64,
+) {
+    match center {
+        Some((center_alpha, center_beta)) => {
+            *center_alpha = blend_duals(alpha, center_alpha, weight);
+            *center_beta = blend_dual_rows(beta, center_beta, weight);
+        }
+        None => *center = Some((alpha.to_vec(), beta.to_vec())),
+    }
+}
+
 fn solve_bp_node(
     state: &mut BpState,
     node: &BpNode,
@@ -390,6 +528,7 @@ fn solve_bp_node(
     };
 
     let mut final_lp: Option<RmpLpResult> = None;
+    let mut stability_center: Option<(Vec<f64>, Vec<Vec<f64>>)> = None;
     loop {
         let lp = match node_rmp.solve(state.columns.len()) {
             Ok(lp) => lp,
@@ -397,8 +536,44 @@ fn solve_bp_node(
         };
         let alpha = lp.leaf_duals.clone();
         let beta = lp.node_duals.clone();
-        let priced_columns = match pricing_backend() {
-            PricingBackend::Native => price_best_new_exact_column(
+        let priced_columns = if dual_stabilization_enabled() {
+            let weight = dual_stabilization_weight();
+            let (price_alpha, price_beta) = if let Some((center_alpha, center_beta)) = &stability_center {
+                (
+                    blend_duals(&alpha, center_alpha, weight),
+                    blend_dual_rows(&beta, center_beta, weight),
+                )
+            } else {
+                (alpha.clone(), beta.clone())
+            };
+
+            let mut stabilized_columns = price_columns_for_duals(
+                pricer_ws,
+                trees,
+                num_leaves,
+                &price_alpha,
+                &price_beta,
+                &blocked_leaves,
+                &state.seen,
+                &forbidden,
+            );
+            stabilized_columns = rescore_profitable_columns(stabilized_columns, trees, &alpha, &beta);
+            if stabilized_columns.is_empty() {
+                price_columns_for_duals(
+                    pricer_ws,
+                    trees,
+                    num_leaves,
+                    &alpha,
+                    &beta,
+                    &blocked_leaves,
+                    &state.seen,
+                    &forbidden,
+                )
+            } else {
+                stabilized_columns
+            }
+        } else {
+            price_columns_for_duals(
                 pricer_ws,
                 trees,
                 num_leaves,
@@ -408,30 +583,6 @@ fn solve_bp_node(
                 &state.seen,
                 &forbidden,
             )
-            .into_iter()
-            .collect::<Vec<_>>(),
-            PricingBackend::PairDp => price_best_new_pairdp_columns(
-                pricer_ws,
-                trees,
-                num_leaves,
-                &alpha,
-                &beta,
-                &blocked_leaves,
-                &state.seen,
-                &forbidden,
-            ),
-            PricingBackend::IlpGlobal | PricingBackend::IlpHybrid => price_best_new_ilp_column(
-                pricer_ws,
-                trees,
-                num_leaves,
-                &alpha,
-                &beta,
-                &blocked_leaves,
-                &state.seen,
-                &forbidden,
-            )
-            .into_iter()
-            .collect::<Vec<_>>(),
         };
         let priced = priced_columns.first().cloned();
         if num_leaves <= ORACLE_ENUM_LEAVES {
@@ -482,6 +633,10 @@ fn solve_bp_node(
                     }
                 }
             }
+        }
+
+        if dual_stabilization_enabled() {
+            update_stability_center(&mut stability_center, &alpha, &beta, dual_stabilization_weight());
         }
 
         let mut added_any = false;
