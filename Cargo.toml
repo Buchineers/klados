@@ -24,6 +24,7 @@ fxhash = "0.2"
 
 # LP/ILP solver
 highs = "2.0"
+highs-sys = "1.12"
 
 # SAT solver
 rustsat = "0.7"

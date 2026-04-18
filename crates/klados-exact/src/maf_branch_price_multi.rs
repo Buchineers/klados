@@ -329,9 +329,16 @@ fn solve_branch_price_multi(instance: &Instance, stats: &mut SolverStats) -> Opt
     };
 
     let mut pricer_ws = MultiPricerWorkspace::new(trees, n);
+    let mut rmp = match PersistentRmp::new(&state.columns, trees, n) {
+        Ok(rmp) => rmp,
+        Err(err) => {
+            eprintln!("[maf-bp-multi] failed to build persistent RMP: {}", err);
+            return None;
+        }
+    };
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        match solve_bp_node(&mut state, &node, trees, n, &mut pricer_ws) {
+        match solve_bp_node(&mut state, &node, trees, n, &mut pricer_ws, &mut rmp) {
             NodeResult::Integral(obj, values) => {
                 if obj < state.best_ub {
                     eprintln!(
@@ -501,6 +508,7 @@ fn solve_bp_node(
     trees: &[Tree],
     num_leaves: usize,
     pricer_ws: &mut MultiPricerWorkspace,
+    rmp: &mut PersistentRmp,
 ) -> NodeResult {
     state.nodes_explored += 1;
     if node.fixed_to_one.len() >= state.best_ub {
@@ -516,21 +524,17 @@ fn solve_bp_node(
 
     let forbidden = ForbiddenColumns::new(state, node);
 
-    let mut node_rmp = match NodeRmp::build(
+    rmp.apply_node_bounds(
         &state.columns,
-        trees,
-        num_leaves,
         &node.fixed_to_one,
         &node.fixed_to_zero,
-    ) {
-        Ok(rmp) => rmp,
-        Err(_) => return NodeResult::Pruned,
-    };
+        &blocked_leaves,
+    );
 
     let mut final_lp: Option<RmpLpResult> = None;
     let mut stability_center: Option<(Vec<f64>, Vec<Vec<f64>>)> = None;
     loop {
-        let lp = match node_rmp.solve(state.columns.len()) {
+        let lp = match rmp.solve(state.columns.len()) {
             Ok(lp) => lp,
             Err(_) => return NodeResult::Pruned,
         };
@@ -650,7 +654,7 @@ fn solve_bp_node(
             }
             let new_ci = state.columns.len();
             state.columns.push(make_bp_column(labels, trees));
-            node_rmp.add_column(new_ci, &state.columns[new_ci], trees);
+            rmp.add_column(new_ci, &state.columns[new_ci], trees);
             if let Some(best_solution) = state.best_solution.as_mut() {
                 best_solution.push(0.0);
             }
@@ -668,7 +672,7 @@ fn solve_bp_node(
 
     let lp = match final_lp {
         Some(lp) => lp,
-        None => match node_rmp.solve(state.columns.len()) {
+        None => match rmp.solve(state.columns.len()) {
             Ok(lp) => lp,
             Err(_) => return NodeResult::Pruned,
         },
@@ -727,6 +731,10 @@ struct PricingPrefixNode {
 
 struct MultiPricerWorkspace {
     descendant_leaves: Vec<Vec<FixedBitSet>>,
+    label_stride: usize,
+    label_lca: Vec<Vec<u32>>,
+    label_side_child: Vec<Vec<u32>>,
+    label_node: Vec<Vec<u32>>,
     memo_m: FxHashMap<Vec<u32>, f64>,
     memo_v: FxHashMap<Vec<u32>, f64>,
 }
@@ -750,8 +758,55 @@ impl MultiPricerWorkspace {
             }
             descendant_leaves.push(leaves);
         }
+
+        let stride = num_leaves + 1;
+        let mut label_lca = Vec::with_capacity(trees.len());
+        let mut label_side_child = Vec::with_capacity(trees.len());
+        let mut label_node = Vec::with_capacity(trees.len());
+        for (ti, tree) in trees.iter().enumerate() {
+            let mut node_by_label = vec![0u32; stride];
+            for la in 1..=num_leaves as u32 {
+                node_by_label[la as usize] = tree.node_by_label(la);
+            }
+            let mut lca_table = vec![0u32; stride * stride];
+            let mut side_table = vec![0u32; stride * stride];
+            for la in 1..=num_leaves as u32 {
+                let node_a = node_by_label[la as usize];
+                let base = (la as usize) * stride;
+                for lb in 1..=num_leaves as u32 {
+                    let idx = base + lb as usize;
+                    if la == lb {
+                        lca_table[idx] = node_a;
+                        side_table[idx] = node_a;
+                        continue;
+                    }
+                    let node_b = node_by_label[lb as usize];
+                    let root = tree.nearest_common_ancestor(node_a, node_b);
+                    lca_table[idx] = root;
+                    let child = if tree.is_leaf(root) {
+                        root
+                    } else {
+                        let (left, right) = tree.children_pair(root);
+                        if descendant_leaves[ti][left as usize].contains(la as usize) {
+                            left
+                        } else {
+                            right
+                        }
+                    };
+                    side_table[idx] = child;
+                }
+            }
+            label_lca.push(lca_table);
+            label_side_child.push(side_table);
+            label_node.push(node_by_label);
+        }
+
         Self {
             descendant_leaves,
+            label_stride: stride,
+            label_lca,
+            label_side_child,
+            label_node,
             memo_m: FxHashMap::default(),
             memo_v: FxHashMap::default(),
         }
@@ -1243,7 +1298,7 @@ struct PairDpSideState {
 
 struct PairDpPricer<'a> {
     trees: &'a [Tree],
-    descendant_leaves: &'a [Vec<FixedBitSet>],
+    workspace: &'a MultiPricerWorkspace,
     active_labels: Vec<u32>,
     active_nodes: Vec<Vec<u32>>,
     alpha: &'a [f64],
@@ -1260,7 +1315,7 @@ struct PairDpPricer<'a> {
 
 impl<'a> PairDpPricer<'a> {
     fn new(
-        descendant_leaves: &'a [Vec<FixedBitSet>],
+        workspace: &'a MultiPricerWorkspace,
         trees: &'a [Tree],
         num_leaves: usize,
         alpha: &'a [f64],
@@ -1274,6 +1329,7 @@ impl<'a> PairDpPricer<'a> {
             .collect::<Vec<_>>();
         let p = active_labels.len();
         let pair_count = p * p;
+        let stride = workspace.label_stride;
 
         let mut active_nodes = Vec::with_capacity(trees.len());
         let mut prefix_beta = Vec::with_capacity(trees.len());
@@ -1281,11 +1337,12 @@ impl<'a> PairDpPricer<'a> {
         let mut side_child = Vec::with_capacity(trees.len());
 
         for (ti, tree) in trees.iter().enumerate() {
-            let nodes = active_labels
+            let node_by_label = &workspace.label_node[ti];
+            let nodes: Vec<u32> = active_labels
                 .iter()
-                .map(|&label| tree.node_by_label(label))
-                .collect::<Vec<_>>();
-            active_nodes.push(nodes.clone());
+                .map(|&label| node_by_label[label as usize])
+                .collect();
+            active_nodes.push(nodes);
 
             let mut prefix = vec![0.0; tree.num_nodes()];
             for node in tree.pre_order() {
@@ -1304,31 +1361,20 @@ impl<'a> PairDpPricer<'a> {
             }
             prefix_beta.push(prefix);
 
+            let lca_table = &workspace.label_lca[ti];
+            let side_table = &workspace.label_side_child[ti];
             let mut tree_roots = vec![0u32; pair_count];
             let mut tree_side_child = vec![0u32; pair_count];
             for a in 0..p {
+                let la = active_labels[a] as usize;
+                let base_ws = la * stride;
+                let base_out = a * p;
                 for b in 0..p {
-                    let idx = a * p + b;
-                    if a == b {
-                        tree_roots[idx] = nodes[a];
-                        tree_side_child[idx] = nodes[a];
-                        continue;
-                    }
-                    let root = tree.nearest_common_ancestor(nodes[a], nodes[b]);
-                    tree_roots[idx] = root;
-                    let child = if tree.is_leaf(root) {
-                        root
-                    } else {
-                        let (left, right) = tree.children_pair(root);
-                        if descendant_leaves[ti][left as usize]
-                            .contains(active_labels[a] as usize)
-                        {
-                            left
-                        } else {
-                            right
-                        }
-                    };
-                    tree_side_child[idx] = child;
+                    let lb = active_labels[b] as usize;
+                    let ws_idx = base_ws + lb;
+                    let out_idx = base_out + b;
+                    tree_roots[out_idx] = lca_table[ws_idx];
+                    tree_side_child[out_idx] = side_table[ws_idx];
                 }
             }
             roots.push(tree_roots);
@@ -1337,7 +1383,7 @@ impl<'a> PairDpPricer<'a> {
 
         Self {
             trees,
-            descendant_leaves,
+            workspace,
             active_labels,
             active_nodes,
             alpha,
@@ -1605,13 +1651,14 @@ impl<'a> PairDpPricer<'a> {
         let idx = self.pair_idx(a, b);
         let label_c = self.active_labels[c] as usize;
         self.trees.iter().enumerate().all(|(ti, _)| {
-            self.descendant_leaves[ti][self.side_child[ti][idx] as usize].contains(label_c)
+            self.workspace.descendant_leaves[ti][self.side_child[ti][idx] as usize]
+                .contains(label_c)
         })
     }
 }
 
 fn solve_best_pairdp_column(
-    descendant_leaves: &[Vec<FixedBitSet>],
+    workspace: &MultiPricerWorkspace,
     trees: &[Tree],
     num_leaves: usize,
     alpha: &[f64],
@@ -1619,7 +1666,7 @@ fn solve_best_pairdp_column(
     blocked_leaves: &[bool],
 ) -> Option<(f64, Vec<u32>)> {
     let mut pricer = PairDpPricer::new(
-        descendant_leaves,
+        workspace,
         trees,
         num_leaves,
         alpha,
@@ -1630,7 +1677,7 @@ fn solve_best_pairdp_column(
 }
 
 fn solve_best_pairdp_columns(
-    descendant_leaves: &[Vec<FixedBitSet>],
+    workspace: &MultiPricerWorkspace,
     trees: &[Tree],
     num_leaves: usize,
     alpha: &[f64],
@@ -1639,7 +1686,7 @@ fn solve_best_pairdp_columns(
     limit: usize,
 ) -> Vec<(f64, Vec<u32>)> {
     let mut pricer = PairDpPricer::new(
-        descendant_leaves,
+        workspace,
         trees,
         num_leaves,
         alpha,
@@ -1660,7 +1707,7 @@ fn price_best_new_pairdp_column_single(
     forbidden: &ForbiddenColumns,
 ) -> Option<(f64, Vec<u32>)> {
     let base = solve_best_pairdp_column(
-        &pricer_ws.descendant_leaves,
+        pricer_ws,
         trees,
         num_leaves,
         alpha,
@@ -1726,7 +1773,7 @@ fn price_best_new_pairdp_columns(
     }
 
     let mut candidates = solve_best_pairdp_columns(
-        &pricer_ws.descendant_leaves,
+        pricer_ws,
         trees,
         num_leaves,
         alpha,
@@ -1850,7 +1897,7 @@ fn solve_pricing_prefix_subproblem_pairdp(
     }
 
     let (score_with_bonus, labels) = solve_best_pairdp_column(
-        &pricer_ws.descendant_leaves,
+        pricer_ws,
         trees,
         num_leaves,
         &alpha_mod,
@@ -2395,22 +2442,25 @@ struct RmpLpResult {
     node_duals: Vec<Vec<f64>>,
 }
 
-struct NodeRmp {
+struct PersistentRmp {
     model: Option<Model>,
-    active_global_cols: Vec<usize>,
     leaf_rows: Vec<Row>,
     leaf_row_idx: Vec<usize>,
     node_rows: Vec<Vec<Option<Row>>>,
     node_row_idx: Vec<Vec<Option<usize>>>,
+    /// HiGHS column index for each global column (parallel to state.columns).
+    col_idx: Vec<i32>,
+    /// Current lower bound applied in HiGHS for each added column.
+    current_lower: Vec<f64>,
+    /// Current upper bound applied in HiGHS for each added column.
+    current_upper: Vec<f64>,
 }
 
-impl NodeRmp {
-    fn build(
+impl PersistentRmp {
+    fn new(
         columns: &[BpColumn],
         trees: &[Tree],
         num_leaves: usize,
-        fixed_to_one: &[usize],
-        fixed_to_zero: &[usize],
     ) -> Result<Self, String> {
         let mut model = Model::new(ColProblem::default());
         model.make_quiet();
@@ -2455,21 +2505,22 @@ impl NodeRmp {
 
         let mut rmp = Self {
             model: Some(model),
-            active_global_cols: Vec::new(),
             leaf_rows,
             leaf_row_idx,
             node_rows,
             node_row_idx,
+            col_idx: Vec::new(),
+            current_lower: Vec::new(),
+            current_upper: Vec::new(),
         };
         for (ci, col) in columns.iter().enumerate() {
-            if column_respects_branchings(columns, ci, fixed_to_one, fixed_to_zero) {
-                rmp.add_column(ci, col, trees);
-            }
+            rmp.add_column(ci, col, trees);
         }
         Ok(rmp)
     }
 
     fn add_column(&mut self, global_ci: usize, col: &BpColumn, trees: &[Tree]) {
+        debug_assert_eq!(global_ci, self.col_idx.len());
         let mut rows = col
             .labels
             .iter()
@@ -2487,13 +2538,63 @@ impl NodeRmp {
         }
         self.model
             .as_mut()
-            .expect("node RMP model present")
+            .expect("RMP model present")
             .add_col(1.0, 0.0.., rows);
-        self.active_global_cols.push(global_ci);
+        self.col_idx.push(global_ci as i32);
+        self.current_lower.push(0.0);
+        self.current_upper.push(f64::INFINITY);
+    }
+
+    fn apply_node_bounds(
+        &mut self,
+        columns: &[BpColumn],
+        fixed_to_one: &[usize],
+        fixed_to_zero: &[usize],
+        blocked_leaves: &[bool],
+    ) {
+        let fixed_one_set: std::collections::HashSet<usize> = fixed_to_one.iter().copied().collect();
+        let fixed_zero_set: std::collections::HashSet<usize> = fixed_to_zero.iter().copied().collect();
+        let ptr = self
+            .model
+            .as_mut()
+            .expect("RMP model present")
+            .as_mut_ptr();
+        for ci in 0..self.col_idx.len() {
+            let (desired_lo, desired_hi) = if fixed_one_set.contains(&ci) {
+                (1.0, 1.0)
+            } else if fixed_zero_set.contains(&ci) {
+                (0.0, 0.0)
+            } else if columns[ci]
+                .labels
+                .iter()
+                .any(|&l| blocked_leaves[l as usize])
+            {
+                (0.0, 0.0)
+            } else {
+                (0.0, f64::INFINITY)
+            };
+            if (self.current_lower[ci] - desired_lo).abs() > 0.0
+                || (self.current_upper[ci].is_finite() != desired_hi.is_finite())
+                || ((self.current_upper[ci] - desired_hi).abs() > 0.0
+                    && self.current_upper[ci].is_finite()
+                    && desired_hi.is_finite())
+            {
+                unsafe {
+                    highs_sys::Highs_changeColBounds(
+                        ptr,
+                        self.col_idx[ci],
+                        desired_lo,
+                        desired_hi,
+                    );
+                }
+                self.current_lower[ci] = desired_lo;
+                self.current_upper[ci] = desired_hi;
+            }
+        }
     }
 
     fn solve(&mut self, total_columns: usize) -> Result<RmpLpResult, String> {
-        let solved = self.model.take().expect("node RMP model present").solve();
+        let solved = self.model.take().expect("RMP model present").solve();
         let status = solved.status();
         if status != HighsModelStatus::Optimal {
             self.model = Some(Model::from(solved));
@@ -2501,8 +2602,12 @@ impl NodeRmp {
         }
         let solution = solved.get_solution();
         let mut column_values = vec![0.0; total_columns];
-        for (local_idx, &global_ci) in self.active_global_cols.iter().enumerate() {
-            column_values[global_ci] = solution.columns()[local_idx];
+        let solution_cols = solution.columns();
+        for (local_idx, &global_ci) in self.col_idx.iter().enumerate() {
+            let ci = global_ci as usize;
+            if ci < total_columns {
+                column_values[ci] = solution_cols[local_idx];
+            }
         }
         let objective = solved.objective_value();
         let dual_rows = solution.dual_rows();
