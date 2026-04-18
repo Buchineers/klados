@@ -37,6 +37,18 @@ fn exact_pricer_profile() -> bool {
     *CACHED.get_or_init(|| std::env::var("KLADOS_BP_MULTI_PROFILE").ok().as_deref() == Some("1"))
 }
 
+fn pairdp_batch_size() -> usize {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("KLADOS_BP_MULTI_PAIRDP_BATCH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|v| v.max(1))
+            .unwrap_or(64)
+    })
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PricingBackend {
     Native,
@@ -385,7 +397,7 @@ fn solve_bp_node(
         };
         let alpha = lp.leaf_duals.clone();
         let beta = lp.node_duals.clone();
-        let priced = match pricing_backend() {
+        let priced_columns = match pricing_backend() {
             PricingBackend::Native => price_best_new_exact_column(
                 pricer_ws,
                 trees,
@@ -395,8 +407,10 @@ fn solve_bp_node(
                 &blocked_leaves,
                 &state.seen,
                 &forbidden,
-            ),
-            PricingBackend::PairDp => price_best_new_pairdp_column(
+            )
+            .into_iter()
+            .collect::<Vec<_>>(),
+            PricingBackend::PairDp => price_best_new_pairdp_columns(
                 pricer_ws,
                 trees,
                 num_leaves,
@@ -415,8 +429,11 @@ fn solve_bp_node(
                 &blocked_leaves,
                 &state.seen,
                 &forbidden,
-            ),
+            )
+            .into_iter()
+            .collect::<Vec<_>>(),
         };
+        let priced = priced_columns.first().cloned();
         if num_leaves <= ORACLE_ENUM_LEAVES {
             let oracle_priced = price_best_column_exhaustive(
                 trees,
@@ -427,7 +444,15 @@ fn solve_bp_node(
                 &state.seen,
                 &forbidden,
             );
-            match (&priced, &oracle_priced) {
+            let priced_profitable =
+                priced
+                    .clone()
+                    .filter(|(score, _)| *score > 1.0 + 1.0e-8);
+            let oracle_profitable =
+                oracle_priced
+                    .clone()
+                    .filter(|(score, _)| *score > 1.0 + 1.0e-8);
+            match (&priced_profitable, &oracle_profitable) {
                 (Some((s1, lhs)), Some((s2, rhs)))
                     if lhs == rhs && (s1 - s2).abs() <= 1e-8 => state.oracle_matches += 1,
                 (None, None) => state.oracle_matches += 1,
@@ -459,26 +484,31 @@ fn solve_bp_node(
             }
         }
 
-        match priced {
-            Some((score, labels)) if score > 1.0 + 1e-8 => {
-                let inserted = state.seen.insert(labels.clone());
-                if !inserted {
-                    final_lp = Some(lp);
-                    break;
-                }
-                let new_ci = state.columns.len();
-                state.columns.push(make_bp_column(labels, trees));
-                node_rmp.add_column(new_ci, &state.columns[new_ci], trees);
-                if let Some(best_solution) = state.best_solution.as_mut() {
-                    best_solution.push(0.0);
-                }
-                state.cg_iterations_total += 1;
+        let mut added_any = false;
+        for (score, labels) in priced_columns {
+            if score <= 1.0 + 1e-8 {
+                continue;
             }
-            _ => {
-                final_lp = Some(lp);
-                break;
+            let inserted = state.seen.insert(labels.clone());
+            if !inserted {
+                continue;
             }
+            let new_ci = state.columns.len();
+            state.columns.push(make_bp_column(labels, trees));
+            node_rmp.add_column(new_ci, &state.columns[new_ci], trees);
+            if let Some(best_solution) = state.best_solution.as_mut() {
+                best_solution.push(0.0);
+            }
+            added_any = true;
         }
+
+        if added_any {
+            state.cg_iterations_total += 1;
+            continue;
+        }
+
+        final_lp = Some(lp);
+        break;
     }
 
     let lp = match final_lp {
@@ -1068,6 +1098,7 @@ struct PairDpPricer<'a> {
     side_child: Vec<Vec<u32>>,
     memo_pair: Vec<Option<f64>>,
     memo_side: Vec<Option<PairDpSideState>>,
+    memo_pair_labels: Vec<Option<Vec<u32>>>,
     solving_pair: Vec<bool>,
     solving_side: Vec<bool>,
 }
@@ -1161,6 +1192,7 @@ impl<'a> PairDpPricer<'a> {
             side_child,
             memo_pair: vec![None; pair_count],
             memo_side: vec![None; pair_count],
+            memo_pair_labels: vec![None; pair_count],
             solving_pair: vec![false; pair_count],
             solving_side: vec![false; pair_count],
         }
@@ -1216,6 +1248,46 @@ impl<'a> PairDpPricer<'a> {
         }
 
         (best_score > NEG_INF / 2.0).then_some((best_score, best_labels))
+    }
+
+    fn collect_profitable_columns(&mut self, limit: usize) -> Vec<(f64, Vec<u32>)> {
+        if self.active_labels.len() < 2 || limit == 0 {
+            return Vec::new();
+        }
+
+        let mut dedup: FxHashMap<Vec<u32>, f64> = FxHashMap::default();
+        let p = self.active_labels.len();
+        for a in 0..p {
+            for b in 0..p {
+                if a == b {
+                    continue;
+                }
+                let score = self.solve_pair(a, b);
+                if score <= 1.0 + 1.0e-8 {
+                    continue;
+                }
+                let labels = self.pair_labels(a, b);
+                if labels.len() < 2 {
+                    continue;
+                }
+                dedup
+                    .entry(labels)
+                    .and_modify(|best| *best = best.max(score))
+                    .or_insert(score);
+            }
+        }
+
+        let mut out = dedup.into_iter().map(|(labels, score)| (score, labels)).collect::<Vec<_>>();
+        out.sort_unstable_by(|lhs, rhs| {
+            rhs.0
+                .total_cmp(&lhs.0)
+                .then_with(|| rhs.1.len().cmp(&lhs.1.len()))
+                .then_with(|| lhs.1.cmp(&rhs.1))
+        });
+        if out.len() > limit {
+            out.truncate(limit);
+        }
+        out
     }
 
     fn pair_idx(&self, a: usize, b: usize) -> usize {
@@ -1287,6 +1359,19 @@ impl<'a> PairDpPricer<'a> {
     fn collect_pair(&mut self, a: usize, b: usize, out: &mut Vec<u32>) {
         self.collect_side(a, b, out);
         self.collect_side(b, a, out);
+    }
+
+    fn pair_labels(&mut self, a: usize, b: usize) -> Vec<u32> {
+        let idx = self.pair_idx(a, b);
+        if let Some(labels) = self.memo_pair_labels[idx].clone() {
+            return labels;
+        }
+        let mut labels = Vec::new();
+        self.collect_pair(a, b, &mut labels);
+        labels.sort_unstable();
+        labels.dedup();
+        self.memo_pair_labels[idx] = Some(labels.clone());
+        labels
     }
 
     fn collect_side(&mut self, a: usize, b: usize, out: &mut Vec<u32>) {
@@ -1389,7 +1474,27 @@ fn solve_best_pairdp_column(
     pricer.solve_best()
 }
 
-fn price_best_new_pairdp_column(
+fn solve_best_pairdp_columns(
+    descendant_leaves: &[Vec<FixedBitSet>],
+    trees: &[Tree],
+    num_leaves: usize,
+    alpha: &[f64],
+    beta: &[Vec<f64>],
+    blocked_leaves: &[bool],
+    limit: usize,
+) -> Vec<(f64, Vec<u32>)> {
+    let mut pricer = PairDpPricer::new(
+        descendant_leaves,
+        trees,
+        num_leaves,
+        alpha,
+        beta,
+        blocked_leaves,
+    );
+    pricer.collect_profitable_columns(limit)
+}
+
+fn price_best_new_pairdp_column_single(
     pricer_ws: &mut MultiPricerWorkspace,
     trees: &[Tree],
     num_leaves: usize,
@@ -1438,6 +1543,58 @@ fn price_best_new_pairdp_column(
         &mut incumbent,
     );
     incumbent
+}
+
+fn price_best_new_pairdp_columns(
+    pricer_ws: &mut MultiPricerWorkspace,
+    trees: &[Tree],
+    num_leaves: usize,
+    alpha: &[f64],
+    beta: &[Vec<f64>],
+    blocked_leaves: &[bool],
+    seen: &HashSet<Vec<u32>>,
+    forbidden: &ForbiddenColumns,
+) -> Vec<(f64, Vec<u32>)> {
+    if pairdp_batch_size() <= 1 {
+        return price_best_new_pairdp_column_single(
+            pricer_ws,
+            trees,
+            num_leaves,
+            alpha,
+            beta,
+            blocked_leaves,
+            seen,
+            forbidden,
+        )
+        .into_iter()
+        .collect();
+    }
+
+    let mut candidates = solve_best_pairdp_columns(
+        &pricer_ws.descendant_leaves,
+        trees,
+        num_leaves,
+        alpha,
+        beta,
+        blocked_leaves,
+        usize::MAX,
+    );
+    candidates.retain(|(score, labels)| {
+        *score > 1.0 + 1.0e-8 && !forbidden.contains(seen, labels)
+    });
+    if candidates.len() > pairdp_batch_size() {
+        candidates.truncate(pairdp_batch_size());
+    }
+
+    if exact_pricer_profile() && !candidates.is_empty() {
+        eprintln!(
+            "[maf-bp-multi] pairdp batch: emitted={} batch_size={}",
+            candidates.len(),
+            pairdp_batch_size()
+        );
+    }
+
+    candidates
 }
 
 fn search_pricing_prefix_dfs_pairdp(
