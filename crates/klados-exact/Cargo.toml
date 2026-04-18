@@ -10,5 +10,6 @@ klados-core = { workspace = true }
 fixedbitset = { workspace = true }
 fxhash = { workspace = true }
 highs = { workspace = true }
+highs-sys = { workspace = true }
 rustsat = { workspace = true }
 rustsat-cadical = { workspace = true }
