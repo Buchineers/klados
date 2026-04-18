@@ -1131,7 +1131,7 @@ fn mark_component_nodes(tree: &Tree, labels: &[u32]) -> FixedBitSet {
 
 const NEG_INF: f64 = -1.0e100;
 
-struct PricerWorkspace {
+pub(crate) struct PricerWorkspace {
     // DP tables (flat, indexed as u * n2 + v)
     v_score: Vec<f64>,
     v_choice: Vec<VChoice>,
@@ -1151,7 +1151,7 @@ struct PricerWorkspace {
 }
 
 impl PricerWorkspace {
-    fn new(t1: &Tree, t2: &Tree) -> Self {
+    pub(crate) fn new(t1: &Tree, t2: &Tree) -> Self {
         let n2 = t2.num_nodes();
         let table_size = t1.num_nodes() * n2;
         let post1 = t1.post_order_vec();
@@ -1273,7 +1273,7 @@ enum MChoice {
 
 /// Run the rooted WMAST pricer using a reusable workspace.
 /// The workspace avoids re-allocating O(n²) tables on every call.
-fn run_rooted_paper_pricer(
+pub(crate) fn run_rooted_paper_pricer(
     ws: &mut PricerWorkspace,
     t1: &Tree,
     t2: &Tree,
