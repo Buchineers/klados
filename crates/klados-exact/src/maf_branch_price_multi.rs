@@ -3,7 +3,7 @@
 //! Current shape:
 //! - generic master problem over an arbitrary number of rooted trees
 //! - exact multi-tree pricing via memoized top-down `M`/`V` recurrences
-//! - exhaustive subset oracle retained only for validation on tiny instances
+//! - exhaustive subset oracle available as an optional validation check on tiny instances
 //! - generic branch-and-bound on fractional columns
 
 use std::cell::Cell;
@@ -19,7 +19,6 @@ use klados_core::{Instance, SolverStats, Tree};
 
 use crate::cluster_reduction::{self, ClusterReductionResult};
 use crate::kernelize::{self, KernelizeConfig};
-use crate::maf_branch_price::MafBranchPriceSolver;
 use crate::ExactSolver;
 
 const ORACLE_ENUM_LEAVES: usize = 24;
@@ -49,14 +48,14 @@ fn pairdp_batch_size() -> usize {
     })
 }
 
-fn force_multi_on_two_trees() -> bool {
+fn exhaustive_oracle_validation_enabled() -> bool {
     use std::sync::OnceLock;
     static CACHED: OnceLock<bool> = OnceLock::new();
     *CACHED.get_or_init(|| {
-        std::env::var("KLADOS_BP_MULTI_FORCE_2TREE")
-            .ok()
-            .as_deref()
-            == Some("1")
+        matches!(
+            std::env::var("KLADOS_BP_MULTI_VALIDATE_PRICER").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+        )
     })
 }
 
@@ -133,12 +132,6 @@ impl ExactSolver for MafBranchPriceMultiSolver {
         }
         if instance.num_trees() == 1 {
             return Some(instance.trees.clone());
-        }
-        if instance.num_trees() == 2 && !force_multi_on_two_trees() {
-            let mut solver = MafBranchPriceSolver::new();
-            let result = solver.solve(instance);
-            self.stats = solver.stats().clone();
-            return result;
         }
         if instance.num_leaves <= 1 {
             return Some(instance.trees[0..1].to_vec());
@@ -589,7 +582,7 @@ fn solve_bp_node(
             )
         };
         let priced = priced_columns.first().cloned();
-        if num_leaves <= ORACLE_ENUM_LEAVES {
+        if exhaustive_oracle_validation_enabled() && num_leaves <= ORACLE_ENUM_LEAVES {
             let oracle_priced = price_best_column_exhaustive(
                 trees,
                 num_leaves,
