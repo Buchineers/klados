@@ -897,8 +897,6 @@ struct SolveResult {
 }
 
 struct PaperRmpLpSolution {
-    singleton_columns: Vec<f64>,
-    candidate_columns: Vec<f64>,
     alpha: Vec<f64>,
     beta: Vec<Vec<f64>>,
 }
@@ -1217,7 +1215,6 @@ fn solve_paper_rmp_lp(
         }
     }
 
-    let candidate_columns = solution.columns()[n_reduced..].to_vec();
     // HiGHS row duals follow the active row-bound sign in minimization:
     // lower-bound rows are nonnegative, upper-bound rows nonpositive.
     // Cover rows are >= 1, so alpha is direct. Packing rows are <= 1, so beta = -row_dual.
@@ -1228,8 +1225,6 @@ fn solve_paper_rmp_lp(
         .collect::<Vec<_>>();
 
     Ok(PaperRmpLpSolution {
-        singleton_columns: solution.columns()[..n_reduced].to_vec(),
-        candidate_columns,
         alpha,
         beta,
     })

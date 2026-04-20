@@ -19,10 +19,6 @@ struct PaceSummaryEntry {
     leaves: usize,
     idigest: String,
     best_known_score: usize,
-    #[serde(default)]
-    num_valid: usize,
-    #[serde(default)]
-    avg_best_compute_time_secs: f64,
 }
 
 pub fn run(
