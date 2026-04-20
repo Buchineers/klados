@@ -13,6 +13,7 @@
 mod chain;
 mod chain32;
 mod cherry;
+#[allow(dead_code)]
 mod cherry_rotation;
 mod expansion;
 mod helpers;

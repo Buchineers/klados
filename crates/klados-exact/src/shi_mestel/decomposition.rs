@@ -18,6 +18,7 @@ use super::search_state::Collapses;
 ///
 /// Returns the combined MAF components (one `Tree` per component), or `None`
 /// if any sub-problem is infeasible.
+#[allow(dead_code)]
 pub fn solve_decomposed_simple<S>(
     forests: &[XForest],
     collapses: &Collapses,

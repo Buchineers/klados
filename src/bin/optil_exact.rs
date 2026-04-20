@@ -3,8 +3,8 @@ use pace26io::binary_tree::IndexedBinTreeBuilder;
 use pace26io::pace::simplified::Instance as PaceInstance;
 use std::io::{self, BufReader};
 
-#[path = "../commands/mod.rs"]
-mod commands;
+#[path = "../commands/exact.rs"]
+mod exact;
 
 fn read_instance() -> Result<Instance, Box<dyn std::error::Error>> {
     let stdin = io::stdin();
@@ -24,5 +24,5 @@ fn read_instance() -> Result<Instance, Box<dyn std::error::Error>> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let instance = read_instance()?;
-    commands::exact::run(&instance, "maf-bp-multi", false)
+    exact::run(&instance, "maf-bp-multi", false)
 }
