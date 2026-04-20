@@ -20,8 +20,6 @@ struct PaceSummaryEntry {
     idigest: String,
     best_known_score: usize,
     #[serde(default)]
-    num_best: usize,
-    #[serde(default)]
     num_valid: usize,
     #[serde(default)]
     avg_best_compute_time_secs: f64,

@@ -495,7 +495,7 @@ pub fn pairwise_refine_ub(trees: &[Tree], num_leaves: usize) -> (usize, Vec<usiz
                         let a = leaves[ii];
                         let b = leaves[jj];
                         let c = leaves[kk];
-                        if is_incompatible_triple(trees, a, b, c, num_leaves) {
+                        if is_incompatible_triple(trees, a, b, c) {
                             // Split: remove c from this component.
                             partition[c] = next_comp;
                             next_comp += 1;
@@ -516,10 +516,10 @@ pub fn pairwise_refine_ub(trees: &[Tree], num_leaves: usize) -> (usize, Vec<usiz
 }
 
 /// Check if triple (a,b,c) is incompatible across trees (different odd leaf).
-fn is_incompatible_triple(trees: &[Tree], a: usize, b: usize, c: usize, n: usize) -> bool {
-    let la = (a + 1) as crate::tree::Label;
-    let lb = (b + 1) as crate::tree::Label;
-    let lc = (c + 1) as crate::tree::Label;
+fn is_incompatible_triple(trees: &[Tree], a: usize, b: usize, c: usize) -> bool {
+    let la = (a + 1) as Label;
+    let lb = (b + 1) as Label;
+    let lc = (c + 1) as Label;
     let mut first_odd = u8::MAX;
     for tree in trees {
         let na = tree.node_by_label(la);

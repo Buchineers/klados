@@ -1,8 +1,9 @@
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use klados_core::Tree;
 use pace26io::binary_tree::{IndexedBinTree, IndexedBinTreeBuilder};
 use pace26io::newick::BinaryTreeParser;
 use std::fs;
+use std::hint::black_box;
 
 fn load_instance(path: &str) -> Option<(Tree, IndexedBinTree, u32)> {
     if !std::path::Path::new(path).exists() {

@@ -320,7 +320,7 @@ impl MaxSatSolver {
             .spawn()
             .expect("Failed to spawn solver");
 
-        self.child_pid.store(child.id() as u32, Ordering::SeqCst);
+        self.child_pid.store(child.id(), Ordering::SeqCst);
 
         use std::io::Write;
         child
@@ -366,7 +366,7 @@ impl MaxSatSolver {
         );
 
         let _ = param_reduction; // accounted for by kernelize::expand_solution
-        return Some(result);
+        Some(result)
     }
 }
 

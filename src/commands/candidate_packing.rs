@@ -891,14 +891,12 @@ fn solve_packing_ilp(
 struct SolveResult {
     objective: f64,
     selected: Option<Vec<usize>>,
-    columns: Vec<f64>,
     nonzero_vars: usize,
     fractional_vars: usize,
     max_fractionality: f64,
 }
 
 struct PaperRmpLpSolution {
-    objective: f64,
     singleton_columns: Vec<f64>,
     candidate_columns: Vec<f64>,
     alpha: Vec<f64>,
@@ -1133,7 +1131,6 @@ fn solve_master(
     Ok(SolveResult {
         objective: solved.objective_value(),
         selected,
-        columns: columns.to_vec(),
         nonzero_vars,
         fractional_vars,
         max_fractionality,
@@ -1231,7 +1228,6 @@ fn solve_paper_rmp_lp(
         .collect::<Vec<_>>();
 
     Ok(PaperRmpLpSolution {
-        objective: solved.objective_value(),
         singleton_columns: solution.columns()[..n_reduced].to_vec(),
         candidate_columns,
         alpha,
