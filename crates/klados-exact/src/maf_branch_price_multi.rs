@@ -6,14 +6,13 @@
 //! - exhaustive subset oracle available as an optional validation check on tiny instances
 //! - generic branch-and-bound on fractional columns
 
-use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::time::Instant;
 
 use fixedbitset::FixedBitSet;
 use fxhash::{FxHashMap, FxHashSet};
-use highs::{Col, ColProblem, HighsModelStatus, Model, Row, RowProblem, Sense};
+use highs::{ColProblem, HighsModelStatus, Model, Row};
 use klados_core::lower_bound::{
     greedy_multi_tree_partition, greedy_multi_tree_ub_seeded, pairwise_refine_ub,
 };
@@ -43,7 +42,7 @@ fn compute_local_bounds(trees: &[Tree], num_leaves: u32) -> LocalBounds {
     // --- Pairwise LB via approx_3 (3-approx on rSPR distance).
     // approx_3 ≤ 3 * d(Ti,Tj)  ⇒  d(Ti,Tj) ≥ ⌈approx_3 / 3⌉  ⇒  components ≥ ⌈approx_3/3⌉ + 1.
     // approx_3 is ~3000x faster than red_blue_approx_detailed on n=230, so we always run it.
-    let t_pair = std::time::Instant::now();
+    let t_pair = Instant::now();
     for i in 0..m {
         for j in (i + 1)..m {
             let approx3 = approx_3_for_instance(&trees[i], &trees[j], num_leaves);
@@ -63,7 +62,7 @@ fn compute_local_bounds(trees: &[Tree], num_leaves: u32) -> LocalBounds {
     let best_partition = if m == 2 {
         None
     } else {
-        let t_multi = std::time::Instant::now();
+        let t_multi = Instant::now();
         let mut best_multi_ub = n;
         let mut best_ref = 0usize;
         let mut best_seed = 0u64;
@@ -79,7 +78,7 @@ fn compute_local_bounds(trees: &[Tree], num_leaves: u32) -> LocalBounds {
         }
         let multi_ms = t_multi.elapsed().as_secs_f64() * 1000.0;
 
-        let t_pr = std::time::Instant::now();
+        let t_pr = Instant::now();
         let (pr_ub, pr_partition) = pairwise_refine_ub(trees, n);
         eprintln!(
             "[bounds] UB m={}: greedy_multi={} ({:.1}ms, {}x21), pairwise_refine={} ({:.1}ms)",
@@ -212,8 +211,6 @@ fn dual_stabilization_weight() -> f64 {
 enum PricingBackend {
     Native,
     PairDp,
-    IlpGlobal,
-    IlpHybrid,
 }
 
 fn pricing_backend() -> PricingBackend {
@@ -222,17 +219,14 @@ fn pricing_backend() -> PricingBackend {
     *CACHED.get_or_init(|| {
         match std::env::var("KLADOS_BP_MULTI_PRICER").ok().as_deref() {
             Some("native") => PricingBackend::Native,
-            Some("pairdp") => PricingBackend::PairDp,
-            Some("ilp-global") => PricingBackend::IlpGlobal,
-            Some("ilp") | Some("ilp-hybrid") => PricingBackend::IlpHybrid,
+            Some("pairdp")
+            | Some("ilp")
+            | Some("ilp-global")
+            | Some("ilp-hybrid") => PricingBackend::PairDp,
             _ => PricingBackend::PairDp,
         }
     })
 }
-
-const ILP_REGION_TOP_POS_LEAVES: usize = 24;
-const ILP_REGION_MAX_LEAVES: usize = 40;
-const ILP_REGION_MAX_CANDIDATES: usize = 32;
 
 pub struct MafBranchPriceMultiSolver {
     stats: SolverStats,
@@ -361,21 +355,7 @@ enum NodeResult {
     Pruned,
 }
 
-thread_local! {
-    static CALL_DEPTH: Cell<usize> = Cell::new(0);
-}
-
-struct CallDepthGuard(usize);
-impl Drop for CallDepthGuard {
-    fn drop(&mut self) {
-        CALL_DEPTH.set(self.0);
-    }
-}
-
 fn solve_branch_price_multi(instance: &Instance, stats: &mut SolverStats) -> Option<Vec<Tree>> {
-    let depth = CALL_DEPTH.get();
-    CALL_DEPTH.set(depth + 1);
-    let _depth_guard = CallDepthGuard(depth);
     let t_total = Instant::now();
 
     let t_kern = Instant::now();
@@ -674,35 +654,6 @@ fn price_columns_for_duals(
             must_link_pairs,
             cannot_link_pairs,
         ),
-        PricingBackend::IlpGlobal | PricingBackend::IlpHybrid => {
-            if must_link_pairs.is_empty() && cannot_link_pairs.is_empty() {
-                price_best_new_ilp_column(
-                    pricer_ws,
-                    trees,
-                    num_leaves,
-                    alpha,
-                    beta,
-                    blocked_leaves,
-                    seen,
-                    forbidden,
-                )
-                .into_iter()
-                .collect::<Vec<_>>()
-            } else {
-                price_best_new_pairdp_columns(
-                    pricer_ws,
-                    trees,
-                    num_leaves,
-                    alpha,
-                    beta,
-                    blocked_leaves,
-                    seen,
-                    forbidden,
-                    must_link_pairs,
-                    cannot_link_pairs,
-                )
-            }
-        }
     }
 }
 
@@ -1007,8 +958,8 @@ struct MultiPricerWorkspace {
     label_lca: Vec<Vec<u32>>,
     label_side_child: Vec<Vec<u32>>,
     label_node: Vec<Vec<u32>>,
-    memo_m: FxHashMap<Vec<u32>, f64>,
-    memo_v: FxHashMap<Vec<u32>, f64>,
+    memo_m: FxHashMap<Box<[u32]>, f64>,
+    memo_v: FxHashMap<Box<[u32]>, f64>,
 }
 
 impl MultiPricerWorkspace {
@@ -1022,10 +973,9 @@ impl MultiPricerWorkspace {
                     leaves[node as usize].insert(lbl);
                 } else {
                     let (l, r) = tree.children_pair(node);
-                    let left_bits = leaves[l as usize].clone();
-                    let right_bits = leaves[r as usize].clone();
-                    leaves[node as usize].union_with(&left_bits);
-                    leaves[node as usize].union_with(&right_bits);
+                    let mut bits = leaves[l as usize].clone();
+                    bits.union_with(&leaves[r as usize]);
+                    leaves[node as usize] = bits;
                 }
             }
             descendant_leaves.push(leaves);
@@ -1089,6 +1039,11 @@ impl MultiPricerWorkspace {
         self.memo_v.clear();
     }
 
+    #[inline]
+    fn tuple_key(tuple: &[u32]) -> Box<[u32]> {
+        tuple.to_vec().into_boxed_slice()
+    }
+
     fn solve_best(
         &mut self,
         trees: &[Tree],
@@ -1132,12 +1087,12 @@ impl MultiPricerWorkspace {
         let inter = self.intersection_bits(tuple);
         let (has_leaf, ub, best_leaf) = self.intersection_stats(&inter, alpha, blocked_leaves);
         if !has_leaf {
-            self.memo_m.insert(tuple.to_vec(), NEG_INF);
+            self.memo_m.insert(Self::tuple_key(tuple), NEG_INF);
             return NEG_INF;
         }
         let mut best = best_leaf;
         if best >= ub - 1e-12 {
-            self.memo_m.insert(tuple.to_vec(), best);
+            self.memo_m.insert(Self::tuple_key(tuple), best);
             return best;
         }
 
@@ -1154,7 +1109,7 @@ impl MultiPricerWorkspace {
                 if cand_left > best {
                     best = cand_left;
                     if best >= ub - 1e-12 {
-                        self.memo_m.insert(tuple.to_vec(), best);
+                        self.memo_m.insert(Self::tuple_key(tuple), best);
                         return best;
                     }
                 }
@@ -1169,7 +1124,7 @@ impl MultiPricerWorkspace {
                 if cand_right > best {
                     best = cand_right;
                     if best >= ub - 1e-12 {
-                        self.memo_m.insert(tuple.to_vec(), best);
+                        self.memo_m.insert(Self::tuple_key(tuple), best);
                         return best;
                     }
                 }
@@ -1183,7 +1138,7 @@ impl MultiPricerWorkspace {
             }
         }
 
-        self.memo_m.insert(tuple.to_vec(), best);
+        self.memo_m.insert(Self::tuple_key(tuple), best);
         best
     }
 
@@ -1202,7 +1157,7 @@ impl MultiPricerWorkspace {
         let inter = self.intersection_bits(tuple);
         let (has_leaf, ub, _best_leaf) = self.intersection_stats(&inter, alpha, blocked_leaves);
         if !has_leaf {
-            self.memo_v.insert(tuple.to_vec(), NEG_INF);
+            self.memo_v.insert(Self::tuple_key(tuple), NEG_INF);
             return NEG_INF;
         }
 
@@ -1216,13 +1171,13 @@ impl MultiPricerWorkspace {
             } else {
                 NEG_INF
             };
-            self.memo_v.insert(tuple.to_vec(), best);
+            self.memo_v.insert(Self::tuple_key(tuple), best);
             return best;
         }
 
         let mut best = NEG_INF;
         if ub <= 0.0 {
-            self.memo_v.insert(tuple.to_vec(), best);
+            self.memo_v.insert(Self::tuple_key(tuple), best);
             return best;
         }
 
@@ -1240,7 +1195,7 @@ impl MultiPricerWorkspace {
                 if cand_left > NEG_INF / 2.0 {
                     best = best.max(cand_left - skip_penalty);
                     if best >= ub - 1e-12 {
-                        self.memo_v.insert(tuple.to_vec(), best);
+                        self.memo_v.insert(Self::tuple_key(tuple), best);
                         return best;
                     }
                 }
@@ -1255,7 +1210,7 @@ impl MultiPricerWorkspace {
                 if cand_right > NEG_INF / 2.0 {
                     best = best.max(cand_right - skip_penalty);
                     if best >= ub - 1e-12 {
-                        self.memo_v.insert(tuple.to_vec(), best);
+                        self.memo_v.insert(Self::tuple_key(tuple), best);
                         return best;
                     }
                 }
@@ -1288,13 +1243,13 @@ impl MultiPricerWorkspace {
                 }
                 best = best.max(left + right - beta_sum);
                 if best >= ub - 1e-12 {
-                    self.memo_v.insert(tuple.to_vec(), best);
+                    self.memo_v.insert(Self::tuple_key(tuple), best);
                     return best;
                 }
             }
         }
 
-        self.memo_v.insert(tuple.to_vec(), best);
+        self.memo_v.insert(Self::tuple_key(tuple), best);
         best
     }
 
@@ -1698,12 +1653,12 @@ impl<'a> PairDpPricer<'a> {
         &mut self,
         limit: usize,
         mut accept: F,
-    ) -> Vec<(f64, Vec<u32>)>
+    ) -> (usize, Vec<(f64, Vec<u32>)>)
     where
         F: FnMut(&[u32]) -> bool,
     {
         if self.active_labels.len() < 2 || limit == 0 {
-            return Vec::new();
+            return (0, Vec::new());
         }
 
         // First pass: gather profitable (score, a, b) without extracting labels.
@@ -1718,6 +1673,10 @@ impl<'a> PairDpPricer<'a> {
                 }
                 scored.push((score, a, b));
             }
+        }
+        let raw_candidates = scored.len();
+        if raw_candidates == 0 {
+            return (0, Vec::new());
         }
         // Highest-score pairs first so label extraction focuses on the best columns.
         scored.sort_unstable_by(|l, r| r.0.total_cmp(&l.0));
@@ -1753,7 +1712,7 @@ impl<'a> PairDpPricer<'a> {
         if out.len() > limit {
             out.truncate(limit);
         }
-        out
+        (raw_candidates, out)
     }
 
     fn pair_idx(&self, a: usize, b: usize) -> usize {
@@ -1965,8 +1924,8 @@ where
     );
     pricer_timing_add_setup(t_setup.elapsed().as_secs_f64() * 1000.0);
     let t_collect = Instant::now();
-    let out = pricer.collect_profitable_columns(limit, accept);
-    pricer_timing_add_collect(t_collect.elapsed().as_secs_f64() * 1000.0, out.len());
+    let (raw, out) = pricer.collect_profitable_columns(limit, accept);
+    pricer_timing_add_collect(t_collect.elapsed().as_secs_f64() * 1000.0, raw);
     out
 }
 
@@ -2273,351 +2232,6 @@ fn price_best_new_exact_column(
         &mut incumbent,
     );
     incumbent
-}
-
-fn price_best_new_ilp_column(
-    pricer_ws: &mut MultiPricerWorkspace,
-    trees: &[Tree],
-    num_leaves: usize,
-    alpha: &[f64],
-    beta: &[Vec<f64>],
-    blocked_leaves: &[bool],
-    seen: &FxHashSet<Vec<u32>>,
-    forbidden: &ForbiddenColumns,
-) -> Option<(f64, Vec<u32>)> {
-    if pricing_backend() == PricingBackend::IlpHybrid {
-        if let Some(priced) = price_best_pair_region_ilp_column(
-            &pricer_ws.descendant_leaves,
-            trees,
-            num_leaves,
-            alpha,
-            beta,
-            blocked_leaves,
-            seen,
-            forbidden,
-        ) {
-            return Some(priced);
-        }
-    }
-
-    price_best_column_ilp(
-        &pricer_ws.descendant_leaves,
-        trees,
-        num_leaves,
-        alpha,
-        beta,
-        blocked_leaves,
-        seen,
-        forbidden,
-    )
-}
-
-#[derive(Clone)]
-struct PairRegionCandidate {
-    upper_bound: f64,
-    labels: Vec<u32>,
-}
-
-fn price_best_pair_region_ilp_column(
-    descendant_leaves: &[Vec<FixedBitSet>],
-    trees: &[Tree],
-    num_leaves: usize,
-    alpha: &[f64],
-    beta: &[Vec<f64>],
-    blocked_leaves: &[bool],
-    seen: &FxHashSet<Vec<u32>>,
-    forbidden: &ForbiddenColumns,
-) -> Option<(f64, Vec<u32>)> {
-    let mut positive_labels = (1..=num_leaves as u32)
-        .filter(|&label| !blocked_leaves[label as usize] && alpha[label as usize] > 1.0e-12)
-        .collect::<Vec<_>>();
-    if positive_labels.is_empty() {
-        return None;
-    }
-    positive_labels.sort_unstable_by(|&lhs, &rhs| {
-        alpha[rhs as usize].total_cmp(&alpha[lhs as usize])
-    });
-
-    for &label in &positive_labels {
-        let singleton = vec![label];
-        if !forbidden.contains(seen, &singleton) && alpha[label as usize] > 1.0 + 1.0e-8 {
-            return Some((alpha[label as usize], singleton));
-        }
-    }
-
-    if positive_labels.len() < 2 {
-        return None;
-    }
-    positive_labels.truncate(ILP_REGION_TOP_POS_LEAVES);
-
-    let mut dedup: FxHashMap<Vec<u32>, f64> = FxHashMap::default();
-    for i in 0..positive_labels.len() {
-        for j in (i + 1)..positive_labels.len() {
-            let a = positive_labels[i];
-            let b = positive_labels[j];
-            let mut region = {
-                let lca = trees[0]
-                    .nearest_common_ancestor(trees[0].node_by_label(a), trees[0].node_by_label(b));
-                descendant_leaves[0][lca as usize].clone()
-            };
-            for ti in 1..trees.len() {
-                let lca = trees[ti]
-                    .nearest_common_ancestor(trees[ti].node_by_label(a), trees[ti].node_by_label(b));
-                region.intersect_with(&descendant_leaves[ti][lca as usize]);
-            }
-            let labels = region
-                .ones()
-                .filter(|&leaf| leaf > 0 && !blocked_leaves[leaf])
-                .map(|leaf| leaf as u32)
-                .collect::<Vec<_>>();
-            if labels.len() < 2 || labels.len() > ILP_REGION_MAX_LEAVES {
-                continue;
-            }
-            let upper_bound = labels
-                .iter()
-                .map(|&label| alpha[label as usize].max(0.0))
-                .sum::<f64>();
-            if upper_bound <= 1.0 + 1.0e-8 {
-                continue;
-            }
-            dedup
-                .entry(labels)
-                .and_modify(|ub| *ub = ub.max(upper_bound))
-                .or_insert(upper_bound);
-        }
-    }
-
-    if dedup.is_empty() {
-        return None;
-    }
-
-    let mut candidates = dedup
-        .into_iter()
-        .map(|(labels, upper_bound)| PairRegionCandidate { upper_bound, labels })
-        .collect::<Vec<_>>();
-    candidates.sort_unstable_by(|lhs, rhs| rhs.upper_bound.total_cmp(&lhs.upper_bound));
-    if candidates.len() > ILP_REGION_MAX_CANDIDATES {
-        candidates.truncate(ILP_REGION_MAX_CANDIDATES);
-    }
-
-    if exact_pricer_profile() {
-        eprintln!(
-            "[maf-bp-multi] pair-region heuristic: positive={} candidates={}",
-            positive_labels.len(),
-            candidates.len()
-        );
-    }
-
-    for candidate in candidates {
-        let mut allowed = vec![false; num_leaves + 1];
-        for &label in &candidate.labels {
-            allowed[label as usize] = true;
-        }
-        let mut blocked = blocked_leaves.to_vec();
-        for label in 1..=num_leaves {
-            if !allowed[label] {
-                blocked[label] = true;
-            }
-        }
-        if let Some((score, labels)) = price_best_column_ilp(
-            descendant_leaves,
-            trees,
-            num_leaves,
-            alpha,
-            beta,
-            &blocked,
-            seen,
-            forbidden,
-        ) {
-            if score > 1.0 + 1.0e-8 {
-                if exact_pricer_profile() {
-                    eprintln!(
-                        "[maf-bp-multi] pair-region hit: score={:.6} size={}",
-                        score,
-                        labels.len()
-                    );
-                }
-                return Some((score, labels));
-            }
-        }
-    }
-
-    None
-}
-
-fn price_best_column_ilp(
-    descendant_leaves: &[Vec<FixedBitSet>],
-    trees: &[Tree],
-    num_leaves: usize,
-    alpha: &[f64],
-    beta: &[Vec<f64>],
-    blocked_leaves: &[bool],
-    seen: &FxHashSet<Vec<u32>>,
-    forbidden: &ForbiddenColumns,
-) -> Option<(f64, Vec<u32>)> {
-    let free_labels = (1..=num_leaves as u32)
-        .filter(|&label| !blocked_leaves[label as usize])
-        .collect::<Vec<_>>();
-    if free_labels.is_empty() {
-        return None;
-    }
-
-    let conflict_triples = find_conflict_triples_multi(trees, &free_labels);
-    let mut pb = RowProblem::default();
-
-    let mut x_vars = vec![None; num_leaves + 1];
-    for &label in &free_labels {
-        let col = pb.add_integer_column(alpha[label as usize], 0.0..=1.0);
-        x_vars[label as usize] = Some(col);
-    }
-
-    pb.add_row(
-        1.0..,
-        free_labels
-            .iter()
-            .filter_map(|&label| x_vars[label as usize].map(|col| (col, 1.0)))
-            .collect::<Vec<_>>(),
-    );
-
-    let mut used_vars: Vec<Vec<Option<Col>>> = Vec::with_capacity(trees.len());
-    for (ti, tree) in trees.iter().enumerate() {
-        let mut tree_used_vars = vec![None; tree.num_nodes()];
-        for node in 0..tree.num_nodes() as u32 {
-            if tree.is_leaf(node) {
-                continue;
-            }
-            let y = pb.add_integer_column(-beta[ti][node as usize], 0.0..=1.0);
-            let (left, right) = tree.children_pair(node);
-            let left_labels = descendant_leaves[ti][left as usize].ones().collect::<Vec<_>>();
-            let right_labels = descendant_leaves[ti][right as usize].ones().collect::<Vec<_>>();
-            let p_left = add_presence_var(&mut pb, &x_vars, &left_labels);
-            let p_right = add_presence_var(&mut pb, &x_vars, &right_labels);
-            if tree.is_root(node) {
-                // Root is used iff both child directions contain selected leaves.
-                pb.add_row(..=0.0, [(y, 1.0), (p_left, -1.0)]);
-                pb.add_row(..=0.0, [(y, 1.0), (p_right, -1.0)]);
-                pb.add_row(-1.0.., [(y, 1.0), (p_left, -1.0), (p_right, -1.0)]);
-            } else {
-                // A non-root Steiner node is used iff at least two of its three
-                // incident directions are active: left, right, or upward/outside.
-                let outside_labels = free_labels
-                    .iter()
-                    .copied()
-                    .filter(|&label| !descendant_leaves[ti][node as usize].contains(label as usize))
-                    .map(|label| label as usize)
-                    .collect::<Vec<_>>();
-                let p_up = add_presence_var(&mut pb, &x_vars, &outside_labels);
-
-                pb.add_row(..=0.0, [(y, 1.0), (p_left, -1.0), (p_right, -1.0)]);
-                pb.add_row(..=0.0, [(y, 1.0), (p_left, -1.0), (p_up, -1.0)]);
-                pb.add_row(..=0.0, [(y, 1.0), (p_right, -1.0), (p_up, -1.0)]);
-
-                pb.add_row(-1.0.., [(y, 1.0), (p_left, -1.0), (p_right, -1.0)]);
-                pb.add_row(-1.0.., [(y, 1.0), (p_left, -1.0), (p_up, -1.0)]);
-                pb.add_row(-1.0.., [(y, 1.0), (p_right, -1.0), (p_up, -1.0)]);
-            }
-            tree_used_vars[node as usize] = Some(y);
-        }
-        used_vars.push(tree_used_vars);
-    }
-
-    for &(a, b, c) in &conflict_triples {
-        let xa = x_vars[a as usize].expect("free leaf var exists");
-        let xb = x_vars[b as usize].expect("free leaf var exists");
-        let xc = x_vars[c as usize].expect("free leaf var exists");
-        pb.add_row(..=2.0, [(xa, 1.0), (xb, 1.0), (xc, 1.0)]);
-    }
-
-    for blocked in forbidden
-        .fixed_zero_labels
-        .iter()
-        .chain(seen.iter())
-    {
-        if blocked.iter().any(|&label| blocked_leaves[label as usize]) {
-            continue;
-        }
-        let blocked_set = blocked.iter().copied().collect::<FxHashSet<_>>();
-        let mut coeffs = Vec::with_capacity(free_labels.len());
-        for &label in &free_labels {
-            let x = x_vars[label as usize].expect("free leaf var exists");
-            if blocked_set.contains(&label) {
-                coeffs.push((x, 1.0));
-            } else {
-                coeffs.push((x, -1.0));
-            }
-        }
-        if blocked.len() > free_labels.len() {
-            continue;
-        }
-        if blocked.iter().all(|&label| x_vars[label as usize].is_some()) {
-            pb.add_row(..=(blocked.len() as f64 - 1.0), coeffs);
-        }
-    }
-
-    let mut model = pb.optimise(Sense::Maximise);
-    model.make_quiet();
-    model.set_option("threads", 1_i32);
-    model.set_option("presolve", "on");
-
-    let solved = model.solve();
-    if solved.status() != HighsModelStatus::Optimal {
-        return None;
-    }
-
-    let values = solved.get_solution().columns().to_vec();
-    let mut labels = Vec::new();
-    let mut x_index = 0usize;
-    for &label in &free_labels {
-        if values[x_index] > 0.5 {
-            labels.push(label);
-        }
-        x_index += 1;
-    }
-
-    if labels.is_empty() || forbidden.contains(seen, &labels) || !is_set_compatible_all(trees, &labels)
-    {
-        return None;
-    }
-    Some((column_score(&labels, trees, alpha, beta), labels))
-}
-
-fn find_conflict_triples_multi(trees: &[Tree], labels: &[u32]) -> Vec<(u32, u32, u32)> {
-    let mut conflicts = Vec::new();
-    for i in 0..labels.len() {
-        for j in (i + 1)..labels.len() {
-            for k in (j + 1)..labels.len() {
-                let a = labels[i];
-                let b = labels[j];
-                let c = labels[k];
-                let topo0 = triplet_topology(&trees[0], a, b, c);
-                if trees[1..]
-                    .iter()
-                    .any(|tree| triplet_topology(tree, a, b, c) != topo0)
-                {
-                    conflicts.push((a, b, c));
-                }
-            }
-        }
-    }
-    conflicts
-}
-
-fn add_presence_var(pb: &mut RowProblem, x_vars: &[Option<Col>], labels: &[usize]) -> Col {
-    let p = pb.add_integer_column(0.0, 0.0..=1.0);
-    for &leaf in labels {
-        if let Some(x) = x_vars[leaf] {
-            pb.add_row(0.0.., [(p, 1.0), (x, -1.0)]);
-        }
-    }
-    let mut coeffs = Vec::with_capacity(labels.len() + 1);
-    coeffs.push((p, 1.0));
-    for &leaf in labels {
-        if let Some(x) = x_vars[leaf] {
-            coeffs.push((x, -1.0));
-        }
-    }
-    pb.add_row(..=0.0, coeffs);
-    p
 }
 
 fn search_pricing_prefix_dfs(

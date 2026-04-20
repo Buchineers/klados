@@ -16,9 +16,8 @@
 //!
 //! Restricted to m = 2 trees; falls back to maf-sat for multi-tree instances.
 
-use std::cell::Cell;
-use std::collections::{BTreeMap, BinaryHeap, HashSet};
 use std::cmp::Ordering;
+use std::collections::{BTreeMap, BinaryHeap, HashSet};
 use std::time::Instant;
 
 use fixedbitset::FixedBitSet;
@@ -131,21 +130,7 @@ enum NodeResult {
 // Main B&P pipeline
 // ---------------------------------------------------------------------------
 
-thread_local! {
-    static CALL_DEPTH: Cell<usize> = Cell::new(0);
-}
-
-struct CallDepthGuard(usize);
-impl Drop for CallDepthGuard {
-    fn drop(&mut self) {
-        CALL_DEPTH.set(self.0);
-    }
-}
-
 fn solve_branch_price(instance: &Instance, stats: &mut SolverStats) -> Option<Vec<Tree>> {
-    let depth = CALL_DEPTH.get();
-    CALL_DEPTH.set(depth + 1);
-    let _depth_guard = CallDepthGuard(depth);
     let t_total = Instant::now();
 
     let config = KernelizeConfig::default();
@@ -351,7 +336,10 @@ fn solve_branch_price(instance: &Instance, stats: &mut SolverStats) -> Option<Ve
         eprintln!("[maf-bp] no solution found, returning None");
         None
     };
-    eprintln!("[maf-bp] solve_branch_price returning: {} (depth={})", if result.is_some() { "Some" } else { "None" }, depth);
+    eprintln!(
+        "[maf-bp] solve_branch_price returning: {}",
+        if result.is_some() { "Some" } else { "None" }
+    );
     result
 }
 
