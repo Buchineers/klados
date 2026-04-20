@@ -1507,11 +1507,13 @@ struct PairDpPricer<'a> {
     prefix_beta: Vec<Vec<f64>>,
     roots: Vec<Vec<u32>>,
     side_child: Vec<Vec<u32>>,
+    pair_order: Vec<(usize, usize)>,
     memo_pair: Vec<Option<f64>>,
     memo_side: Vec<Option<PairDpSideState>>,
     memo_pair_labels: Vec<Option<Vec<u32>>>,
     solving_pair: Vec<bool>,
     solving_side: Vec<bool>,
+    solved_2tree: bool,
 }
 
 impl<'a> PairDpPricer<'a> {
@@ -1582,6 +1584,27 @@ impl<'a> PairDpPricer<'a> {
             side_child.push(tree_side_child);
         }
 
+        let mut pair_order = Vec::new();
+        if trees.len() == 2 {
+            pair_order.reserve(pair_count.saturating_sub(p));
+            for a in 0..p {
+                for b in 0..p {
+                    if a == b {
+                        continue;
+                    }
+                    let idx = a * p + b;
+                    let key = trees
+                        .iter()
+                        .enumerate()
+                        .map(|(ti, tree)| tree.subtree_size[roots[ti][idx] as usize] as usize)
+                        .sum::<usize>();
+                    pair_order.push((key, idx));
+                }
+            }
+            pair_order
+                .sort_unstable_by(|lhs, rhs| lhs.0.cmp(&rhs.0).then_with(|| lhs.1.cmp(&rhs.1)));
+        }
+
         Self {
             trees,
             workspace,
@@ -1592,11 +1615,13 @@ impl<'a> PairDpPricer<'a> {
             prefix_beta,
             roots,
             side_child,
+            pair_order,
             memo_pair: vec![None; pair_count],
             memo_side: vec![None; pair_count],
             memo_pair_labels: vec![None; pair_count],
             solving_pair: vec![false; pair_count],
             solving_side: vec![false; pair_count],
+            solved_2tree: false,
         }
     }
 
@@ -1719,9 +1744,81 @@ impl<'a> PairDpPricer<'a> {
         a * self.active_labels.len() + b
     }
 
+    fn solve_all_2tree(&mut self) {
+        if self.solved_2tree {
+            return;
+        }
+
+        let p = self.active_labels.len();
+        let mut pos = 0usize;
+        while pos < self.pair_order.len() {
+            let key = self.pair_order[pos].0;
+            let mut end = pos + 1;
+            while end < self.pair_order.len() && self.pair_order[end].0 == key {
+                end += 1;
+            }
+
+            for &(_, idx) in &self.pair_order[pos..end] {
+                let a = idx / p;
+                let b = idx % p;
+                let label_a = self.active_labels[a];
+                let mut best_score =
+                    self.alpha[label_a as usize] - self.singleton_chain_penalty_2tree(a, idx);
+                let mut best_choice = PairDpSideChoice::Singleton;
+
+                for c in 0..p {
+                    if c == a || c == b || !self.is_same_side_2tree(idx, c) {
+                        continue;
+                    }
+                    let idx_ac = self.pair_idx(a, c);
+                    let child_score = self.memo_pair[idx_ac]
+                        .expect("child pair must be solved earlier in pair DP order");
+                    if child_score <= NEG_INF / 2.0 {
+                        continue;
+                    }
+                    let cand = child_score - self.transition_chain_penalty_2tree(idx, idx_ac);
+                    if cand > best_score + 1.0e-12 {
+                        best_score = cand;
+                        best_choice = PairDpSideChoice::Split(c);
+                    }
+                }
+
+                self.memo_side[idx] = Some(PairDpSideState {
+                    score: best_score,
+                    choice: best_choice,
+                });
+            }
+
+            for &(_, idx) in &self.pair_order[pos..end] {
+                let a = idx / p;
+                let b = idx % p;
+                let left = self.memo_side[idx]
+                    .expect("left side state present after pair DP side phase")
+                    .score;
+                let right = self.memo_side[self.pair_idx(b, a)]
+                    .expect("right side state present after pair DP side phase")
+                    .score;
+                let score = if left <= NEG_INF / 2.0 || right <= NEG_INF / 2.0 {
+                    NEG_INF
+                } else {
+                    -self.root_penalty_2tree(idx) + left + right
+                };
+                self.memo_pair[idx] = Some(score);
+            }
+
+            pos = end;
+        }
+
+        self.solved_2tree = true;
+    }
+
     fn solve_pair(&mut self, a: usize, b: usize) -> f64 {
         debug_assert!(a != b);
         let idx = self.pair_idx(a, b);
+        if self.trees.len() == 2 {
+            self.solve_all_2tree();
+            return self.memo_pair[idx].unwrap_or(NEG_INF);
+        }
         if let Some(score) = self.memo_pair[idx] {
             return score;
         }
@@ -1746,6 +1843,12 @@ impl<'a> PairDpPricer<'a> {
     fn solve_side(&mut self, a: usize, b: usize) -> f64 {
         debug_assert!(a != b);
         let idx = self.pair_idx(a, b);
+        if self.trees.len() == 2 {
+            self.solve_all_2tree();
+            return self.memo_side[idx]
+                .expect("side state present after 2-tree pair DP solve")
+                .score;
+        }
         if let Some(state) = self.memo_side[idx] {
             return state.score;
         }
@@ -1853,6 +1956,23 @@ impl<'a> PairDpPricer<'a> {
             .sum()
     }
 
+    #[inline(always)]
+    fn root_penalty_2tree(&self, idx: usize) -> f64 {
+        self.beta[0][self.roots[0][idx] as usize] + self.beta[1][self.roots[1][idx] as usize]
+    }
+
+    #[inline(always)]
+    fn singleton_chain_penalty_2tree(&self, a: usize, idx: usize) -> f64 {
+        self.path_internal_penalty(0, &self.trees[0], self.side_child[0][idx], self.active_nodes[0][a])
+            + self.path_internal_penalty(1, &self.trees[1], self.side_child[1][idx], self.active_nodes[1][a])
+    }
+
+    #[inline(always)]
+    fn transition_chain_penalty_2tree(&self, idx_ab: usize, idx_ac: usize) -> f64 {
+        self.path_internal_penalty(0, &self.trees[0], self.side_child[0][idx_ab], self.roots[0][idx_ac])
+            + self.path_internal_penalty(1, &self.trees[1], self.side_child[1][idx_ab], self.roots[1][idx_ac])
+    }
+
     fn path_internal_penalty(&self, ti: usize, tree: &Tree, anc: u32, desc: u32) -> f64 {
         if anc == desc {
             return 0.0;
@@ -1878,6 +1998,14 @@ impl<'a> PairDpPricer<'a> {
             self.workspace.descendant_leaves[ti][self.side_child[ti][idx] as usize]
                 .contains(label_c)
         })
+    }
+
+    #[inline(always)]
+    fn is_same_side_2tree(&self, idx: usize, c: usize) -> bool {
+        let label_c = self.active_labels[c] as usize;
+        self.workspace.descendant_leaves[0][self.side_child[0][idx] as usize].contains(label_c)
+            && self.workspace.descendant_leaves[1][self.side_child[1][idx] as usize]
+                .contains(label_c)
     }
 }
 
