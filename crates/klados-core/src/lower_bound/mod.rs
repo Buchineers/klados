@@ -42,30 +42,80 @@ pub fn maf_bounds(trees: &[Tree], num_leaves: u32) -> MafBounds {
     // lb_cuts[i][j] = best known lower bound on the pairwise cuts d(Ti, Tj).
     let mut lb_cuts = vec![vec![0usize; m]; m];
 
-    for i in 0..m {
-        for j in (i + 1)..m {
-            let rb = red_blue_approx_detailed(&trees[i], &trees[j]);
+    let t_pairwise = std::time::Instant::now();
+    let mut t_rb_total_ms = 0.0f64;
+    let mut t_cherry_total_ms = 0.0f64;
+    let mut rb_calls: usize = 0;
+    let mut rb_skipped: usize = 0;
 
-            // Use the dual value D as LB on cuts (tighter than ceil(UB/2)).
+    if m == 2 {
+        // Single pair: need both rb (for UB on 2-tree case) and cherry. Keep original path.
+        let t_rb = std::time::Instant::now();
+        let rb = red_blue_approx_detailed(&trees[0], &trees[1]);
+        t_rb_total_ms += t_rb.elapsed().as_secs_f64() * 1000.0;
+        rb_calls += 1;
+
+        let pair_lb = rb.dual_lb;
+        lb_cuts[0][1] = pair_lb;
+        lb_cuts[1][0] = pair_lb;
+        best_lb = best_lb.max(pair_lb + 1);
+        best_ub_pair = best_ub_pair.min(rb.ub + 1);
+
+        let t_ch = std::time::Instant::now();
+        let cherry_ub = cherry_reduce_ub(&trees[0], &trees[1]);
+        t_cherry_total_ms += t_ch.elapsed().as_secs_f64() * 1000.0;
+        best_ub_pair = best_ub_pair.min(cherry_ub + 1);
+    } else {
+        // Stage 1 (cheap): cherry_reduce_ub for all pairs.
+        //   - cherry_ub is an UPPER bound on d(Ti, Tj)
+        //   - dual_lb (from rb) is a LOWER bound on d(Ti, Tj)
+        //   - So dual_lb ≤ cherry_ub
+        //   - Max-pair component LB contribution is at most cherry_ub + 1
+        //   - If cherry_ub + 1 ≤ current best_lb, rb on this pair cannot tighten it
+        let mut pair_cherry: Vec<(usize, usize, usize)> = Vec::with_capacity(m * (m - 1) / 2);
+        for i in 0..m {
+            for j in (i + 1)..m {
+                let t_ch = std::time::Instant::now();
+                let cu = cherry_reduce_ub(&trees[i], &trees[j]);
+                t_cherry_total_ms += t_ch.elapsed().as_secs_f64() * 1000.0;
+                pair_cherry.push((i, j, cu));
+            }
+        }
+
+        // Stage 2: sort pairs by cherry_ub desc; run rb only where it can tighten best_lb.
+        // For skipped pairs we leave lb_cuts[i][j] = 0 (safe under-approximation of dual_lb,
+        // so the additive LB stays valid — possibly weaker, never invalidated).
+        pair_cherry.sort_by(|a, b| b.2.cmp(&a.2));
+        for &(i, j, cu) in &pair_cherry {
+            // best_ub_pair is only used for m==2, so don't bother updating it here.
+            if cu + 1 <= best_lb {
+                rb_skipped += 1;
+                continue;
+            }
+            let t_rb = std::time::Instant::now();
+            let rb = red_blue_approx_detailed(&trees[i], &trees[j]);
+            t_rb_total_ms += t_rb.elapsed().as_secs_f64() * 1000.0;
+            rb_calls += 1;
+
             let pair_lb = rb.dual_lb;
             lb_cuts[i][j] = pair_lb;
             lb_cuts[j][i] = pair_lb;
-
-            let lb_components = pair_lb + 1;
-            if lb_components > best_lb {
-                best_lb = lb_components;
-            }
-            let approx_ub_components = rb.ub + 1;
-            if approx_ub_components < best_ub_pair {
-                best_ub_pair = approx_ub_components;
-            }
-
-            let cherry_ub = cherry_reduce_ub(&trees[i], &trees[j]);
-            let ub_components = cherry_ub + 1;
-            if ub_components < best_ub_pair {
-                best_ub_pair = ub_components;
-            }
+            best_lb = best_lb.max(pair_lb + 1);
         }
+    }
+
+    let pairwise_total_ms = t_pairwise.elapsed().as_secs_f64() * 1000.0;
+    if m >= 5 {
+        eprintln!(
+            "[bounds] pairwise m={}: total={:.1}ms (red_blue={:.1}ms/{}calls, cherry_reduce={:.1}ms, rb_skipped={}, best_lb={})",
+            m,
+            pairwise_total_ms,
+            t_rb_total_ms,
+            rb_calls,
+            t_cherry_total_ms,
+            rb_skipped,
+            best_lb,
+        );
     }
 
     // Additive multi-tree LB: for each reference Ti,
@@ -95,6 +145,7 @@ pub fn maf_bounds(trees: &[Tree], num_leaves: u32) -> MafBounds {
         let n = num_leaves as usize;
 
         // (a) All-tree cherry reduction.
+        let t_multi = std::time::Instant::now();
         let mut best_multi_ub = n;
         let mut best_ref = 0usize;
         let mut best_seed = 0u64;
@@ -107,6 +158,10 @@ pub fn maf_bounds(trees: &[Tree], num_leaves: u32) -> MafBounds {
                     best_seed = seed;
                 }
             }
+        }
+        let multi_ms = t_multi.elapsed().as_secs_f64() * 1000.0;
+        if m >= 5 {
+            eprintln!("[bounds] greedy_multi_tree_ub_seeded ({}x21): {:.1}ms", m, multi_ms);
         }
 
         // (b) Pairwise-refine: start from best pair's partition, refine for all trees.

@@ -14,14 +14,158 @@ use std::time::Instant;
 use fixedbitset::FixedBitSet;
 use fxhash::FxHashMap;
 use highs::{Col, ColProblem, HighsModelStatus, Model, Row, RowProblem, Sense};
-use klados_core::lower_bound::maf_bounds;
+use klados_core::lower_bound::{
+    cherry_reduce_ub, greedy_multi_tree_partition, greedy_multi_tree_ub_seeded,
+    pairwise_refine_ub,
+};
 use klados_core::{Instance, SolverStats, Tree};
+
+use crate::whidden::approx_3_for_instance;
+
+/// Subset of `MafBounds` that's actually used by this solver.
+/// We replace the expensive red_blue_approx_detailed pairwise loop with approx_3
+/// (per-pair 3-approximation of rSPR distance) for the LB, since:
+///   (a) approx_3 is ~100x cheaper than red_blue_approx_detailed
+///   (b) B&P pruning actually uses the LP bound, not the initial LB
+///   (c) `MafBounds.lower` is not read on the hot path here — only the partition is.
+struct LocalBounds {
+    lower: usize,
+    upper: usize,
+    best_partition: Option<Vec<usize>>,
+}
+
+fn compute_local_bounds(trees: &[Tree], num_leaves: u32) -> LocalBounds {
+    if trees.len() <= 1 {
+        return LocalBounds { lower: 1, upper: 1, best_partition: None };
+    }
+
+    let m = trees.len();
+    let n = num_leaves as usize;
+    let mut best_lb = 1usize;
+
+    // --- Pairwise LB via approx_3 (3-approx on rSPR distance).
+    // approx_3 ≤ 3 * d(Ti,Tj)  ⇒  d(Ti,Tj) ≥ ⌈approx_3 / 3⌉  ⇒  components ≥ ⌈approx_3/3⌉ + 1.
+    // approx_3 is ~3000x faster than red_blue_approx_detailed on n=230, so we always run it.
+    let t_pair = std::time::Instant::now();
+    let mut best_ub_pair = usize::MAX;
+    for i in 0..m {
+        for j in (i + 1)..m {
+            let approx3 = approx_3_for_instance(&trees[i], &trees[j], num_leaves);
+            let pair_lb_cuts = ((approx3 + 2) / 3) as usize; // ceil div
+            best_lb = best_lb.max(pair_lb_cuts + 1);
+            if m == 2 {
+                // We need a 2-tree UB. cherry_reduce_ub on top of approx_3 is a useful tightener.
+                let cu = cherry_reduce_ub(&trees[i], &trees[j]);
+                best_ub_pair = best_ub_pair.min(cu + 1);
+            }
+        }
+    }
+    let pair_ms = t_pair.elapsed().as_secs_f64() * 1000.0;
+    if m >= 5 || std::env::var("KLADOS_BP_MULTI_PROFILE").ok().as_deref() == Some("1") {
+        eprintln!(
+            "[bounds] pairwise m={}: approx_3={:.1}ms for {} pairs, best_lb={}",
+            m, pair_ms, m * (m - 1) / 2, best_lb,
+        );
+    }
+
+    // --- Upper bound / warm-start partition.
+    let (upper, best_partition) = if m == 2 {
+        (best_ub_pair.min(n), None)
+    } else {
+        let t_multi = std::time::Instant::now();
+        let mut best_multi_ub = n;
+        let mut best_ref = 0usize;
+        let mut best_seed = 0u64;
+        for ref_idx in 0..m {
+            for seed in 0..=20u64 {
+                let ub = greedy_multi_tree_ub_seeded(trees, ref_idx, seed);
+                if ub < best_multi_ub {
+                    best_multi_ub = ub;
+                    best_ref = ref_idx;
+                    best_seed = seed;
+                }
+            }
+        }
+        let multi_ms = t_multi.elapsed().as_secs_f64() * 1000.0;
+
+        let t_pr = std::time::Instant::now();
+        let (pr_ub, pr_partition) = pairwise_refine_ub(trees, n);
+        eprintln!(
+            "[bounds] UB m={}: greedy_multi={} ({:.1}ms, {}x21), pairwise_refine={} ({:.1}ms)",
+            m, best_multi_ub, multi_ms, m, pr_ub, t_pr.elapsed().as_secs_f64() * 1000.0,
+        );
+
+        if pr_ub < best_multi_ub {
+            (pr_ub.min(n), Some(pr_partition))
+        } else {
+            let (_, partition) = greedy_multi_tree_partition(trees, best_ref, best_seed);
+            (best_multi_ub.min(n), Some(partition))
+        }
+    };
+
+    LocalBounds {
+        lower: best_lb.min(upper),
+        upper,
+        best_partition,
+    }
+}
 
 use crate::cluster_reduction::{self, ClusterReductionResult};
 use crate::kernelize::{self, KernelizeConfig};
 use crate::ExactSolver;
 
 const ORACLE_ENUM_LEAVES: usize = 24;
+
+#[derive(Default, Clone, Copy)]
+struct PricerTiming {
+    setup_ms: f64,
+    collect_ms: f64,
+    filter_ms: f64,
+    raw_candidates: usize,
+    filtered_candidates: usize,
+}
+
+thread_local! {
+    static PRICER_TIMING: std::cell::Cell<PricerTiming> = const {
+        std::cell::Cell::new(PricerTiming {
+            setup_ms: 0.0,
+            collect_ms: 0.0,
+            filter_ms: 0.0,
+            raw_candidates: 0,
+            filtered_candidates: 0,
+        })
+    };
+}
+
+fn pricer_timing_reset() -> PricerTiming {
+    PRICER_TIMING.with(|c| c.replace(PricerTiming::default()))
+}
+
+fn pricer_timing_add_setup(ms: f64) {
+    PRICER_TIMING.with(|c| {
+        let mut t = c.get();
+        t.setup_ms += ms;
+        c.set(t);
+    });
+}
+
+fn pricer_timing_add_collect(ms: f64, raw: usize) {
+    PRICER_TIMING.with(|c| {
+        let mut t = c.get();
+        t.collect_ms += ms;
+        t.raw_candidates += raw;
+        c.set(t);
+    });
+}
+
+fn pricer_timing_add_filter(ms: f64, kept: usize) {
+    PRICER_TIMING.with(|c| {
+        let mut t = c.get();
+        t.filter_ms += ms;
+        t.filtered_candidates += kept;
+        c.set(t);
+    });
+}
 const NEG_INF: f64 = -1.0e100;
 
 fn exact_pricer_trace() -> bool {
@@ -159,6 +303,20 @@ struct BpState {
     cg_iterations_total: usize,
     oracle_matches: usize,
     oracle_mismatches: usize,
+    pricing_time_ms: f64,
+    lp_solve_time_ms: f64,
+    pricing_calls: usize,
+    lp_solve_calls: usize,
+    columns_added: usize,
+    node_time_ms: f64,
+    apply_bounds_time_ms: f64,
+    add_column_time_ms: f64,
+    branch_select_time_ms: f64,
+    pricer_setup_ms: f64,
+    pricer_collect_ms: f64,
+    pricer_filter_ms: f64,
+    pricer_candidates_raw: usize,
+    pricer_candidates_after_filter: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -233,9 +391,11 @@ fn solve_branch_price_multi(instance: &Instance, stats: &mut SolverStats) -> Opt
     let _depth_guard = CallDepthGuard(depth);
     let t_total = Instant::now();
 
+    let t_kern = Instant::now();
     let config = KernelizeConfig::default();
     let kern = kernelize::kernelize_best(instance, &config);
     let reduced = &kern.instance;
+    let kern_ms = t_kern.elapsed().as_secs_f64() * 1000.0;
 
     eprintln!(
         "[maf-bp-multi] kernelized {} -> {} leaves (m={})",
@@ -265,9 +425,12 @@ fn solve_branch_price_multi(instance: &Instance, stats: &mut SolverStats) -> Opt
     let trees = &reduced.trees;
     let param_reduction_32 = kern.param_reduction;
 
-    match cluster_reduction::try_cluster_reduction(reduced, &mut |subinstance| {
+    let t_cluster = Instant::now();
+    let cluster_result = cluster_reduction::try_cluster_reduction(reduced, &mut |subinstance| {
         solve_branch_price_multi(subinstance, &mut SolverStats::default())
-    })? {
+    })?;
+    let cluster_ms = t_cluster.elapsed().as_secs_f64() * 1000.0;
+    match cluster_result {
         ClusterReductionResult::NotApplicable => {}
         ClusterReductionResult::Solved(solution) => {
             let exact_k = solution.components.len() + param_reduction_32;
@@ -288,7 +451,9 @@ fn solve_branch_price_multi(instance: &Instance, stats: &mut SolverStats) -> Opt
         }
     }
 
-    let bounds = maf_bounds(trees, reduced.num_leaves);
+    let t_bounds = Instant::now();
+    let bounds = compute_local_bounds(trees, reduced.num_leaves);
+    let bounds_ms = t_bounds.elapsed().as_secs_f64() * 1000.0;
     let mut columns: Vec<BpColumn> = (1..=n as u32)
         .map(|label| make_bp_column(vec![label], trees))
         .collect();
@@ -332,6 +497,20 @@ fn solve_branch_price_multi(instance: &Instance, stats: &mut SolverStats) -> Opt
         cg_iterations_total: 0,
         oracle_matches: 0,
         oracle_mismatches: 0,
+        pricing_time_ms: 0.0,
+        lp_solve_time_ms: 0.0,
+        pricing_calls: 0,
+        lp_solve_calls: 0,
+        columns_added: 0,
+        node_time_ms: 0.0,
+        apply_bounds_time_ms: 0.0,
+        add_column_time_ms: 0.0,
+        branch_select_time_ms: 0.0,
+        pricer_setup_ms: 0.0,
+        pricer_collect_ms: 0.0,
+        pricer_filter_ms: 0.0,
+        pricer_candidates_raw: 0,
+        pricer_candidates_after_filter: 0,
     };
 
     let root = BpNode {
@@ -342,7 +521,10 @@ fn solve_branch_price_multi(instance: &Instance, stats: &mut SolverStats) -> Opt
         depth: 0,
     };
 
+    let t_pricer_ws = Instant::now();
     let mut pricer_ws = MultiPricerWorkspace::new(trees, n);
+    let pricer_ws_ms = t_pricer_ws.elapsed().as_secs_f64() * 1000.0;
+    let t_rmp_new = Instant::now();
     let mut rmp = match PersistentRmp::new(&state.columns, trees, n) {
         Ok(rmp) => rmp,
         Err(err) => {
@@ -350,9 +532,13 @@ fn solve_branch_price_multi(instance: &Instance, stats: &mut SolverStats) -> Opt
             return None;
         }
     };
+    let rmp_new_ms = t_rmp_new.elapsed().as_secs_f64() * 1000.0;
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        match solve_bp_node(&mut state, &node, trees, n, &mut pricer_ws, &mut rmp) {
+        let node_t0 = Instant::now();
+        let result = solve_bp_node(&mut state, &node, trees, n, &mut pricer_ws, &mut rmp);
+        state.node_time_ms += node_t0.elapsed().as_secs_f64() * 1000.0;
+        match result {
             NodeResult::Integral(obj, values) => {
                 if obj < state.best_ub {
                     eprintln!(
@@ -416,14 +602,48 @@ fn solve_branch_price_multi(instance: &Instance, stats: &mut SolverStats) -> Opt
     );
     stats.upper_bound = Some(components.len());
     stats.lower_bound = components.len();
+    let total_ms = t_total.elapsed().as_secs_f64() * 1000.0;
+    let node_in_ms = state.pricing_time_ms
+        + state.lp_solve_time_ms
+        + state.apply_bounds_time_ms
+        + state.add_column_time_ms
+        + state.branch_select_time_ms;
+    let node_other_ms = (state.node_time_ms - node_in_ms).max(0.0);
+    let outside_nodes_ms = (total_ms - state.node_time_ms).max(0.0);
     eprintln!(
-        "[maf-bp-multi] optimal: {} components, {} B&B nodes, {} CG iterations, oracle_matches={}, oracle_mismatches={}, {:.1}ms total",
+        "[maf-bp-multi] optimal: {} components, {} B&B nodes, {} CG iters, {} cols, oracle(m/mm)={}/{}, {:.1}ms total",
         components.len(),
         state.nodes_explored,
         state.cg_iterations_total,
+        state.columns_added,
         state.oracle_matches,
         state.oracle_mismatches,
-        t_total.elapsed().as_secs_f64() * 1000.0,
+        total_ms,
+    );
+    eprintln!(
+        "[maf-bp-multi] setup: kern={:.1}ms, cluster={:.1}ms, bounds={:.1}ms, pricer_ws={:.1}ms, rmp_new={:.1}ms",
+        kern_ms, cluster_ms, bounds_ms, pricer_ws_ms, rmp_new_ms,
+    );
+    eprintln!(
+        "[maf-bp-multi] pricer: setup={:.1}ms, collect={:.1}ms, filter={:.1}ms, raw_cands={}, kept={}",
+        state.pricer_setup_ms,
+        state.pricer_collect_ms,
+        state.pricer_filter_ms,
+        state.pricer_candidates_raw,
+        state.pricer_candidates_after_filter,
+    );
+    eprintln!(
+        "[maf-bp-multi] timing: node_total={:.1}ms (pricing={:.1}/{}, lp={:.1}/{}, apply_bounds={:.1}, add_col={:.1}, branch_sel={:.1}, node_other={:.1}), outside_nodes={:.1}",
+        state.node_time_ms,
+        state.pricing_time_ms,
+        state.pricing_calls,
+        state.lp_solve_time_ms,
+        state.lp_solve_calls,
+        state.apply_bounds_time_ms,
+        state.add_column_time_ms,
+        state.branch_select_time_ms,
+        node_other_ms,
+        outside_nodes_ms,
     );
     Some(components)
 }
@@ -585,6 +805,7 @@ fn solve_bp_node(
 
     let forbidden = ForbiddenColumns::new(state, node);
 
+    let apply_t0 = Instant::now();
     rmp.apply_node_bounds(
         &state.columns,
         &node.fixed_to_one,
@@ -593,16 +814,25 @@ fn solve_bp_node(
         &node.cannot_link_pairs,
         &blocked_leaves,
     );
+    state.apply_bounds_time_ms += apply_t0.elapsed().as_secs_f64() * 1000.0;
 
     let mut final_lp: Option<RmpLpResult> = None;
     let mut stability_center: Option<(Vec<f64>, Vec<Vec<f64>>)> = None;
     loop {
+        let lp_t0 = Instant::now();
         let lp = match rmp.solve(state.columns.len()) {
             Ok(lp) => lp,
-            Err(_) => return NodeResult::Pruned,
+            Err(_) => {
+                state.lp_solve_time_ms += lp_t0.elapsed().as_secs_f64() * 1000.0;
+                state.lp_solve_calls += 1;
+                return NodeResult::Pruned;
+            }
         };
+        state.lp_solve_time_ms += lp_t0.elapsed().as_secs_f64() * 1000.0;
+        state.lp_solve_calls += 1;
         let alpha = lp.leaf_duals.clone();
         let beta = lp.node_duals.clone();
+        let pricing_t0 = Instant::now();
         let priced_columns = if dual_stabilization_enabled() {
             let weight = dual_stabilization_weight();
             let (price_alpha, price_beta) = if let Some((center_alpha, center_beta)) = &stability_center {
@@ -657,6 +887,14 @@ fn solve_bp_node(
                 &node.cannot_link_pairs,
             )
         };
+        state.pricing_time_ms += pricing_t0.elapsed().as_secs_f64() * 1000.0;
+        state.pricing_calls += 1;
+        let pt = pricer_timing_reset();
+        state.pricer_setup_ms += pt.setup_ms;
+        state.pricer_collect_ms += pt.collect_ms;
+        state.pricer_filter_ms += pt.filter_ms;
+        state.pricer_candidates_raw += pt.raw_candidates;
+        state.pricer_candidates_after_filter += pt.filtered_candidates;
         let priced = priced_columns.first().cloned();
         if exhaustive_oracle_validation_enabled() && num_leaves <= ORACLE_ENUM_LEAVES {
             let oracle_priced = price_best_column_exhaustive(
@@ -713,6 +951,7 @@ fn solve_bp_node(
         }
 
         let mut added_any = false;
+        let add_t0 = Instant::now();
         for (score, labels) in priced_columns {
             if score <= 1.0 + 1e-8 {
                 continue;
@@ -728,7 +967,9 @@ fn solve_bp_node(
                 best_solution.push(0.0);
             }
             added_any = true;
+            state.columns_added += 1;
         }
+        state.add_column_time_ms += add_t0.elapsed().as_secs_f64() * 1000.0;
 
         if added_any {
             state.cg_iterations_total += 1;
@@ -741,10 +982,16 @@ fn solve_bp_node(
 
     let lp = match final_lp {
         Some(lp) => lp,
-        None => match rmp.solve(state.columns.len()) {
-            Ok(lp) => lp,
-            Err(_) => return NodeResult::Pruned,
-        },
+        None => {
+            let lp_t0 = Instant::now();
+            let result = rmp.solve(state.columns.len());
+            state.lp_solve_time_ms += lp_t0.elapsed().as_secs_f64() * 1000.0;
+            state.lp_solve_calls += 1;
+            match result {
+                Ok(lp) => lp,
+                Err(_) => return NodeResult::Pruned,
+            }
+        }
     };
 
     let lp_bound = (lp.objective - 1e-6).ceil() as usize;
@@ -757,7 +1004,10 @@ fn solve_bp_node(
         return NodeResult::Integral(obj, lp.column_values);
     }
 
-    if let Some(pair) = select_branch_pair(&state.columns, &lp.column_values, num_leaves) {
+    let sel_t0 = Instant::now();
+    let pair_opt = select_branch_pair(&state.columns, &lp.column_values, num_leaves);
+    state.branch_select_time_ms += sel_t0.elapsed().as_secs_f64() * 1000.0;
+    if let Some(pair) = pair_opt {
         return NodeResult::BranchPair {
             lp_obj: lp.objective,
             pair,
@@ -1527,13 +1777,21 @@ impl<'a> PairDpPricer<'a> {
         (best_score > NEG_INF / 2.0).then_some((best_score, best_labels))
     }
 
-    fn collect_profitable_columns(&mut self, limit: usize) -> Vec<(f64, Vec<u32>)> {
+    fn collect_profitable_columns<F>(
+        &mut self,
+        limit: usize,
+        mut accept: F,
+    ) -> Vec<(f64, Vec<u32>)>
+    where
+        F: FnMut(&[u32]) -> bool,
+    {
         if self.active_labels.len() < 2 || limit == 0 {
             return Vec::new();
         }
 
-        let mut dedup: FxHashMap<Vec<u32>, f64> = FxHashMap::default();
+        // First pass: gather profitable (score, a, b) without extracting labels.
         let p = self.active_labels.len();
+        let mut scored: Vec<(f64, usize, usize)> = Vec::with_capacity(p * p);
         for a in 0..p {
             for b in 0..p {
                 if a == b {
@@ -1543,15 +1801,31 @@ impl<'a> PairDpPricer<'a> {
                 if score <= 1.0 + 1.0e-8 {
                     continue;
                 }
-                let labels = self.pair_labels(a, b);
-                if labels.len() < 2 {
-                    continue;
-                }
-                dedup
-                    .entry(labels)
-                    .and_modify(|best| *best = best.max(score))
-                    .or_insert(score);
+                scored.push((score, a, b));
             }
+        }
+        // Highest-score pairs first so label extraction focuses on the best columns.
+        scored.sort_unstable_by(|l, r| r.0.total_cmp(&l.0));
+
+        // Second pass: extract labels in score order; stop early once we have `limit`
+        // filter-accepted unique columns. This avoids materializing labels for the
+        // bulk of profitable pairs that would be truncated away.
+        let mut dedup: FxHashMap<Vec<u32>, f64> = FxHashMap::default();
+        for &(score, a, b) in scored.iter() {
+            if dedup.len() >= limit {
+                break;
+            }
+            let labels = self.pair_labels(a, b);
+            if labels.len() < 2 {
+                continue;
+            }
+            if !accept(&labels) {
+                continue;
+            }
+            dedup
+                .entry(labels)
+                .and_modify(|best| *best = best.max(score))
+                .or_insert(score);
         }
 
         let mut out = dedup.into_iter().map(|(labels, score)| (score, labels)).collect::<Vec<_>>();
@@ -1752,7 +2026,7 @@ fn solve_best_pairdp_column(
     pricer.solve_best()
 }
 
-fn solve_best_pairdp_columns(
+fn solve_best_pairdp_columns<F>(
     workspace: &MultiPricerWorkspace,
     trees: &[Tree],
     num_leaves: usize,
@@ -1760,7 +2034,12 @@ fn solve_best_pairdp_columns(
     beta: &[Vec<f64>],
     blocked_leaves: &[bool],
     limit: usize,
-) -> Vec<(f64, Vec<u32>)> {
+    accept: F,
+) -> Vec<(f64, Vec<u32>)>
+where
+    F: FnMut(&[u32]) -> bool,
+{
+    let t_setup = Instant::now();
     let mut pricer = PairDpPricer::new(
         workspace,
         trees,
@@ -1769,7 +2048,11 @@ fn solve_best_pairdp_columns(
         beta,
         blocked_leaves,
     );
-    pricer.collect_profitable_columns(limit)
+    pricer_timing_add_setup(t_setup.elapsed().as_secs_f64() * 1000.0);
+    let t_collect = Instant::now();
+    let out = pricer.collect_profitable_columns(limit, accept);
+    pricer_timing_add_collect(t_collect.elapsed().as_secs_f64() * 1000.0, out.len());
+    out
 }
 
 fn price_best_new_pairdp_column_single(
@@ -1862,28 +2145,25 @@ fn price_best_new_pairdp_columns(
         .collect();
     }
 
-    let mut candidates = solve_best_pairdp_columns(
+    let candidates = solve_best_pairdp_columns(
         pricer_ws,
         trees,
         num_leaves,
         alpha,
         beta,
         blocked_leaves,
-        usize::MAX,
-    );
-    candidates.retain(|(score, labels)| {
-        *score > 1.0 + 1.0e-8
-            && pricing_candidate_allowed(
+        pairdp_batch_size(),
+        |labels| {
+            pricing_candidate_allowed(
                 labels,
                 seen,
                 forbidden,
                 must_link_pairs,
                 cannot_link_pairs,
             )
-    });
-    if candidates.len() > pairdp_batch_size() {
-        candidates.truncate(pairdp_batch_size());
-    }
+        },
+    );
+    pricer_timing_add_filter(0.0, candidates.len());
 
     if exact_pricer_profile() && !candidates.is_empty() {
         eprintln!(
