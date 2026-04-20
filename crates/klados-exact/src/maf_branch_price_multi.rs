@@ -8,15 +8,14 @@
 
 use std::cell::Cell;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 use fixedbitset::FixedBitSet;
-use fxhash::FxHashMap;
+use fxhash::{FxHashMap, FxHashSet};
 use highs::{Col, ColProblem, HighsModelStatus, Model, Row, RowProblem, Sense};
 use klados_core::lower_bound::{
-    cherry_reduce_ub, greedy_multi_tree_partition, greedy_multi_tree_ub_seeded,
-    pairwise_refine_ub,
+    greedy_multi_tree_partition, greedy_multi_tree_ub_seeded, pairwise_refine_ub,
 };
 use klados_core::{Instance, SolverStats, Tree};
 
@@ -29,14 +28,12 @@ use crate::whidden::approx_3_for_instance;
 ///   (b) B&P pruning actually uses the LP bound, not the initial LB
 ///   (c) `MafBounds.lower` is not read on the hot path here — only the partition is.
 struct LocalBounds {
-    lower: usize,
-    upper: usize,
     best_partition: Option<Vec<usize>>,
 }
 
 fn compute_local_bounds(trees: &[Tree], num_leaves: u32) -> LocalBounds {
     if trees.len() <= 1 {
-        return LocalBounds { lower: 1, upper: 1, best_partition: None };
+        return LocalBounds { best_partition: None };
     }
 
     let m = trees.len();
@@ -47,17 +44,11 @@ fn compute_local_bounds(trees: &[Tree], num_leaves: u32) -> LocalBounds {
     // approx_3 ≤ 3 * d(Ti,Tj)  ⇒  d(Ti,Tj) ≥ ⌈approx_3 / 3⌉  ⇒  components ≥ ⌈approx_3/3⌉ + 1.
     // approx_3 is ~3000x faster than red_blue_approx_detailed on n=230, so we always run it.
     let t_pair = std::time::Instant::now();
-    let mut best_ub_pair = usize::MAX;
     for i in 0..m {
         for j in (i + 1)..m {
             let approx3 = approx_3_for_instance(&trees[i], &trees[j], num_leaves);
             let pair_lb_cuts = ((approx3 + 2) / 3) as usize; // ceil div
             best_lb = best_lb.max(pair_lb_cuts + 1);
-            if m == 2 {
-                // We need a 2-tree UB. cherry_reduce_ub on top of approx_3 is a useful tightener.
-                let cu = cherry_reduce_ub(&trees[i], &trees[j]);
-                best_ub_pair = best_ub_pair.min(cu + 1);
-            }
         }
     }
     let pair_ms = t_pair.elapsed().as_secs_f64() * 1000.0;
@@ -68,9 +59,9 @@ fn compute_local_bounds(trees: &[Tree], num_leaves: u32) -> LocalBounds {
         );
     }
 
-    // --- Upper bound / warm-start partition.
-    let (upper, best_partition) = if m == 2 {
-        (best_ub_pair.min(n), None)
+    // --- Warm-start partition.
+    let best_partition = if m == 2 {
+        None
     } else {
         let t_multi = std::time::Instant::now();
         let mut best_multi_ub = n;
@@ -96,18 +87,14 @@ fn compute_local_bounds(trees: &[Tree], num_leaves: u32) -> LocalBounds {
         );
 
         if pr_ub < best_multi_ub {
-            (pr_ub.min(n), Some(pr_partition))
+            Some(pr_partition)
         } else {
             let (_, partition) = greedy_multi_tree_partition(trees, best_ref, best_seed);
-            (best_multi_ub.min(n), Some(partition))
+            Some(partition)
         }
     };
 
-    LocalBounds {
-        lower: best_lb.min(upper),
-        upper,
-        best_partition,
-    }
+    LocalBounds { best_partition }
 }
 
 use crate::cluster_reduction::{self, ClusterReductionResult};
@@ -296,7 +283,7 @@ struct BpColumn {
 
 struct BpState {
     columns: Vec<BpColumn>,
-    seen: HashSet<Vec<u32>>,
+    seen: FxHashSet<Vec<u32>>,
     best_ub: usize,
     best_solution: Option<Vec<f64>>,
     nodes_explored: usize,
@@ -358,7 +345,7 @@ impl ForbiddenColumns {
         Self { fixed_zero_labels }
     }
 
-    fn contains(&self, seen: &HashSet<Vec<u32>>, labels: &[u32]) -> bool {
+    fn contains(&self, seen: &FxHashSet<Vec<u32>>, labels: &[u32]) -> bool {
         seen.contains(labels)
             || self
                 .fixed_zero_labels
@@ -457,7 +444,7 @@ fn solve_branch_price_multi(instance: &Instance, stats: &mut SolverStats) -> Opt
     let mut columns: Vec<BpColumn> = (1..=n as u32)
         .map(|label| make_bp_column(vec![label], trees))
         .collect();
-    let mut seen: HashSet<Vec<u32>> = columns.iter().map(|c| c.labels.clone()).collect();
+    let mut seen: FxHashSet<Vec<u32>> = columns.iter().map(|c| c.labels.clone()).collect();
 
     let mut best_solution = {
         let mut values = vec![0.0; columns.len()];
@@ -655,7 +642,7 @@ fn price_columns_for_duals(
     alpha: &[f64],
     beta: &[Vec<f64>],
     blocked_leaves: &[bool],
-    seen: &HashSet<Vec<u32>>,
+    seen: &FxHashSet<Vec<u32>>,
     forbidden: &ForbiddenColumns,
     must_link_pairs: &[LeafPair],
     cannot_link_pairs: &[LeafPair],
@@ -816,9 +803,8 @@ fn solve_bp_node(
     );
     state.apply_bounds_time_ms += apply_t0.elapsed().as_secs_f64() * 1000.0;
 
-    let mut final_lp: Option<RmpLpResult> = None;
     let mut stability_center: Option<(Vec<f64>, Vec<Vec<f64>>)> = None;
-    loop {
+    let lp = loop {
         let lp_t0 = Instant::now();
         let lp = match rmp.solve(state.columns.len()) {
             Ok(lp) => lp,
@@ -976,24 +962,8 @@ fn solve_bp_node(
             continue;
         }
 
-        final_lp = Some(lp);
-        break;
-    }
-
-    let lp = match final_lp {
-        Some(lp) => lp,
-        None => {
-            let lp_t0 = Instant::now();
-            let result = rmp.solve(state.columns.len());
-            state.lp_solve_time_ms += lp_t0.elapsed().as_secs_f64() * 1000.0;
-            state.lp_solve_calls += 1;
-            match result {
-                Ok(lp) => lp,
-                Err(_) => return NodeResult::Pruned,
-            }
-        }
+        break lp;
     };
-
     let lp_bound = (lp.objective - 1e-6).ceil() as usize;
     if lp_bound >= state.best_ub {
         return NodeResult::Pruned;
@@ -1022,30 +992,6 @@ fn solve_bp_node(
         },
         None => NodeResult::Pruned,
     }
-}
-
-#[derive(Clone)]
-struct PricedColumn {
-    score: f64,
-    labels: Vec<u32>,
-}
-
-impl PricedColumn {
-    fn none() -> Self {
-        Self {
-            score: NEG_INF,
-            labels: Vec::new(),
-        }
-    }
-
-    fn is_some(&self) -> bool {
-        self.score > NEG_INF / 2.0 && !self.labels.is_empty()
-    }
-}
-
-fn better_column(lhs: &PricedColumn, rhs: &PricedColumn) -> bool {
-    lhs.score > rhs.score + 1e-12
-        || ((lhs.score - rhs.score).abs() <= 1e-12 && lhs.labels.len() > rhs.labels.len())
 }
 
 #[derive(Clone)]
@@ -1584,32 +1530,6 @@ fn oriented_children_tuple(tuple: &[u32], trees: &[Tree], orient: usize) -> (Vec
     (left_tuple, right_tuple)
 }
 
-fn merge_sorted_labels(lhs: &[u32], rhs: &[u32]) -> Vec<u32> {
-    let mut merged = Vec::with_capacity(lhs.len() + rhs.len());
-    let mut i = 0usize;
-    let mut j = 0usize;
-    while i < lhs.len() && j < rhs.len() {
-        match lhs[i].cmp(&rhs[j]) {
-            Ordering::Less => {
-                merged.push(lhs[i]);
-                i += 1;
-            }
-            Ordering::Greater => {
-                merged.push(rhs[j]);
-                j += 1;
-            }
-            Ordering::Equal => {
-                merged.push(lhs[i]);
-                i += 1;
-                j += 1;
-            }
-        }
-    }
-    merged.extend_from_slice(&lhs[i..]);
-    merged.extend_from_slice(&rhs[j..]);
-    merged
-}
-
 #[derive(Clone, Copy)]
 enum PairDpSideChoice {
     Singleton,
@@ -1745,10 +1665,7 @@ impl<'a> PairDpPricer<'a> {
         }
 
         for a in 0..p {
-            for b in 0..p {
-                if a == b {
-                    continue;
-                }
+            for b in (a + 1)..p {
                 let score = self.solve_pair(a, b);
                 if score <= best_score + 1.0e-12 {
                     continue;
@@ -1770,7 +1687,7 @@ impl<'a> PairDpPricer<'a> {
             eprintln!(
                 "[maf-bp-multi] pairdp profile: p={} pairs={}",
                 self.active_labels.len(),
-                self.active_labels.len() * self.active_labels.len()
+                self.active_labels.len().saturating_mul(self.active_labels.len().saturating_sub(1)) / 2
             );
         }
 
@@ -1791,12 +1708,10 @@ impl<'a> PairDpPricer<'a> {
 
         // First pass: gather profitable (score, a, b) without extracting labels.
         let p = self.active_labels.len();
-        let mut scored: Vec<(f64, usize, usize)> = Vec::with_capacity(p * p);
+        let mut scored: Vec<(f64, usize, usize)> =
+            Vec::with_capacity(p.saturating_mul(p.saturating_sub(1)) / 2);
         for a in 0..p {
-            for b in 0..p {
-                if a == b {
-                    continue;
-                }
+            for b in (a + 1)..p {
                 let score = self.solve_pair(a, b);
                 if score <= 1.0 + 1.0e-8 {
                     continue;
@@ -2062,7 +1977,7 @@ fn price_best_new_pairdp_column_single(
     alpha: &[f64],
     beta: &[Vec<f64>],
     blocked_leaves: &[bool],
-    seen: &HashSet<Vec<u32>>,
+    seen: &FxHashSet<Vec<u32>>,
     forbidden: &ForbiddenColumns,
     must_link_pairs: &[LeafPair],
     cannot_link_pairs: &[LeafPair],
@@ -2123,7 +2038,7 @@ fn price_best_new_pairdp_columns(
     alpha: &[f64],
     beta: &[Vec<f64>],
     blocked_leaves: &[bool],
-    seen: &HashSet<Vec<u32>>,
+    seen: &FxHashSet<Vec<u32>>,
     forbidden: &ForbiddenColumns,
     must_link_pairs: &[LeafPair],
     cannot_link_pairs: &[LeafPair],
@@ -2183,7 +2098,7 @@ fn search_pricing_prefix_dfs_pairdp(
     alpha: &[f64],
     beta: &[Vec<f64>],
     blocked_leaves: &[bool],
-    seen: &HashSet<Vec<u32>>,
+    seen: &FxHashSet<Vec<u32>>,
     forbidden: &ForbiddenColumns,
     must_link_pairs: &[LeafPair],
     cannot_link_pairs: &[LeafPair],
@@ -2312,7 +2227,7 @@ fn price_best_new_exact_column(
     alpha: &[f64],
     beta: &[Vec<f64>],
     blocked_leaves: &[bool],
-    seen: &HashSet<Vec<u32>>,
+    seen: &FxHashSet<Vec<u32>>,
     forbidden: &ForbiddenColumns,
     must_link_pairs: &[LeafPair],
     cannot_link_pairs: &[LeafPair],
@@ -2367,7 +2282,7 @@ fn price_best_new_ilp_column(
     alpha: &[f64],
     beta: &[Vec<f64>],
     blocked_leaves: &[bool],
-    seen: &HashSet<Vec<u32>>,
+    seen: &FxHashSet<Vec<u32>>,
     forbidden: &ForbiddenColumns,
 ) -> Option<(f64, Vec<u32>)> {
     if pricing_backend() == PricingBackend::IlpHybrid {
@@ -2410,7 +2325,7 @@ fn price_best_pair_region_ilp_column(
     alpha: &[f64],
     beta: &[Vec<f64>],
     blocked_leaves: &[bool],
-    seen: &HashSet<Vec<u32>>,
+    seen: &FxHashSet<Vec<u32>>,
     forbidden: &ForbiddenColumns,
 ) -> Option<(f64, Vec<u32>)> {
     let mut positive_labels = (1..=num_leaves as u32)
@@ -2537,7 +2452,7 @@ fn price_best_column_ilp(
     alpha: &[f64],
     beta: &[Vec<f64>],
     blocked_leaves: &[bool],
-    seen: &HashSet<Vec<u32>>,
+    seen: &FxHashSet<Vec<u32>>,
     forbidden: &ForbiddenColumns,
 ) -> Option<(f64, Vec<u32>)> {
     let free_labels = (1..=num_leaves as u32)
@@ -2621,7 +2536,7 @@ fn price_best_column_ilp(
         if blocked.iter().any(|&label| blocked_leaves[label as usize]) {
             continue;
         }
-        let blocked_set = blocked.iter().copied().collect::<HashSet<_>>();
+        let blocked_set = blocked.iter().copied().collect::<FxHashSet<_>>();
         let mut coeffs = Vec::with_capacity(free_labels.len());
         for &label in &free_labels {
             let x = x_vars[label as usize].expect("free leaf var exists");
@@ -2711,7 +2626,7 @@ fn search_pricing_prefix_dfs(
     alpha: &[f64],
     beta: &[Vec<f64>],
     blocked_leaves: &[bool],
-    seen: &HashSet<Vec<u32>>,
+    seen: &FxHashSet<Vec<u32>>,
     forbidden: &ForbiddenColumns,
     must_link_pairs: &[LeafPair],
     cannot_link_pairs: &[LeafPair],
@@ -2961,8 +2876,8 @@ impl PersistentRmp {
         cannot_link_pairs: &[LeafPair],
         blocked_leaves: &[bool],
     ) {
-        let fixed_one_set: std::collections::HashSet<usize> = fixed_to_one.iter().copied().collect();
-        let fixed_zero_set: std::collections::HashSet<usize> = fixed_to_zero.iter().copied().collect();
+        let fixed_one_set: FxHashSet<usize> = fixed_to_one.iter().copied().collect();
+        let fixed_zero_set: FxHashSet<usize> = fixed_to_zero.iter().copied().collect();
         let ptr = self
             .model
             .as_mut()
@@ -3060,7 +2975,7 @@ fn price_best_column_exhaustive(
     alpha: &[f64],
     beta: &[Vec<f64>],
     blocked_leaves: &[bool],
-    seen: &HashSet<Vec<u32>>,
+    seen: &FxHashSet<Vec<u32>>,
     forbidden: &ForbiddenColumns,
 ) -> Option<(f64, Vec<u32>)> {
     let available = (1..=num_leaves as u32)
@@ -3296,7 +3211,7 @@ fn labels_satisfy_pair_constraints(
 
 fn pricing_candidate_allowed(
     labels: &[u32],
-    seen: &HashSet<Vec<u32>>,
+    seen: &FxHashSet<Vec<u32>>,
     forbidden: &ForbiddenColumns,
     must_link_pairs: &[LeafPair],
     cannot_link_pairs: &[LeafPair],

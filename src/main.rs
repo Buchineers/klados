@@ -25,7 +25,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Exact {
-        #[arg(long, default_value = "shi-mestel")]
+        #[arg(long, default_value = "maf-bp-multi")]
         approach: String,
     },
     Heuristic {
