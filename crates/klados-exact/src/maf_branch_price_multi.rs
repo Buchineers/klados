@@ -22,6 +22,20 @@ struct LocalBounds {
     best_partition: Option<Vec<usize>>,
 }
 
+fn sampled_reference_indices(m: usize, limit: usize) -> Vec<usize> {
+    if limit >= m {
+        return (0..m).collect();
+    }
+    let mut out = Vec::with_capacity(limit);
+    for slot in 0..limit {
+        let idx = slot * (m - 1) / (limit - 1).max(1);
+        if out.last().copied() != Some(idx) {
+            out.push(idx);
+        }
+    }
+    out
+}
+
 fn compute_local_bounds(trees: &[Tree], num_leaves: u32) -> LocalBounds {
     if trees.len() <= 1 {
         return LocalBounds { best_partition: None };
@@ -33,11 +47,19 @@ fn compute_local_bounds(trees: &[Tree], num_leaves: u32) -> LocalBounds {
     let best_partition = if m == 2 {
         None
     } else {
+        let (ref_limit, seed_limit, run_pairwise) = if m >= 20 || n >= 200 {
+            (4usize, 2u64, false)
+        } else if m >= 12 || n >= 140 {
+            (6usize, 3u64, true)
+        } else {
+            (m, 5u64, true)
+        };
+        let ref_indices = sampled_reference_indices(m, ref_limit.min(m));
         let mut best_multi_ub = n;
         let mut best_ref = 0usize;
         let mut best_seed = 0u64;
-        for ref_idx in 0..m {
-            for seed in 0..=4u64 {
+        for ref_idx in ref_indices {
+            for seed in 0..seed_limit {
                 let ub = greedy_multi_tree_ub_seeded(trees, ref_idx, seed);
                 if ub < best_multi_ub {
                     best_multi_ub = ub;
@@ -46,9 +68,14 @@ fn compute_local_bounds(trees: &[Tree], num_leaves: u32) -> LocalBounds {
                 }
             }
         }
-        let (pr_ub, pr_partition) = pairwise_refine_ub(trees, n);
-        if pr_ub < best_multi_ub {
-            Some(pr_partition)
+        if run_pairwise {
+            let (pr_ub, pr_partition) = pairwise_refine_ub(trees, n);
+            if pr_ub < best_multi_ub {
+                Some(pr_partition)
+            } else {
+                let (_, partition) = greedy_multi_tree_partition(trees, best_ref, best_seed);
+                Some(partition)
+            }
         } else {
             let (_, partition) = greedy_multi_tree_partition(trees, best_ref, best_seed);
             Some(partition)
@@ -110,6 +137,81 @@ struct BpColumn {
     labels: Vec<u32>,
     covered_internal_nodes: Vec<Vec<usize>>,
     total_internal_count: usize,
+}
+
+struct ColumnBuildScratch {
+    marks: Vec<Vec<u32>>,
+    epochs: Vec<u32>,
+}
+
+impl ColumnBuildScratch {
+    fn new(trees: &[Tree]) -> Self {
+        Self {
+            marks: trees.iter().map(|tree| vec![0; tree.num_nodes()]).collect(),
+            epochs: vec![1; trees.len()],
+        }
+    }
+
+    fn next_stamp(&mut self, ti: usize) -> u32 {
+        let stamp = self.epochs[ti];
+        if stamp == u32::MAX {
+            self.marks[ti].fill(0);
+            self.epochs[ti] = 2;
+            1
+        } else {
+            self.epochs[ti] += 1;
+            stamp
+        }
+    }
+
+    fn build_column(&mut self, mut labels: Vec<u32>, trees: &[Tree]) -> BpColumn {
+        labels.sort_unstable();
+        labels.dedup();
+        let covered_internal_nodes = if labels.len() >= 2 {
+            trees.iter()
+                .enumerate()
+                .map(|(ti, tree)| self.mark_component_nodes(ti, tree, &labels))
+                .collect::<Vec<_>>()
+        } else {
+            trees.iter().map(|_| Vec::new()).collect::<Vec<_>>()
+        };
+        let total_internal_count = covered_internal_nodes.iter().map(|nodes| nodes.len()).sum();
+        BpColumn {
+            labels,
+            covered_internal_nodes,
+            total_internal_count,
+        }
+    }
+
+    fn mark_component_nodes(&mut self, ti: usize, tree: &Tree, labels: &[u32]) -> Vec<usize> {
+        let stamp = self.next_stamp(ti);
+        let marks = &mut self.marks[ti];
+        let mut lca_node = tree.node_by_label(labels[0]);
+        for &label in &labels[1..] {
+            lca_node = tree.nearest_common_ancestor(lca_node, tree.node_by_label(label));
+        }
+
+        let mut covered = Vec::new();
+        for &label in labels {
+            let mut cur = tree.node_by_label(label);
+            loop {
+                let idx = cur as usize;
+                if marks[idx] == stamp {
+                    break;
+                }
+                marks[idx] = stamp;
+                if !tree.is_leaf(cur) {
+                    covered.push(idx);
+                }
+                if cur == lca_node {
+                    break;
+                }
+                cur = tree.parent[idx];
+            }
+        }
+        covered.sort_unstable();
+        covered
+    }
 }
 
 struct BpState {
@@ -211,6 +313,7 @@ fn solve_branch_price_multi(instance: &Instance, stats: &mut SolverStats) -> Opt
     let n = reduced.num_leaves as usize;
     let trees = &reduced.trees;
     let param_reduction_32 = kern.param_reduction;
+    let mut column_builder = ColumnBuildScratch::new(trees);
 
     let cluster_result = cluster_reduction::try_cluster_reduction(reduced, &mut |subinstance| {
         solve_branch_price_multi(subinstance, &mut SolverStats::default())
@@ -238,7 +341,7 @@ fn solve_branch_price_multi(instance: &Instance, stats: &mut SolverStats) -> Opt
 
     let bounds = compute_local_bounds(trees, reduced.num_leaves);
     let mut columns: Vec<BpColumn> = (1..=n as u32)
-        .map(|label| make_bp_column(vec![label], trees))
+        .map(|label| column_builder.build_column(vec![label], trees))
         .collect();
     let mut seen: FxHashSet<Vec<u32>> = columns.iter().map(|c| c.labels.clone()).collect();
 
@@ -262,7 +365,7 @@ fn solve_branch_price_multi(instance: &Instance, stats: &mut SolverStats) -> Opt
             if let Some((ci, _)) = columns.iter().enumerate().find(|(_, col)| col.labels == *labels) {
                 values[ci] = 1.0;
             } else {
-                columns.push(make_bp_column(labels.clone(), trees));
+                columns.push(column_builder.build_column(labels.clone(), trees));
                 values.push(1.0);
                 seen.insert(labels.clone());
             }
@@ -299,7 +402,15 @@ fn solve_branch_price_multi(instance: &Instance, stats: &mut SolverStats) -> Opt
     };
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        let result = solve_bp_node(&mut state, &node, trees, n, &mut pricer_ws, &mut rmp);
+        let result = solve_bp_node(
+            &mut state,
+            &node,
+            trees,
+            n,
+            &mut pricer_ws,
+            &mut rmp,
+            &mut column_builder,
+        );
         match result {
             NodeResult::Integral(obj, values) => {
                 if obj < state.best_ub {
@@ -383,6 +494,7 @@ fn solve_bp_node(
     num_leaves: usize,
     pricer_ws: &mut MultiPricerWorkspace,
     rmp: &mut PersistentRmp,
+    column_builder: &mut ColumnBuildScratch,
 ) -> NodeResult {
     state.nodes_explored += 1;
     if node.fixed_to_one.len() >= state.best_ub {
@@ -440,7 +552,7 @@ fn solve_bp_node(
                 continue;
             }
             let new_ci = state.columns.len();
-            state.columns.push(make_bp_column(labels, trees));
+            state.columns.push(column_builder.build_column(labels, trees));
             rmp.add_column(new_ci, &state.columns[new_ci], trees);
             if let Some(best_solution) = state.best_solution.as_mut() {
                 best_solution.push(0.0);
@@ -485,7 +597,6 @@ fn solve_bp_node(
 }
 
 struct MultiPricerWorkspace {
-    descendant_leaves: Vec<Vec<FixedBitSet>>,
     label_stride: usize,
     label_lca: Vec<Vec<u32>>,
     label_side_child: Vec<Vec<u32>>,
@@ -554,7 +665,6 @@ impl MultiPricerWorkspace {
         }
 
         Self {
-            descendant_leaves,
             label_stride: stride,
             label_lca,
             label_side_child,
@@ -578,12 +688,14 @@ struct PairDpSideState {
 
 struct PairDpPricer<'a> {
     trees: &'a [Tree],
-    workspace: &'a MultiPricerWorkspace,
     active_labels: Vec<u32>,
     active_nodes: Vec<Vec<u32>>,
+    active_descendants: Vec<Vec<FixedBitSet>>,
     alpha: &'a [f64],
     beta: &'a [Vec<f64>],
     prefix_beta: Vec<Vec<f64>>,
+    roots: Vec<Vec<u32>>,
+    side_child: Vec<Vec<u32>>,
     pair_order: Vec<(usize, usize)>,
     memo_pair: Vec<Option<f64>>,
     memo_side: Vec<Option<PairDpSideState>>,
@@ -611,7 +723,10 @@ impl<'a> PairDpPricer<'a> {
         let pair_count = p * p;
 
         let mut active_nodes = Vec::with_capacity(trees.len());
+        let mut active_descendants = Vec::with_capacity(trees.len());
         let mut prefix_beta = Vec::with_capacity(trees.len());
+        let mut roots = Vec::with_capacity(trees.len());
+        let mut side_child = Vec::with_capacity(trees.len());
 
         for (ti, tree) in trees.iter().enumerate() {
             let node_by_label = &workspace.label_node[ti];
@@ -620,6 +735,21 @@ impl<'a> PairDpPricer<'a> {
                 .map(|&label| node_by_label[label as usize])
                 .collect();
             active_nodes.push(nodes);
+
+            let mut desc = vec![FixedBitSet::with_capacity(p); tree.num_nodes()];
+            for (ai, &node) in active_nodes[ti].iter().enumerate() {
+                desc[node as usize].insert(ai);
+            }
+            for node in tree.post_order_vec() {
+                if tree.is_leaf(node) {
+                    continue;
+                }
+                let (l, r) = tree.children_pair(node);
+                let mut bits = desc[l as usize].clone();
+                bits.union_with(&desc[r as usize]);
+                desc[node as usize] = bits;
+            }
+            active_descendants.push(desc);
 
             let mut prefix = vec![0.0; tree.num_nodes()];
             for node in tree.pre_order() {
@@ -637,27 +767,41 @@ impl<'a> PairDpPricer<'a> {
                 prefix[node as usize] = parent_sum + own;
             }
             prefix_beta.push(prefix);
+
+            let stride = workspace.label_stride;
+            let lca_table = &workspace.label_lca[ti];
+            let side_table = &workspace.label_side_child[ti];
+            let mut tree_roots = vec![0u32; pair_count];
+            let mut tree_side_child = vec![0u32; pair_count];
+            for a in 0..p {
+                let la = active_labels[a] as usize;
+                let base_ws = la * stride;
+                let base_out = a * p;
+                for b in 0..p {
+                    let lb = active_labels[b] as usize;
+                    let ws_idx = base_ws + lb;
+                    let out_idx = base_out + b;
+                    tree_roots[out_idx] = lca_table[ws_idx];
+                    tree_side_child[out_idx] = side_table[ws_idx];
+                }
+            }
+            roots.push(tree_roots);
+            side_child.push(tree_side_child);
         }
 
         let mut pair_order = Vec::new();
         if trees.len() == 2 {
-            let stride = workspace.label_stride;
             pair_order.reserve(pair_count.saturating_sub(p));
             for a in 0..p {
-                let la = active_labels[a] as usize;
                 for b in 0..p {
                     if a == b {
                         continue;
                     }
-                    let lb = active_labels[b] as usize;
-                    let ws_idx = la * stride + lb;
                     let idx = a * p + b;
                     let key = trees
                         .iter()
                         .enumerate()
-                        .map(|(ti, tree)| {
-                            tree.subtree_size[workspace.label_lca[ti][ws_idx] as usize] as usize
-                        })
+                        .map(|(ti, tree)| tree.subtree_size[roots[ti][idx] as usize] as usize)
                         .sum::<usize>();
                     pair_order.push((key, idx));
                 }
@@ -668,12 +812,14 @@ impl<'a> PairDpPricer<'a> {
 
         Self {
             trees,
-            workspace,
             active_labels,
             active_nodes,
+            active_descendants,
             alpha,
             beta,
             prefix_beta,
+            roots,
+            side_child,
             pair_order,
             memo_pair: vec![None; pair_count],
             memo_side: vec![None; pair_count],
@@ -686,16 +832,12 @@ impl<'a> PairDpPricer<'a> {
 
     #[inline(always)]
     fn root_of(&self, ti: usize, a: usize, b: usize) -> u32 {
-        let la = self.active_labels[a] as usize;
-        let lb = self.active_labels[b] as usize;
-        self.workspace.label_lca[ti][la * self.workspace.label_stride + lb]
+        self.roots[ti][self.pair_idx(a, b)]
     }
 
     #[inline(always)]
     fn side_of(&self, ti: usize, a: usize, b: usize) -> u32 {
-        let la = self.active_labels[a] as usize;
-        let lb = self.active_labels[b] as usize;
-        self.workspace.label_side_child[ti][la * self.workspace.label_stride + lb]
+        self.side_child[ti][self.pair_idx(a, b)]
     }
 
     fn collect_profitable_columns<F>(
@@ -790,10 +932,12 @@ impl<'a> PairDpPricer<'a> {
                     self.alpha[label_a as usize] - self.singleton_chain_penalty_2tree(a, b);
                 let mut best_choice = PairDpSideChoice::Singleton;
 
-                for c in 0..p {
-                    if c == a || c == b || !self.is_same_side_2tree(a, b, c) {
-                        continue;
-                    }
+                let mut candidates = self.active_descendants[0][self.side_of(0, a, b) as usize].clone();
+                candidates
+                    .intersect_with(&self.active_descendants[1][self.side_of(1, a, b) as usize]);
+                candidates.set(a, false);
+                candidates.set(b, false);
+                for c in candidates.ones() {
                     let idx_ac = self.pair_idx(a, c);
                     let child_score = self.memo_pair[idx_ac]
                         .expect("child pair must be solved earlier in pair DP order");
@@ -885,10 +1029,13 @@ impl<'a> PairDpPricer<'a> {
         let mut best_score = self.alpha[label_a as usize] - self.singleton_chain_penalty(a, b);
         let mut best_choice = PairDpSideChoice::Singleton;
 
-        for c in 0..self.active_labels.len() {
-            if c == a || c == b || !self.is_same_side(a, b, c) {
-                continue;
-            }
+        let mut candidates = self.active_descendants[0][self.side_of(0, a, b) as usize].clone();
+        for ti in 1..self.trees.len() {
+            candidates.intersect_with(&self.active_descendants[ti][self.side_of(ti, a, b) as usize]);
+        }
+        candidates.set(a, false);
+        candidates.set(b, false);
+        for c in candidates.ones() {
             let child_score = self.solve_pair(a, c);
             if child_score <= NEG_INF / 2.0 {
                 continue;
@@ -1012,21 +1159,6 @@ impl<'a> PairDpPricer<'a> {
         (upper - lower).max(0.0)
     }
 
-    fn is_same_side(&self, a: usize, b: usize, c: usize) -> bool {
-        let label_c = self.active_labels[c] as usize;
-        (0..self.trees.len()).all(|ti| {
-            self.workspace.descendant_leaves[ti][self.side_of(ti, a, b) as usize]
-                .contains(label_c)
-        })
-    }
-
-    #[inline(always)]
-    fn is_same_side_2tree(&self, a: usize, b: usize, c: usize) -> bool {
-        let label_c = self.active_labels[c] as usize;
-        self.workspace.descendant_leaves[0][self.side_of(0, a, b) as usize].contains(label_c)
-            && self.workspace.descendant_leaves[1][self.side_of(1, a, b) as usize]
-                .contains(label_c)
-    }
 }
 
 fn price_best_new_pairdp_columns(
@@ -1074,6 +1206,9 @@ struct PersistentRmp {
     current_lower: Vec<f64>,
     /// Current upper bound applied in HiGHS for each added column.
     current_upper: Vec<f64>,
+    fixed_one_mark: Vec<u32>,
+    fixed_zero_mark: Vec<u32>,
+    mark_epoch: u32,
 }
 
 impl PersistentRmp {
@@ -1132,6 +1267,9 @@ impl PersistentRmp {
             col_idx: Vec::new(),
             current_lower: Vec::new(),
             current_upper: Vec::new(),
+            fixed_one_mark: Vec::new(),
+            fixed_zero_mark: Vec::new(),
+            mark_epoch: 1,
         };
         for (ci, col) in columns.iter().enumerate() {
             rmp.add_column(ci, col, trees);
@@ -1163,6 +1301,8 @@ impl PersistentRmp {
         self.col_idx.push(global_ci as i32);
         self.current_lower.push(0.0);
         self.current_upper.push(f64::INFINITY);
+        self.fixed_one_mark.push(0);
+        self.fixed_zero_mark.push(0);
     }
 
     fn apply_node_bounds(
@@ -1174,27 +1314,37 @@ impl PersistentRmp {
         cannot_link_pairs: &[LeafPair],
         blocked_leaves: &[bool],
     ) {
-        let fixed_one_set: FxHashSet<usize> = fixed_to_one.iter().copied().collect();
-        let fixed_zero_set: FxHashSet<usize> = fixed_to_zero.iter().copied().collect();
+        if self.mark_epoch == u32::MAX {
+            self.fixed_one_mark.fill(0);
+            self.fixed_zero_mark.fill(0);
+            self.mark_epoch = 1;
+        }
+        self.mark_epoch += 1;
+        let epoch = self.mark_epoch;
+        for &ci in fixed_to_one {
+            if ci < self.fixed_one_mark.len() {
+                self.fixed_one_mark[ci] = epoch;
+            }
+        }
+        for &ci in fixed_to_zero {
+            if ci < self.fixed_zero_mark.len() {
+                self.fixed_zero_mark[ci] = epoch;
+            }
+        }
         let ptr = self
             .model
             .as_mut()
             .expect("RMP model present")
             .as_mut_ptr();
         for ci in 0..self.col_idx.len() {
-            let (desired_lo, desired_hi) = if fixed_one_set.contains(&ci) {
+            let labels = &columns[ci].labels;
+            let (desired_lo, desired_hi) = if self.fixed_one_mark[ci] == epoch {
                 (1.0, 1.0)
-            } else if fixed_zero_set.contains(&ci) {
+            } else if self.fixed_zero_mark[ci] == epoch {
                 (0.0, 0.0)
-            } else if columns[ci]
-                .labels
-                .iter()
-                .any(|&l| blocked_leaves[l as usize])
-                || !column_respects_branchings(
-                    columns,
-                    ci,
-                    fixed_to_one,
-                    fixed_to_zero,
+            } else if labels.iter().any(|&l| blocked_leaves[l as usize])
+                || !labels_satisfy_pair_constraints(
+                    labels,
                     must_link_pairs,
                     cannot_link_pairs,
                 )
@@ -1483,35 +1633,6 @@ fn node_branchings_self_consistent(columns: &[BpColumn], node: &BpNode) -> bool 
     true
 }
 
-fn column_respects_branchings(
-    columns: &[BpColumn],
-    ci: usize,
-    fixed_to_one: &[usize],
-    fixed_to_zero: &[usize],
-    must_link_pairs: &[LeafPair],
-    cannot_link_pairs: &[LeafPair],
-) -> bool {
-    if fixed_to_zero
-        .iter()
-        .any(|&blocked_ci| columns[blocked_ci].labels == columns[ci].labels)
-    {
-        return false;
-    }
-    for &forced_ci in fixed_to_one {
-        if forced_ci == ci {
-            continue;
-        }
-        if !labels_disjoint(&columns[forced_ci].labels, &columns[ci].labels) {
-            return false;
-        }
-    }
-    labels_satisfy_pair_constraints(
-        &columns[ci].labels,
-        must_link_pairs,
-        cannot_link_pairs,
-    )
-}
-
 fn make_leafset(labels: &[u32], num_leaves: u32) -> FixedBitSet {
     let mut bits = FixedBitSet::with_capacity(num_leaves as usize + 1);
     for &label in labels {
@@ -1522,49 +1643,4 @@ fn make_leafset(labels: &[u32], num_leaves: u32) -> FixedBitSet {
 
 fn clean_dual(value: f64) -> f64 {
     if value.abs() <= 1.0e-9 { 0.0 } else { value }
-}
-
-fn make_bp_column(mut labels: Vec<u32>, trees: &[Tree]) -> BpColumn {
-    labels.sort_unstable();
-    labels.dedup();
-    let covered_internal_nodes = if labels.len() >= 2 {
-        trees.iter()
-            .map(|tree| {
-                mark_component_nodes(tree, &labels)
-                    .ones()
-                    .filter(|&node| !tree.is_leaf(node as u32))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>()
-    } else {
-        trees.iter().map(|_| Vec::new()).collect::<Vec<_>>()
-    };
-    let total_internal_count = covered_internal_nodes.iter().map(|nodes| nodes.len()).sum();
-    BpColumn {
-        labels,
-        covered_internal_nodes,
-        total_internal_count,
-    }
-}
-
-fn mark_component_nodes(tree: &Tree, labels: &[u32]) -> FixedBitSet {
-    let mut bits = FixedBitSet::with_capacity(tree.num_nodes());
-    if labels.is_empty() {
-        return bits;
-    }
-    let mut lca_node = tree.node_by_label(labels[0]);
-    for &label in &labels[1..] {
-        lca_node = tree.nearest_common_ancestor(lca_node, tree.node_by_label(label));
-    }
-    for &label in labels {
-        let mut cur = tree.node_by_label(label);
-        loop {
-            bits.insert(cur as usize);
-            if cur == lca_node {
-                break;
-            }
-            cur = tree.parent[cur as usize];
-        }
-    }
-    bits
 }
