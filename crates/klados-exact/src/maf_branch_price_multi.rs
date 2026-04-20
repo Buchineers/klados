@@ -161,10 +161,28 @@ struct BpState {
     oracle_mismatches: usize,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct LeafPair {
+    a: u32,
+    b: u32,
+}
+
+impl LeafPair {
+    fn new(lhs: u32, rhs: u32) -> Self {
+        if lhs <= rhs {
+            Self { a: lhs, b: rhs }
+        } else {
+            Self { a: rhs, b: lhs }
+        }
+    }
+}
+
 #[derive(Clone)]
 struct BpNode {
     fixed_to_one: Vec<usize>,
     fixed_to_zero: Vec<usize>,
+    must_link_pairs: Vec<LeafPair>,
+    cannot_link_pairs: Vec<LeafPair>,
     depth: usize,
 }
 
@@ -193,7 +211,8 @@ impl ForbiddenColumns {
 
 enum NodeResult {
     Integral(usize, Vec<f64>),
-    Branch { lp_obj: f64, branch_col: usize },
+    BranchPair { lp_obj: f64, pair: LeafPair },
+    BranchColumn { lp_obj: f64, branch_col: usize },
     Pruned,
 }
 
@@ -318,6 +337,8 @@ fn solve_branch_price_multi(instance: &Instance, stats: &mut SolverStats) -> Opt
     let root = BpNode {
         fixed_to_one: vec![],
         fixed_to_zero: vec![],
+        must_link_pairs: vec![],
+        cannot_link_pairs: vec![],
         depth: 0,
     };
 
@@ -344,7 +365,28 @@ fn solve_branch_price_multi(instance: &Instance, stats: &mut SolverStats) -> Opt
                     state.best_solution = Some(padded);
                 }
             }
-            NodeResult::Branch { lp_obj, branch_col } => {
+            NodeResult::BranchPair { lp_obj, pair } => {
+                let lp_lb = (lp_obj - 1e-6).ceil() as usize;
+                if lp_lb >= state.best_ub {
+                    continue;
+                }
+
+                let mut right = node.clone();
+                if !right.cannot_link_pairs.contains(&pair) {
+                    right.cannot_link_pairs.push(pair);
+                }
+                right.depth += 1;
+
+                let mut left = node.clone();
+                if !left.must_link_pairs.contains(&pair) {
+                    left.must_link_pairs.push(pair);
+                }
+                left.depth += 1;
+
+                stack.push(right);
+                stack.push(left);
+            }
+            NodeResult::BranchColumn { lp_obj, branch_col } => {
                 let lp_lb = (lp_obj - 1e-6).ceil() as usize;
                 if lp_lb >= state.best_ub {
                     continue;
@@ -395,6 +437,8 @@ fn price_columns_for_duals(
     blocked_leaves: &[bool],
     seen: &HashSet<Vec<u32>>,
     forbidden: &ForbiddenColumns,
+    must_link_pairs: &[LeafPair],
+    cannot_link_pairs: &[LeafPair],
 ) -> Vec<(f64, Vec<u32>)> {
     match pricing_backend() {
         PricingBackend::Native => price_best_new_exact_column(
@@ -406,6 +450,8 @@ fn price_columns_for_duals(
             blocked_leaves,
             seen,
             forbidden,
+            must_link_pairs,
+            cannot_link_pairs,
         )
         .into_iter()
         .collect::<Vec<_>>(),
@@ -418,19 +464,38 @@ fn price_columns_for_duals(
             blocked_leaves,
             seen,
             forbidden,
+            must_link_pairs,
+            cannot_link_pairs,
         ),
-        PricingBackend::IlpGlobal | PricingBackend::IlpHybrid => price_best_new_ilp_column(
-            pricer_ws,
-            trees,
-            num_leaves,
-            alpha,
-            beta,
-            blocked_leaves,
-            seen,
-            forbidden,
-        )
-        .into_iter()
-        .collect::<Vec<_>>(),
+        PricingBackend::IlpGlobal | PricingBackend::IlpHybrid => {
+            if must_link_pairs.is_empty() && cannot_link_pairs.is_empty() {
+                price_best_new_ilp_column(
+                    pricer_ws,
+                    trees,
+                    num_leaves,
+                    alpha,
+                    beta,
+                    blocked_leaves,
+                    seen,
+                    forbidden,
+                )
+                .into_iter()
+                .collect::<Vec<_>>()
+            } else {
+                price_best_new_pairdp_columns(
+                    pricer_ws,
+                    trees,
+                    num_leaves,
+                    alpha,
+                    beta,
+                    blocked_leaves,
+                    seen,
+                    forbidden,
+                    must_link_pairs,
+                    cannot_link_pairs,
+                )
+            }
+        }
     }
 }
 
@@ -507,6 +572,9 @@ fn solve_bp_node(
     if node.fixed_to_one.len() >= state.best_ub {
         return NodeResult::Pruned;
     }
+    if !node_branchings_self_consistent(&state.columns, node) {
+        return NodeResult::Pruned;
+    }
 
     let mut blocked_leaves = vec![false; num_leaves + 1];
     for &forced_ci in &node.fixed_to_one {
@@ -521,6 +589,8 @@ fn solve_bp_node(
         &state.columns,
         &node.fixed_to_one,
         &node.fixed_to_zero,
+        &node.must_link_pairs,
+        &node.cannot_link_pairs,
         &blocked_leaves,
     );
 
@@ -553,6 +623,8 @@ fn solve_bp_node(
                 &blocked_leaves,
                 &state.seen,
                 &forbidden,
+                &node.must_link_pairs,
+                &node.cannot_link_pairs,
             );
             stabilized_columns = rescore_profitable_columns(stabilized_columns, trees, &alpha, &beta);
             if stabilized_columns.is_empty() {
@@ -565,6 +637,8 @@ fn solve_bp_node(
                     &blocked_leaves,
                     &state.seen,
                     &forbidden,
+                    &node.must_link_pairs,
+                    &node.cannot_link_pairs,
                 )
             } else {
                 stabilized_columns
@@ -579,6 +653,8 @@ fn solve_bp_node(
                 &blocked_leaves,
                 &state.seen,
                 &forbidden,
+                &node.must_link_pairs,
+                &node.cannot_link_pairs,
             )
         };
         let priced = priced_columns.first().cloned();
@@ -681,9 +757,16 @@ fn solve_bp_node(
         return NodeResult::Integral(obj, lp.column_values);
     }
 
+    if let Some(pair) = select_branch_pair(&state.columns, &lp.column_values, num_leaves) {
+        return NodeResult::BranchPair {
+            lp_obj: lp.objective,
+            pair,
+        };
+    }
+
     let branch_col = select_branch_column(&state.columns, &lp.column_values, num_leaves);
     match branch_col {
-        Some(col_idx) => NodeResult::Branch {
+        Some(col_idx) => NodeResult::BranchColumn {
             lp_obj: lp.objective,
             branch_col: col_idx,
         },
@@ -1698,6 +1781,8 @@ fn price_best_new_pairdp_column_single(
     blocked_leaves: &[bool],
     seen: &HashSet<Vec<u32>>,
     forbidden: &ForbiddenColumns,
+    must_link_pairs: &[LeafPair],
+    cannot_link_pairs: &[LeafPair],
 ) -> Option<(f64, Vec<u32>)> {
     let base = solve_best_pairdp_column(
         pricer_ws,
@@ -1708,7 +1793,13 @@ fn price_best_new_pairdp_column_single(
         blocked_leaves,
     )?;
     let (base_score, base_labels) = base;
-    if !forbidden.contains(seen, &base_labels) {
+    if pricing_candidate_allowed(
+        &base_labels,
+        seen,
+        forbidden,
+        must_link_pairs,
+        cannot_link_pairs,
+    ) {
         return Some((base_score, base_labels));
     }
 
@@ -1732,6 +1823,8 @@ fn price_best_new_pairdp_column_single(
         blocked_leaves,
         seen,
         forbidden,
+        must_link_pairs,
+        cannot_link_pairs,
         &free_labels,
         &[],
         required_bonus,
@@ -1749,6 +1842,8 @@ fn price_best_new_pairdp_columns(
     blocked_leaves: &[bool],
     seen: &HashSet<Vec<u32>>,
     forbidden: &ForbiddenColumns,
+    must_link_pairs: &[LeafPair],
+    cannot_link_pairs: &[LeafPair],
 ) -> Vec<(f64, Vec<u32>)> {
     if pairdp_batch_size() <= 1 {
         return price_best_new_pairdp_column_single(
@@ -1760,6 +1855,8 @@ fn price_best_new_pairdp_columns(
             blocked_leaves,
             seen,
             forbidden,
+            must_link_pairs,
+            cannot_link_pairs,
         )
         .into_iter()
         .collect();
@@ -1775,7 +1872,14 @@ fn price_best_new_pairdp_columns(
         usize::MAX,
     );
     candidates.retain(|(score, labels)| {
-        *score > 1.0 + 1.0e-8 && !forbidden.contains(seen, labels)
+        *score > 1.0 + 1.0e-8
+            && pricing_candidate_allowed(
+                labels,
+                seen,
+                forbidden,
+                must_link_pairs,
+                cannot_link_pairs,
+            )
     });
     if candidates.len() > pairdp_batch_size() {
         candidates.truncate(pairdp_batch_size());
@@ -1801,6 +1905,8 @@ fn search_pricing_prefix_dfs_pairdp(
     blocked_leaves: &[bool],
     seen: &HashSet<Vec<u32>>,
     forbidden: &ForbiddenColumns,
+    must_link_pairs: &[LeafPair],
+    cannot_link_pairs: &[LeafPair],
     free_labels: &[u32],
     prefix_membership: &[bool],
     required_bonus: f64,
@@ -1831,7 +1937,13 @@ fn search_pricing_prefix_dfs_pairdp(
         }
     }
 
-    if !forbidden.contains(seen, &candidate.labels) {
+    if pricing_candidate_allowed(
+        &candidate.labels,
+        seen,
+        forbidden,
+        must_link_pairs,
+        cannot_link_pairs,
+    ) {
         match incumbent {
             Some((best_score, best_labels))
                 if candidate.score < *best_score - 1e-12
@@ -1857,6 +1969,8 @@ fn search_pricing_prefix_dfs_pairdp(
             blocked_leaves,
             seen,
             forbidden,
+            must_link_pairs,
+            cannot_link_pairs,
             free_labels,
             &child_prefix,
             required_bonus,
@@ -1920,12 +2034,20 @@ fn price_best_new_exact_column(
     blocked_leaves: &[bool],
     seen: &HashSet<Vec<u32>>,
     forbidden: &ForbiddenColumns,
+    must_link_pairs: &[LeafPair],
+    cannot_link_pairs: &[LeafPair],
 ) -> Option<(f64, Vec<u32>)> {
     let base = pricer_ws.solve_best(trees, alpha, beta, blocked_leaves);
     let Some((base_score, base_labels)) = base else {
         return None;
     };
-    if !forbidden.contains(seen, &base_labels) {
+    if pricing_candidate_allowed(
+        &base_labels,
+        seen,
+        forbidden,
+        must_link_pairs,
+        cannot_link_pairs,
+    ) {
         return Some((base_score, base_labels));
     }
 
@@ -1948,6 +2070,8 @@ fn price_best_new_exact_column(
         blocked_leaves,
         seen,
         forbidden,
+        must_link_pairs,
+        cannot_link_pairs,
         &free_labels,
         &[],
         required_bonus,
@@ -2309,6 +2433,8 @@ fn search_pricing_prefix_dfs(
     blocked_leaves: &[bool],
     seen: &HashSet<Vec<u32>>,
     forbidden: &ForbiddenColumns,
+    must_link_pairs: &[LeafPair],
+    cannot_link_pairs: &[LeafPair],
     free_labels: &[u32],
     prefix_membership: &[bool],
     required_bonus: f64,
@@ -2338,7 +2464,13 @@ fn search_pricing_prefix_dfs(
         }
     }
 
-    if !forbidden.contains(seen, &candidate.labels) {
+    if pricing_candidate_allowed(
+        &candidate.labels,
+        seen,
+        forbidden,
+        must_link_pairs,
+        cannot_link_pairs,
+    ) {
         match incumbent {
             Some((best_score, best_labels))
                 if candidate.score < *best_score - 1e-12
@@ -2363,6 +2495,8 @@ fn search_pricing_prefix_dfs(
             blocked_leaves,
             seen,
             forbidden,
+            must_link_pairs,
+            cannot_link_pairs,
             free_labels,
             &child_prefix,
             required_bonus,
@@ -2543,6 +2677,8 @@ impl PersistentRmp {
         columns: &[BpColumn],
         fixed_to_one: &[usize],
         fixed_to_zero: &[usize],
+        must_link_pairs: &[LeafPair],
+        cannot_link_pairs: &[LeafPair],
         blocked_leaves: &[bool],
     ) {
         let fixed_one_set: std::collections::HashSet<usize> = fixed_to_one.iter().copied().collect();
@@ -2561,6 +2697,14 @@ impl PersistentRmp {
                 .labels
                 .iter()
                 .any(|&l| blocked_leaves[l as usize])
+                || !column_respects_branchings(
+                    columns,
+                    ci,
+                    fixed_to_one,
+                    fixed_to_zero,
+                    must_link_pairs,
+                    cannot_link_pairs,
+                )
             {
                 (0.0, 0.0)
             } else {
@@ -2743,6 +2887,60 @@ fn reconstruct_components(columns: &[BpColumn], values: &[f64], instance: &Insta
     components
 }
 
+fn select_branch_pair(columns: &[BpColumn], values: &[f64], num_leaves: usize) -> Option<LeafPair> {
+    const ACTIVE_EPS: f64 = 1.0e-9;
+    const FRACTIONAL_EPS: f64 = 1.0e-6;
+
+    let stride = num_leaves + 1;
+    let mut together = vec![0.0; stride * stride];
+    let mut support_count = vec![0usize; stride * stride];
+
+    for (ci, &value) in values.iter().enumerate() {
+        if value <= ACTIVE_EPS {
+            continue;
+        }
+        let labels = &columns[ci].labels;
+        if labels.len() < 2 {
+            continue;
+        }
+        for i in 0..labels.len() {
+            let a = labels[i] as usize;
+            let row = a * stride;
+            for &label_b in &labels[(i + 1)..] {
+                let b = label_b as usize;
+                let idx = row + b;
+                together[idx] += value;
+                support_count[idx] += 1;
+            }
+        }
+    }
+
+    let mut best_pair = None;
+    let mut best_balance = f64::NEG_INFINITY;
+    let mut best_support = 0usize;
+    for a in 1..=num_leaves {
+        let row = a * stride;
+        for b in (a + 1)..=num_leaves {
+            let idx = row + b;
+            let together_mass = together[idx];
+            if together_mass <= FRACTIONAL_EPS || together_mass >= 1.0 - FRACTIONAL_EPS {
+                continue;
+            }
+            let balance = 0.5 - (together_mass - 0.5).abs();
+            let support = support_count[idx];
+            if balance > best_balance + 1.0e-12
+                || ((balance - best_balance).abs() <= 1.0e-12 && support > best_support)
+            {
+                best_pair = Some(LeafPair::new(a as u32, b as u32));
+                best_balance = balance;
+                best_support = support;
+            }
+        }
+    }
+
+    best_pair
+}
+
 fn select_branch_column(columns: &[BpColumn], values: &[f64], num_leaves: usize) -> Option<usize> {
     let mut seen = vec![false; num_leaves + 1];
     let mut duplicated = vec![false; num_leaves + 1];
@@ -2794,11 +2992,78 @@ fn labels_disjoint(a: &[u32], b: &[u32]) -> bool {
     true
 }
 
+fn labels_contain(labels: &[u32], target: u32) -> bool {
+    labels.binary_search(&target).is_ok()
+}
+
+fn labels_satisfy_pair_constraints(
+    labels: &[u32],
+    must_link_pairs: &[LeafPair],
+    cannot_link_pairs: &[LeafPair],
+) -> bool {
+    for &pair in must_link_pairs {
+        if labels_contain(labels, pair.a) != labels_contain(labels, pair.b) {
+            return false;
+        }
+    }
+    for &pair in cannot_link_pairs {
+        if labels_contain(labels, pair.a) && labels_contain(labels, pair.b) {
+            return false;
+        }
+    }
+    true
+}
+
+fn pricing_candidate_allowed(
+    labels: &[u32],
+    seen: &HashSet<Vec<u32>>,
+    forbidden: &ForbiddenColumns,
+    must_link_pairs: &[LeafPair],
+    cannot_link_pairs: &[LeafPair],
+) -> bool {
+    !forbidden.contains(seen, labels)
+        && labels_satisfy_pair_constraints(labels, must_link_pairs, cannot_link_pairs)
+}
+
+fn node_branchings_self_consistent(columns: &[BpColumn], node: &BpNode) -> bool {
+    if node
+        .must_link_pairs
+        .iter()
+        .any(|pair| node.cannot_link_pairs.contains(pair))
+    {
+        return false;
+    }
+    if node
+        .fixed_to_one
+        .iter()
+        .any(|ci| node.fixed_to_zero.contains(ci))
+    {
+        return false;
+    }
+    for (idx, &forced_ci) in node.fixed_to_one.iter().enumerate() {
+        if !labels_satisfy_pair_constraints(
+            &columns[forced_ci].labels,
+            &node.must_link_pairs,
+            &node.cannot_link_pairs,
+        ) {
+            return false;
+        }
+        for &other_ci in &node.fixed_to_one[(idx + 1)..] {
+            if !labels_disjoint(&columns[forced_ci].labels, &columns[other_ci].labels) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn column_respects_branchings(
     columns: &[BpColumn],
     ci: usize,
     fixed_to_one: &[usize],
     fixed_to_zero: &[usize],
+    must_link_pairs: &[LeafPair],
+    cannot_link_pairs: &[LeafPair],
 ) -> bool {
     if fixed_to_zero
         .iter()
@@ -2814,7 +3079,11 @@ fn column_respects_branchings(
             return false;
         }
     }
-    true
+    labels_satisfy_pair_constraints(
+        &columns[ci].labels,
+        must_link_pairs,
+        cannot_link_pairs,
+    )
 }
 
 fn make_leafset(labels: &[u32], num_leaves: u32) -> FixedBitSet {
@@ -2829,7 +3098,9 @@ fn clean_dual(value: f64) -> f64 {
     if value.abs() <= 1.0e-9 { 0.0 } else { value }
 }
 
-fn make_bp_column(labels: Vec<u32>, trees: &[Tree]) -> BpColumn {
+fn make_bp_column(mut labels: Vec<u32>, trees: &[Tree]) -> BpColumn {
+    labels.sort_unstable();
+    labels.dedup();
     let covered_internal_nodes = if labels.len() >= 2 {
         trees.iter()
             .map(|tree| {
