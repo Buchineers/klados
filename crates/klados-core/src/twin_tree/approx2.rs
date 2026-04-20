@@ -51,7 +51,7 @@ fn pw_lca_of_mask(tf: &TwinForest, ti: usize, depth: &[u16], mask: u128) -> Node
     let mut result = NONE;
     let mut m = mask;
     while m != 0 {
-        let bit = m.trailing_zeros() as u32;
+        let bit = m.trailing_zeros();
         m &= m - 1;
         let node = tf.label_to_node[ti][(bit + 1) as usize];
         if result == NONE {
@@ -77,21 +77,6 @@ struct Partition {
 }
 
 impl Partition {
-    fn new_empty(max_label: u32) -> Self {
-        Self {
-            comp: vec![0u32; max_label as usize + 1],
-            masks: vec![0],
-            next_id: 1,
-        }
-    }
-
-    fn insert_leaf(&mut self, lbl: u32) {
-        if lbl > 0 {
-            self.comp[lbl as usize] = 0;
-            self.masks[0] |= 1u128 << (lbl - 1);
-        }
-    }
-
     #[inline]
     fn count_components(&self) -> usize {
         self.masks.iter().filter(|&&m| m != 0).count()

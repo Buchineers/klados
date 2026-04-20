@@ -2215,7 +2215,7 @@ mod tests {
             H4Mode::Staged,
         ] {
             let mut profile = SolveProfile::default();
-            let result = sat_solve_maf_cut(&instance, 4, 1, &mut profile, false, mode);
+            let result = sat_solve_maf_cut(&instance, 4, 1, &mut profile, false, mode, None);
             assert!(result.is_some(), "mode {:?} returned no solution", mode);
             assert_eq!(result.unwrap().len(), 3, "mode {:?}", mode);
         }
@@ -2233,7 +2233,7 @@ mod tests {
             H4Mode::Staged,
         ] {
             let mut profile = SolveProfile::default();
-            let result = sat_solve_maf_cut(&instance, 4, 1, &mut profile, false, mode);
+            let result = sat_solve_maf_cut(&instance, 4, 1, &mut profile, false, mode, None);
             assert!(result.is_some(), "mode {:?} returned no solution", mode);
             assert_eq!(result.unwrap().len(), 1, "mode {:?}", mode);
         }

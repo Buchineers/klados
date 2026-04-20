@@ -438,7 +438,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     )?;
                 }
                 Some(Commands::KernelizeDiag) => {
-                    commands::kernelize_diag::run(&instance, cli.verbose)?;
+                    commands::kernelize_diag::run(&instance)?;
                 }
                 Some(Commands::DeleteLeaf { leaf }) => {
                     commands::delete_leaf::run(&instance, leaf)?;

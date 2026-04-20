@@ -59,13 +59,13 @@ pub fn tree_canonical_for_labels(tree: &Tree, labels: &FixedBitSet) -> u64 {
     fn build(tree: &Tree, node: NodeId, labels: &FixedBitSet) -> Option<u64> {
         if tree.is_leaf(node) {
             let lbl = tree.label[node as usize];
-            if labels.contains(lbl as usize) {
+            return if labels.contains(lbl as usize) {
                 let mut h = lbl as u64;
                 h = h.wrapping_mul(0x9e3779b97f4a7c15);
                 h ^= h >> 30;
-                return Some(h);
+                Some(h)
             } else {
-                return None;
+                None
             }
         }
         if let Some((l, r)) = tree.children(node) {

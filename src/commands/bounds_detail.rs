@@ -1,9 +1,9 @@
 //! Detailed bounds comparison: red-blue (UB + dual LB), Wu LP relax, Olver LP*.
 
-use klados_core::Instance;
 use klados_core::lower_bound::{
-    cherry_reduce_ub, maf_bounds, red_blue_approx, red_blue_approx_detailed,
+    cherry_reduce_ub, maf_bounds, red_blue_approx_detailed,
 };
+use klados_core::Instance;
 use klados_exact::whidden::approx_2_lb_for_instance;
 
 pub fn run(instance: &Instance) -> Result<(), Box<dyn std::error::Error>> {
@@ -82,25 +82,6 @@ pub fn run(instance: &Instance) -> Result<(), Box<dyn std::error::Error>> {
         }
     } else {
         eprintln!("Wu LP relax:   skipped (n={} > 60)", n);
-    }
-
-    // 4. Olver LP* (2-tree only, compact formulation).
-    if m == 2 && n <= 150 {
-        let t0 = std::time::Instant::now();
-        if let Some(olver_val) = klados_exact::maf_ilp::solve_olver_lp(instance) {
-            let olver_ms = t0.elapsed().as_secs_f64() * 1000.0;
-            let olver_lb = olver_val.ceil() as usize;
-            eprintln!(
-                "Olver LP*:     {:.4} (ceil={}) ({:.1}ms)",
-                olver_val, olver_lb, olver_ms
-            );
-        } else {
-            eprintln!("Olver LP*:     failed");
-        }
-    } else if m != 2 {
-        eprintln!("Olver LP*:     skipped (m={}, 2-tree only)", m);
-    } else {
-        eprintln!("Olver LP*:     skipped (n={} > 150)", n);
     }
 
     // Print summary line for easy parsing.

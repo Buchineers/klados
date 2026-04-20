@@ -6,10 +6,10 @@
 
 use std::time::Instant;
 
-use klados_core::{Instance, NONE, Tree};
+use klados_core::{Instance, NONE};
 use klados_exact::kernelize::{self, KernelizeConfig};
 
-pub fn run(instance: &Instance, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run(instance: &Instance) -> Result<(), Box<dyn std::error::Error>> {
     let m = instance.num_trees();
     let n = instance.num_leaves;
 

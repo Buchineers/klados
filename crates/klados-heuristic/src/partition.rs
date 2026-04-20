@@ -152,7 +152,7 @@ impl PartitionHeuristicSolver {
         seen_leafsets: &mut HashSet<Vec<u32>>,
         kern: &kernelize::KernelizeResult,
         original: &Instance,
-        rep_to_all: &std::collections::HashMap<u32, Vec<u32>, fxhash::FxBuildHasher>,
+        rep_to_all: &HashMap<u32, Vec<u32>, fxhash::FxBuildHasher>,
         start_seed: u64,
         batch_size: u64,
     ) -> usize {
@@ -1328,7 +1328,7 @@ impl PartitionHeuristicSolver {
         reduced_forbidden: &[u32],
         workspace: &mut Option<GlobalPricingWorkspace>,
         reverse_map: &[u32],
-        rep_to_all: &std::collections::HashMap<u32, Vec<u32>, fxhash::FxBuildHasher>,
+        rep_to_all: &HashMap<u32, Vec<u32>, fxhash::FxBuildHasher>,
         original: &Instance,
         forbidden_labels: &HashSet<u32>,
         max_per_round: usize,
@@ -1665,7 +1665,7 @@ fn partition_groups(partition: &[usize]) -> Vec<Vec<u32>> {
 fn expand_reduced_leafset(
     reduced_labels: &[u32],
     reverse_map: &[u32],
-    rep_to_all: &std::collections::HashMap<u32, Vec<u32>, fxhash::FxBuildHasher>,
+    rep_to_all: &HashMap<u32, Vec<u32>, fxhash::FxBuildHasher>,
     original_num_leaves: u32,
 ) -> FixedBitSet {
     let mut bits = FixedBitSet::with_capacity(original_num_leaves as usize + 1);
@@ -1684,7 +1684,7 @@ fn expand_reduced_leafset(
 
 fn build_original_to_reduced_map(
     kern: &kernelize::KernelizeResult,
-    rep_to_all: &std::collections::HashMap<u32, Vec<u32>, fxhash::FxBuildHasher>,
+    rep_to_all: &HashMap<u32, Vec<u32>, fxhash::FxBuildHasher>,
     original_num_leaves: u32,
 ) -> Vec<u32> {
     let mut original_to_reduced = vec![0u32; original_num_leaves as usize + 1];
@@ -1849,7 +1849,7 @@ fn prune_candidate_pool(
 fn materialize_components(
     selected: &[usize],
     candidates: &[PartitionBlock],
-    rep_to_all: &std::collections::HashMap<u32, Vec<u32>, fxhash::FxBuildHasher>,
+    rep_to_all: &HashMap<u32, Vec<u32>, fxhash::FxBuildHasher>,
     kern: &kernelize::KernelizeResult,
     original: &Instance,
 ) -> (Vec<Tree>, usize) {

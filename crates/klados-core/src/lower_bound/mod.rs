@@ -151,7 +151,7 @@ pub fn maf_bounds(trees: &[Tree], num_leaves: u32) -> MafBounds {
         let mut best_seed = 0u64;
         for ref_idx in 0..m {
             for seed in 0..=20u64 {
-                let ub = cherry::greedy_multi_tree_ub_seeded(trees, ref_idx, seed);
+                let ub = greedy_multi_tree_ub_seeded(trees, ref_idx, seed);
                 if ub < best_multi_ub {
                     best_multi_ub = ub;
                     best_ref = ref_idx;
@@ -166,7 +166,7 @@ pub fn maf_bounds(trees: &[Tree], num_leaves: u32) -> MafBounds {
 
         // (b) Pairwise-refine: start from best pair's partition, refine for all trees.
         let t_pr = std::time::Instant::now();
-        let (pr_ub, pr_partition) = cherry::pairwise_refine_ub(trees, n);
+        let (pr_ub, pr_partition) = pairwise_refine_ub(trees, n);
         eprintln!(
             "[bounds] Pairwise-refine UB: {} (all-tree cherry: {}) in {:.1}ms",
             pr_ub, best_multi_ub, t_pr.elapsed().as_secs_f64() * 1000.0
@@ -176,7 +176,7 @@ pub fn maf_bounds(trees: &[Tree], num_leaves: u32) -> MafBounds {
             (pr_ub.min(n), Some(pr_partition))
         } else {
             let ub = best_multi_ub.min(n);
-            let (_, partition) = cherry::greedy_multi_tree_partition(trees, best_ref, best_seed);
+            let (_, partition) = greedy_multi_tree_partition(trees, best_ref, best_seed);
             (ub, Some(partition))
         }
     };

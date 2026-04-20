@@ -1,7 +1,6 @@
 //! Delete a specific leaf from an instance and output the reduced instance.
 
 use klados_core::Instance;
-use klados_exact::kernelize;
 use pace26io::newick::NewickWriter;
 use std::io::{self, Write};
 
@@ -21,7 +20,7 @@ pub fn run(instance: &Instance, leaf: u32) -> Result<(), Box<dyn std::error::Err
     //
     // Simpler: use the same approach as the pipeline — build keep set and restrict.
     let n = instance.num_leaves as usize;
-    let mut keep_labels: Vec<u32> = (1..=instance.num_leaves).filter(|&l| l != leaf).collect();
+    let keep_labels: Vec<u32> = (1..=instance.num_leaves).filter(|&l| l != leaf).collect();
 
     // Build label map
     let new_n = keep_labels.len() as u32;

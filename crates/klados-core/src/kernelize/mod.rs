@@ -18,7 +18,6 @@ mod expansion;
 mod helpers;
 mod instance_ops;
 pub mod rule;
-mod short_chain;
 mod stats;
 
 #[cfg(test)]
@@ -35,7 +34,6 @@ pub use stats::{KernelizeStats, build_surviving_taxa, print_stats, print_taxa_de
 
 use chain::ChainRule;
 use cherry::CherryRule;
-use cherry_rotation::TripleRule;
 
 /// Which reduction rules are enabled.
 #[derive(Clone, Debug)]

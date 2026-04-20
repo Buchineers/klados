@@ -338,11 +338,6 @@ impl Default for ParentBounds {
     }
 }
 
-/// Margin for parent val3 propagation.
-/// Skip approx_3 if parent_val3 + MARGIN ≤ 3*k.
-/// Value of 6 allows for up to 2 cascading greedy changes.
-const VAL3_SKIP_MARGIN: i32 = 6;
-
 /// Margin for parent approx_2_lb propagation.
 /// Skip approx_2_lb if parent_2lb + MARGIN ≤ k.
 const APPROX2_SKIP_MARGIN: i32 = 2;
@@ -350,19 +345,6 @@ const APPROX2_SKIP_MARGIN: i32 = 2;
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
-
-pub fn solve(instance: &Instance, stats: &mut SolverStats) -> Option<Vec<Tree>> {
-    let mut rule_stats = WhiddenRuleStats::default();
-    solve_with_config(instance, stats, &mut rule_stats, &BBConfig::default())
-}
-
-pub fn solve_with_rule_stats(
-    instance: &Instance,
-    stats: &mut SolverStats,
-    rule_stats: &mut WhiddenRuleStats,
-) -> Option<Vec<Tree>> {
-    solve_with_config(instance, stats, rule_stats, &BBConfig::default())
-}
 
 pub fn solve_with_rule_stats_and_progress<F>(
     instance: &Instance,
@@ -375,17 +357,6 @@ where
     F: FnMut(WhiddenProgressUpdate) + ?Sized,
 {
     solve_with_config_and_progress(instance, stats, rule_stats, config, progress)
-}
-
-pub fn solve_with_config(
-    instance: &Instance,
-    stats: &mut SolverStats,
-    rule_stats: &mut WhiddenRuleStats,
-    config: &BBConfig,
-) -> Option<Vec<Tree>> {
-    solve_with_config_and_progress::<fn(WhiddenProgressUpdate)>(
-        instance, stats, rule_stats, config, None,
-    )
 }
 
 fn solve_with_config_and_progress<F>(
@@ -1685,7 +1656,7 @@ fn approx_3(tf: &mut TwinForest, um: &mut UndoMachine) -> i32 {
                 t1_c,
                 t2_a,
                 t2_b: _,
-                t2_c,
+                t2_c: _t2_c,
                 cut_b_only,
                 ..
             } => {
@@ -2023,7 +1994,7 @@ fn extract_components(tf: &TwinForest) -> Vec<Tree> {
         }
 
         // Expand: find all original labels whose representative is in this component
-        let mut leafset = fixedbitset::FixedBitSet::with_capacity(n as usize + 1);
+        let mut leafset = FixedBitSet::with_capacity(n as usize + 1);
         for &lbl in &current_labels {
             for orig in 1..=n {
                 if collapsed[orig as usize] == lbl {

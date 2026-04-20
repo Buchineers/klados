@@ -362,35 +362,3 @@ fn try_32_delete_multi_partner(
 
     interceptor_exists
 }
-
-/// Check if `victim` can be deleted in a multi-tree 3-2 reduction (original 2-partner version).
-fn try_32_delete(trees: &[Tree], siblings: &[u32], keeper: u32, victim: u32) -> bool {
-    let mut interceptor_exists = false;
-
-    for (t_idx, tree) in trees.iter().enumerate() {
-        if siblings[t_idx] == keeper {
-            continue;
-        }
-        if siblings[t_idx] != victim {
-            return false;
-        }
-
-        let node_keeper = tree.node_by_label(keeper);
-        let node_victim = tree.node_by_label(victim);
-        if node_keeper == NONE || node_victim == NONE {
-            return false;
-        }
-        let parent_victim = tree.parent[node_victim as usize];
-        if parent_victim == NONE {
-            return false;
-        }
-        let gp_victim = tree.parent[parent_victim as usize];
-        let parent_keeper = tree.parent[node_keeper as usize];
-        if gp_victim == NONE || parent_keeper == NONE || parent_keeper != gp_victim {
-            return false;
-        }
-        interceptor_exists = true;
-    }
-
-    interceptor_exists
-}

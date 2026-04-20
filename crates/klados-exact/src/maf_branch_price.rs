@@ -73,8 +73,8 @@ impl ExactSolver for MafBranchPriceSolver {
                 instance.num_trees()
             );
             let mut sat = crate::maf_sat::MafSatSolver::new();
-            let result = crate::ExactSolver::solve(&mut sat, instance);
-            self.stats = crate::ExactSolver::stats(&sat).clone();
+            let result = ExactSolver::solve(&mut sat, instance);
+            self.stats = ExactSolver::stats(&sat).clone();
             return result;
         }
         solve_branch_price(instance, &mut self.stats)
@@ -210,8 +210,8 @@ fn solve_branch_price(instance: &Instance, stats: &mut SolverStats) -> Option<Ve
     // Seed columns and best_solution from the greedy partition so LP pruning works from node 0.
     // Without this, the solver can't prune fractional nodes until it stumbles upon
     // an integral LP solution naturally — causing the tree to explode in depth.
-    let mut best_solution: Option<Vec<f64>> = None;
-    let mut best_ub = n; // default: singleton solution
+    let best_solution: Option<Vec<f64>>;
+    let best_ub;
     if let Some(partition) = &bounds.best_partition {
         let mut comp_labels: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
         for (leaf_idx, &comp_id) in partition.iter().enumerate() {
@@ -388,7 +388,6 @@ fn solve_bp_node(
         Err(_) => return NodeResult::Pruned,
     };
     // Column generation loop
-    let mut cg_iters_this_node = 0usize;
     let mut final_lp: Option<RmpLpResult> = None;
     loop {
         let lp = match node_rmp.solve(state.columns.len()) {
@@ -464,7 +463,6 @@ fn solve_bp_node(
             best_solution.push(0.0);
         }
         state.cg_iterations_total += 1;
-        cg_iters_this_node += 1;
     }
 
     // Final LP solve at this node (reuse the terminal LP if we already have it).
@@ -821,9 +819,9 @@ fn labels_disjoint(a: &[u32], b: &[u32]) -> bool {
     let mut j = 0usize;
     while i < a.len() && j < b.len() {
         match a[i].cmp(&b[j]) {
-            std::cmp::Ordering::Less => i += 1,
-            std::cmp::Ordering::Greater => j += 1,
-            std::cmp::Ordering::Equal => return false,
+            Ordering::Less => i += 1,
+            Ordering::Greater => j += 1,
+            Ordering::Equal => return false,
         }
     }
     true
@@ -1072,9 +1070,9 @@ fn membership_over_free_labels(free_labels: &[u32], labels: &[u32]) -> Vec<bool>
     let mut j = 0usize;
     while i < free_labels.len() && j < labels.len() {
         match free_labels[i].cmp(&labels[j]) {
-            std::cmp::Ordering::Less => i += 1,
-            std::cmp::Ordering::Greater => j += 1,
-            std::cmp::Ordering::Equal => {
+            Ordering::Less => i += 1,
+            Ordering::Greater => j += 1,
+            Ordering::Equal => {
                 membership[i] = true;
                 i += 1;
                 j += 1;
@@ -1196,11 +1194,6 @@ impl PricerWorkspace {
         }
     }
 
-    #[inline(always)]
-    fn idx(&self, u: u32, v: u32) -> usize {
-        u as usize * self.n2 + v as usize
-    }
-
     /// Recompute live-leaf counts for the current blocked set.
     /// Returns true if the root pair has any live leaves at all.
     fn compute_live_counts(&mut self, t1: &Tree, t2: &Tree, blocked: &[bool]) -> bool {
@@ -1303,8 +1296,6 @@ pub(crate) fn run_rooted_paper_pricer(
 
     // Phase 2: leaf vs internal — skip-left/skip-right for V, max-propagation for M
     for &u in &ws.leaves1 {
-        let lbl = t1.label[u as usize];
-        let blocked = blocked_leaves.get(lbl as usize).copied().unwrap_or(false);
         for &v in &ws.internal2 {
             let pair = idx(u, v);
             // Skip if t2 subtree has no live leaves
@@ -1351,8 +1342,6 @@ pub(crate) fn run_rooted_paper_pricer(
         for &v in &ws.leaves2 {
             let pair = idx(u, v);
             let (ul, ur) = t1.children_pair(u);
-            let lbl = t2.label[v as usize];
-            let blocked = blocked_leaves.get(lbl as usize).copied().unwrap_or(false);
 
             // V: can only skip in t1
             let left = -beta_u + ws.v_score[idx(ul, v)];
