@@ -100,10 +100,8 @@ const WIDEPRICER_ANCHOR_LABELS: usize = 160;
 const WIDEPRICER_PARTNERS_PER_ANCHOR: usize = 16;
 const WIDEPRICER_PAIR_TRIALS: usize = 2048;
 const WIDEPRICER_MIN_ACTIVE_LABELS: usize = 330;
-const EXACTPROXY_MIN_EVALS: usize = 256;
 const COLUMN_RESERVE_CAP: usize = 0;
 const COLUMN_RESERVE_REFILL: usize = 0;
-
 pub struct MafBranchPriceMultiSolver {
     stats: SolverStats,
 }
@@ -572,6 +570,7 @@ fn solve_bp_node(
     );
     state.t_lp_apply_bounds += t0.elapsed().as_secs_f64();
 
+    let mut pricer_cache: Option<PairDpPricer<'_>> = None;
     let lp = loop {
         let t_solve = Instant::now();
         let lp = match rmp.solve(state.columns.len()) {
@@ -634,6 +633,7 @@ fn solve_bp_node(
         }
 
         let priced_columns = price_best_new_pairdp_columns(
+            &mut pricer_cache,
             pricer_ws,
             trees,
             num_leaves,
@@ -811,8 +811,8 @@ struct PairDpPricer<'a> {
     active_mask: FixedBitSet,
     /// label -> active index; u32::MAX for inactive labels.
     label_to_active_idx: Vec<u32>,
-    alpha: &'a [f64],
-    beta: &'a [Vec<f64>],
+    alpha: Vec<f64>,
+    beta: Vec<Vec<f64>>,
     prefix_beta: Vec<Vec<f64>>,
     roots: Vec<Vec<u32>>,
     side_child: Vec<Vec<u32>>,
@@ -829,19 +829,26 @@ struct PricingColumns {
 }
 
 impl<'a> PairDpPricer<'a> {
-    fn new(
-        workspace: &'a MultiPricerWorkspace,
-        trees: &'a [Tree],
+    fn collect_active_labels(
         num_leaves: usize,
-        alpha: &'a [f64],
-        beta: &'a [Vec<f64>],
+        alpha: &[f64],
         blocked_leaves: &[bool],
-    ) -> Self {
-        let active_labels = (1..=num_leaves as u32)
+    ) -> Vec<u32> {
+        (1..=num_leaves as u32)
             .filter(|&label| {
                 !blocked_leaves[label as usize] && alpha[label as usize] > 1.0e-12
             })
-            .collect::<Vec<_>>();
+            .collect()
+    }
+
+    fn with_active_labels(
+        workspace: &'a MultiPricerWorkspace,
+        trees: &'a [Tree],
+        num_leaves: usize,
+        active_labels: Vec<u32>,
+        alpha: &[f64],
+        beta: &[Vec<f64>],
+    ) -> Self {
         let p = active_labels.len();
         let pair_count = p * p;
 
@@ -910,8 +917,8 @@ impl<'a> PairDpPricer<'a> {
             descendant_leaves: &workspace.descendant_leaves,
             active_mask,
             label_to_active_idx,
-            alpha,
-            beta,
+            alpha: alpha.to_vec(),
+            beta: beta.to_vec(),
             prefix_beta,
             roots,
             side_child,
@@ -921,6 +928,71 @@ impl<'a> PairDpPricer<'a> {
             solving_pair: vec![false; pair_count],
             solving_side: vec![false; pair_count],
         }
+    }
+
+    fn same_active_set(&self, active_labels: &[u32]) -> bool {
+        self.active_labels.as_slice() == active_labels
+    }
+
+    fn refresh_duals(&mut self, alpha: &[f64], beta: &[Vec<f64>]) {
+        self.alpha.clear();
+        self.alpha.extend_from_slice(alpha);
+
+        if self.beta.len() != beta.len() {
+            self.beta = beta.to_vec();
+        } else {
+            for (dst, src) in self.beta.iter_mut().zip(beta.iter()) {
+                dst.clear();
+                dst.extend_from_slice(src);
+            }
+        }
+
+        self.refresh_prefix_beta();
+        self.reset_memos();
+    }
+
+    fn refresh_prefix_beta(&mut self) {
+        if self.prefix_beta.len() != self.trees.len() {
+            self.prefix_beta = self
+                .trees
+                .iter()
+                .map(|tree| vec![0.0; tree.num_nodes()])
+                .collect();
+        }
+        for (ti, tree) in self.trees.iter().enumerate() {
+            let prefix = &mut self.prefix_beta[ti];
+            if prefix.len() != tree.num_nodes() {
+                prefix.resize(tree.num_nodes(), 0.0);
+            }
+            for node in tree.pre_order() {
+                let parent = tree.parent[node as usize];
+                let parent_sum = if parent == klados_core::NONE {
+                    0.0
+                } else {
+                    prefix[parent as usize]
+                };
+                let own = if tree.is_leaf(node) {
+                    0.0
+                } else {
+                    self.beta[ti][node as usize]
+                };
+                prefix[node as usize] = parent_sum + own;
+            }
+        }
+    }
+
+    fn reset_memos(&mut self) {
+        for slot in &mut self.memo_pair {
+            *slot = None;
+        }
+        for slot in &mut self.memo_side {
+            *slot = None;
+        }
+        for slot in &mut self.memo_pair_labels {
+            *slot = None;
+        }
+        self.solving_pair.fill(false);
+        self.solving_side.fill(false);
     }
 
     #[inline(always)]
@@ -1377,9 +1449,10 @@ impl<'a> PairDpPricer<'a> {
 
 }
 
-fn price_best_new_pairdp_columns(
-    pricer_ws: &mut MultiPricerWorkspace,
-    trees: &[Tree],
+fn price_best_new_pairdp_columns<'a>(
+    pricer_cache: &mut Option<PairDpPricer<'a>>,
+    pricer_ws: &'a MultiPricerWorkspace,
+    trees: &'a [Tree],
     num_leaves: usize,
     alpha: &[f64],
     beta: &[Vec<f64>],
@@ -1394,14 +1467,33 @@ fn price_best_new_pairdp_columns(
     allow_wide: bool,
 ) -> PricingColumns {
     let t0 = Instant::now();
-    let mut pricer = PairDpPricer::new(
-        pricer_ws,
-        trees,
-        num_leaves,
-        alpha,
-        beta,
-        blocked_leaves,
-    );
+    let active_labels = PairDpPricer::collect_active_labels(num_leaves, alpha, blocked_leaves);
+    let pricer = if let Some(pricer) = pricer_cache.as_mut() {
+        if pricer.same_active_set(&active_labels) {
+            pricer.refresh_duals(alpha, beta);
+            pricer
+        } else {
+            *pricer_cache = Some(PairDpPricer::with_active_labels(
+                pricer_ws,
+                trees,
+                num_leaves,
+                active_labels,
+                alpha,
+                beta,
+            ));
+            pricer_cache.as_mut().expect("pricer cache present")
+        }
+    } else {
+        *pricer_cache = Some(PairDpPricer::with_active_labels(
+            pricer_ws,
+            trees,
+            num_leaves,
+            active_labels,
+            alpha,
+            beta,
+        ));
+        pricer_cache.as_mut().expect("pricer cache present")
+    };
     *t_new += t0.elapsed().as_secs_f64();
     let t1 = Instant::now();
     let fast = pricer.collect_fast_columns(
