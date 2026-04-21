@@ -104,6 +104,24 @@ const MEMO_MIN_LEAVES: u32 = 4;
 const MEMO_MAX_LEAVES: u32 = 96;
 const COLUMN_RESERVE_CAP: usize = 0;
 const COLUMN_RESERVE_REFILL: usize = 0;
+
+fn adaptive_exact_batch_size(active_labels: usize, root_node: bool) -> usize {
+    let mut batch = if active_labels >= 1200 {
+        256
+    } else if active_labels >= 768 {
+        192
+    } else if active_labels >= 384 {
+        128
+    } else if active_labels >= 256 {
+        96
+    } else {
+        PAIRDP_BATCH_SIZE
+    };
+    if !root_node {
+        batch = batch.min(96);
+    }
+    batch
+}
 pub struct MafBranchPriceMultiSolver {
     stats: SolverStats,
 }
@@ -1721,9 +1739,10 @@ fn price_best_new_pairdp_columns<'a>(
         pricer_cache.as_mut().expect("pricer cache present")
     };
     *t_new += t0.elapsed().as_secs_f64();
+    let exact_batch_size = adaptive_exact_batch_size(pricer.active_labels.len(), allow_wide);
     let t1 = Instant::now();
     let fast = pricer.collect_fast_columns(
-        FASTPRICER_BATCH_SIZE.min(PAIRDP_BATCH_SIZE),
+        FASTPRICER_BATCH_SIZE.min(exact_batch_size),
         COLUMN_RESERVE_REFILL,
         |labels| {
             pricing_candidate_allowed(labels, seen, forbidden, must_link_pairs, cannot_link_pairs)
@@ -1733,7 +1752,7 @@ fn price_best_new_pairdp_columns<'a>(
     if !fast.is_empty() {
         let mut reserve = fast;
         let immediate = reserve
-            .drain(..reserve.len().min(FASTPRICER_BATCH_SIZE.min(PAIRDP_BATCH_SIZE)))
+            .drain(..reserve.len().min(FASTPRICER_BATCH_SIZE.min(exact_batch_size)))
             .collect();
         return PricingColumns { immediate, reserve };
     }
@@ -1741,7 +1760,7 @@ fn price_best_new_pairdp_columns<'a>(
     if allow_wide && pricer.active_labels.len() >= WIDEPRICER_MIN_ACTIVE_LABELS {
         let t1b = Instant::now();
         let wide = pricer.collect_wide_columns(
-            WIDEPRICER_BATCH_SIZE.min(PAIRDP_BATCH_SIZE),
+            WIDEPRICER_BATCH_SIZE.min(exact_batch_size),
             COLUMN_RESERVE_REFILL,
             |labels| {
                 pricing_candidate_allowed(labels, seen, forbidden, must_link_pairs, cannot_link_pairs)
@@ -1751,7 +1770,7 @@ fn price_best_new_pairdp_columns<'a>(
         if !wide.is_empty() {
             let mut reserve = wide;
             let immediate = reserve
-                .drain(..reserve.len().min(WIDEPRICER_BATCH_SIZE.min(PAIRDP_BATCH_SIZE)))
+                .drain(..reserve.len().min(WIDEPRICER_BATCH_SIZE.min(exact_batch_size)))
                 .collect();
             return PricingColumns { immediate, reserve };
         }
@@ -1759,7 +1778,7 @@ fn price_best_new_pairdp_columns<'a>(
 
     let t2 = Instant::now();
     let exact = pricer.collect_profitable_columns(
-        PAIRDP_BATCH_SIZE,
+        exact_batch_size,
         COLUMN_RESERVE_REFILL,
         |labels| {
             pricing_candidate_allowed(labels, seen, forbidden, must_link_pairs, cannot_link_pairs)
@@ -1768,7 +1787,7 @@ fn price_best_new_pairdp_columns<'a>(
     *t_collect += t2.elapsed().as_secs_f64();
     let mut reserve = exact;
     let immediate = reserve
-        .drain(..reserve.len().min(PAIRDP_BATCH_SIZE))
+        .drain(..reserve.len().min(exact_batch_size))
         .collect();
     PricingColumns { immediate, reserve }
 }
