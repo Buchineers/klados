@@ -91,6 +91,10 @@ use crate::ExactSolver;
 
 const NEG_INF: f64 = -1.0e100;
 const PAIRDP_BATCH_SIZE: usize = 64;
+const FASTPRICER_BATCH_SIZE: usize = 16;
+const FASTPRICER_ANCHOR_LABELS: usize = 64;
+const FASTPRICER_PARTNERS_PER_ANCHOR: usize = 8;
+const FASTPRICER_PAIR_TRIALS: usize = 256;
 
 pub struct MafBranchPriceMultiSolver {
     stats: SolverStats,
@@ -757,13 +761,11 @@ struct PairDpPricer<'a> {
     prefix_beta: Vec<Vec<f64>>,
     roots: Vec<Vec<u32>>,
     side_child: Vec<Vec<u32>>,
-    pair_order: Vec<(usize, usize)>,
     memo_pair: Vec<Option<f64>>,
     memo_side: Vec<Option<PairDpSideState>>,
     memo_pair_labels: Vec<Option<Vec<u32>>>,
     solving_pair: Vec<bool>,
     solving_side: Vec<bool>,
-    solved_2tree: bool,
 }
 
 impl<'a> PairDpPricer<'a> {
@@ -841,27 +843,6 @@ impl<'a> PairDpPricer<'a> {
             side_child.push(tree_side_child);
         }
 
-        let mut pair_order = Vec::new();
-        if trees.len() == 2 {
-            pair_order.reserve(pair_count.saturating_sub(p));
-            for a in 0..p {
-                for b in 0..p {
-                    if a == b {
-                        continue;
-                    }
-                    let idx = a * p + b;
-                    let key = trees
-                        .iter()
-                        .enumerate()
-                        .map(|(ti, tree)| tree.subtree_size[roots[ti][idx] as usize] as usize)
-                        .sum::<usize>();
-                    pair_order.push((key, idx));
-                }
-            }
-            pair_order
-                .sort_unstable_by(|lhs, rhs| lhs.0.cmp(&rhs.0).then_with(|| lhs.1.cmp(&rhs.1)));
-        }
-
         Self {
             trees,
             active_labels,
@@ -874,13 +855,11 @@ impl<'a> PairDpPricer<'a> {
             prefix_beta,
             roots,
             side_child,
-            pair_order,
             memo_pair: vec![None; pair_count],
             memo_side: vec![None; pair_count],
             memo_pair_labels: vec![None; pair_count],
             solving_pair: vec![false; pair_count],
             solving_side: vec![false; pair_count],
-            solved_2tree: false,
         }
     }
 
@@ -960,101 +939,110 @@ impl<'a> PairDpPricer<'a> {
         (raw_candidates, out)
     }
 
-    fn pair_idx(&self, a: usize, b: usize) -> usize {
-        a * self.active_labels.len() + b
-    }
-
-    fn solve_all_2tree(&mut self) {
-        if self.solved_2tree {
-            return;
+    fn collect_fast_columns<F>(
+        &mut self,
+        limit: usize,
+        mut accept: F,
+    ) -> Vec<(f64, Vec<u32>)>
+    where
+        F: FnMut(&[u32]) -> bool,
+    {
+        if self.active_labels.len() < 2 || limit == 0 {
+            return Vec::new();
         }
 
         let p = self.active_labels.len();
-        let mut pos = 0usize;
-        while pos < self.pair_order.len() {
-            let key = self.pair_order[pos].0;
-            let mut end = pos + 1;
-            while end < self.pair_order.len() && self.pair_order[end].0 == key {
-                end += 1;
-            }
+        let mut anchor_labels: Vec<usize> = (0..p).collect();
+        anchor_labels.sort_unstable_by(|&lhs, &rhs| {
+            self.alpha[self.active_labels[rhs] as usize]
+                .total_cmp(&self.alpha[self.active_labels[lhs] as usize])
+                .then_with(|| lhs.cmp(&rhs))
+        });
+        let anchor_limit = FASTPRICER_ANCHOR_LABELS
+            .max(limit.saturating_mul(2))
+            .min(anchor_labels.len());
+        anchor_labels.truncate(anchor_limit);
 
-            for &(_, idx) in &self.pair_order[pos..end] {
-                let a = idx / p;
-                let b = idx % p;
-                let label_a = self.active_labels[a];
-                let label_b = self.active_labels[b];
-                let mut best_score =
-                    self.alpha[label_a as usize] - self.singleton_chain_penalty_2tree(a, b);
-                let mut best_choice = PairDpSideChoice::Singleton;
-
-                let side0 = self.side_of(0, a, b) as usize;
-                let side1 = self.side_of(1, a, b) as usize;
-                let d0 = self.descendant_leaves[0][side0].as_slice();
-                let d1 = self.descendant_leaves[1][side1].as_slice();
-                let am = self.active_mask.as_slice();
-                let la_w = label_a as usize >> 6;
-                let la_m = 1usize << (label_a as usize & 63);
-                let lb_w = label_b as usize >> 6;
-                let lb_m = 1usize << (label_b as usize & 63);
-                for wi in 0..d0.len() {
-                    let mut w = d0[wi] & d1[wi] & am[wi];
-                    if wi == la_w { w &= !la_m; }
-                    if wi == lb_w { w &= !lb_m; }
-                    while w != 0 {
-                        let bit = w.trailing_zeros() as usize;
-                        w &= w - 1;
-                        let c_label = (wi << 6) + bit;
-                        let c = self.label_to_active_idx[c_label] as usize;
-                        let idx_ac = self.pair_idx(a, c);
-                        let child_score = self.memo_pair[idx_ac]
-                            .expect("child pair must be solved earlier in pair DP order");
-                        if child_score <= NEG_INF / 2.0 {
-                            continue;
-                        }
-                        let cand = child_score - self.transition_chain_penalty_2tree(a, b, c);
-                        if cand > best_score + 1.0e-12 {
-                            best_score = cand;
-                            best_choice = PairDpSideChoice::Split(c);
-                        }
+        let mut scored_pairs = Vec::with_capacity(
+            anchor_limit.saturating_mul(FASTPRICER_PARTNERS_PER_ANCHOR),
+        );
+        for &a in &anchor_labels {
+            let mut best_partners: Vec<(f64, usize, usize)> =
+                Vec::with_capacity(FASTPRICER_PARTNERS_PER_ANCHOR);
+            for b in 0..p {
+                if a == b {
+                    continue;
+                }
+                let proxy = self.quick_pair_proxy(a, b);
+                if proxy > 1.0 - 1.0e-6 {
+                    let pair = if a < b { (proxy, a, b) } else { (proxy, b, a) };
+                    if best_partners.len() < FASTPRICER_PARTNERS_PER_ANCHOR {
+                        best_partners.push(pair);
+                        best_partners.sort_unstable_by(|lhs, rhs| rhs.0.total_cmp(&lhs.0));
+                    } else if pair.0 > best_partners.last().unwrap().0 {
+                        best_partners.pop();
+                        best_partners.push(pair);
+                        best_partners.sort_unstable_by(|lhs, rhs| rhs.0.total_cmp(&lhs.0));
                     }
                 }
-
-                self.memo_side[idx] = Some(PairDpSideState {
-                    score: best_score,
-                    choice: best_choice,
-                });
             }
+            scored_pairs.extend(best_partners);
+        }
+        if scored_pairs.is_empty() {
+            return Vec::new();
+        }
+        scored_pairs.sort_unstable_by(|lhs, rhs| {
+            rhs.0
+                .total_cmp(&lhs.0)
+                .then_with(|| lhs.1.cmp(&rhs.1))
+                .then_with(|| lhs.2.cmp(&rhs.2))
+        });
 
-            for &(_, idx) in &self.pair_order[pos..end] {
-                let a = idx / p;
-                let b = idx % p;
-                let left = self.memo_side[idx]
-                    .expect("left side state present after pair DP side phase")
-                    .score;
-                let right = self.memo_side[self.pair_idx(b, a)]
-                    .expect("right side state present after pair DP side phase")
-                    .score;
-                let score = if left <= NEG_INF / 2.0 || right <= NEG_INF / 2.0 {
-                    NEG_INF
-                } else {
-                    -self.root_penalty_2tree(a, b) + left + right
-                };
-                self.memo_pair[idx] = Some(score);
+        let trial_limit = scored_pairs
+            .len()
+            .min(FASTPRICER_PAIR_TRIALS.max(limit.saturating_mul(4)));
+        let mut dedup: FxHashMap<Vec<u32>, f64> = FxHashMap::default();
+        for &(_, a, b) in scored_pairs.iter().take(trial_limit) {
+            let score = self.solve_pair(a, b);
+            if score <= 1.0 + 1.0e-8 {
+                continue;
             }
-
-            pos = end;
+            let labels = self.pair_labels(a, b);
+            if labels.len() < 2 || !accept(&labels) {
+                continue;
+            }
+            dedup
+                .entry(labels)
+                .and_modify(|best| *best = best.max(score))
+                .or_insert(score);
+            if dedup.len() >= limit {
+                break;
+            }
         }
 
-        self.solved_2tree = true;
+        let mut out = dedup
+            .into_iter()
+            .map(|(labels, score)| (score, labels))
+            .collect::<Vec<_>>();
+        out.sort_unstable_by(|lhs, rhs| {
+            rhs.0
+                .total_cmp(&lhs.0)
+                .then_with(|| rhs.1.len().cmp(&lhs.1.len()))
+                .then_with(|| lhs.1.cmp(&rhs.1))
+        });
+        if out.len() > limit {
+            out.truncate(limit);
+        }
+        out
+    }
+
+    fn pair_idx(&self, a: usize, b: usize) -> usize {
+        a * self.active_labels.len() + b
     }
 
     fn solve_pair(&mut self, a: usize, b: usize) -> f64 {
         debug_assert!(a != b);
         let idx = self.pair_idx(a, b);
-        if self.trees.len() == 2 {
-            self.solve_all_2tree();
-            return self.memo_pair[idx].unwrap_or(NEG_INF);
-        }
         if let Some(score) = self.memo_pair[idx] {
             return score;
         }
@@ -1079,12 +1067,6 @@ impl<'a> PairDpPricer<'a> {
     fn solve_side(&mut self, a: usize, b: usize) -> f64 {
         debug_assert!(a != b);
         let idx = self.pair_idx(a, b);
-        if self.trees.len() == 2 {
-            self.solve_all_2tree();
-            return self.memo_side[idx]
-                .expect("side state present after 2-tree pair DP solve")
-                .score;
-        }
         if let Some(state) = self.memo_side[idx] {
             return state.score;
         }
@@ -1213,22 +1195,14 @@ impl<'a> PairDpPricer<'a> {
             .sum()
     }
 
-    #[inline(always)]
-    fn root_penalty_2tree(&self, a: usize, b: usize) -> f64 {
-        self.beta[0][self.root_of(0, a, b) as usize]
-            + self.beta[1][self.root_of(1, a, b) as usize]
-    }
-
-    #[inline(always)]
-    fn singleton_chain_penalty_2tree(&self, a: usize, b: usize) -> f64 {
-        self.path_internal_penalty(0, &self.trees[0], self.side_of(0, a, b), self.active_nodes[0][a])
-            + self.path_internal_penalty(1, &self.trees[1], self.side_of(1, a, b), self.active_nodes[1][a])
-    }
-
-    #[inline(always)]
-    fn transition_chain_penalty_2tree(&self, a: usize, b: usize, c: usize) -> f64 {
-        self.path_internal_penalty(0, &self.trees[0], self.side_of(0, a, b), self.root_of(0, a, c))
-            + self.path_internal_penalty(1, &self.trees[1], self.side_of(1, a, b), self.root_of(1, a, c))
+    fn quick_pair_proxy(&self, a: usize, b: usize) -> f64 {
+        let label_a = self.active_labels[a] as usize;
+        let label_b = self.active_labels[b] as usize;
+        self.alpha[label_a]
+            + self.alpha[label_b]
+            - self.root_penalty(a, b)
+            - self.singleton_chain_penalty(a, b)
+            - self.singleton_chain_penalty(b, a)
     }
 
     fn path_internal_penalty(&self, ti: usize, tree: &Tree, anc: u32, desc: u32) -> f64 {
@@ -1277,16 +1251,20 @@ fn price_best_new_pairdp_columns(
     );
     *t_new += t0.elapsed().as_secs_f64();
     let t1 = Instant::now();
-    if trees.len() == 2 {
-        pricer.solve_all_2tree();
-    }
+    let fast = pricer.collect_fast_columns(FASTPRICER_BATCH_SIZE.min(PAIRDP_BATCH_SIZE), |labels| {
+        pricing_candidate_allowed(labels, seen, forbidden, must_link_pairs, cannot_link_pairs)
+    });
     *t_solve += t1.elapsed().as_secs_f64();
+    if !fast.is_empty() {
+        return fast;
+    }
+
     let t2 = Instant::now();
-    let (_raw, out) = pricer.collect_profitable_columns(PAIRDP_BATCH_SIZE, |labels| {
+    let (_raw, exact) = pricer.collect_profitable_columns(PAIRDP_BATCH_SIZE, |labels| {
         pricing_candidate_allowed(labels, seen, forbidden, must_link_pairs, cannot_link_pairs)
     });
     *t_collect += t2.elapsed().as_secs_f64();
-    out
+    exact
 }
 
 struct RmpLpResult {
