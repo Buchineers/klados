@@ -95,6 +95,14 @@ const FASTPRICER_BATCH_SIZE: usize = 16;
 const FASTPRICER_ANCHOR_LABELS: usize = 64;
 const FASTPRICER_PARTNERS_PER_ANCHOR: usize = 8;
 const FASTPRICER_PAIR_TRIALS: usize = 256;
+const WIDEPRICER_BATCH_SIZE: usize = 32;
+const WIDEPRICER_ANCHOR_LABELS: usize = 160;
+const WIDEPRICER_PARTNERS_PER_ANCHOR: usize = 16;
+const WIDEPRICER_PAIR_TRIALS: usize = 2048;
+const WIDEPRICER_MIN_ACTIVE_LABELS: usize = 330;
+const EXACTPROXY_MIN_EVALS: usize = 256;
+const COLUMN_RESERVE_CAP: usize = 0;
+const COLUMN_RESERVE_REFILL: usize = 0;
 
 pub struct MafBranchPriceMultiSolver {
     stats: SolverStats,
@@ -221,6 +229,8 @@ impl ColumnBuildScratch {
 struct BpState {
     columns: Vec<BpColumn>,
     seen: FxHashSet<Vec<u32>>,
+    reserve_columns: Vec<ReservedColumn>,
+    reserve_seen: FxHashSet<Vec<u32>>,
     best_ub: usize,
     best_solution: Option<Vec<f64>>,
     nodes_explored: usize,
@@ -234,6 +244,11 @@ struct BpState {
     t_add_col: f64,
     t_cuts: f64,
     cuts_added: usize,
+}
+
+struct ReservedColumn {
+    score_hint: f64,
+    column: BpColumn,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -389,6 +404,8 @@ fn solve_branch_price_multi(instance: &Instance, stats: &mut SolverStats) -> Opt
     let mut state = BpState {
         columns,
         seen,
+        reserve_columns: Vec::new(),
+        reserve_seen: FxHashSet::default(),
         best_ub,
         best_solution,
         nodes_explored: 0,
@@ -577,7 +594,45 @@ fn solve_bp_node(
 
         let alpha = &lp.leaf_duals;
         let beta = &lp.node_duals;
-        let t_price = Instant::now();
+        let t_reserve = Instant::now();
+        let reserved_columns = collect_reserved_columns(
+            state,
+            alpha,
+            beta,
+            &blocked_leaves,
+            &forbidden,
+            &node.must_link_pairs,
+            &node.cannot_link_pairs,
+            PAIRDP_BATCH_SIZE,
+        );
+        state.t_pricer_collect += t_reserve.elapsed().as_secs_f64();
+
+        let mut added_any = false;
+        for (score, column) in reserved_columns {
+            if score <= 1.0 + 1e-8 {
+                continue;
+            }
+            let labels = column.labels.clone();
+            let inserted = state.seen.insert(labels);
+            if !inserted {
+                continue;
+            }
+            let new_ci = state.columns.len();
+            state.columns.push(column);
+            let t_add = Instant::now();
+            rmp.add_column(new_ci, &state.columns[new_ci], trees);
+            state.t_add_col += t_add.elapsed().as_secs_f64();
+            if let Some(best_solution) = state.best_solution.as_mut() {
+                best_solution.push(0.0);
+            }
+            added_any = true;
+            state.columns_added += 1;
+        }
+        if added_any {
+            state.cg_iterations_total += 1;
+            continue;
+        }
+
         let priced_columns = price_best_new_pairdp_columns(
             pricer_ws,
             trees,
@@ -592,11 +647,11 @@ fn solve_bp_node(
             &mut state.t_pricer_new,
             &mut state.t_pricer_solve,
             &mut state.t_pricer_collect,
+            node.depth == 0,
         );
-        let _ = t_price; // individual phase timings already captured below
+        stash_reserved_columns(state, priced_columns.reserve, trees, column_builder);
 
-        let mut added_any = false;
-        for (score, labels) in priced_columns {
+        for (score, labels) in priced_columns.immediate {
             if score <= 1.0 + 1e-8 {
                 continue;
             }
@@ -768,6 +823,11 @@ struct PairDpPricer<'a> {
     solving_side: Vec<bool>,
 }
 
+struct PricingColumns {
+    immediate: Vec<(f64, Vec<u32>)>,
+    reserve: Vec<(f64, Vec<u32>)>,
+}
+
 impl<'a> PairDpPricer<'a> {
     fn new(
         workspace: &'a MultiPricerWorkspace,
@@ -876,42 +936,56 @@ impl<'a> PairDpPricer<'a> {
     fn collect_profitable_columns<F>(
         &mut self,
         limit: usize,
+        stash_limit: usize,
         mut accept: F,
-    ) -> (usize, Vec<(f64, Vec<u32>)>)
+    ) -> Vec<(f64, Vec<u32>)>
     where
         F: FnMut(&[u32]) -> bool,
     {
         if self.active_labels.len() < 2 || limit == 0 {
-            return (0, Vec::new());
+            return Vec::new();
         }
 
-        // First pass: gather profitable (score, a, b) without extracting labels.
         let p = self.active_labels.len();
-        let mut scored: Vec<(f64, usize, usize)> =
+        let mut proxy_order: Vec<(f64, usize, usize)> =
             Vec::with_capacity(p.saturating_mul(p.saturating_sub(1)) / 2);
         for a in 0..p {
             for b in (a + 1)..p {
-                let score = self.solve_pair(a, b);
-                if score <= 1.0 + 1.0e-8 {
-                    continue;
-                }
-                scored.push((score, a, b));
+                proxy_order.push((self.quick_pair_proxy(a, b), a, b));
             }
         }
-        let raw_candidates = scored.len();
-        if raw_candidates == 0 {
-            return (0, Vec::new());
+        let target = limit.saturating_add(stash_limit);
+        let cmp_desc = |lhs: &(f64, usize, usize), rhs: &(f64, usize, usize)| {
+            rhs.0
+                .total_cmp(&lhs.0)
+                .then_with(|| lhs.1.cmp(&rhs.1))
+                .then_with(|| lhs.2.cmp(&rhs.2))
+        };
+        // Partition so the top-K pairs by proxy sit in [0..keep); sort only that head.
+        // Exactness: if the top-K scan finds ANY profitable column we return them and
+        // CG continues (pricing will be called again). If it finds NONE, we must check
+        // the rest before declaring pricing complete — otherwise we could falsely
+        // terminate CG at a non-optimal LP.
+        let keep = target.saturating_mul(16).max(1024).min(proxy_order.len());
+        if keep < proxy_order.len() {
+            proxy_order.select_nth_unstable_by(keep, cmp_desc);
+            let (head, tail) = proxy_order.split_at_mut(keep);
+            head.sort_unstable_by(cmp_desc);
+            // Tail kept unordered — only scanned if head finds nothing.
+            let _ = tail;
+        } else {
+            proxy_order.sort_unstable_by(cmp_desc);
         }
-        // Highest-score pairs first so label extraction focuses on the best columns.
-        scored.sort_unstable_by(|l, r| r.0.total_cmp(&l.0));
 
-        // Second pass: extract labels in score order; stop early once we have `limit`
-        // filter-accepted unique columns. This avoids materializing labels for the
-        // bulk of profitable pairs that would be truncated away.
         let mut dedup: FxHashMap<Vec<u32>, f64> = FxHashMap::default();
-        for &(score, a, b) in scored.iter() {
-            if dedup.len() >= limit {
+        let mut scanned_all = keep >= proxy_order.len();
+        for &(_, a, b) in proxy_order.iter().take(keep) {
+            if dedup.len() >= target {
                 break;
+            }
+            let score = self.solve_pair(a, b);
+            if score <= 1.0 + 1.0e-8 {
+                continue;
             }
             let labels = self.pair_labels(a, b);
             if labels.len() < 2 {
@@ -925,6 +999,31 @@ impl<'a> PairDpPricer<'a> {
                 .and_modify(|best| *best = best.max(score))
                 .or_insert(score);
         }
+        if dedup.is_empty() && !scanned_all {
+            // Correctness fallback: check remaining pairs to prove none are profitable.
+            for &(_, a, b) in proxy_order.iter().skip(keep) {
+                let score = self.solve_pair(a, b);
+                if score <= 1.0 + 1.0e-8 {
+                    continue;
+                }
+                let labels = self.pair_labels(a, b);
+                if labels.len() < 2 {
+                    continue;
+                }
+                if !accept(&labels) {
+                    continue;
+                }
+                dedup
+                    .entry(labels)
+                    .and_modify(|best| *best = best.max(score))
+                    .or_insert(score);
+                if dedup.len() >= target {
+                    break;
+                }
+            }
+            scanned_all = true;
+        }
+        let _ = scanned_all;
 
         let mut out = dedup.into_iter().map(|(labels, score)| (score, labels)).collect::<Vec<_>>();
         out.sort_unstable_by(|lhs, rhs| {
@@ -933,15 +1032,19 @@ impl<'a> PairDpPricer<'a> {
                 .then_with(|| rhs.1.len().cmp(&lhs.1.len()))
                 .then_with(|| lhs.1.cmp(&rhs.1))
         });
-        if out.len() > limit {
-            out.truncate(limit);
+        if out.len() > target {
+            out.truncate(target);
         }
-        (raw_candidates, out)
+        out
     }
 
-    fn collect_fast_columns<F>(
+    fn collect_proxy_columns<F>(
         &mut self,
         limit: usize,
+        stash_limit: usize,
+        anchor_budget: usize,
+        partners_per_anchor: usize,
+        pair_trial_limit: usize,
         mut accept: F,
     ) -> Vec<(f64, Vec<u32>)>
     where
@@ -958,17 +1061,16 @@ impl<'a> PairDpPricer<'a> {
                 .total_cmp(&self.alpha[self.active_labels[lhs] as usize])
                 .then_with(|| lhs.cmp(&rhs))
         });
-        let anchor_limit = FASTPRICER_ANCHOR_LABELS
+        let anchor_limit = anchor_budget
             .max(limit.saturating_mul(2))
             .min(anchor_labels.len());
         anchor_labels.truncate(anchor_limit);
 
         let mut scored_pairs = Vec::with_capacity(
-            anchor_limit.saturating_mul(FASTPRICER_PARTNERS_PER_ANCHOR),
+            anchor_limit.saturating_mul(partners_per_anchor),
         );
         for &a in &anchor_labels {
-            let mut best_partners: Vec<(f64, usize, usize)> =
-                Vec::with_capacity(FASTPRICER_PARTNERS_PER_ANCHOR);
+            let mut best_partners: Vec<(f64, usize, usize)> = Vec::with_capacity(partners_per_anchor);
             for b in 0..p {
                 if a == b {
                     continue;
@@ -976,7 +1078,7 @@ impl<'a> PairDpPricer<'a> {
                 let proxy = self.quick_pair_proxy(a, b);
                 if proxy > 1.0 - 1.0e-6 {
                     let pair = if a < b { (proxy, a, b) } else { (proxy, b, a) };
-                    if best_partners.len() < FASTPRICER_PARTNERS_PER_ANCHOR {
+                    if best_partners.len() < partners_per_anchor {
                         best_partners.push(pair);
                         best_partners.sort_unstable_by(|lhs, rhs| rhs.0.total_cmp(&lhs.0));
                     } else if pair.0 > best_partners.last().unwrap().0 {
@@ -998,9 +1100,10 @@ impl<'a> PairDpPricer<'a> {
                 .then_with(|| lhs.2.cmp(&rhs.2))
         });
 
+        let target = limit.saturating_add(stash_limit);
         let trial_limit = scored_pairs
             .len()
-            .min(FASTPRICER_PAIR_TRIALS.max(limit.saturating_mul(4)));
+            .min(pair_trial_limit.max(target.saturating_mul(4)));
         let mut dedup: FxHashMap<Vec<u32>, f64> = FxHashMap::default();
         for &(_, a, b) in scored_pairs.iter().take(trial_limit) {
             let score = self.solve_pair(a, b);
@@ -1015,7 +1118,7 @@ impl<'a> PairDpPricer<'a> {
                 .entry(labels)
                 .and_modify(|best| *best = best.max(score))
                 .or_insert(score);
-            if dedup.len() >= limit {
+            if dedup.len() >= target {
                 break;
             }
         }
@@ -1030,10 +1133,48 @@ impl<'a> PairDpPricer<'a> {
                 .then_with(|| rhs.1.len().cmp(&lhs.1.len()))
                 .then_with(|| lhs.1.cmp(&rhs.1))
         });
-        if out.len() > limit {
-            out.truncate(limit);
+        if out.len() > target {
+            out.truncate(target);
         }
         out
+    }
+
+    fn collect_fast_columns<F>(
+        &mut self,
+        limit: usize,
+        stash_limit: usize,
+        accept: F,
+    ) -> Vec<(f64, Vec<u32>)>
+    where
+        F: FnMut(&[u32]) -> bool,
+    {
+        self.collect_proxy_columns(
+            limit,
+            stash_limit,
+            FASTPRICER_ANCHOR_LABELS,
+            FASTPRICER_PARTNERS_PER_ANCHOR,
+            FASTPRICER_PAIR_TRIALS,
+            accept,
+        )
+    }
+
+    fn collect_wide_columns<F>(
+        &mut self,
+        limit: usize,
+        stash_limit: usize,
+        accept: F,
+    ) -> Vec<(f64, Vec<u32>)>
+    where
+        F: FnMut(&[u32]) -> bool,
+    {
+        self.collect_proxy_columns(
+            limit,
+            stash_limit,
+            WIDEPRICER_ANCHOR_LABELS,
+            WIDEPRICER_PARTNERS_PER_ANCHOR,
+            WIDEPRICER_PAIR_TRIALS,
+            accept,
+        )
     }
 
     fn pair_idx(&self, a: usize, b: usize) -> usize {
@@ -1080,42 +1221,53 @@ impl<'a> PairDpPricer<'a> {
         let mut best_score = self.alpha[label_a as usize] - self.singleton_chain_penalty(a, b);
         let mut best_choice = PairDpSideChoice::Singleton;
 
-        // Collect candidate labels via word-level AND across all trees' descendant bitsets
-        // intersected with the active mask, then clear a and b.
         let num_trees = self.trees.len();
-        let side_nodes: Vec<usize> = (0..num_trees)
-            .map(|ti| self.side_of(ti, a, b) as usize)
-            .collect();
-        let d0 = self.descendant_leaves[0][side_nodes[0]].as_slice();
-        let am = self.active_mask.as_slice();
-        let la_w = label_a as usize >> 6;
-        let la_m = 1usize << (label_a as usize & 63);
-        let lb_w = label_b as usize >> 6;
-        let lb_m = 1usize << (label_b as usize & 63);
-        let mut candidate_labels: Vec<usize> = Vec::new();
+        let pair_ix = a * self.active_labels.len() + b;
+
+        // `descendant_leaves` is `&'a [...]` (Copy), so this does not reborrow self.
+        let desc: &[Vec<FixedBitSet>] = self.descendant_leaves;
+        // SAFETY: `active_mask` is never mutated while solve_pair recurses — it's
+        // fixed for the lifetime of this pricer. Extending the lifetime here lets us
+        // iterate it while also calling `&mut self.solve_pair`.
+        let am: &[usize] = unsafe {
+            let s = self.active_mask.as_slice();
+            std::slice::from_raw_parts(s.as_ptr(), s.len())
+        };
+        // Cache per-tree side-node indices on stack (assumes num_trees <= 64).
+        let mut side_nodes = [0u32; 64];
+        debug_assert!(num_trees <= 64);
+        for ti in 0..num_trees {
+            side_nodes[ti] = self.side_child[ti][pair_ix];
+        }
+
+        let la = label_a as usize;
+        let lb = label_b as usize;
+        let la_w = la >> 6;
+        let la_m = 1usize << (la & 63);
+        let lb_w = lb >> 6;
+        let lb_m = 1usize << (lb & 63);
+        let d0 = desc[0][side_nodes[0] as usize].as_slice();
         for wi in 0..d0.len() {
             let mut w = d0[wi] & am[wi];
             for ti in 1..num_trees {
-                w &= self.descendant_leaves[ti][side_nodes[ti]].as_slice()[wi];
+                w &= desc[ti][side_nodes[ti] as usize].as_slice()[wi];
             }
             if wi == la_w { w &= !la_m; }
             if wi == lb_w { w &= !lb_m; }
             while w != 0 {
                 let bit = w.trailing_zeros() as usize;
                 w &= w - 1;
-                candidate_labels.push((wi << 6) + bit);
-            }
-        }
-        for c_label in candidate_labels {
-            let c = self.label_to_active_idx[c_label] as usize;
-            let child_score = self.solve_pair(a, c);
-            if child_score <= NEG_INF / 2.0 {
-                continue;
-            }
-            let cand = child_score - self.transition_chain_penalty(a, b, c);
-            if cand > best_score + 1.0e-12 {
-                best_score = cand;
-                best_choice = PairDpSideChoice::Split(c);
+                let c_label = (wi << 6) + bit;
+                let c = self.label_to_active_idx[c_label] as usize;
+                let child_score = self.solve_pair(a, c);
+                if child_score <= NEG_INF / 2.0 {
+                    continue;
+                }
+                let cand = child_score - self.transition_chain_penalty(a, b, c);
+                if cand > best_score + 1.0e-12 {
+                    best_score = cand;
+                    best_choice = PairDpSideChoice::Split(c);
+                }
             }
         }
 
@@ -1239,7 +1391,8 @@ fn price_best_new_pairdp_columns(
     t_new: &mut f64,
     t_solve: &mut f64,
     t_collect: &mut f64,
-) -> Vec<(f64, Vec<u32>)> {
+    allow_wide: bool,
+) -> PricingColumns {
     let t0 = Instant::now();
     let mut pricer = PairDpPricer::new(
         pricer_ws,
@@ -1251,20 +1404,177 @@ fn price_best_new_pairdp_columns(
     );
     *t_new += t0.elapsed().as_secs_f64();
     let t1 = Instant::now();
-    let fast = pricer.collect_fast_columns(FASTPRICER_BATCH_SIZE.min(PAIRDP_BATCH_SIZE), |labels| {
-        pricing_candidate_allowed(labels, seen, forbidden, must_link_pairs, cannot_link_pairs)
-    });
+    let fast = pricer.collect_fast_columns(
+        FASTPRICER_BATCH_SIZE.min(PAIRDP_BATCH_SIZE),
+        COLUMN_RESERVE_REFILL,
+        |labels| {
+            pricing_candidate_allowed(labels, seen, forbidden, must_link_pairs, cannot_link_pairs)
+        },
+    );
     *t_solve += t1.elapsed().as_secs_f64();
     if !fast.is_empty() {
-        return fast;
+        let mut reserve = fast;
+        let immediate = reserve
+            .drain(..reserve.len().min(FASTPRICER_BATCH_SIZE.min(PAIRDP_BATCH_SIZE)))
+            .collect();
+        return PricingColumns { immediate, reserve };
+    }
+
+    if allow_wide && pricer.active_labels.len() >= WIDEPRICER_MIN_ACTIVE_LABELS {
+        let t1b = Instant::now();
+        let wide = pricer.collect_wide_columns(
+            WIDEPRICER_BATCH_SIZE.min(PAIRDP_BATCH_SIZE),
+            COLUMN_RESERVE_REFILL,
+            |labels| {
+                pricing_candidate_allowed(labels, seen, forbidden, must_link_pairs, cannot_link_pairs)
+            },
+        );
+        *t_solve += t1b.elapsed().as_secs_f64();
+        if !wide.is_empty() {
+            let mut reserve = wide;
+            let immediate = reserve
+                .drain(..reserve.len().min(WIDEPRICER_BATCH_SIZE.min(PAIRDP_BATCH_SIZE)))
+                .collect();
+            return PricingColumns { immediate, reserve };
+        }
     }
 
     let t2 = Instant::now();
-    let (_raw, exact) = pricer.collect_profitable_columns(PAIRDP_BATCH_SIZE, |labels| {
-        pricing_candidate_allowed(labels, seen, forbidden, must_link_pairs, cannot_link_pairs)
-    });
+    let exact = pricer.collect_profitable_columns(
+        PAIRDP_BATCH_SIZE,
+        COLUMN_RESERVE_REFILL,
+        |labels| {
+            pricing_candidate_allowed(labels, seen, forbidden, must_link_pairs, cannot_link_pairs)
+        },
+    );
     *t_collect += t2.elapsed().as_secs_f64();
-    exact
+    let mut reserve = exact;
+    let immediate = reserve
+        .drain(..reserve.len().min(PAIRDP_BATCH_SIZE))
+        .collect();
+    PricingColumns { immediate, reserve }
+}
+
+fn column_pricing_score(col: &BpColumn, alpha: &[f64], beta: &[Vec<f64>]) -> f64 {
+    let leaf_gain: f64 = col.labels.iter().map(|&label| alpha[label as usize]).sum();
+    let node_penalty: f64 = col
+        .covered_internal_nodes
+        .iter()
+        .enumerate()
+        .map(|(ti, nodes)| nodes.iter().map(|&node| beta[ti][node]).sum::<f64>())
+        .sum();
+    leaf_gain - node_penalty
+}
+
+fn stash_reserved_columns(
+    state: &mut BpState,
+    reserve: Vec<(f64, Vec<u32>)>,
+    trees: &[Tree],
+    column_builder: &mut ColumnBuildScratch,
+) {
+    if COLUMN_RESERVE_CAP == 0 || reserve.is_empty() {
+        return;
+    }
+    for (score_hint, labels) in reserve {
+        if state.seen.contains(&labels) || state.reserve_seen.contains(&labels) {
+            continue;
+        }
+        let col = column_builder.build_column(labels.clone(), trees);
+        state.reserve_seen.insert(labels);
+        state.reserve_columns.push(ReservedColumn {
+            score_hint,
+            column: col,
+        });
+    }
+    if state.reserve_columns.len() > COLUMN_RESERVE_CAP {
+        state.reserve_columns.sort_unstable_by(|lhs, rhs| {
+            rhs.score_hint
+                .total_cmp(&lhs.score_hint)
+                .then_with(|| rhs.column.labels.len().cmp(&lhs.column.labels.len()))
+                .then_with(|| lhs.column.labels.cmp(&rhs.column.labels))
+        });
+        while state.reserve_columns.len() > COLUMN_RESERVE_CAP {
+            if let Some(removed) = state.reserve_columns.pop() {
+                state.reserve_seen.remove(&removed.column.labels);
+            }
+        }
+    }
+}
+
+fn collect_reserved_columns(
+    state: &mut BpState,
+    alpha: &[f64],
+    beta: &[Vec<f64>],
+    blocked_leaves: &[bool],
+    forbidden: &ForbiddenColumns,
+    must_link_pairs: &[LeafPair],
+    cannot_link_pairs: &[LeafPair],
+    limit: usize,
+) -> Vec<(f64, BpColumn)> {
+    if limit == 0 || state.reserve_columns.is_empty() {
+        return Vec::new();
+    }
+
+    let mut stale = Vec::new();
+    let mut scored = Vec::new();
+    for (ri, entry) in state.reserve_columns.iter().enumerate() {
+        let labels = &entry.column.labels;
+        if state.seen.contains(labels) {
+            stale.push(ri);
+            continue;
+        }
+        if labels.iter().any(|&label| blocked_leaves[label as usize]) {
+            continue;
+        }
+        if forbidden.contains(&state.seen, labels)
+            || !labels_satisfy_pair_constraints(labels, must_link_pairs, cannot_link_pairs)
+        {
+            continue;
+        }
+        let score = column_pricing_score(&entry.column, alpha, beta);
+        if score > 1.0 + 1.0e-8 {
+            scored.push((score, ri));
+        }
+    }
+
+    if scored.is_empty() && stale.is_empty() {
+        return Vec::new();
+    }
+
+    scored.sort_unstable_by(|lhs, rhs| {
+        rhs.0
+            .total_cmp(&lhs.0)
+            .then_with(|| lhs.1.cmp(&rhs.1))
+    });
+    if scored.len() > limit {
+        scored.truncate(limit);
+    }
+
+    let mut selected_scores: FxHashMap<usize, f64> = FxHashMap::default();
+    for (score, ri) in scored {
+        selected_scores.insert(ri, score);
+    }
+
+    let mut remove = stale;
+    remove.extend(selected_scores.keys().copied());
+    remove.sort_unstable();
+    remove.dedup();
+
+    let mut out = Vec::with_capacity(selected_scores.len());
+    for &ri in remove.iter().rev() {
+        let removed = state.reserve_columns.swap_remove(ri);
+        state.reserve_seen.remove(&removed.column.labels);
+        if let Some(score) = selected_scores.remove(&ri) {
+            out.push((score, removed.column));
+        }
+    }
+    out.sort_unstable_by(|lhs, rhs| {
+        rhs.0
+            .total_cmp(&lhs.0)
+            .then_with(|| rhs.1.labels.len().cmp(&lhs.1.labels.len()))
+            .then_with(|| lhs.1.labels.cmp(&rhs.1.labels))
+    });
+    out
 }
 
 struct RmpLpResult {
