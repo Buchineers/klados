@@ -100,6 +100,8 @@ const WIDEPRICER_ANCHOR_LABELS: usize = 160;
 const WIDEPRICER_PARTNERS_PER_ANCHOR: usize = 16;
 const WIDEPRICER_PAIR_TRIALS: usize = 2048;
 const WIDEPRICER_MIN_ACTIVE_LABELS: usize = 330;
+const MEMO_MIN_LEAVES: u32 = 4;
+const MEMO_MAX_LEAVES: u32 = 96;
 const COLUMN_RESERVE_CAP: usize = 0;
 const COLUMN_RESERVE_REFILL: usize = 0;
 pub struct MafBranchPriceMultiSolver {
@@ -141,6 +143,20 @@ impl ExactSolver for MafBranchPriceMultiSolver {
     fn stats(&self) -> &SolverStats {
         &self.stats
     }
+}
+
+#[derive(Default)]
+struct ExactSubinstanceMemo {
+    solutions: FxHashMap<String, Vec<Vec<u32>>>,
+    hits: usize,
+    stores: usize,
+    skipped_ambiguous: usize,
+}
+
+struct CanonicalMemoView {
+    key: String,
+    label_to_canonical: Vec<u32>,
+    canonical_to_label: Vec<u32>,
 }
 
 struct BpColumn {
@@ -305,6 +321,25 @@ enum NodeResult {
 }
 
 fn solve_branch_price_multi(instance: &Instance, stats: &mut SolverStats) -> Option<Vec<Tree>> {
+    let mut memo = ExactSubinstanceMemo::default();
+    let result = solve_branch_price_multi_cached(instance, stats, &mut memo);
+    if memo.hits > 0 || memo.stores > 0 || memo.skipped_ambiguous > 0 {
+        eprintln!(
+            "[maf-bp-multi] memo: hits={} stores={} entries={} skipped_ambiguous={}",
+            memo.hits,
+            memo.stores,
+            memo.solutions.len(),
+            memo.skipped_ambiguous,
+        );
+    }
+    result
+}
+
+fn solve_branch_price_multi_cached(
+    instance: &Instance,
+    stats: &mut SolverStats,
+    memo: &mut ExactSubinstanceMemo,
+) -> Option<Vec<Tree>> {
     let t_total = Instant::now();
 
     let config = KernelizeConfig::default();
@@ -335,17 +370,50 @@ fn solve_branch_price_multi(instance: &Instance, stats: &mut SolverStats) -> Opt
         return Some(components);
     }
 
+    let memo_view = if reduced.num_trees() == 2
+        && (MEMO_MIN_LEAVES..=MEMO_MAX_LEAVES).contains(&reduced.num_leaves)
+    {
+        match canonicalize_two_tree_instance(reduced) {
+            Some(view) => {
+                if let Some(cached_partition) = memo.solutions.get(&view.key) {
+                    memo.hits += 1;
+                    let reduced_components =
+                        reconstruct_cached_components(cached_partition, &view, reduced);
+                    let components = kernelize::expand_solution(
+                        reduced_components,
+                        &kern,
+                        instance.reference_tree(),
+                        instance.num_leaves,
+                    );
+                    stats.upper_bound = Some(components.len());
+                    stats.lower_bound = components.len();
+                    return Some(components);
+                }
+                Some(view)
+            }
+            None => {
+                memo.skipped_ambiguous += 1;
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let n = reduced.num_leaves as usize;
     let trees = &reduced.trees;
     let param_reduction_32 = kern.param_reduction;
     let mut column_builder = ColumnBuildScratch::new(trees);
 
     let cluster_result = cluster_reduction::try_cluster_reduction(reduced, &mut |subinstance| {
-        solve_branch_price_multi(subinstance, &mut SolverStats::default())
+        solve_branch_price_multi_cached(subinstance, &mut SolverStats::default(), memo)
     })?;
     match cluster_result {
         ClusterReductionResult::NotApplicable => {}
         ClusterReductionResult::Solved(solution) => {
+            if let Some(view) = memo_view.as_ref() {
+                store_cached_solution(memo, view, &solution.components);
+            }
             let exact_k = solution.components.len() + param_reduction_32;
             stats.lower_bound = exact_k;
             stats.upper_bound = Some(exact_k);
@@ -502,6 +570,9 @@ fn solve_branch_price_multi(instance: &Instance, stats: &mut SolverStats) -> Opt
 
     let values = state.best_solution.as_ref()?;
     let reduced_components = reconstruct_components(&state.columns, values, reduced);
+    if let Some(view) = memo_view.as_ref() {
+        store_cached_solution(memo, view, &reduced_components);
+    }
     let components = kernelize::expand_solution(
         reduced_components,
         &kern,
@@ -531,6 +602,161 @@ fn solve_branch_price_multi(instance: &Instance, stats: &mut SolverStats) -> Opt
         state.cuts_added,
     );
     Some(components)
+}
+
+fn canonicalize_two_tree_instance(instance: &Instance) -> Option<CanonicalMemoView> {
+    debug_assert_eq!(instance.num_trees(), 2);
+    let t0 = &instance.trees[0];
+    let t1 = &instance.trees[1];
+    let codes0 = unlabeled_subtree_codes(t0);
+    let codes1 = unlabeled_subtree_codes(t1);
+    let mut entries = Vec::with_capacity(instance.num_leaves as usize);
+
+    for label in 1..=instance.num_leaves {
+        let sig0 = leaf_pair_signature(t0, label, &codes0);
+        let sig1 = leaf_pair_signature(t1, label, &codes1);
+        entries.push((format!("{}#{}", sig0, sig1), label));
+    }
+    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    if entries.windows(2).any(|w| w[0].0 == w[1].0) {
+        return None;
+    }
+
+    let n = instance.num_leaves as usize;
+    let mut label_to_canonical = vec![0u32; n + 1];
+    let mut canonical_to_label = vec![0u32; n + 1];
+    for (new_idx, (_, label)) in entries.iter().enumerate() {
+        let canon = (new_idx + 1) as u32;
+        label_to_canonical[*label as usize] = canon;
+        canonical_to_label[canon as usize] = *label;
+    }
+
+    let relabeled0 = t0.relabel(&label_to_canonical, instance.num_leaves);
+    let relabeled1 = t1.relabel(&label_to_canonical, instance.num_leaves);
+    let key = format!(
+        "{}||{}",
+        labeled_tree_signature(&relabeled0, relabeled0.root),
+        labeled_tree_signature(&relabeled1, relabeled1.root)
+    );
+
+    Some(CanonicalMemoView {
+        key,
+        label_to_canonical,
+        canonical_to_label,
+    })
+}
+
+fn unlabeled_subtree_codes(tree: &Tree) -> Vec<String> {
+    let mut codes = vec![String::new(); tree.num_nodes()];
+    for node in tree.post_order() {
+        codes[node as usize] = if tree.is_leaf(node) {
+            "L".to_string()
+        } else {
+            let (left, right) = tree.children_pair(node);
+            let (a, b) = if codes[left as usize] <= codes[right as usize] {
+                (&codes[left as usize], &codes[right as usize])
+            } else {
+                (&codes[right as usize], &codes[left as usize])
+            };
+            let mut sig = String::with_capacity(a.len() + b.len() + 3);
+            sig.push('(');
+            sig.push_str(a);
+            sig.push(',');
+            sig.push_str(b);
+            sig.push(')');
+            sig
+        };
+    }
+    codes
+}
+
+fn leaf_pair_signature(tree: &Tree, label: u32, subtree_codes: &[String]) -> String {
+    let mut cur = tree.node_by_label(label);
+    let mut parts: Vec<&str> = Vec::new();
+    while !tree.is_root(cur) {
+        let parent = tree.parent[cur as usize];
+        let sibling = if tree.left[parent as usize] == cur {
+            tree.right[parent as usize]
+        } else {
+            tree.left[parent as usize]
+        };
+        parts.push(subtree_codes[sibling as usize].as_str());
+        cur = parent;
+    }
+
+    let mut sig = String::new();
+    for part in parts.iter().rev() {
+        sig.push('|');
+        sig.push_str(part);
+    }
+    sig
+}
+
+fn labeled_tree_signature(tree: &Tree, node: u32) -> String {
+    if tree.is_leaf(node) {
+        return tree.label[node as usize].to_string();
+    }
+    let (left, right) = tree.children_pair(node);
+    let left_sig = labeled_tree_signature(tree, left);
+    let right_sig = labeled_tree_signature(tree, right);
+    let (a, b) = if left_sig <= right_sig {
+        (left_sig, right_sig)
+    } else {
+        (right_sig, left_sig)
+    };
+    format!("({},{})", a, b)
+}
+
+fn reconstruct_cached_components(
+    cached_partition: &[Vec<u32>],
+    view: &CanonicalMemoView,
+    instance: &Instance,
+) -> Vec<Tree> {
+    let actual_groups = cached_partition
+        .iter()
+        .map(|group| {
+            let mut labels = group
+                .iter()
+                .map(|&label| view.canonical_to_label[label as usize])
+                .collect::<Vec<_>>();
+            labels.sort_unstable();
+            labels
+        })
+        .collect::<Vec<_>>();
+    build_component_forest(&actual_groups, instance.reference_tree(), instance.num_leaves)
+}
+
+fn store_cached_solution(
+    memo: &mut ExactSubinstanceMemo,
+    view: &CanonicalMemoView,
+    components: &[Tree],
+) {
+    let mut canonical_groups = components
+        .iter()
+        .map(|component| {
+            let mut labels = component
+                .leaves()
+                .map(|label| view.label_to_canonical[label as usize])
+                .collect::<Vec<_>>();
+            labels.sort_unstable();
+            labels
+        })
+        .collect::<Vec<_>>();
+    canonical_groups.sort_unstable();
+    memo.solutions.entry(view.key.clone()).or_insert_with(|| {
+        memo.stores += 1;
+        canonical_groups
+    });
+}
+
+fn build_component_forest(groups: &[Vec<u32>], reference: &Tree, num_leaves: u32) -> Vec<Tree> {
+    groups
+        .iter()
+        .map(|labels| {
+            let leafset = make_leafset(labels, num_leaves);
+            Tree::component_from_leafset(&leafset, reference, num_leaves)
+        })
+        .collect()
 }
 
 fn solve_bp_node(
