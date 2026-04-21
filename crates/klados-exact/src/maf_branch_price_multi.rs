@@ -622,25 +622,67 @@ fn solve_branch_price_multi_cached(
     Some(components)
 }
 
+const CANON_WL_MAX_ROUNDS: usize = 6;
+
 fn canonicalize_two_tree_instance(instance: &Instance) -> Option<CanonicalMemoView> {
     debug_assert_eq!(instance.num_trees(), 2);
     let t0 = &instance.trees[0];
     let t1 = &instance.trees[1];
-    let codes0 = unlabeled_subtree_codes(t0);
-    let codes1 = unlabeled_subtree_codes(t1);
-    let mut entries = Vec::with_capacity(instance.num_leaves as usize);
+    let n = instance.num_leaves as usize;
 
-    for label in 1..=instance.num_leaves {
-        let sig0 = leaf_pair_signature(t0, label, &codes0);
-        let sig1 = leaf_pair_signature(t1, label, &codes1);
-        entries.push((format!("{}#{}", sig0, sig1), label));
+    // WL-refinement: iteratively sharpen per-leaf colors using the colored subtree
+    // codes from both trees. Two leaves converge to the same color iff they're
+    // indistinguishable under the joint (T0 structure, T1 structure, path context)
+    // after all refinement rounds. Most "ambiguous" leaf pairs under the pure
+    // structural signature are resolved by round 2 because of cross-tree context.
+    let mut leaf_color: Vec<u32> = vec![0; n + 1];
+    let mut prev_classes: usize = 1;
+
+    for _round in 0..CANON_WL_MAX_ROUNDS {
+        let codes0 = colored_subtree_codes_ids(t0, &leaf_color);
+        let codes1 = colored_subtree_codes_ids(t1, &leaf_color);
+
+        let mut entries: Vec<(Vec<u32>, Vec<u32>, u32)> = Vec::with_capacity(n);
+        for label in 1..=n as u32 {
+            let p0 = leaf_path_codes_ids(t0, label, &codes0);
+            let p1 = leaf_path_codes_ids(t1, label, &codes1);
+            entries.push((p0, p1, label));
+        }
+        entries.sort_unstable_by(|a, b| {
+            a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)).then_with(|| a.2.cmp(&b.2))
+        });
+
+        let mut new_color = vec![0u32; n + 1];
+        let mut cur_id: u32 = 0;
+        for i in 0..entries.len() {
+            if i > 0
+                && (entries[i].0 != entries[i - 1].0 || entries[i].1 != entries[i - 1].1)
+            {
+                cur_id += 1;
+            }
+            new_color[entries[i].2 as usize] = cur_id;
+        }
+        let classes = cur_id as usize + 1;
+
+        let stable = new_color == leaf_color;
+        leaf_color = new_color;
+        if classes == n || stable || classes == prev_classes {
+            break;
+        }
+        prev_classes = classes;
     }
+
+    // Order leaves by refined color (ties broken by original label for determinism).
+    let mut entries: Vec<(u32, u32)> = (1..=n as u32)
+        .map(|l| (leaf_color[l as usize], l))
+        .collect();
     entries.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
     if entries.windows(2).any(|w| w[0].0 == w[1].0) {
+        // Residual ambiguity — genuinely interchangeable leaves. Skip memoization
+        // to stay correct.
         return None;
     }
 
-    let n = instance.num_leaves as usize;
     let mut label_to_canonical = vec![0u32; n + 1];
     let mut canonical_to_label = vec![0u32; n + 1];
     for (new_idx, (_, label)) in entries.iter().enumerate() {
@@ -664,33 +706,37 @@ fn canonicalize_two_tree_instance(instance: &Instance) -> Option<CanonicalMemoVi
     })
 }
 
-fn unlabeled_subtree_codes(tree: &Tree) -> Vec<String> {
-    let mut codes = vec![String::new(); tree.num_nodes()];
+/// Per-round colored subtree codes. Leaves get their current `leaf_color` as ID
+/// (offset by a sentinel so they can't collide with internal-node IDs); internal
+/// nodes get a fresh ID per distinct (sorted) child-code pair.
+fn colored_subtree_codes_ids(tree: &Tree, leaf_color: &[u32]) -> Vec<u32> {
+    const INTERNAL_ID_OFFSET: u32 = 1_000_000_000;
+    let mut codes = vec![0u32; tree.num_nodes()];
+    let mut mapper: FxHashMap<(u32, u32), u32> = FxHashMap::default();
+    let mut next_internal: u32 = INTERNAL_ID_OFFSET;
     for node in tree.post_order() {
         codes[node as usize] = if tree.is_leaf(node) {
-            "L".to_string()
+            let lbl = tree.label[node as usize] as usize;
+            leaf_color[lbl]
         } else {
-            let (left, right) = tree.children_pair(node);
-            let (a, b) = if codes[left as usize] <= codes[right as usize] {
-                (&codes[left as usize], &codes[right as usize])
-            } else {
-                (&codes[right as usize], &codes[left as usize])
-            };
-            let mut sig = String::with_capacity(a.len() + b.len() + 3);
-            sig.push('(');
-            sig.push_str(a);
-            sig.push(',');
-            sig.push_str(b);
-            sig.push(')');
-            sig
+            let (l, r) = tree.children_pair(node);
+            let a = codes[l as usize];
+            let b = codes[r as usize];
+            let key = if a <= b { (a, b) } else { (b, a) };
+            *mapper.entry(key).or_insert_with(|| {
+                let id = next_internal;
+                next_internal += 1;
+                id
+            })
         };
     }
     codes
 }
 
-fn leaf_pair_signature(tree: &Tree, label: u32, subtree_codes: &[String]) -> String {
+/// Collect sibling subtree IDs along the path from leaf → root (leaf-first order).
+fn leaf_path_codes_ids(tree: &Tree, label: u32, subtree_codes: &[u32]) -> Vec<u32> {
     let mut cur = tree.node_by_label(label);
-    let mut parts: Vec<&str> = Vec::new();
+    let mut parts: Vec<u32> = Vec::new();
     while !tree.is_root(cur) {
         let parent = tree.parent[cur as usize];
         let sibling = if tree.left[parent as usize] == cur {
@@ -698,16 +744,10 @@ fn leaf_pair_signature(tree: &Tree, label: u32, subtree_codes: &[String]) -> Str
         } else {
             tree.left[parent as usize]
         };
-        parts.push(subtree_codes[sibling as usize].as_str());
+        parts.push(subtree_codes[sibling as usize]);
         cur = parent;
     }
-
-    let mut sig = String::new();
-    for part in parts.iter().rev() {
-        sig.push('|');
-        sig.push_str(part);
-    }
-    sig
+    parts
 }
 
 fn labeled_tree_signature(tree: &Tree, node: u32) -> String {
