@@ -85,6 +85,8 @@ fn compute_local_bounds(trees: &[Tree], num_leaves: u32) -> LocalBounds {
     LocalBounds { best_partition }
 }
 
+use klados_core::cluster_decomposition;
+
 use crate::cluster_reduction::{self, ClusterReductionResult};
 use crate::kernelize::{self, KernelizeConfig};
 use crate::ExactSolver;
@@ -101,9 +103,15 @@ const WIDEPRICER_PARTNERS_PER_ANCHOR: usize = 16;
 const WIDEPRICER_PAIR_TRIALS: usize = 2048;
 const WIDEPRICER_MIN_ACTIVE_LABELS: usize = 330;
 const MEMO_MIN_LEAVES: u32 = 4;
-const MEMO_MAX_LEAVES: u32 = 96;
+const MEMO_MAX_LEAVES: u32 = 512;
 const COLUMN_RESERVE_CAP: usize = 0;
 const COLUMN_RESERVE_REFILL: usize = 0;
+// The current Rust rSPR decomposition treats selected clusters as independent
+// closed subinstances. Whidden's original code carries boundary/rho state when
+// joining clusters; without that, this path returned 513 vs the known 495 on
+// heuristic instance 070bfd..., so keep it off until boundary states are ported.
+const RSPR_CLUSTER_DECOMP_EXPERIMENTAL: bool = false;
+const RSPR_CLUSTER_MIN_LEAVES: u32 = 128;
 
 fn adaptive_exact_batch_size(active_labels: usize, root_node: bool) -> usize {
     let mut batch = if active_labels >= 1200 {
@@ -423,6 +431,34 @@ fn solve_branch_price_multi_cached(
     let param_reduction_32 = kern.param_reduction;
     let mut column_builder = ColumnBuildScratch::new(trees);
 
+    if RSPR_CLUSTER_DECOMP_EXPERIMENTAL && reduced.num_leaves >= RSPR_CLUSTER_MIN_LEAVES {
+        if let Some(solution) = cluster_decomposition::try_rspr_cluster_decomposition(
+            reduced,
+            &mut |subinstance| {
+                solve_branch_price_multi_cached(subinstance, &mut SolverStats::default(), memo)
+            },
+        ) {
+            if let Some(view) = memo_view.as_ref() {
+                store_cached_solution(memo, view, &solution);
+            }
+            let exact_k = solution.len() + param_reduction_32;
+            stats.lower_bound = exact_k;
+            stats.upper_bound = Some(exact_k);
+            let components = kernelize::expand_solution(
+                solution,
+                &kern,
+                instance.reference_tree(),
+                instance.num_leaves,
+            );
+            eprintln!(
+                "[maf-bp-multi] optimal: {} components (rspr cluster decomp), {:.1}ms total",
+                components.len(),
+                t_total.elapsed().as_secs_f64() * 1000.0,
+            );
+            return Some(components);
+        }
+    }
+
     let cluster_result = cluster_reduction::try_cluster_reduction(reduced, &mut |subinstance| {
         solve_branch_price_multi_cached(subinstance, &mut SolverStats::default(), memo)
     })?;
@@ -673,15 +709,12 @@ fn canonicalize_two_tree_instance(instance: &Instance) -> Option<CanonicalMemoVi
     }
 
     // Order leaves by refined color (ties broken by original label for determinism).
+    // We still build the final cache key from the fully relabeled tree signatures,
+    // so residual WL ambiguity can only reduce cache sharing, not create false hits.
     let mut entries: Vec<(u32, u32)> = (1..=n as u32)
         .map(|l| (leaf_color[l as usize], l))
         .collect();
     entries.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-    if entries.windows(2).any(|w| w[0].0 == w[1].0) {
-        // Residual ambiguity — genuinely interchangeable leaves. Skip memoization
-        // to stay correct.
-        return None;
-    }
 
     let mut label_to_canonical = vec![0u32; n + 1];
     let mut canonical_to_label = vec![0u32; n + 1];

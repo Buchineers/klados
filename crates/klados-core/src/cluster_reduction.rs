@@ -147,23 +147,57 @@ where
 
     let subproblems = build_cluster_subproblems(instance, &cluster);
 
-    let tp1_solution = solve_subproblem(&subproblems.tp1.instance)?;
     let tp2_solution = solve_subproblem(&subproblems.tp2.instance)?;
-    let tp3_solution = solve_subproblem(&subproblems.tp3.instance)?;
+
+    // Adding the marker leaf cannot lower the optimum: deleting that leaf from
+    // any marker-instance forest yields a forest for the closed instance. If we
+    // can attach the marker to an existing optimal closed component and validate
+    // the resulting forest, equality is proven and the marker solve is skipped.
+    let (tp1_solution, tp1_equal) = match try_attach_marker_to_solution(
+        &tp2_solution,
+        &subproblems.tp2.labels,
+        &subproblems.tp1,
+        SubproblemLabel::MarkerDown,
+    ) {
+        Some(solution) => (Some(solution), true),
+        None => {
+            let solution = solve_subproblem(&subproblems.tp1.instance)?;
+            let equal = solution.len() == tp2_solution.len();
+            (Some(solution), equal)
+        }
+    };
+
     let tp4_solution = solve_subproblem(&subproblems.tp4.instance)?;
 
-    let merge_across_boundary =
-        tp1_solution.len() == tp2_solution.len() && tp3_solution.len() == tp4_solution.len();
+    let (tp3_solution, tp3_equal) = if tp1_equal {
+        match try_attach_marker_to_solution(
+            &tp4_solution,
+            &subproblems.tp4.labels,
+            &subproblems.tp3,
+            SubproblemLabel::MarkerUp,
+        ) {
+            Some(solution) => (Some(solution), true),
+            None => {
+                let solution = solve_subproblem(&subproblems.tp3.instance)?;
+                let equal = solution.len() == tp4_solution.len();
+                (Some(solution), equal)
+            }
+        }
+    } else {
+        (None, false)
+    };
+
+    let merge_across_boundary = tp1_equal && tp3_equal;
 
     let final_leafsets = if merge_across_boundary {
         let tp1 = decode_forest_with_marker(
-            &tp1_solution,
+            tp1_solution.as_ref()?,
             &subproblems.tp1.labels,
             SubproblemLabel::MarkerDown,
             instance.num_leaves,
         )?;
         let tp3 = decode_forest_with_marker(
-            &tp3_solution,
+            tp3_solution.as_ref()?,
             &subproblems.tp3.labels,
             SubproblemLabel::MarkerUp,
             instance.num_leaves,
@@ -202,6 +236,213 @@ where
         cluster_size,
         rest_size,
     }))
+}
+
+fn try_attach_marker_to_solution(
+    closed_solution: &[Tree],
+    closed_labels: &[SubproblemLabel],
+    marker_subproblem: &PackedSubproblem,
+    marker: SubproblemLabel,
+) -> Option<Vec<Tree>> {
+    if closed_solution.is_empty() {
+        return None;
+    }
+
+    let n = marker_subproblem.instance.num_leaves as usize;
+    let marker_label = marker_subproblem
+        .labels
+        .iter()
+        .position(|desc| *desc == marker)?;
+    let mut original_to_marker_label = FxHashMap::default();
+    for (label, desc) in marker_subproblem.labels.iter().enumerate().skip(1) {
+        if let SubproblemLabel::Original(original) = desc {
+            original_to_marker_label.insert(*original, label);
+        }
+    }
+
+    let mut base_leafsets = Vec::with_capacity(closed_solution.len());
+    for component in closed_solution {
+        let mut leafset = FixedBitSet::with_capacity(n + 1);
+        for label in component.leaves() {
+            let SubproblemLabel::Original(original) = closed_labels.get(label as usize)? else {
+                return None;
+            };
+            let mapped = *original_to_marker_label.get(original)?;
+            leafset.insert(mapped);
+        }
+        if leafset.count_ones(..) == 0 {
+            return None;
+        }
+        base_leafsets.push(leafset);
+    }
+
+    let base_nodes = component_nodes_for_instance(&base_leafsets, &marker_subproblem.instance)?;
+    let mut used_nodes: Vec<FixedBitSet> = marker_subproblem
+        .instance
+        .trees
+        .iter()
+        .map(|tree| FixedBitSet::with_capacity(tree.num_nodes()))
+        .collect();
+    for component in &base_nodes {
+        for (ti, nodes) in component.iter().enumerate() {
+            for node in nodes.ones() {
+                if used_nodes[ti].contains(node) {
+                    return None;
+                }
+                used_nodes[ti].insert(node);
+            }
+        }
+    }
+
+    for attach_idx in 0..base_leafsets.len() {
+        let mut augmented = base_leafsets[attach_idx].clone();
+        augmented.insert(marker_label);
+        if marker_attachment_valid(
+            &augmented,
+            &marker_subproblem.instance,
+            &base_nodes[attach_idx],
+            &used_nodes,
+        ) {
+            let mut candidate = base_leafsets.clone();
+            candidate[attach_idx] = augmented;
+            return Some(build_components_from_leafsets(
+                &candidate,
+                marker_subproblem.instance.reference_tree(),
+                marker_subproblem.instance.num_leaves,
+            ));
+        }
+    }
+
+    None
+}
+
+fn component_nodes_for_instance(
+    leafsets: &[FixedBitSet],
+    instance: &Instance,
+) -> Option<Vec<Vec<FixedBitSet>>> {
+    let mut out = Vec::with_capacity(leafsets.len());
+    for leafset in leafsets {
+        let Some(reference_signature) = induced_tree_signature(&instance.trees[0], leafset) else {
+            return None;
+        };
+
+        let mut component = Vec::with_capacity(instance.num_trees());
+        for tree in &instance.trees {
+            let Some(signature) = induced_tree_signature(tree, leafset) else {
+                return None;
+            };
+            if signature != reference_signature {
+                return None;
+            }
+
+            let Some(nodes) = covered_internal_nodes_for_leafset(tree, leafset) else {
+                return None;
+            };
+            let mut bitset = FixedBitSet::with_capacity(tree.num_nodes());
+            for node in nodes {
+                bitset.insert(node);
+            }
+            component.push(bitset);
+        }
+        out.push(component);
+    }
+
+    Some(out)
+}
+
+fn marker_attachment_valid(
+    augmented_leafset: &FixedBitSet,
+    instance: &Instance,
+    old_component_nodes: &[FixedBitSet],
+    used_nodes: &[FixedBitSet],
+) -> bool {
+    let Some(reference_signature) = induced_tree_signature(&instance.trees[0], augmented_leafset) else {
+        return false;
+    };
+
+    for (ti, tree) in instance.trees.iter().enumerate() {
+        let Some(signature) = induced_tree_signature(tree, augmented_leafset) else {
+            return false;
+        };
+        if signature != reference_signature {
+            return false;
+        }
+
+        let Some(nodes) = covered_internal_nodes_for_leafset(tree, augmented_leafset) else {
+            return false;
+        };
+        for node in nodes {
+            if used_nodes[ti].contains(node) && !old_component_nodes[ti].contains(node) {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+fn covered_internal_nodes_for_leafset(tree: &Tree, leafset: &FixedBitSet) -> Option<Vec<usize>> {
+    let mut labels = leafset.ones();
+    let first = labels.next()? as Label;
+    let mut lca_node = tree.node_by_label(first);
+    if lca_node == NONE {
+        return None;
+    }
+    let mut component_labels = vec![first];
+    for label in labels {
+        let label = label as Label;
+        let node = tree.node_by_label(label);
+        if node == NONE {
+            return None;
+        }
+        lca_node = tree.nearest_common_ancestor(lca_node, node);
+        component_labels.push(label);
+    }
+
+    let mut seen = FixedBitSet::with_capacity(tree.num_nodes());
+    let mut covered = Vec::new();
+    for label in component_labels {
+        let mut cur = tree.node_by_label(label);
+        loop {
+            let idx = cur as usize;
+            if seen.contains(idx) {
+                break;
+            }
+            seen.insert(idx);
+            if !tree.is_leaf(cur) {
+                covered.push(idx);
+            }
+            if cur == lca_node {
+                break;
+            }
+            cur = tree.parent[idx];
+        }
+    }
+    Some(covered)
+}
+
+fn induced_tree_signature(tree: &Tree, leafset: &FixedBitSet) -> Option<String> {
+    fn build(tree: &Tree, leafset: &FixedBitSet, node: NodeId) -> Option<String> {
+        if tree.is_leaf(node) {
+            let label = tree.label[node as usize] as usize;
+            return leafset.contains(label).then(|| label.to_string());
+        }
+
+        let (left, right) = tree.children(node)?;
+        match (build(tree, leafset, left), build(tree, leafset, right)) {
+            (None, None) => None,
+            (Some(child), None) | (None, Some(child)) => Some(child),
+            (Some(left_sig), Some(right_sig)) => {
+                if left_sig <= right_sig {
+                    Some(format!("({},{})", left_sig, right_sig))
+                } else {
+                    Some(format!("({},{})", right_sig, left_sig))
+                }
+            }
+        }
+    }
+
+    build(tree, leafset, tree.root)
 }
 
 fn tree_clusters_with_nodes(tree: &Tree, num_leaves: usize) -> Vec<(FixedBitSet, NodeId)> {
