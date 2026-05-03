@@ -40,6 +40,7 @@ pub struct TwinForest {
     pub orig_left: Vec<NodeId>,
     pub orig_right: Vec<NodeId>,
     pub orig_label: Vec<Label>,
+    pub orig_t2_parent: Vec<NodeId>,
 
     // --- Precomputed T2 depth (immutable, for Case 3 orientation) ---
     pub t2_depth: Vec<u16>,
@@ -84,6 +85,7 @@ impl TwinForest {
             orig_left: t1.left.clone(),
             orig_right: t1.right.clone(),
             orig_label: t1.label.clone(),
+            orig_t2_parent: t2.parent.clone(),
             t2_depth: vec![0; n2],
             protected: vec![false; n2],
             state_hash,
