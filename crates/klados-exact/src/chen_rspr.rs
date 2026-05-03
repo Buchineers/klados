@@ -331,7 +331,7 @@ impl BranchCut {
             BranchCut::One { locks_after, .. } | BranchCut::Many { locks_after, .. } => locks_after,
         };
         for &lock in locks {
-            if lock != NONE && tf.parent[T2][lock as usize] != NONE {
+            if lock != NONE {
                 undo::protect_edge(tf, lock, um);
             }
         }
@@ -590,9 +590,7 @@ fn apply_branch_cut(tf: &mut TwinForest, branch: &BranchCut, um: &mut undo::Undo
     match branch {
         BranchCut::One { node, .. } => cut_t2_node(tf, *node, um),
         BranchCut::Many { nodes, .. } => {
-            let mut ordered = nodes.clone();
-            ordered.sort_unstable_by_key(|&node| std::cmp::Reverse(depth_to_root(tf, T2, node)));
-            for node in ordered {
+            for &node in nodes {
                 cut_t2_node(tf, node, um);
             }
         }
@@ -1081,7 +1079,7 @@ struct ChenAppState {
 
 impl ChenAppState {
     fn from_twin(tf: &TwinForest) -> Self {
-        Self {
+        let mut state = Self {
             parent: tf.parent.clone(),
             orig_parent: [tf.orig_parent.clone(), tf.orig_t2_parent.clone()],
             left: tf.left.clone(),
@@ -1091,6 +1089,71 @@ impl ChenAppState {
             num_nodes: tf.num_nodes,
             t1_cut_list: Vec::new(),
             f2_cut_list: Vec::new(),
+        };
+        // The exact search's undo contract deliberately leaves stale topology
+        // on contracted-away nodes (for speed / hash stability).  Java's
+        // Vertex.contract() physically detaches those nodes.  The Chen App2
+        // bounder walks parent/child pointers extensively, so sanitize the
+        // cloned view to contain only nodes reachable from current components
+        // through parent-consistent child links.
+        state.sanitize_live_topology();
+        state
+    }
+
+    fn sanitize_live_topology(&mut self) {
+        for ti in [T1, T2] {
+            let mut live = vec![false; self.num_nodes[ti]];
+            let mut stack = Vec::new();
+            for &root in &self.components[ti] {
+                if root != NONE && (root as usize) < self.num_nodes[ti] {
+                    stack.push(root);
+                }
+            }
+            while let Some(node) = stack.pop() {
+                if node == NONE || (node as usize) >= self.num_nodes[ti] || live[node as usize] {
+                    continue;
+                }
+                live[node as usize] = true;
+                let lc = self.left[ti][node as usize];
+                if lc != NONE
+                    && (lc as usize) < self.num_nodes[ti]
+                    && self.parent[ti][lc as usize] == node
+                {
+                    stack.push(lc);
+                }
+                let rc = self.right[ti][node as usize];
+                if rc != NONE
+                    && (rc as usize) < self.num_nodes[ti]
+                    && self.parent[ti][rc as usize] == node
+                {
+                    stack.push(rc);
+                }
+            }
+
+            for node in 0..self.num_nodes[ti] {
+                if !live[node] {
+                    self.parent[ti][node] = NONE;
+                    self.left[ti][node] = NONE;
+                    self.right[ti][node] = NONE;
+                    continue;
+                }
+                let lc = self.left[ti][node];
+                if lc != NONE
+                    && ((lc as usize) >= self.num_nodes[ti]
+                        || !live[lc as usize]
+                        || self.parent[ti][lc as usize] != node as NodeId)
+                {
+                    self.left[ti][node] = NONE;
+                }
+                let rc = self.right[ti][node];
+                if rc != NONE
+                    && ((rc as usize) >= self.num_nodes[ti]
+                        || !live[rc as usize]
+                        || self.parent[ti][rc as usize] != node as NodeId)
+                {
+                    self.right[ti][node] = NONE;
+                }
+            }
         }
     }
 
@@ -3071,7 +3134,6 @@ fn d_f_cut_nodes(tf: &TwinForest, ti: usize, a: NodeId, b: NodeId) -> Option<Vec
         if s != NONE { out.push(s); }
         cur = tf.parent[ti][cur as usize];
     }
-    out.sort_unstable(); out.dedup();
     Some(out)
 }
 
