@@ -3049,71 +3049,30 @@ fn check_better_cuts(tf: &TwinForest, t1_parent: NodeId, t2_x1: NodeId, t2_x2: N
     lc != NONE && rc != NONE && tf.is_leaf(T1, lc) && tf.is_leaf(T1, rc)
 }
 
+/// Java `Instance.dangling(f2a, f2b)` lines 457-477.
 fn d_f_cut_nodes(tf: &TwinForest, ti: usize, a: NodeId, b: NodeId) -> Option<Vec<NodeId>> {
-    if find_root(tf, ti, a) != find_root(tf, ti, b) {
-        return None;
-    }
-
+    if find_root(tf, ti, a) != find_root(tf, ti, b) { return None; }
     let lca = lca_current(tf, ti, a, b);
-    if lca == NONE {
-        return None;
+    if lca == NONE { return None; }
+    // Java 462-463: both direct children of LCA → empty
+    if tf.parent[ti][a as usize] == lca && tf.parent[ti][b as usize] == lca {
+        return Some(Vec::new());
     }
-
-    let mut on_path = vec![false; tf.num_nodes[ti]];
-    let mut cur = a;
-    loop {
-        on_path[cur as usize] = true;
-        if cur == lca {
-            break;
-        }
-        cur = tf.parent[ti][cur as usize];
-    }
-    cur = b;
-    loop {
-        on_path[cur as usize] = true;
-        if cur == lca {
-            break;
-        }
-        cur = tf.parent[ti][cur as usize];
-    }
-
     let mut out = Vec::new();
-    cur = a;
-    while cur != lca {
-        let p = tf.parent[ti][cur as usize];
-        collect_off_path_children(tf, ti, p, &on_path, &mut out);
-        cur = p;
+    let mut cur = a;
+    while tf.parent[ti][cur as usize] != lca {
+        let s = tf.sibling(ti, cur);
+        if s != NONE { out.push(s); }
+        cur = tf.parent[ti][cur as usize];
     }
     cur = b;
-    while cur != lca {
-        let p = tf.parent[ti][cur as usize];
-        collect_off_path_children(tf, ti, p, &on_path, &mut out);
-        cur = p;
+    while tf.parent[ti][cur as usize] != lca {
+        let s = tf.sibling(ti, cur);
+        if s != NONE { out.push(s); }
+        cur = tf.parent[ti][cur as usize];
     }
-    collect_off_path_children(tf, ti, lca, &on_path, &mut out);
-    out.sort_unstable();
-    out.dedup();
+    out.sort_unstable(); out.dedup();
     Some(out)
-}
-
-fn collect_off_path_children(
-    tf: &TwinForest,
-    ti: usize,
-    node: NodeId,
-    on_path: &[bool],
-    out: &mut Vec<NodeId>,
-) {
-    if node == NONE || tf.is_leaf(ti, node) {
-        return;
-    }
-    let lc = tf.left[ti][node as usize];
-    if lc != NONE && !on_path[lc as usize] {
-        out.push(lc);
-    }
-    let rc = tf.right[ti][node as usize];
-    if rc != NONE && !on_path[rc as usize] {
-        out.push(rc);
-    }
 }
 
 fn contract_matching_pair(
