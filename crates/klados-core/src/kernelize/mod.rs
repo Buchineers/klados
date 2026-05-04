@@ -140,6 +140,16 @@ pub fn kernelize(instance: &Instance, config: &KernelizeConfig) -> KernelizeResu
             let find_start = std::time::Instant::now();
             let found = rule.find(&ctx);
             if let Some(action) = found {
+                // Safety net: refuse to remove a protected label even if a rule
+                // returns one (defense-in-depth).
+                let removed_label = match &action {
+                    ReductionAction::Collapse { remove, .. } => *remove,
+                    ReductionAction::Delete { victim } => *victim,
+                };
+                if ctx.is_protected(removed_label) {
+                    continue 'outer; // skip this action, try next rule
+                }
+
                 *rule_counts.entry(rule.name()).or_default() += 1;
 
                 let original_labels = match &action {

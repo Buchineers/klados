@@ -151,3 +151,119 @@ fn only_chain32_disabled() {
     assert_eq!(result.stats.reduced_leaves, 6);
     assert_eq!(result.param_reduction, 0);
 }
+
+// ═══════════════════════════════════════════════════════════════
+// Protected-label tests
+// ═══════════════════════════════════════════════════════════════
+
+fn make_ctx_protected<'a>(
+    inst: &'a Instance,
+    rev: &'a [u32],
+    protected: &'a [u32],
+) -> RuleContext<'a> {
+    RuleContext {
+        instance: inst,
+        protected_labels: protected,
+        composite_rev: rev,
+        victim_strategy: VictimStrategy::First,
+    }
+}
+
+#[test]
+fn cherry_respects_protected_remove() {
+    // (((1,2),(3,4)) both trees — {1,2} and {3,4} are cherries.
+    // Protect 2: the rule should swap and collapse {2,1} instead of {1,2},
+    // i.e. keep=1, remove=2 becomes keep=2, remove=1.
+    let inst = instance_from_newick(&["((1,2),(3,4))", "((1,2),(3,4))"]);
+    let rev: Vec<u32> = (0..=inst.num_leaves).collect();
+    let protected = [2];
+    let ctx = make_ctx_protected(&inst, &rev, &protected);
+    let rule = CherryRule;
+    let action = rule.find(&ctx);
+    assert!(matches!(
+        action,
+        Some(ReductionAction::Collapse { keep: 2, remove: 1 })
+    ));
+}
+
+#[test]
+fn cherry_refuses_both_protected() {
+    // Same cherries, but protect both {1, 2}. The swap won't help;
+    // neither can be safely removed. Rule must return None.
+    let inst = instance_from_newick(&["((1,2),(3,4))", "((1,2),(3,4))"]);
+    let rev: Vec<u32> = (0..=inst.num_leaves).collect();
+    let protected = [1, 2];
+    let ctx = make_ctx_protected(&inst, &rev, &protected);
+    let rule = CherryRule;
+    assert!(rule.find(&ctx).is_none());
+}
+
+#[test]
+fn chain32_refuses_protected_victim() {
+    // tiny01 has a 3-2 chain that deletes a victim.
+    // Protect the victim — the rule should skip.
+    let inst = instance_from_newick(&["(((5,6),(3,4)),(1,2))", "(((((4,2),1),5),3),6)"]);
+    let rev: Vec<u32> = (0..=inst.num_leaves).collect();
+
+    // First, find which label is the victim without protection.
+    let ctx = make_ctx(&inst, &rev);
+    let rule = Chain32Rule {
+        allow_multi: false,
+        max_partners: usize::MAX,
+    };
+    let action = rule.find(&ctx);
+    assert!(matches!(action, Some(ReductionAction::Delete { .. })));
+    let victim = match action.unwrap() {
+        ReductionAction::Delete { victim } => victim,
+        _ => panic!("expected Delete"),
+    };
+
+    // Now protect that victim — rule should refuse.
+    let protected = [victim];
+    let ctx_prot = make_ctx_protected(&inst, &rev, &protected);
+    assert!(rule.find(&ctx_prot).is_none());
+}
+
+#[test]
+fn pipeline_preserves_protected_labels() {
+    // tiny01 kernelizes from 6 to 4 leaves with Cherry + Chain32.
+    // Protect one of the labels that would be collapsed/deleted.
+    // The pipeline should leave it alone and produce a larger kernel.
+    let inst = instance_from_newick(&["(((5,6),(3,4)),(1,2))", "(((((4,2),1),5),3),6)"]);
+    let config = KernelizeConfig {
+        protected_labels: vec![1, 2, 3, 4, 5, 6], // protect ALL leaves
+        ..KernelizeConfig::default()
+    };
+    let result = kernelize(&inst, &config);
+    // With all labels protected, no reduction should fire.
+    assert_eq!(result.stats.reduced_leaves, 6);
+    assert_eq!(result.stats.total_removed(), 0);
+
+    // Now protect just the cherry-victim label and verify the cherry swaps
+    // keep/remove (keeping the protected label) and still fires.
+    // The default tiny01 run: cherry collapses {1,2} with keep=1, remove=2.
+    // With label 2 protected, the rule swaps to keep=2, remove=1 → cherry still fires.
+    // Then chain32 fires → final kernel is 4 leaves, but the protected label
+    // survives as the representative.
+    let config = KernelizeConfig {
+        protected_labels: vec![2], // protect label 2 (default cherry remove)
+        ..KernelizeConfig::default()
+    };
+    let result = kernelize(&inst, &config);
+    // Cherry fires with roles swapped (keep=2, remove=1): 6 → 5 leaves.
+    // Chain32 fires: 5 → 4 leaves. Protected label 2 survives.
+    assert_eq!(result.stats.reduced_leaves, 4);
+    assert_eq!(result.stats.subtree_removed(), 1); // cherry still fired
+    assert_eq!(result.stats.chain32_removed(), 1); // chain32 still fired
+
+    // Verify that the protected label 2 survives as a representative in the
+    // reverse map (meaning it wasn't removed from the instance).
+    let prot_label_present = result
+        .reverse_map
+        .iter()
+        .any(|&orig| orig == 2);
+    assert!(
+        prot_label_present,
+        "protected label 2 should appear in the reverse map"
+    );
+}

@@ -11,6 +11,11 @@ pub struct Instance {
     pub num_leaves: u32,
     /// Instance name (from STRIDE metadata)
     pub name: Option<String>,
+    /// Labels that must survive kernelization unchanged.
+    /// Each entry names a label in THIS instance's label space 1..=num_leaves.
+    /// The kernelization pipeline merges these with any caller-supplied
+    /// protected_labels when constructing KernelizeConfig.
+    pub protected_labels: Vec<u32>,
 }
 
 impl Instance {
@@ -21,6 +26,7 @@ impl Instance {
             trees,
             num_leaves,
             name: None,
+            protected_labels: Vec::new(),
         }
     }
 

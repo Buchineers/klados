@@ -3,6 +3,8 @@
 //! Provides arena-based tree representation for cache-efficient traversal
 //! during the FPT search.
 
+pub mod af_validator;
+pub mod brute_maf;
 pub mod cluster_decomposition;
 pub mod cluster_reduction;
 pub mod instance;

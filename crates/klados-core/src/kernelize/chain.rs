@@ -32,11 +32,14 @@ impl ReductionRule for ChainRule {
         };
 
         let (victim, chain_neighbor) = found?;
+
+        // Refuse to absorb a protected label.
+        if ctx.is_protected(victim) {
+            return None;
+        }
+
         // Chain reduction is a collapse: victim is absorbed by chain_neighbor.
         // We return Collapse with keep=chain_neighbor, remove=victim.
-        // BUT the pipeline uses restrict_instance_simple (delete) not reduce_instance (collapse).
-        // To maintain identical behavior, we use a Collapse action where the pipeline
-        // records the collapse in original space and then restricts (deletes) the victim.
         Some(ReductionAction::Collapse {
             keep: chain_neighbor,
             remove: victim,
