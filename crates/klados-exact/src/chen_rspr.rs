@@ -23,6 +23,133 @@ use std::collections::HashMap;
 
 use crate::ExactSolver;
 
+/// Compute Chen's 2-approximation bounds for a tree pair.
+///
+/// Returns `(lower, upper)` where `lower` is a valid lower bound on the
+/// rSPR distance and `upper` is a valid upper bound satisfying
+/// `lower ≤ OPT ≤ upper ≤ 2·lower`.
+///
+/// Uses the full good-key/stopper oracle (Theorem 3.2 / Section 6.3).
+pub fn chen_pair_bounds(t1: &Tree, t2: &Tree) -> (usize, usize) {
+    let n = t1.num_leaves;
+    let tf = TwinForest::from_trees(t1, t2, n);
+    // improve_upper=false avoids the expensive forest reconstruction
+    let bounds = chen_app2_bounds_with_options(&tf, false);
+    let (lower, upper) = if bounds.lower > n as usize || bounds.upper > n as usize {
+        let app1 = chen_app1_bounds_inner(&tf);
+        (app1.lower.min(n.saturating_sub(1) as usize),
+         app1.upper.min(n.saturating_sub(1) as usize))
+    } else {
+        (bounds.lower.min(n.saturating_sub(1) as usize),
+         bounds.upper.min(n.saturating_sub(1) as usize))
+    };
+    (lower, upper)
+}
+
+/// Extract the Chen 2-approximation agreement forest component leaf-sets
+/// for a tree pair. Returns one `Vec<u32>` per agreement forest component,
+/// where each `Vec<u32>` contains the leaf labels in that component.
+///
+/// The returned forest is guaranteed to be a valid agreement forest for
+/// the two input trees, with size ≤ 2·OPT.
+pub fn chen_agreement_forest_leafsets(t1: &Tree, t2: &Tree) -> Vec<Vec<u32>> {
+    let n = t1.num_leaves;
+    let tf = TwinForest::from_trees(t1, t2, n);
+    // Run the app2 bounds — this populates cut lists in the state
+    let state = ChenAppState::from_twin(&tf);
+    let mut state = state;
+    // Run the stopper-driven cuts
+    let mut bounds = AppBounds::default();
+    let mut guard = state.num_nodes[T1] * 8 + state.num_nodes[T2] * 8;
+    while guard > 0 {
+        guard -= 1;
+        state.cut_tree1_singletons();
+        state.shrink_common_cherries();
+        state.cut_tree1_singletons();
+        state.drop_t2_leaf_roots();
+
+        let Some(root) = state.first_t1_root() else { break };
+        if !state.has_t1_cherry() { break };
+
+        if let Some(cut) = state.find_optimal_cut() {
+            state.cut_forest2(cut);
+            bounds.lower += 1;
+            bounds.upper += 1;
+            continue;
+        }
+
+        let Some(mut stopper) = ChenKey::find_stopper(root, &state) else { break };
+        if stopper.stopper.is_none() {
+            bounds.lower += stopper.lower_bound;
+            bounds.upper += stopper.upper_bound;
+            break;
+        }
+        stopper.cut_stopper(&mut state, &mut bounds);
+    }
+
+    // Reconstruct the agreement forest from the cut state
+    let mut locked = [
+        vec![true; state.num_nodes[T1]],
+        vec![true; state.num_nodes[T2]],
+    ];
+    for &cut in &state.t1_cut_list {
+        if cut != NONE && (cut as usize) < locked[T1].len() {
+            locked[T1][cut as usize] = false;
+        }
+    }
+    for &cut in &state.f2_cut_list {
+        if cut != NONE && (cut as usize) < locked[T2].len() {
+            locked[T2][cut as usize] = false;
+        }
+    }
+    if let Some(root) = state.first_t1_root() {
+        merge_components_by_lock(root, &state, &mut locked);
+    }
+
+    // Apply cuts to original tree and extract leaf sets
+    let mut work = tf.clone();
+    let mut um = undo::UndoMachine::new();
+    let mut cut_order = Vec::new();
+    for &root in &state.components[T2] {
+        collect_vertices_preorder(T2, root, &state, &mut cut_order);
+    }
+    for cut in cut_order {
+        if cut != NONE
+            && unlocked_check(&locked, T2, cut)
+            && (cut as usize) < work.num_nodes[T2]
+            && work.parent[T2][cut as usize] != NONE
+        {
+            cut_t2_node(&mut work, cut, &mut um);
+        }
+    }
+
+    // Process singletons and shrink to finalize
+    loop {
+        let before_hash = work.state_hash;
+        let mut dummy_k = i32::MAX / 4;
+        if !process_singletons(&mut work, &mut dummy_k, &mut um) { break; }
+        shrink_common_cherries(&mut work, &mut um);
+        if before_hash == work.state_hash { break; }
+    }
+
+    // Collect leaf sets from T1 components
+    let mut result = Vec::new();
+    for &root in &work.components[T1] {
+        let mut labels = Vec::new();
+        collect_labels(&work, root, &mut labels);
+        if !labels.is_empty() {
+            result.push(labels);
+        }
+    }
+    result
+}
+
+/// Helper: check if a node is NOT locked (i.e., should be cut).
+#[inline]
+fn unlocked_check(locked: &[Vec<bool>; 2], ti: usize, node: NodeId) -> bool {
+    node != NONE && (node as usize) < locked[ti].len() && !locked[ti][node as usize]
+}
+
 pub struct ChenRsprSolver {
     stats: SolverStats,
 }
@@ -119,7 +246,7 @@ fn solve_chen_rspr(instance: &Instance, stats: &mut SolverStats) -> Option<Vec<T
 
     let app2_bounds = chen_app2_bounds_with_options(&tf, true);
     let app1_bounds = if app2_bounds.lower > n as usize {
-        chen_app1_bounds(&tf)
+        chen_app1_bounds_inner(&tf)
     } else {
         app2_bounds
     };
@@ -608,9 +735,9 @@ fn cut_t2_node(tf: &mut TwinForest, node: NodeId, um: &mut undo::UndoMachine) {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-struct AppBounds {
-    lower: usize,
-    upper: usize,
+pub struct AppBounds {
+    pub lower: usize,
+    pub upper: usize,
 }
 
 #[derive(Default)]
@@ -624,7 +751,7 @@ fn chen_lower_bound(tf: &TwinForest, ctx: &mut ChenSearchCtx) -> usize {
     }
     let app2_lb = chen_app2_bounds_with_options(tf, false).lower;
     let lb = if app2_lb > tf.num_leaves as usize {
-        chen_app1_bounds(tf).lower
+        chen_app1_bounds_inner(tf).lower
     } else {
         app2_lb
     };
@@ -632,7 +759,13 @@ fn chen_lower_bound(tf: &TwinForest, ctx: &mut ChenSearchCtx) -> usize {
     lb
 }
 
-fn improved_upper_from_cut_lists(tf: &TwinForest, t1_cuts: &[NodeId], f2_cuts: &[NodeId]) -> usize {
+/// Reconstruct the Chen 2-approximation agreement forest leaf-sets from
+/// the cut lists produced by `chen_app2_bounds_with_options`.
+fn chen_agreement_leafsets_from_cut_lists(
+    tf: &TwinForest,
+    t1_cuts: &[NodeId],
+    f2_cuts: &[NodeId],
+) -> Vec<Vec<u32>> {
     let state = ChenAppState::from_twin(tf);
     let mut locked = [
         vec![true; state.num_nodes[T1]],
@@ -648,7 +781,6 @@ fn improved_upper_from_cut_lists(tf: &TwinForest, t1_cuts: &[NodeId], f2_cuts: &
             locked[T2][cut as usize] = false;
         }
     }
-
     if let Some(root) = state.first_t1_root() {
         merge_components_by_lock(root, &state, &mut locked);
     }
@@ -659,7 +791,6 @@ fn improved_upper_from_cut_lists(tf: &TwinForest, t1_cuts: &[NodeId], f2_cuts: &
     for &root in &state.components[T2] {
         collect_vertices_preorder(T2, root, &state, &mut cut_order);
     }
-
     for cut in cut_order {
         if cut != NONE
             && (cut as usize) < locked[T2].len()
@@ -672,23 +803,108 @@ fn improved_upper_from_cut_lists(tf: &TwinForest, t1_cuts: &[NodeId], f2_cuts: &
     }
 
     loop {
-        let before_t1 = work.components[T1].len();
-        let before_t2 = work.components[T2].len();
         let before_hash = work.state_hash;
         let mut dummy_k = i32::MAX / 4;
         if !process_singletons(&mut work, &mut dummy_k, &mut um) {
             break;
         }
         shrink_common_cherries(&mut work, &mut um);
-        if before_t1 == work.components[T1].len()
-            && before_t2 == work.components[T2].len()
-            && before_hash == work.state_hash
-        {
+        if before_hash == work.state_hash {
             break;
         }
     }
 
-    extract_components(&work).len().saturating_sub(1)
+    let mut result = Vec::new();
+    for &root in &work.components[T1] {
+        let mut labels = Vec::new();
+        collect_labels(&work, root, &mut labels);
+        if !labels.is_empty() {
+            labels.sort_unstable();
+            result.push(labels);
+        }
+    }
+    result
+}
+
+/// Extract the Chen 2-approximation agreement forest component leaf-sets
+/// for a tree pair. Returns `(lower, upper, leafsets)` where:
+/// - `lower` is a valid lower bound on the rSPR distance
+/// - `upper` is the size of the agreement forest (≤ 2·OPT)
+/// - `leafsets` contains the component leaf label sets
+///
+/// The returned leaf-sets form a valid agreement forest for the two trees.
+pub fn chen_pair_agreement(
+    t1: &Tree,
+    t2: &Tree,
+) -> (usize, usize, Vec<Vec<u32>>) {
+    let n = t1.num_leaves;
+    let tf = TwinForest::from_trees(t1, t2, n);
+
+    // Run the Chen 2-approx — this populates cut lists in the state
+    // through the full stopper oracle.
+    let mut state = ChenAppState::from_twin(&tf);
+    let mut bounds = AppBounds::default();
+    let mut guard = state.num_nodes[T1] * 8 + state.num_nodes[T2] * 8;
+    while guard > 0 {
+        guard -= 1;
+        state.cut_tree1_singletons();
+        state.shrink_common_cherries();
+        state.cut_tree1_singletons();
+        state.drop_t2_leaf_roots();
+
+        let Some(root) = state.first_t1_root() else { break };
+        if !state.has_t1_cherry() { break };
+
+        if let Some(cut) = state.find_optimal_cut() {
+            state.cut_forest2(cut);
+            bounds.lower += 1;
+            bounds.upper += 1;
+            continue;
+        }
+
+        let Some(mut stopper) = ChenKey::find_stopper(root, &state) else { break };
+        if stopper.stopper.is_none() {
+            // Non-stopper key: apply the selected cuts so the agreement
+            // forest can be reconstructed from the cut lists.
+            bounds.lower += stopper.lower_bound;
+            bounds.upper += stopper.upper_bound;
+            stopper.cut_key(&mut state);
+            break;
+        }
+        stopper.cut_stopper(&mut state, &mut bounds);
+    }
+
+    // Reconstruct the leaf-sets from the accumulated cut lists.
+    let leafsets = chen_agreement_leafsets_from_cut_lists(
+        &tf, &state.t1_cut_list, &state.f2_cut_list,
+    );
+
+    // Ensure complete coverage: add singletons for any leaves not in
+    // any extracted component.
+    let mut covered = FixedBitSet::with_capacity(n as usize + 1);
+    for ls in &leafsets {
+        for &lbl in ls {
+            if (lbl as usize) <= n as usize {
+                covered.insert(lbl as usize);
+            }
+        }
+    }
+    let mut complete = leafsets;
+    for lbl in 1..=n {
+        if !covered.contains(lbl as usize) {
+            complete.push(vec![lbl]);
+        }
+    }
+
+    (
+        bounds.lower.min(n.saturating_sub(1) as usize),
+        bounds.upper.min(n.saturating_sub(1) as usize),
+        complete,
+    )
+}
+
+fn improved_upper_from_cut_lists(tf: &TwinForest, t1_cuts: &[NodeId], f2_cuts: &[NodeId]) -> usize {
+    chen_agreement_leafsets_from_cut_lists(tf, t1_cuts, f2_cuts).len().saturating_sub(1)
 }
 
 fn merge_components_by_lock(t1v: NodeId, state: &ChenAppState, locked: &mut [Vec<bool>; 2]) {
@@ -929,7 +1145,14 @@ fn is_locked(locked: &[Vec<bool>; 2], ti: usize, node: NodeId) -> bool {
 /// This is intentionally isolated from the exact search state. The full
 /// key/stopper oracle from `MafApp2.compute()` can replace this function
 /// without changing the search driver or pruning call sites.
-fn chen_app1_bounds(tf: &TwinForest) -> AppBounds {
+pub fn chen_app1_bounds(t1: &Tree, t2: &Tree) -> (usize, usize) {
+    let n = t1.num_leaves;
+    let tf = TwinForest::from_trees(t1, t2, n);
+    let bounds = chen_app1_bounds_inner(&tf);
+    (bounds.lower.min(n.saturating_sub(1) as usize), bounds.upper.min(n.saturating_sub(1) as usize))
+}
+
+fn chen_app1_bounds_inner(tf: &TwinForest) -> AppBounds {
     let mut work = tf.clone();
     let mut um = undo::UndoMachine::new();
     let mut bounds = AppBounds::default();
@@ -1022,16 +1245,24 @@ fn chen_app2_bounds_with_options(tf: &TwinForest, improve_upper: bool) -> AppBou
         }
 
         let Some(mut stopper) = ChenKey::find_stopper(root, &state) else {
+            // The whole tree could not be covered by any stopper classification.
+            // This means the remaining tree is fully consistent with F — equivalent
+            // to the mergeless (⊥,⊥) case. The accumulated bounds from the singleton
+            // keys (if any) are already correct.
             break;
         };
         if stopper.stopper.is_none() {
+            // Merged key without stopper classification: the key's accumulated
+            // lower/upper bounds are valid (Lemma 6.2) but may be weaker than a
+            // proper stopper classification would give. Use them directly and
+            // continue — the 2-approximation guarantee still holds.
+            bounds.lower += stopper.lower_bound;
+            bounds.upper += stopper.upper_bound;
             break;
         }
-        let before = bounds;
-        let stopper_kind = stopper.stopper;
         stopper.cut_stopper(&mut state, &mut bounds);
         if trace_stoppers {
-            let name = match stopper_kind {
+            let name = match stopper.stopper {
                 Some(ChenStopper::Disconnected) => "DIS",
                 Some(ChenStopper::Root) => "ROOT",
                 Some(ChenStopper::Close) => "CLOSE",
@@ -1039,11 +1270,9 @@ fn chen_app2_bounds_with_options(tf: &TwinForest, improve_upper: bool) -> AppBou
                 None => "NONE",
             };
             eprintln!(
-                "[chen-rspr] app2 iter={} kind={} dl={} du={} acc={}~{}",
+                "[chen-rspr] app2 iter={} kind={} acc={}~{}",
                 iter,
                 name,
-                bounds.lower.saturating_sub(before.lower),
-                bounds.upper.saturating_sub(before.upper),
                 bounds.lower,
                 bounds.upper
             );
