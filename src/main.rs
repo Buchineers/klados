@@ -151,6 +151,8 @@ enum Commands {
     CheckBounds {
         #[arg(value_name = "FILE")]
         list_file: std::path::PathBuf,
+        #[arg(long, value_name = "FILE")]
+        scores: Option<std::path::PathBuf>,
     },
     CompareBounds {
         #[arg(value_name = "FILE")]
@@ -226,12 +228,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Commands::ValidateBounds { scores_file, top_n }) => {
-            commands::validate::run(&scores_file, top_n)?;
+        Some(Commands::ValidateBounds { scores_file, top_n: _ }) => {
+            // Redirect to check-bounds which uses Chen + Whidden comparison
+            let list_file = std::path::PathBuf::from("instances/heuristic_pub.lst");
+            commands::check::run(&list_file, &scores_file)?;
             return Ok(());
         }
-        Some(Commands::CheckBounds { list_file }) => {
-            commands::check::run(&list_file)?;
+        Some(Commands::CheckBounds { list_file, scores }) => {
+            let scores_path = scores.unwrap_or_else(|| std::path::PathBuf::from("pace_summary.json"));
+            commands::check::run(&list_file, &scores_path)?;
             return Ok(());
         }
         Some(Commands::CompareBounds {

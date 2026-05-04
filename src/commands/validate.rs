@@ -1,4 +1,6 @@
-//! Validate bounds against best known scores.
+//! Validate Chen 2-approx and Whidden 3-approx bounds against known optimal
+//! scores from pace_summary.json. Computes per-method timing, tightness vs OPT,
+//! and reports any violations (LB > OPT or UB < OPT).
 
 use std::collections::HashMap;
 use std::fs;
@@ -6,422 +8,159 @@ use std::io::BufReader;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use klados_core::{Instance, Tree};
-use klados_exact::lower_bound::maf_bounds;
+use klados_core::Instance;
+use klados_exact::chen_rspr::chen_pair_bounds;
+use klados_exact::kernelize::{self, KernelizeConfig};
+use klados_exact::whidden::approx_3_for_instance;
 use pace26io::binary_tree::IndexedBinTreeBuilder;
 use pace26io::pace::simplified::Instance as PaceInstance;
 
-#[derive(serde::Deserialize)]
-struct ScoreEntry {
-    best_known: usize,
-    our_score: usize,
-    leaves: usize,
-    trees: usize,
-    #[serde(default)]
-    name: String,
-    path: String,
-}
-
-// STRIDE summary.json format (one JSON object per line)
-#[derive(serde::Deserialize, Debug)]
-#[allow(dead_code)]
-struct SummaryEntry {
-    #[serde(rename = "s_key")]
-    key: String,
-    #[serde(rename = "s_idigest")]
-    idigest: String,
-    #[serde(rename = "s_num_trees")]
-    num_trees: u32,
-    #[serde(rename = "s_num_leaves")]
-    num_leaves: u32,
-    #[serde(rename = "s_prev_best")]
-    prev_best: Option<u32>,
-    #[serde(rename = "s_score")]
-    score: u32,
-    #[serde(rename = "s_path")]
-    path: String,
-}
-
-// PACE public database format (JSON array)
-#[derive(serde::Deserialize, Debug)]
-#[allow(dead_code)]
-struct PaceSummaryEntry {
-    track: String,
-    inst_num: usize,
-    name: String,
-    trees: usize,
-    leaves: usize,
-    idigest: String,
-    best_known_score: usize,
-    #[serde(default)]
-    num_best: usize,
-    #[serde(default)]
-    num_valid: usize,
-    #[serde(default)]
-    avg_best_compute_time_secs: f64,
-}
-
-pub fn run(scores_file: &PathBuf, top_n: usize) -> Result<(), Box<dyn std::error::Error>> {
-    let content = fs::read_to_string(scores_file)?;
-
-    // Detect file format
-    let first_line = content.lines().next().unwrap_or("");
-    let is_summary_format = first_line.contains("s_key") || first_line.contains("s_prev_best");
-
-    // Try pace_summary.json format first (JSON array with "idigest", "best_known_score")
-    let is_pace_format = first_line.trim_start().starts_with('[');
-
-    let entries: HashMap<String, ScoreEntry> = if is_pace_format {
-        // Parse PACE public database format: JSON array of objects.
-        // Resolve instance files via stride-downloads/<h[0:2]>/<h[2:4]>/<h[4:]>
-        let pace_entries: Vec<PaceSummaryEntry> = serde_json::from_str(&content)?;
-        let mut entries = HashMap::new();
-        let base = scores_file.parent().unwrap_or(std::path::Path::new("."));
-        for pe in &pace_entries {
-            if pe.track != "exact" {
-                continue;
-            }
-            let h = pe.idigest.to_lowercase();
-            let path = base
-                .join("stride-downloads")
-                .join(&h[..2])
-                .join(&h[2..4])
-                .join(&h[4..]);
-            entries.insert(
-                h.clone(),
-                ScoreEntry {
-                    best_known: pe.best_known_score,
-                    our_score: pe.best_known_score,
-                    leaves: pe.leaves,
-                    trees: pe.trees,
-                    name: pe.name.clone(),
-                    path: path.to_string_lossy().into_owned(),
-                },
-            );
+pub fn run(
+    list_file: &PathBuf,
+    scores_file: &PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Load known scores
+    let scores_data: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(scores_file)?)?;
+    let scores_arr = scores_data.as_array().ok_or("pace_summary.json is not an array")?;
+    let mut known_scores: HashMap<String, usize> = HashMap::new();
+    for entry in scores_arr {
+        if let (Some(id), Some(score)) = (
+            entry["idigest"].as_str(),
+            entry["best_known_score"].as_u64(),
+        ) {
+            // Match on first 32 hex chars (full hash), case-insensitive
+            known_scores.insert(id.to_uppercase(), score as usize);
         }
-        entries
-    } else if is_summary_format {
-        // Parse summary.json format (one JSON object per line)
-        let mut entries = HashMap::new();
-        for line in content.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Ok(summary) = serde_json::from_str::<SummaryEntry>(line) {
-                let optimal = if let Some(db_best) = summary.prev_best {
-                    (summary.score as usize).min(db_best as usize)
-                } else {
-                    summary.score as usize
-                };
-                entries.insert(
-                    summary.idigest.clone(),
-                    ScoreEntry {
-                        best_known: optimal,
-                        our_score: optimal,
-                        leaves: summary.num_leaves as usize,
-                        trees: summary.num_trees as usize,
-                        name: String::new(),
-                        path: summary.path,
-                    },
-                );
-            }
-        }
-        entries
-    } else {
-        // Original best_known_scores.json format
-        serde_json::from_str(&content)?
-    };
-    let base_dir = scores_file.parent().unwrap_or(std::path::Path::new("."));
-
-    let mut sorted_entries: Vec<_> = entries.iter().collect();
-    sorted_entries.sort_by(|a, b| (a.1.leaves, a.1.trees).cmp(&(b.1.leaves, b.1.trees)));
-
-    if top_n > 0 {
-        sorted_entries.truncate(top_n);
     }
 
-    println!(
-        "Validating bounds against {} instances...\n",
-        sorted_entries.len()
-    );
-    println!(
-        "{:<40} {:>6} {:>6} {:>6} {:>6} {:>6} {:>5} {:>7} {:>8}",
-        "Instance", "Leaves", "Trees", "Best", "LB", "UB", "Gap", "Tight%", "Time(ms)"
-    );
-    println!("{}", "-".repeat(100));
+    let content = fs::read_to_string(list_file)?;
+    let lines: Vec<&str> = content.lines().collect();
+    let base_dir = list_file.parent().unwrap_or(std::path::Path::new("."));
 
-    let mut total_time_ms = 0.0f64;
-    let mut upper_violations = 0usize;
-    let mut lower_violations = 0usize;
-    let mut violation_list: Vec<(String, usize, usize, usize, usize, String)> = Vec::new();
-    let mut processed = 0usize;
-    let mut errors = 0usize;
+    let total = lines.iter().filter(|l| {
+        let l = l.trim();
+        !l.is_empty() && !l.starts_with('#')
+    }).count();
 
-    let mut gaps: Vec<usize> = Vec::new();
-    let mut tightness_pcts: Vec<f64> = Vec::new();
+    eprintln!("Validating bounds on {} instances\n", total);
 
-    for (digest, entry) in sorted_entries {
-        let entry_path = std::path::Path::new(&entry.path);
-        let full_path = if entry_path.is_absolute() {
-            entry_path.to_path_buf()
-        } else {
-            base_dir.join(entry_path)
-        };
+    // Header
+    println!("{:>16} {:>5} {:>5} | {:>5} {:>5} {:>5} | {:>5} {:>5} {:>5} | {:>5} {:>5}",
+        "Instance", "n", "kern", "w3LB", "w3UB", "t_ms", "chLB", "chUB", "t_ms", "opt", "ok?");
+    println!("{}", "-".repeat(90));
 
-        if !full_path.exists() {
-            println!(
-                "{:<40} {:>6} {:>6} {:>6} {:>6} {:>6} {:>5} {:>7} {:>8}",
-                &digest[..20],
-                entry.leaves,
-                entry.trees,
-                entry.best_known,
-                "N/A",
-                "FILE",
-                "-",
-                "-",
-                "-"
-            );
-            errors += 1;
-            continue;
-        }
+    let mut processed = 0;
+    let mut errors = 0;
+    let mut w3_total_ms = 0.0;
+    let mut ch_total_ms = 0.0;
+    let mut ch_violations = 0;
+    let mut w3_violations = 0;
+    let mut ch_ratios = Vec::new();
+    let mut w3_ratios = Vec::new();
 
-        let start = Instant::now();
+    let kern_config = KernelizeConfig::default();
 
-        let file_content = match fs::read_to_string(&full_path) {
-            Ok(c) => c,
-            Err(_) => {
-                println!(
-                    "{:<40} {:>6} {:>6} {:>6} {:>6} {:>6} {:>5} {:>7} {:>8}",
-                    &digest[..20],
-                    entry.leaves,
-                    entry.trees,
-                    entry.best_known,
-                    "N/A",
-                    "READ",
-                    "-",
-                    "-",
-                    "-"
-                );
-                errors += 1;
-                continue;
-            }
-        };
+    for line in &lines {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        let digest = line.strip_prefix("s:").unwrap_or(line);
+        let short = &digest[..16.min(digest.len())];
 
-        let reader = BufReader::new(file_content.as_bytes());
+        let rel = format!("stride-downloads/{}/{}/{}", &digest[..2], &digest[2..4], &digest[4..]);
+        let path = { let p = base_dir.join(&rel); if p.exists() { p } else { PathBuf::from(&rel) } };
+        if !path.exists() { errors += 1; continue; }
+        let fc = match fs::read_to_string(&path) { Ok(c) => c, Err(_) => { errors += 1; continue; } };
+        let reader = BufReader::new(fc.as_bytes());
         let mut builder = IndexedBinTreeBuilder::default();
-        let pace = match PaceInstance::try_read(reader, &mut builder) {
-            Ok(p) => p,
-            Err(_) => {
-                println!(
-                    "{:<40} {:>6} {:>6} {:>6} {:>6} {:>6} {:>5} {:>7} {:>8}",
-                    &digest[..20],
-                    entry.leaves,
-                    entry.trees,
-                    entry.best_known,
-                    "N/A",
-                    "PARSE",
-                    "-",
-                    "-",
-                    "-"
-                );
-                errors += 1;
-                continue;
-            }
-        };
+        let pace = match PaceInstance::try_read(reader, &mut builder) { Ok(p) => p, Err(_) => { errors += 1; continue; } };
 
         let num_leaves = pace.num_leaves as u32;
-        let trees: Vec<Tree> = pace
-            .trees
-            .iter()
-            .map(|t| Tree::from_cursor(t.top_down(), num_leaves))
+        let trees: Vec<_> = pace.trees.iter()
+            .map(|t| klados_core::Tree::from_cursor(t.top_down(), num_leaves))
             .collect();
         let instance = Instance::new(trees, num_leaves);
+        let m = instance.num_trees();
 
-        let bounds = maf_bounds(&instance.trees, instance.num_leaves);
-        let elapsed = start.elapsed().as_micros() as f64;
-        total_time_ms += elapsed / 1000.0;
+        // Kernelize
+        let kern = kernelize::kernelize(&instance, &kern_config);
+        let reduced = &kern.instance;
+        let n_kern = reduced.num_leaves;
+        let pr = kern.param_reduction;
 
-        let reference = entry.best_known.min(entry.our_score);
-        let lb = bounds.lower;
-        let ub = bounds.upper;
+        let opt_score = known_scores.get(&digest.to_uppercase()).copied();
 
-        let tightness_pct = if reference > 0 {
-            (lb as f64 / reference as f64) * 100.0
-        } else {
-            100.0
-        };
-        tightness_pcts.push(tightness_pct);
+        if m != 2 { continue; }
 
-        let gap;
-        if ub < reference {
-            upper_violations += 1;
-            gap = reference - ub;
-            violation_list.push((digest.clone(), lb, ub, reference, gap, "UPPER".to_string()));
-        } else if lb > reference {
-            lower_violations += 1;
-            gap = lb - reference;
-            violation_list.push((digest.clone(), lb, ub, reference, gap, "LOWER".to_string()));
-        } else {
-            gap = ub - reference;
-        }
+        // -- Whidden 3-approx --
+        let t0 = Instant::now();
+        let w3_cuts = approx_3_for_instance(&reduced.trees[0], &reduced.trees[1], reduced.num_leaves) as usize;
+        let w3_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let w3_lb = w3_cuts.div_ceil(3) + 1 + pr;     // ceil(cuts/3) + 1 = MAF LB
+        let w3_ub = w3_cuts + 1 + pr;                  // cuts + 1 = MAF UB
 
-        gaps.push(gap);
+        // -- Chen 2-approx --
+        let t0 = Instant::now();
+        let (cl, cu) = chen_pair_bounds(&reduced.trees[0], &reduced.trees[1]);
+        let ch_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let ch_lb = cl.saturating_add(1) + pr;
+        let ch_ub = cu.saturating_add(1) + pr;
+
+        w3_total_ms += w3_ms;
+        ch_total_ms += ch_ms;
+
+        // Validate
+        let ok_w3 = if let Some(opt) = opt_score {
+            let v = w3_lb <= opt && opt <= w3_ub;
+            if !v { w3_violations += 1; }
+            if opt > 0 { w3_ratios.push(w3_ub as f64 / opt as f64); }
+            v
+        } else { true }; // no known optimum to check
+
+        let ok_ch = if let Some(opt) = opt_score {
+            let v = ch_lb <= opt && opt <= ch_ub;
+            if !v { ch_violations += 1; }
+            if opt > 0 { ch_ratios.push(ch_ub as f64 / opt as f64); }
+            v
+        } else { true };
+
         processed += 1;
 
-        let name = if entry.name.is_empty() {
-            digest[..20].to_string()
-        } else {
-            format!(
-                "{} ({})",
-                &entry.name[..entry.name.len().min(15)],
-                &digest[..8]
-            )
+        let ok_str = match (opt_score, ok_w3, ok_ch) {
+            (None, _, _) => "?".to_string(),
+            (Some(_), true, true) => "✓".to_string(),
+            _ => format!("!{}{}", if !ok_w3 { "w" } else { "" }, if !ok_ch { "c" } else { "" }),
         };
 
-        println!(
-            "{:<40} {:>6} {:>6} {:>6} {:>6} {:>6} {:>5} {:>6.1}% {:>8.2}",
-            name,
-            entry.leaves,
-            entry.trees,
-            reference,
-            lb,
-            ub,
-            gap,
-            tightness_pct,
-            elapsed / 1000.0
+        println!("{:>16} {:>5} {:>5} | {:>5} {:>5} {:>5.0} | {:>5} {:>5} {:>5.0} | {:>5} {:>5}",
+            short, num_leaves, n_kern,
+            w3_lb, w3_ub, w3_ms,
+            ch_lb, ch_ub, ch_ms,
+            opt_score.unwrap_or(0), ok_str,
         );
     }
 
-    let total_violations = upper_violations + lower_violations;
+    println!("{}", "-".repeat(90));
 
-    println!("{}", "-".repeat(100));
-
-    if gaps.is_empty() {
-        println!("No instances processed.");
-        return Ok(());
-    }
-
-    gaps.sort_unstable();
-    tightness_pcts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-    let total_gap: usize = gaps.iter().sum();
-    let mean_gap = total_gap as f64 / processed as f64;
-    let median_gap = gaps[processed / 2];
-    let max_gap = *gaps.last().unwrap();
-    let min_gap = *gaps.first().unwrap();
-
-    let tight_count = gaps.iter().filter(|&&g| g == 0).count();
-    let tight_pct = (tight_count as f64 / processed as f64) * 100.0;
-
-    let mean_tightness: f64 = tightness_pcts.iter().sum::<f64>() / processed as f64;
-    let median_tightness = tightness_pcts[processed / 2];
-    let min_tightness = tightness_pcts.first().unwrap();
-
-    println!("\n=== SUMMARY ===");
-    println!("Total instances:     {}", entries.len());
-    println!("Processed:           {}", processed);
-    println!("Errors:              {}", errors);
-    println!(
-        "Total time:          {:.2} ms ({:.3} ms/instance)",
-        total_time_ms,
-        total_time_ms / processed as f64
-    );
-
-    println!("\n--- Violations ---");
-    println!("Upper violations:    {} (our UB < best)", upper_violations);
-    println!("Lower violations:    {} (our LB > best)", lower_violations);
-    println!("Total violations:    {}", total_violations);
-    println!(
-        "Success rate:        {:.2}%",
-        100.0 * (processed - total_violations) as f64 / processed as f64
-    );
-
-    println!("\n--- Gap Statistics (UB - Best) ---");
-    println!("Total gap:           {}", total_gap);
-    println!("Mean gap:            {:.2}", mean_gap);
-    println!("Median gap:          {}", median_gap);
-    println!("Min gap:             {}", min_gap);
-    println!("Max gap:             {}", max_gap);
-
-    println!("\n--- Tightness (LB/Best %) ---");
-    println!("Mean tightness:      {:.1}%", mean_tightness);
-    println!("Median tightness:    {:.1}%", median_tightness);
-    println!("Min tightness:       {:.1}%", min_tightness);
-    println!("Tight (gap=0):       {} ({:.1}%)", tight_count, tight_pct);
-
-    println!("\n--- Gap Distribution ---");
-    let mut gap_histogram: HashMap<usize, usize> = HashMap::new();
-    for &g in &gaps {
-        *gap_histogram.entry(g).or_insert(0) += 1;
-    }
-    let mut sorted_gaps: Vec<_> = gap_histogram.iter().collect();
-    sorted_gaps.sort_by_key(|(g, _)| **g);
-
-    let max_count = sorted_gaps.iter().map(|(_, c)| **c).max().unwrap_or(1);
-    for (gap, count) in sorted_gaps.iter() {
-        let pct = (**count as f64 / processed as f64) * 100.0;
-        let bar_len = (**count as f64 / max_count as f64 * 40.0) as usize;
-        let bar = "█".repeat(bar_len.max(1));
-        println!(
-            "  gap={:>2}: {:>4} instances ({:>5.1}%) {}",
-            gap, count, pct, bar
-        );
-    }
-
-    println!("\n--- Tightness Distribution ---");
-    let mut tightness_buckets: [usize; 5] = [0; 5];
-    for &t in &tightness_pcts {
-        if t < 20.0 {
-            tightness_buckets[0] += 1;
-        } else if t < 40.0 {
-            tightness_buckets[1] += 1;
-        } else if t < 60.0 {
-            tightness_buckets[2] += 1;
-        } else if t < 80.0 {
-            tightness_buckets[3] += 1;
-        } else {
-            tightness_buckets[4] += 1;
+    // Summary
+    if processed > 0 {
+        let avg_w3 = w3_total_ms / processed as f64;
+        let avg_ch = ch_total_ms / processed as f64;
+        println!("\n{:>16} {:>5} {:>5} | {:>5} {:>5} {:>5.0} | {:>5} {:>5} {:>5.0} |",
+            "AVG (ms)", "", "", "", "", avg_w3, "", "", avg_ch);
+        println!("{} instances | errors: {}", processed, errors);
+        if w3_violations > 0 { println!("WARNING: Whidden 3-approx VIOLATIONS: {}", w3_violations); }
+        if ch_violations > 0 { println!("WARNING: Chen 2-approx VIOLATIONS: {}", ch_violations); }
+        if !ch_ratios.is_empty() {
+            let avg_r = ch_ratios.iter().sum::<f64>() / ch_ratios.len() as f64;
+            let max_r = ch_ratios.iter().cloned().fold(0.0, f64::max);
+            println!("Chen tightness vs OPT: avg={:.2}x max={:.2}x", avg_r, max_r);
         }
-    }
-
-    let bucket_labels = ["0-20%", "20-40%", "40-60%", "60-80%", "80-100%"];
-    let max_bucket = *tightness_buckets.iter().max().unwrap_or(&1);
-    for (i, (label, &count)) in bucket_labels
-        .iter()
-        .zip(tightness_buckets.iter())
-        .enumerate()
-    {
-        let pct = (count as f64 / processed as f64) * 100.0;
-        let bar_len = (count as f64 / max_bucket as f64 * 30.0) as usize;
-        let bar = "█".repeat(bar_len.max(1));
-        let marker = if i == 4 { " ← tight" } else { "" };
-        println!(
-            "  {}: {:>4} instances ({:>5.1}%) {}{}",
-            label, count, pct, bar, marker
-        );
-    }
-
-    if total_violations > 0 {
-        println!("\n=== ALL VIOLATIONS ===");
-        println!(
-            "{:<20} {:>6} {:>6} {:>6} {:>8} {:>8}",
-            "Instance", "Lower", "Upper", "Best", "Gap", "Type"
-        );
-        println!("{}", "-".repeat(70));
-        for (digest, lower, upper, best, gap, vtype) in &violation_list {
-            println!(
-                "{:<20} {:>6} {:>6} {:>6} {:>8} {:>8}",
-                &digest[..20],
-                lower,
-                upper,
-                best,
-                gap,
-                vtype
-            );
+        if !w3_ratios.is_empty() {
+            let avg_r = w3_ratios.iter().sum::<f64>() / w3_ratios.len() as f64;
+            let max_r = w3_ratios.iter().cloned().fold(0.0, f64::max);
+            println!("Whidden tightness vs OPT: avg={:.2}x max={:.2}x", avg_r, max_r);
         }
-        println!("\nWARNING: Found {} total violations", total_violations);
-    } else if processed > 0 {
-        println!("\nOK: All bounds valid");
     }
 
     Ok(())

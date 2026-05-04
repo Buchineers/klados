@@ -1,9 +1,10 @@
-//! Detailed bounds comparison: red-blue (UB + dual LB), Wu LP relax, Olver LP*.
+//! Detailed bounds comparison: red-blue (UB + dual LB), Chen 2-approx, Wu LP relax, Olver LP*.
 
 use klados_core::lower_bound::{
     cherry_reduce_ub, maf_bounds, red_blue_approx_detailed,
 };
 use klados_core::Instance;
+use klados_exact::chen_rspr::chen_pair_bounds;
 use klados_exact::whidden::approx_2_lb_for_instance;
 
 pub fn run(instance: &Instance) -> Result<(), Box<dyn std::error::Error>> {
@@ -21,12 +22,12 @@ pub fn run(instance: &Instance) -> Result<(), Box<dyn std::error::Error>> {
         bounds.lower, bounds.upper, bounds_ms
     );
 
-    // 2. Pairwise red-blue: UB, LB via ceil(UB/2), LB via dual D.
+    // 2. Pairwise red-blue and Chen 2-approx.
     if m == 2 {
         let t0 = std::time::Instant::now();
         let rb = red_blue_approx_detailed(&instance.trees[0], &instance.trees[1]);
         let rb_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        let lb_half = (rb.ub + 1) / 2; // ceil(ub/2) on cuts, which is ceil((comps-1)/2)
+        let lb_half = (rb.ub + 1) / 2;
         eprintln!(
             "Red-Blue:      UB={} LB_half={} LB_dual={} ({:.1}ms)",
             rb.ub, lb_half, rb.dual_lb, rb_ms
@@ -36,6 +37,19 @@ pub fn run(instance: &Instance) -> Result<(), Box<dyn std::error::Error>> {
         let a2_lb = approx_2_lb_for_instance(&instance.trees[0], &instance.trees[1], n);
         let a2_ms = t0.elapsed().as_secs_f64() * 1000.0;
         eprintln!("Olver-TF LB:   {} ({:.1}ms)", a2_lb, a2_ms);
+
+        let t0 = std::time::Instant::now();
+        let (chen_lb, chen_ub) = chen_pair_bounds(&instance.trees[0], &instance.trees[1]);
+        let chen_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let chen_lb_comps = chen_lb + 1; // rSPR cuts -> MAF components
+        let chen_ub_comps = chen_ub + 1;
+        eprintln!(
+            "Chen 2-approx: LB_cuts={} UB_cuts={} → LB_comps={} UB_comps={} ({:.1}ms)  ratio={:.3}",
+            chen_lb, chen_ub,
+            chen_lb_comps, chen_ub_comps,
+            chen_ms,
+            chen_ub_comps as f64 / chen_lb_comps.max(1) as f64,
+        );
 
         let t0 = std::time::Instant::now();
         let cherry_ub = cherry_reduce_ub(&instance.trees[0], &instance.trees[1]);
