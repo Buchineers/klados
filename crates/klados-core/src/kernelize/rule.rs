@@ -35,6 +35,17 @@ pub struct RuleContext<'a> {
     pub victim_strategy: VictimStrategy,
 }
 
+impl<'a> RuleContext<'a> {
+    /// Check whether a label in current reduced space maps to a protected original label.
+    pub fn is_protected(&self, label: u32) -> bool {
+        if self.protected_labels.is_empty() {
+            return false;
+        }
+        let orig = self.composite_rev[label as usize];
+        self.protected_labels.contains(&orig)
+    }
+}
+
 /// A single reduction rule.
 ///
 /// Each rule implements `find`, which scans the current instance for one

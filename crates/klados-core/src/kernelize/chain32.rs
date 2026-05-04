@@ -59,7 +59,12 @@ impl ReductionRule for Chain32Rule {
             }
         };
 
-        victim.map(|v| ReductionAction::Delete { victim: v })
+        // Refuse to delete a protected label.
+        let v = victim?;
+        if ctx.is_protected(v) {
+            return None;
+        }
+        Some(ReductionAction::Delete { victim: v })
     }
 }
 

@@ -21,24 +21,19 @@ impl ReductionRule for CherryRule {
             ctx.instance.num_leaves,
         )?;
 
-        // Protect labels: if the remove_label is protected, swap it to be the representative
-        if is_protected(ctx.protected_labels, ctx.composite_rev, remove)
-            && !is_protected(ctx.protected_labels, ctx.composite_rev, keep)
-        {
+        // If the remove label is protected but keep is not, swap them so the
+        // protected label survives as the representative.
+        if ctx.is_protected(remove) && !ctx.is_protected(keep) {
             std::mem::swap(&mut keep, &mut remove);
+        }
+
+        // If both are protected, refuse to collapse — can't keep both.
+        if ctx.is_protected(remove) {
+            return None;
         }
 
         Some(ReductionAction::Collapse { keep, remove })
     }
-}
-
-/// Check whether a label in current reduced space maps to a protected original label.
-fn is_protected(protected: &[u32], composite_rev: &[u32], label: u32) -> bool {
-    if protected.is_empty() {
-        return false;
-    }
-    let orig = composite_rev[label as usize];
-    protected.contains(&orig)
 }
 
 /// Find a single common cherry (two sibling leaves with the same parent in all trees).
