@@ -87,6 +87,7 @@ fn compute_local_bounds(trees: &[Tree], num_leaves: u32) -> LocalBounds {
 
 use klados_core::cluster_decomposition;
 
+use crate::chen_rspr::chen_pair_agreement;
 use crate::cluster_reduction::{self, ClusterReductionResult};
 use crate::kernelize::{self, KernelizeConfig};
 use crate::ExactSolver;
@@ -555,6 +556,40 @@ fn solve_branch_price_multi_cached(
         }
         best_solution = Some(values);
         best_ub = comp_labels.len().min(n);
+    }
+
+    // Seed the RMP with multi-leaf agreement-forest components produced by
+    // Chen's 2-approximation. Only safe in the 2-tree case: a column that is
+    // a valid AF component for pair (T_i, T_j) need NOT be a valid component
+    // for any other tree T_k. The master LP enforces per-tree node-cover
+    // (≤1 covering column per internal node) but does not check that the
+    // restricted shapes T_k|X agree across all trees, so a pair-derived
+    // column can be selected as part of an integer solution that fails the
+    // AF validator. With m == 2 the agreement is a property of the only
+    // tree pair, so the seed columns are always feasible.
+    if trees.len() == 2 {
+        let chen_t0 = Instant::now();
+        let (_, _, leafsets) = chen_pair_agreement(&trees[0], &trees[1]);
+        let mut chen_columns_added = 0usize;
+        for labels in leafsets {
+            if labels.len() < 2 {
+                continue; // singletons are already in the initial set
+            }
+            if seen.contains(&labels) {
+                continue;
+            }
+            seen.insert(labels.clone());
+            columns.push(column_builder.build_column(labels, trees));
+            if let Some(values) = best_solution.as_mut() {
+                values.push(0.0);
+            }
+            chen_columns_added += 1;
+        }
+        eprintln!(
+            "[maf-bp-multi] chen seed: {} columns in {:.1}ms",
+            chen_columns_added,
+            chen_t0.elapsed().as_secs_f64() * 1000.0,
+        );
     }
 
     let mut state = BpState {
