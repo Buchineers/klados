@@ -38,7 +38,9 @@ fn sampled_reference_indices(m: usize, limit: usize) -> Vec<usize> {
 
 fn compute_local_bounds(trees: &[Tree], num_leaves: u32) -> LocalBounds {
     if trees.len() <= 1 {
-        return LocalBounds { best_partition: None };
+        return LocalBounds {
+            best_partition: None,
+        };
     }
 
     let m = trees.len();
@@ -87,10 +89,10 @@ fn compute_local_bounds(trees: &[Tree], num_leaves: u32) -> LocalBounds {
 
 use klados_core::cluster_decomposition;
 
+use crate::ExactSolver;
 use crate::chen_rspr::chen_pair_agreement;
 use crate::cluster_reduction::{self, ClusterReductionResult};
 use crate::kernelize::{self, KernelizeConfig};
-use crate::ExactSolver;
 
 const NEG_INF: f64 = -1.0e100;
 const PAIRDP_BATCH_SIZE: usize = 64;
@@ -113,8 +115,9 @@ const COLUMN_RESERVE_REFILL: usize = 0;
 // heuristic instance 070bfd..., so keep it off until boundary states are ported.
 const RSPR_CLUSTER_DECOMP_EXPERIMENTAL: bool = false;
 const RSPR_CLUSTER_MIN_LEAVES: u32 = 128;
-// Whidden 2-tree cluster decomposition kicks in above this size.
-// Phase 2 WIP: debugging merge validation.
+// Strict Whidden/rSPR-style 2-tree common-cluster decomposition kicks in above
+// this size.  Relaxed/batch variants remain opt-in inside whidden_cluster until
+// the full rspr boundary/rho join state is represented.
 const WHIDDEN_DECOMP_MIN_LEAVES: u32 = 20;
 
 fn adaptive_exact_batch_size(active_labels: usize, root_node: bool) -> usize {
@@ -224,7 +227,8 @@ impl ColumnBuildScratch {
         labels.sort_unstable();
         labels.dedup();
         let covered_internal_nodes = if labels.len() >= 2 {
-            trees.iter()
+            trees
+                .iter()
                 .enumerate()
                 .map(|(ti, tree)| self.mark_component_nodes(ti, tree, &labels))
                 .collect::<Vec<_>>()
@@ -438,14 +442,18 @@ fn solve_branch_price_multi_cached(
     let param_reduction_32 = kern.param_reduction;
     let mut column_builder = ColumnBuildScratch::new(trees);
 
-    // Whidden cluster decomposition: 2-tree only, recursive D&C through B&P.
+    // Whidden/rspr cluster decomposition for 2-tree instances.  The default
+    // path in whidden_cluster is the exact strict common-cluster split
+    // (inner + outer - 1), applied recursively through this callback.  The
+    // previously-prototyped batch/relaxed join variants remain opt-in inside
+    // whidden_cluster because a valid AF from those variants is not by itself
+    // an optimality certificate.
     if reduced.num_trees() == 2 && reduced.num_leaves >= WHIDDEN_DECOMP_MIN_LEAVES {
-        if let Some(solution) = crate::whidden_cluster::try_whidden_decomp_2tree(
-            reduced,
-            &mut |subinstance| {
+        if let Some(solution) =
+            crate::whidden_cluster::try_whidden_decomp_2tree(reduced, &mut |subinstance| {
                 solve_branch_price_multi_cached(subinstance, &mut SolverStats::default(), memo)
-            },
-        ) {
+            })
+        {
             if let Some(view) = memo_view.as_ref() {
                 store_cached_solution(memo, view, &solution);
             }
@@ -459,7 +467,7 @@ fn solve_branch_price_multi_cached(
                 instance.num_leaves,
             );
             eprintln!(
-                "[maf-bp-multi] optimal: {} components (whidden decomp, n={}), {:.1}ms total",
+                "[maf-bp-multi] optimal: {} components (whidden strict cluster decomp, n={}), {:.1}ms total",
                 components.len(),
                 reduced.num_leaves,
                 t_total.elapsed().as_secs_f64() * 1000.0,
@@ -469,12 +477,11 @@ fn solve_branch_price_multi_cached(
     }
 
     if RSPR_CLUSTER_DECOMP_EXPERIMENTAL && reduced.num_leaves >= RSPR_CLUSTER_MIN_LEAVES {
-        if let Some(solution) = cluster_decomposition::try_rspr_cluster_decomposition(
-            reduced,
-            &mut |subinstance| {
+        if let Some(solution) =
+            cluster_decomposition::try_rspr_cluster_decomposition(reduced, &mut |subinstance| {
                 solve_branch_price_multi_cached(subinstance, &mut SolverStats::default(), memo)
-            },
-        ) {
+            })
+        {
             if let Some(view) = memo_view.as_ref() {
                 store_cached_solution(memo, view, &solution);
             }
@@ -542,11 +549,18 @@ fn solve_branch_price_multi_cached(
     if let Some(partition) = &bounds.best_partition {
         let mut comp_labels: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
         for (leaf_idx, &comp_id) in partition.iter().enumerate() {
-            comp_labels.entry(comp_id).or_default().push((leaf_idx + 1) as u32);
+            comp_labels
+                .entry(comp_id)
+                .or_default()
+                .push((leaf_idx + 1) as u32);
         }
         let mut values = vec![0.0; columns.len()];
         for labels in comp_labels.values() {
-            if let Some((ci, _)) = columns.iter().enumerate().find(|(_, col)| col.labels == *labels) {
+            if let Some((ci, _)) = columns
+                .iter()
+                .enumerate()
+                .find(|(_, col)| col.labels == *labels)
+            {
                 values[ci] = 1.0;
             } else {
                 columns.push(column_builder.build_column(labels.clone(), trees));
@@ -590,6 +604,60 @@ fn solve_branch_price_multi_cached(
             chen_columns_added,
             chen_t0.elapsed().as_secs_f64() * 1000.0,
         );
+    }
+
+    // Feed the relaxed rspr-style decomposition into B&P as an incumbent only.
+    // This ports the useful "solve clusters first" idea without repeating the
+    // previous correctness bug: a validated relaxed join is a feasible UB, not
+    // a proof that lower_bound == upper_bound until ClusterInstance::join_cluster
+    // is ported in full.
+    if reduced.num_trees() == 2 && reduced.num_leaves >= WHIDDEN_DECOMP_MIN_LEAVES {
+        let relaxed_t0 = Instant::now();
+        if let Some(incumbent) =
+            crate::whidden_cluster::try_whidden_relaxed_incumbent_2tree(reduced, &mut |sub| {
+                solve_branch_price_multi_cached(sub, &mut SolverStats::default(), memo)
+            })
+        {
+            if incumbent.len() < best_ub {
+                let mut values = vec![0.0; columns.len()];
+                let mut ok = true;
+                let mut added = 0usize;
+                for component in &incumbent {
+                    let labels: Vec<u32> = component.leaves().collect();
+                    if labels.is_empty() {
+                        continue;
+                    }
+                    let ci = match columns.iter().position(|col| col.labels == labels) {
+                        Some(ci) => ci,
+                        None => {
+                            if !seen.insert(labels.clone()) {
+                                ok = false;
+                                break;
+                            }
+                            let ci = columns.len();
+                            columns.push(column_builder.build_column(labels, trees));
+                            values.push(0.0);
+                            added += 1;
+                            ci
+                        }
+                    };
+                    if ci >= values.len() {
+                        values.resize(columns.len(), 0.0);
+                    }
+                    values[ci] = 1.0;
+                }
+                if ok {
+                    best_ub = incumbent.len();
+                    best_solution = Some(values);
+                    eprintln!(
+                        "[maf-bp-multi] relaxed whidden incumbent: {} components, {} cols added, {:.1}ms",
+                        best_ub,
+                        added,
+                        relaxed_t0.elapsed().as_secs_f64() * 1000.0,
+                    );
+                }
+            }
+        }
     }
 
     let mut state = BpState {
@@ -756,15 +824,15 @@ fn canonicalize_two_tree_instance(instance: &Instance) -> Option<CanonicalMemoVi
             entries.push((p0, p1, label));
         }
         entries.sort_unstable_by(|a, b| {
-            a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)).then_with(|| a.2.cmp(&b.2))
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.2.cmp(&b.2))
         });
 
         let mut new_color = vec![0u32; n + 1];
         let mut cur_id: u32 = 0;
         for i in 0..entries.len() {
-            if i > 0
-                && (entries[i].0 != entries[i - 1].0 || entries[i].1 != entries[i - 1].1)
-            {
+            if i > 0 && (entries[i].0 != entries[i - 1].0 || entries[i].1 != entries[i - 1].1) {
                 cur_id += 1;
             }
             new_color[entries[i].2 as usize] = cur_id;
@@ -885,7 +953,11 @@ fn reconstruct_cached_components(
             labels
         })
         .collect::<Vec<_>>();
-    build_component_forest(&actual_groups, instance.reference_tree(), instance.num_leaves)
+    build_component_forest(
+        &actual_groups,
+        instance.reference_tree(),
+        instance.num_leaves,
+    )
 }
 
 fn store_cached_solution(
@@ -1048,7 +1120,9 @@ fn solve_bp_node(
                 continue;
             }
             let new_ci = state.columns.len();
-            state.columns.push(column_builder.build_column(labels, trees));
+            state
+                .columns
+                .push(column_builder.build_column(labels, trees));
             let t_add = Instant::now();
             rmp.add_column(new_ci, &state.columns[new_ci], trees);
             state.t_add_col += t_add.elapsed().as_secs_f64();
@@ -1175,7 +1249,6 @@ impl MultiPricerWorkspace {
     }
 }
 
-
 #[derive(Clone, Copy)]
 enum PairDpSideChoice {
     Singleton,
@@ -1223,9 +1296,7 @@ impl<'a> PairDpPricer<'a> {
         blocked_leaves: &[bool],
     ) -> Vec<u32> {
         (1..=num_leaves as u32)
-            .filter(|&label| {
-                !blocked_leaves[label as usize] && alpha[label as usize] > 1.0e-12
-            })
+            .filter(|&label| !blocked_leaves[label as usize] && alpha[label as usize] > 1.0e-12)
             .collect()
     }
 
@@ -1485,7 +1556,10 @@ impl<'a> PairDpPricer<'a> {
         }
         let _ = scanned_all;
 
-        let mut out = dedup.into_iter().map(|(labels, score)| (score, labels)).collect::<Vec<_>>();
+        let mut out = dedup
+            .into_iter()
+            .map(|(labels, score)| (score, labels))
+            .collect::<Vec<_>>();
         out.sort_unstable_by(|lhs, rhs| {
             rhs.0
                 .total_cmp(&lhs.0)
@@ -1526,11 +1600,10 @@ impl<'a> PairDpPricer<'a> {
             .min(anchor_labels.len());
         anchor_labels.truncate(anchor_limit);
 
-        let mut scored_pairs = Vec::with_capacity(
-            anchor_limit.saturating_mul(partners_per_anchor),
-        );
+        let mut scored_pairs = Vec::with_capacity(anchor_limit.saturating_mul(partners_per_anchor));
         for &a in &anchor_labels {
-            let mut best_partners: Vec<(f64, usize, usize)> = Vec::with_capacity(partners_per_anchor);
+            let mut best_partners: Vec<(f64, usize, usize)> =
+                Vec::with_capacity(partners_per_anchor);
             for b in 0..p {
                 if a == b {
                     continue;
@@ -1712,8 +1785,12 @@ impl<'a> PairDpPricer<'a> {
             for ti in 1..num_trees {
                 w &= desc[ti][side_nodes[ti] as usize].as_slice()[wi];
             }
-            if wi == la_w { w &= !la_m; }
-            if wi == lb_w { w &= !lb_m; }
+            if wi == la_w {
+                w &= !la_m;
+            }
+            if wi == lb_w {
+                w &= !lb_m;
+            }
             while w != 0 {
                 let bit = w.trailing_zeros() as usize;
                 w &= w - 1;
@@ -1797,12 +1874,7 @@ impl<'a> PairDpPricer<'a> {
             .iter()
             .enumerate()
             .map(|(ti, tree)| {
-                self.path_internal_penalty(
-                    ti,
-                    tree,
-                    self.side_of(ti, a, b),
-                    self.root_of(ti, a, c),
-                )
+                self.path_internal_penalty(ti, tree, self.side_of(ti, a, b), self.root_of(ti, a, c))
             })
             .sum()
     }
@@ -1810,8 +1882,7 @@ impl<'a> PairDpPricer<'a> {
     fn quick_pair_proxy(&self, a: usize, b: usize) -> f64 {
         let label_a = self.active_labels[a] as usize;
         let label_b = self.active_labels[b] as usize;
-        self.alpha[label_a]
-            + self.alpha[label_b]
+        self.alpha[label_a] + self.alpha[label_b]
             - self.root_penalty(a, b)
             - self.singleton_chain_penalty(a, b)
             - self.singleton_chain_penalty(b, a)
@@ -1834,7 +1905,6 @@ impl<'a> PairDpPricer<'a> {
         };
         (upper - lower).max(0.0)
     }
-
 }
 
 fn price_best_new_pairdp_columns<'a>(
@@ -1896,7 +1966,11 @@ fn price_best_new_pairdp_columns<'a>(
     if !fast.is_empty() {
         let mut reserve = fast;
         let immediate = reserve
-            .drain(..reserve.len().min(FASTPRICER_BATCH_SIZE.min(exact_batch_size)))
+            .drain(
+                ..reserve
+                    .len()
+                    .min(FASTPRICER_BATCH_SIZE.min(exact_batch_size)),
+            )
             .collect();
         return PricingColumns { immediate, reserve };
     }
@@ -1907,27 +1981,34 @@ fn price_best_new_pairdp_columns<'a>(
             WIDEPRICER_BATCH_SIZE.min(exact_batch_size),
             COLUMN_RESERVE_REFILL,
             |labels| {
-                pricing_candidate_allowed(labels, seen, forbidden, must_link_pairs, cannot_link_pairs)
+                pricing_candidate_allowed(
+                    labels,
+                    seen,
+                    forbidden,
+                    must_link_pairs,
+                    cannot_link_pairs,
+                )
             },
         );
         *t_solve += t1b.elapsed().as_secs_f64();
         if !wide.is_empty() {
             let mut reserve = wide;
             let immediate = reserve
-                .drain(..reserve.len().min(WIDEPRICER_BATCH_SIZE.min(exact_batch_size)))
+                .drain(
+                    ..reserve
+                        .len()
+                        .min(WIDEPRICER_BATCH_SIZE.min(exact_batch_size)),
+                )
                 .collect();
             return PricingColumns { immediate, reserve };
         }
     }
 
     let t2 = Instant::now();
-    let exact = pricer.collect_profitable_columns(
-        exact_batch_size,
-        COLUMN_RESERVE_REFILL,
-        |labels| {
+    let exact =
+        pricer.collect_profitable_columns(exact_batch_size, COLUMN_RESERVE_REFILL, |labels| {
             pricing_candidate_allowed(labels, seen, forbidden, must_link_pairs, cannot_link_pairs)
-        },
-    );
+        });
     *t_collect += t2.elapsed().as_secs_f64();
     let mut reserve = exact;
     let immediate = reserve
@@ -2022,11 +2103,7 @@ fn collect_reserved_columns(
         return Vec::new();
     }
 
-    scored.sort_unstable_by(|lhs, rhs| {
-        rhs.0
-            .total_cmp(&lhs.0)
-            .then_with(|| lhs.1.cmp(&rhs.1))
-    });
+    scored.sort_unstable_by(|lhs, rhs| rhs.0.total_cmp(&lhs.0).then_with(|| lhs.1.cmp(&rhs.1)));
     if scored.len() > limit {
         scored.truncate(limit);
     }
@@ -2090,11 +2167,7 @@ struct PersistentRmp {
 }
 
 impl PersistentRmp {
-    fn new(
-        columns: &[BpColumn],
-        trees: &[Tree],
-        num_leaves: usize,
-    ) -> Result<Self, String> {
+    fn new(columns: &[BpColumn], trees: &[Tree], num_leaves: usize) -> Result<Self, String> {
         let mut model = Model::new(ColProblem::default());
         model.make_quiet();
         model.set_option("threads", 1_i32);
@@ -2168,17 +2241,13 @@ impl PersistentRmp {
             }
         }
         let values: Vec<f64> = vec![1.0; row_indices.len()];
-        let ptr = self
-            .model
-            .as_mut()
-            .expect("RMP model present")
-            .as_mut_ptr();
+        let ptr = self.model.as_mut().expect("RMP model present").as_mut_ptr();
         unsafe {
             highs_sys::Highs_addCol(
                 ptr,
-                1.0,               // cost
-                0.0,               // lower bound
-                f64::INFINITY,     // upper bound
+                1.0,           // cost
+                0.0,           // lower bound
+                f64::INFINITY, // upper bound
                 row_indices.len() as i32,
                 row_indices.as_ptr(),
                 values.as_ptr(),
@@ -2196,16 +2265,9 @@ impl PersistentRmp {
     fn add_node_row_lazy(&mut self, ti: usize, node: usize) {
         debug_assert!(self.node_row_idx[ti][node].is_none());
         let cols_covering = &self.node_to_cols[ti][node];
-        let indices: Vec<i32> = cols_covering
-            .iter()
-            .map(|&ci| self.col_idx[ci])
-            .collect();
+        let indices: Vec<i32> = cols_covering.iter().map(|&ci| self.col_idx[ci]).collect();
         let values: Vec<f64> = vec![1.0; indices.len()];
-        let ptr = self
-            .model
-            .as_mut()
-            .expect("RMP model present")
-            .as_mut_ptr();
+        let ptr = self.model.as_mut().expect("RMP model present").as_mut_ptr();
         unsafe {
             highs_sys::Highs_addRow(
                 ptr,
@@ -2281,11 +2343,7 @@ impl PersistentRmp {
                 self.fixed_zero_mark[ci] = epoch;
             }
         }
-        let ptr = self
-            .model
-            .as_mut()
-            .expect("RMP model present")
-            .as_mut_ptr();
+        let ptr = self.model.as_mut().expect("RMP model present").as_mut_ptr();
         for ci in 0..self.col_idx.len() {
             let labels = &columns[ci].labels;
             let (desired_lo, desired_hi) = if self.fixed_one_mark[ci] == epoch {
@@ -2293,11 +2351,7 @@ impl PersistentRmp {
             } else if self.fixed_zero_mark[ci] == epoch {
                 (0.0, 0.0)
             } else if labels.iter().any(|&l| blocked_leaves[l as usize])
-                || !labels_satisfy_pair_constraints(
-                    labels,
-                    must_link_pairs,
-                    cannot_link_pairs,
-                )
+                || !labels_satisfy_pair_constraints(labels, must_link_pairs, cannot_link_pairs)
             {
                 (0.0, 0.0)
             } else {
@@ -2310,12 +2364,7 @@ impl PersistentRmp {
                     && desired_hi.is_finite())
             {
                 unsafe {
-                    highs_sys::Highs_changeColBounds(
-                        ptr,
-                        self.col_idx[ci],
-                        desired_lo,
-                        desired_hi,
-                    );
+                    highs_sys::Highs_changeColBounds(ptr, self.col_idx[ci], desired_lo, desired_hi);
                 }
                 self.current_lower[ci] = desired_lo;
                 self.current_upper[ci] = desired_hi;
@@ -2490,7 +2539,11 @@ fn select_branch_column(columns: &[BpColumn], values: &[f64], num_leaves: usize)
         if value <= 1.0e-9 || value >= 1.0 - 1.0e-9 {
             continue;
         }
-        if !columns[ci].labels.iter().any(|&label| duplicated[label as usize]) {
+        if !columns[ci]
+            .labels
+            .iter()
+            .any(|&label| duplicated[label as usize])
+        {
             continue;
         }
         if columns[ci].labels.len() <= 1 || columns[ci].total_internal_count == 0 {

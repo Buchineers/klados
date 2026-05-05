@@ -9,10 +9,10 @@
 //!      beyond what the AF requires).
 
 use fixedbitset::FixedBitSet;
+use klados_core::Instance;
 use klados_core::af_validator::validate_agreement_forest;
 use klados_core::brute_maf::brute_force_maf;
-use klados_core::tree::{Label, NodeId, Tree, NONE};
-use klados_core::Instance;
+use klados_core::tree::{Label, NONE, NodeId, Tree};
 use klados_exact::chen_rspr::chen_pair_agreement;
 
 struct Lcg(u64);
@@ -21,7 +21,10 @@ impl Lcg {
         Self(seed.wrapping_mul(0x9E3779B97F4A7C15) ^ 0xDEADBEEFCAFEBABE)
     }
     fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         self.0
     }
     fn range(&mut self, n: usize) -> usize {
@@ -149,16 +152,26 @@ fn run_battery(n: u32, num_pairs: usize, base_seed: u64) {
 }
 
 #[test]
-fn chen_pair_agreement_n5() { run_battery(5, 50, 0xCEA5_0000); }
+fn chen_pair_agreement_n5() {
+    run_battery(5, 50, 0xCEA5_0000);
+}
 
 #[test]
-fn chen_pair_agreement_n6() { run_battery(6, 50, 0xCEA6_0000); }
+fn chen_pair_agreement_n6() {
+    run_battery(6, 50, 0xCEA6_0000);
+}
 
 #[test]
-fn chen_pair_agreement_n7() { run_battery(7, 50, 0xCEA7_0000); }
+fn chen_pair_agreement_n7() {
+    run_battery(7, 50, 0xCEA7_0000);
+}
 
 #[test]
-fn chen_pair_agreement_n8() { run_battery(8, 30, 0xCEA8_0000); }
+fn chen_pair_agreement_n8() {
+    run_battery(8, 30, 0xCEA8_0000);
+}
 
 #[test]
-fn chen_pair_agreement_n10() { run_battery(10, 20, 0xCEAA_0000); }
+fn chen_pair_agreement_n10() {
+    run_battery(10, 20, 0xCEAA_0000);
+}

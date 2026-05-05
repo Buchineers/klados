@@ -38,11 +38,15 @@ pub fn chen_pair_bounds(t1: &Tree, t2: &Tree) -> (usize, usize) {
     let bounds = chen_app2_bounds_with_options(&tf, false);
     let (lower, upper) = if bounds.lower > n as usize || bounds.upper > n as usize {
         let app1 = chen_app1_bounds_inner(&tf);
-        (app1.lower.min(n.saturating_sub(1) as usize),
-         app1.upper.min(n.saturating_sub(1) as usize))
+        (
+            app1.lower.min(n.saturating_sub(1) as usize),
+            app1.upper.min(n.saturating_sub(1) as usize),
+        )
     } else {
-        (bounds.lower.min(n.saturating_sub(1) as usize),
-         bounds.upper.min(n.saturating_sub(1) as usize))
+        (
+            bounds.lower.min(n.saturating_sub(1) as usize),
+            bounds.upper.min(n.saturating_sub(1) as usize),
+        )
     };
     (lower, upper)
 }
@@ -689,10 +693,7 @@ fn uf_union(uf: &mut [u32], a: u32, b: u32) {
 /// stopper machinery sometimes calls `unrecord_f2_cut` to re-assemble cut
 /// pieces (e.g. `cut_complex_key`); those re-assemblies only show in the
 /// live structure.
-fn chen_agreement_leafsets_from_state(
-    _tf: &TwinForest,
-    state: &ChenAppState,
-) -> Vec<Vec<u32>> {
+fn chen_agreement_leafsets_from_state(_tf: &TwinForest, state: &ChenAppState) -> Vec<Vec<u32>> {
     let n = state.num_leaves;
     let mut uf = state.leaf_uf.clone();
     let mut groups: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
@@ -715,10 +716,7 @@ fn chen_agreement_leafsets_from_state(
 /// - `leafsets` contains the component leaf label sets
 ///
 /// The returned leaf-sets form a valid agreement forest for the two trees.
-pub fn chen_pair_agreement(
-    t1: &Tree,
-    t2: &Tree,
-) -> (usize, usize, Vec<Vec<u32>>) {
+pub fn chen_pair_agreement(t1: &Tree, t2: &Tree) -> (usize, usize, Vec<Vec<u32>>) {
     let n = t1.num_leaves;
     let tf = TwinForest::from_trees(t1, t2, n);
 
@@ -734,8 +732,12 @@ pub fn chen_pair_agreement(
         state.cut_tree1_singletons();
         state.drop_t2_leaf_roots();
 
-        let Some(root) = state.first_t1_root() else { break };
-        if !state.has_t1_cherry() { break };
+        let Some(root) = state.first_t1_root() else {
+            break;
+        };
+        if !state.has_t1_cherry() {
+            break;
+        };
 
         if let Some(cut) = state.find_optimal_cut() {
             state.cut_forest2(cut);
@@ -744,7 +746,9 @@ pub fn chen_pair_agreement(
             continue;
         }
 
-        let Some(mut stopper) = ChenKey::find_stopper(root, &state) else { break };
+        let Some(mut stopper) = ChenKey::find_stopper(root, &state) else {
+            break;
+        };
         if stopper.stopper.is_none() {
             // Non-stopper key: apply the selected cuts so the agreement
             // forest can be reconstructed from the cut lists.
@@ -766,7 +770,9 @@ pub fn chen_pair_agreement(
 }
 
 fn improved_upper_from_state(tf: &TwinForest, state: &ChenAppState) -> usize {
-    chen_agreement_leafsets_from_state(tf, state).len().saturating_sub(1)
+    chen_agreement_leafsets_from_state(tf, state)
+        .len()
+        .saturating_sub(1)
 }
 
 /// Native approximation bound oracle matching the simple cut loop used as the
@@ -781,7 +787,10 @@ pub fn chen_app1_bounds(t1: &Tree, t2: &Tree) -> (usize, usize) {
     let n = t1.num_leaves;
     let tf = TwinForest::from_trees(t1, t2, n);
     let bounds = chen_app1_bounds_inner(&tf);
-    (bounds.lower.min(n.saturating_sub(1) as usize), bounds.upper.min(n.saturating_sub(1) as usize))
+    (
+        bounds.lower.min(n.saturating_sub(1) as usize),
+        bounds.upper.min(n.saturating_sub(1) as usize),
+    )
 }
 
 fn chen_app1_bounds_inner(tf: &TwinForest) -> AppBounds {
@@ -903,17 +912,13 @@ fn chen_app2_bounds_with_options(tf: &TwinForest, improve_upper: bool) -> AppBou
             };
             eprintln!(
                 "[chen-rspr] app2 iter={} kind={} acc={}~{}",
-                iter,
-                name,
-                bounds.lower,
-                bounds.upper
+                iter, name, bounds.lower, bounds.upper
             );
         }
     }
     if improve_upper {
         let raw_bounds = bounds;
-        let improved_upper =
-            improved_upper_from_state(tf, &state);
+        let improved_upper = improved_upper_from_state(tf, &state);
         bounds.upper = bounds.upper.min(improved_upper);
         if trace_stoppers {
             eprintln!(
@@ -1145,8 +1150,16 @@ impl ChenAppState {
             // its new delegate so a cascading contraction can keep unioning.
             let lc = self.left[T1][t1_parent as usize];
             let rc = self.right[T1][t1_parent as usize];
-            let lr = if lc != NONE { self.node_repr_t1[lc as usize] } else { 0 };
-            let rr = if rc != NONE { self.node_repr_t1[rc as usize] } else { 0 };
+            let lr = if lc != NONE {
+                self.node_repr_t1[lc as usize]
+            } else {
+                0
+            };
+            let rr = if rc != NONE {
+                self.node_repr_t1[rc as usize]
+            } else {
+                0
+            };
             if lr != 0 && rr != 0 {
                 uf_union(&mut self.leaf_uf, lr, rr);
             }
@@ -3011,9 +3024,13 @@ fn check_better_cuts(tf: &TwinForest, t1_parent: NodeId, t2_x1: NodeId, t2_x2: N
 
 /// Java `Instance.dangling(f2a, f2b)` lines 457-477.
 fn d_f_cut_nodes(tf: &TwinForest, ti: usize, a: NodeId, b: NodeId) -> Option<Vec<NodeId>> {
-    if find_root(tf, ti, a) != find_root(tf, ti, b) { return None; }
+    if find_root(tf, ti, a) != find_root(tf, ti, b) {
+        return None;
+    }
     let lca = lca_current(tf, ti, a, b);
-    if lca == NONE { return None; }
+    if lca == NONE {
+        return None;
+    }
     // Java 462-463: both direct children of LCA → empty
     if tf.parent[ti][a as usize] == lca && tf.parent[ti][b as usize] == lca {
         return Some(Vec::new());
@@ -3022,13 +3039,17 @@ fn d_f_cut_nodes(tf: &TwinForest, ti: usize, a: NodeId, b: NodeId) -> Option<Vec
     let mut cur = a;
     while tf.parent[ti][cur as usize] != lca {
         let s = tf.sibling(ti, cur);
-        if s != NONE { out.push(s); }
+        if s != NONE {
+            out.push(s);
+        }
         cur = tf.parent[ti][cur as usize];
     }
     cur = b;
     while tf.parent[ti][cur as usize] != lca {
         let s = tf.sibling(ti, cur);
-        if s != NONE { out.push(s); }
+        if s != NONE {
+            out.push(s);
+        }
         cur = tf.parent[ti][cur as usize];
     }
     Some(out)
@@ -3148,7 +3169,11 @@ fn extract_components(tf: &TwinForest) -> Vec<Tree> {
     extract_components_with_reference(tf, tf.num_leaves, &tree_from_original(tf))
 }
 
-fn extract_components_with_reference(tf: &TwinForest, output_n: u32, reference: &Tree) -> Vec<Tree> {
+fn extract_components_with_reference(
+    tf: &TwinForest,
+    output_n: u32,
+    reference: &Tree,
+) -> Vec<Tree> {
     let n = tf.num_leaves;
     let mut collapsed: Vec<Label> = tf.collapsed_into[..=n as usize].to_vec();
     for _ in 0..n {

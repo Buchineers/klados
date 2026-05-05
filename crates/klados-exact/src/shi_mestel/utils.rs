@@ -66,7 +66,7 @@ pub fn tree_canonical_for_labels(tree: &Tree, labels: &FixedBitSet) -> u64 {
                 Some(h)
             } else {
                 None
-            }
+            };
         }
         if let Some((l, r)) = tree.children(node) {
             let left = build(tree, l, labels);

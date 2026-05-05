@@ -1224,10 +1224,7 @@ fn solve_paper_rmp_lp(
         .map(|row| row.into_iter().map(|v| clean_dual(-v)).collect::<Vec<_>>())
         .collect::<Vec<_>>();
 
-    Ok(PaperRmpLpSolution {
-        alpha,
-        beta,
-    })
+    Ok(PaperRmpLpSolution { alpha, beta })
 }
 
 fn price_missing_component(
