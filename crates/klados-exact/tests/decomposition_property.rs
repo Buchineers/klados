@@ -13,10 +13,10 @@
 //!   - Deterministic LCG seed so failures reproduce
 //!   - Each instance runs in < 50ms via brute force + B&P; full battery < 30s
 
-use klados_core::af_validator::{validate_agreement_forest, AfValidation};
-use klados_core::brute_maf::brute_force_maf;
-use klados_core::tree::{Label, NodeId, Tree, NONE};
 use klados_core::Instance;
+use klados_core::af_validator::{AfValidation, validate_agreement_forest};
+use klados_core::brute_maf::brute_force_maf;
+use klados_core::tree::{Label, NONE, NodeId, Tree};
 use klados_exact::ExactSolver;
 
 /// Tiny LCG; we don't need crypto-quality, just reproducible.
@@ -26,7 +26,10 @@ impl Lcg {
         Self(seed.wrapping_mul(0x9E3779B97F4A7C15) ^ 0xDEADBEEFCAFEBABE)
     }
     fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         self.0
     }
     fn range(&mut self, n: usize) -> usize {

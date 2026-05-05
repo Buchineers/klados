@@ -1,8 +1,9 @@
 //! Whidden-style cluster decomposition for 2-tree MAF instances.
 //!
-//! Identifies a "cluster point" c in T1 — an internal node whose round-trip
-//! depth (T1 -> twin in T2 -> back to T1) does not exceed depth(c). For such
-//! a c with leaf-set X, the optimal MAF decomposes as
+//! The production path identifies a strict/common "cluster point" c in T1 —
+//! an internal node whose round-trip (T1 -> twin in T2 -> back to T1) lands
+//! exactly on c, so the same pendant leaf-set X can be cut out in both trees.
+//! For such a c, the optimal MAF decomposes as
 //!
 //!   d(T1, T2) = d(T1|X, T2|X) + d(T1[X->P], T2[X->P]) - 1
 //!
@@ -14,38 +15,87 @@
 //! P-component is the "anchor". The merge is validated against the original
 //! instance; if no anchor produces a valid AF, decomposition is aborted.
 //!
-//! Restricted to m == 2. Returns None if no cluster point exists or if no
-//! valid merge is found.
+//! Restricted to m == 2. Returns None if no strict cluster point exists or if
+//! no valid merge is found.  rspr's more general relaxed/batch machinery uses
+//! explicit forest boundary state (rho/component-zero/cluster-node joins); the
+//! old Rust prototypes for those variants remain opt-in below until that state
+//! is ported faithfully.
 
 use fixedbitset::FixedBitSet;
 
-use klados_core::af_validator::validate_agreement_forest;
-use klados_core::tree::{Label, NodeId, Tree, NONE};
 use klados_core::Instance;
+use klados_core::af_validator::validate_agreement_forest;
+use klados_core::tree::{Label, NONE, NodeId, Tree};
 
 /// Try Whidden cluster decomposition on a 2-tree instance.
 ///
 /// `solve` is invoked on each sub-instance; pass the inner solver
 /// (e.g. B&P-Multi). Returns `None` if no useful cluster point is found
 /// or if any sub-solve returns `None`.
-pub fn try_whidden_decomp_2tree<F>(
+pub fn try_whidden_decomp_2tree<F>(instance: &Instance, solve: &mut F) -> Option<Vec<Tree>>
+where
+    F: FnMut(&Instance) -> Option<Vec<Tree>>,
+{
+    // The C++ rspr code does *not* solve relaxed/batch clusters as closed
+    // leaf-set subinstances.  It builds boundary-aware forests, possibly adds
+    // rho, and joins them back through ClusterForest/ClusterInstance state.
+    // The older Rust batch/relaxed prototypes are therefore opt-in only:
+    // validation proves feasibility, not optimality.  The default fallback is
+    // the exact strict common-cluster split below.
+    if env_flag("KLADOS_WHIDDEN_BATCH_STRICT") {
+        if let Some(r) = try_batch_decomp(instance, solve) {
+            return Some(r);
+        }
+    }
+    if env_flag("KLADOS_WHIDDEN_RSPR_GREEDY") {
+        if let Some(r) = try_rspr_decomp(instance, solve) {
+            return Some(r);
+        }
+    }
+    try_single_decomp(instance, solve)
+}
+
+/// Try the relaxed/batch rspr-inspired decompositions as a *feasible
+/// incumbent only*.
+///
+/// These paths deliberately do not certify optimality until the full
+/// ClusterInstance boundary join is represented natively.  The returned forest
+/// has passed the AF validator, so callers may safely use it as an upper bound
+/// / incumbent, but must not set lower_bound from it.
+pub fn try_whidden_relaxed_incumbent_2tree<F>(
     instance: &Instance,
     solve: &mut F,
 ) -> Option<Vec<Tree>>
 where
     F: FnMut(&Instance) -> Option<Vec<Tree>>,
 {
-    if let Some(r) = try_rspr_decomp(instance, solve) { return Some(r); }
-    try_single_decomp(instance, solve)
+    if let Some(r) = try_rspr_decomp(instance, solve) {
+        return Some(r);
+    }
+    if env_flag("KLADOS_WHIDDEN_BATCH_INCUMBENT") {
+        return try_batch_decomp(instance, solve);
+    }
+    None
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| {
+        let v = v.trim().to_ascii_lowercase();
+        matches!(v.as_str(), "1" | "true" | "yes" | "on")
+    })
 }
 
 /// rspr-style: find clusters, solve inners, keep anchors in tree, prune rest.
 fn try_rspr_decomp<F>(instance: &Instance, solve: &mut F) -> Option<Vec<Tree>>
-where F: FnMut(&Instance) -> Option<Vec<Tree>>
+where
+    F: FnMut(&Instance) -> Option<Vec<Tree>>,
 {
     let n = instance.num_leaves as usize;
-    if n < 6 { return None; }
-    let t1 = &instance.trees[0]; let t2 = &instance.trees[1];
+    if n < 6 {
+        return None;
+    }
+    let t1 = &instance.trees[0];
+    let t2 = &instance.trees[1];
     let leaf_sets = compute_leaf_sets(t1, n);
     let tw12 = compute_twins(t1, t2);
     let tw21 = compute_twins(t2, t1);
@@ -54,30 +104,47 @@ where F: FnMut(&Instance) -> Option<Vec<Tree>>
     let mut is_cl = vec![false; t1.num_nodes()];
     let mut pts = Vec::new();
     for node in t1.post_order() {
-        if t1.is_leaf(node) || t1.is_root(node) { continue; }
+        if t1.is_leaf(node) || t1.is_root(node) {
+            continue;
+        }
         let sz = leaf_sets[node as usize].count_ones(..);
-        if sz < 2 || sz > n - 2 { continue; }
+        if sz < 2 || sz > n - 2 {
+            continue;
+        }
         let t2t = tw12[node as usize];
-        if t2t == NONE { continue; }
-        if t1.depth[node as usize] > t1.depth[tw21[t2t as usize] as usize] { continue; }
+        if t2t == NONE {
+            continue;
+        }
+        if t1.depth[node as usize] > t1.depth[tw21[t2t as usize] as usize] {
+            continue;
+        }
         if let Some((l, r)) = t1.children(node) {
-            if is_cl[l as usize] && is_cl[r as usize] { continue; }
+            if is_cl[l as usize] && is_cl[r as usize] {
+                continue;
+            }
         }
         is_cl[node as usize] = true;
         pts.push((node, sz.min(n - sz)));
     }
     pts.sort_by_key(|(_, s)| -(*s as isize));
-    if pts.is_empty() { return None; }
+    if pts.is_empty() {
+        return None;
+    }
 
     // 2. Greedy disjoint selection.
     let cap = leaf_sets.first().map(|l| l.len()).unwrap_or(0);
     let mut taken = FixedBitSet::with_capacity(cap);
     let mut sel: Vec<usize> = Vec::new();
     for (i, (node, _)) in pts.iter().enumerate() {
-        if !taken.is_disjoint(&leaf_sets[*node as usize]) { continue; }
-        taken.union_with(&leaf_sets[*node as usize]); sel.push(i);
+        if !taken.is_disjoint(&leaf_sets[*node as usize]) {
+            continue;
+        }
+        taken.union_with(&leaf_sets[*node as usize]);
+        sel.push(i);
     }
-    if sel.is_empty() { return None; }
+    if sel.is_empty() {
+        return None;
+    }
 
     // 3. Solve each cluster's inner instance. Find anchors by trial-validate.
     let mut inner_results: Vec<(Vec<Tree>, usize, FixedBitSet)> = Vec::with_capacity(sel.len());
@@ -87,23 +154,47 @@ where F: FnMut(&Instance) -> Option<Vec<Tree>>
         let leaves = leaf_sets[cnode as usize].clone();
         all_clustered.union_with(&leaves);
         let csize = leaves.count_ones(..);
-        let mut imap = vec![0u32; n + 1]; let mut ito = vec![0u32; csize + 1]; let mut l = 1u32;
-        for leaf in leaves.ones() { imap[leaf] = l; ito[l as usize] = leaf as u32; l += 1; }
-        let inner = solve(&Instance::new(vec![t1.relabel(&imap, csize as u32), t2.relabel(&imap, csize as u32)], csize as u32))?;
+        let mut imap = vec![0u32; n + 1];
+        let mut ito = vec![0u32; csize + 1];
+        let mut l = 1u32;
+        for leaf in leaves.ones() {
+            imap[leaf] = l;
+            ito[l as usize] = leaf as u32;
+            l += 1;
+        }
+        let inner = solve(&Instance::new(
+            vec![
+                t1.relabel(&imap, csize as u32),
+                t2.relabel(&imap, csize as u32),
+            ],
+            csize as u32,
+        ))?;
 
         // Decode inner components to original labels.
-        let decoded: Vec<Tree> = inner.iter().map(|c| c.relabel(&ito, instance.num_leaves)).collect();
+        let decoded: Vec<Tree> = inner
+            .iter()
+            .map(|c| c.relabel(&ito, instance.num_leaves))
+            .collect();
         inner_results.push((decoded, 0, leaves)); // anchor = first component
     }
 
     // 4. Build remaining: keep non-clustered leaves + anchor leaves, prune rest.
     let mut remaining_keep = FixedBitSet::with_capacity(n + 1);
-    for lbl in 1..=n as u32 { remaining_keep.insert(lbl as usize); }
+    for lbl in 1..=n as u32 {
+        remaining_keep.insert(lbl as usize);
+    }
     for (decoded, anchor_idx, leaves) in &inner_results {
-        let anchor_leaves: FixedBitSet = decoded[*anchor_idx].leaves().fold(
-            FixedBitSet::with_capacity(n + 1), |mut s, lbl| { s.insert(lbl as usize); s });
+        let anchor_leaves: FixedBitSet =
+            decoded[*anchor_idx]
+                .leaves()
+                .fold(FixedBitSet::with_capacity(n + 1), |mut s, lbl| {
+                    s.insert(lbl as usize);
+                    s
+                });
         for leaf in leaves.ones() {
-            if !anchor_leaves.contains(leaf) { remaining_keep.set(leaf, false); }
+            if !anchor_leaves.contains(leaf) {
+                remaining_keep.set(leaf, false);
+            }
         }
     }
     // Compact via relabel.
@@ -111,10 +202,16 @@ where F: FnMut(&Instance) -> Option<Vec<Tree>>
     let mut rem_rev = vec![0u32; n + 1];
     let mut next_rem: u32 = 1;
     for lbl in 1..=n as u32 {
-        if remaining_keep.contains(lbl as usize) { rem_map[lbl as usize] = next_rem; rem_rev[next_rem as usize] = lbl; next_rem += 1; }
+        if remaining_keep.contains(lbl as usize) {
+            rem_map[lbl as usize] = next_rem;
+            rem_rev[next_rem as usize] = lbl;
+            next_rem += 1;
+        }
     }
     let rem_n = next_rem - 1;
-    if rem_n <= 1 { return None; }
+    if rem_n <= 1 {
+        return None;
+    }
     let rem_t1 = t1.relabel(&rem_map, rem_n);
     let rem_t2 = t2.relabel(&rem_map, rem_n);
     let rem_inst = Instance::new(vec![rem_t1, rem_t2], rem_n);
@@ -124,7 +221,9 @@ where F: FnMut(&Instance) -> Option<Vec<Tree>>
     let mut result: Vec<Tree> = Vec::new();
     for (decoded, anchor_idx, _) in &inner_results {
         for (j, c) in decoded.iter().enumerate() {
-            if j != *anchor_idx { result.push(c.clone()); }
+            if j != *anchor_idx {
+                result.push(c.clone());
+            }
         }
     }
     for c in &rem_solution {
@@ -132,42 +231,71 @@ where F: FnMut(&Instance) -> Option<Vec<Tree>>
     }
 
     if !result.is_empty() && validate_agreement_forest(instance, &result).is_ok() {
-        eprintln!("[whidden] rspr n={}: {} clusters -> {} comps", n, sel.len(), result.len());
+        eprintln!(
+            "[whidden] rspr n={}: {} clusters -> {} comps",
+            n,
+            sel.len(),
+            result.len()
+        );
         return Some(result);
     }
     None
 }
 
 fn try_batch_decomp<F>(instance: &Instance, solve: &mut F) -> Option<Vec<Tree>>
-where F: FnMut(&Instance) -> Option<Vec<Tree>>
+where
+    F: FnMut(&Instance) -> Option<Vec<Tree>>,
 {
     let n = instance.num_leaves as usize;
-    let t1 = &instance.trees[0]; let t2 = &instance.trees[1];
+    let t1 = &instance.trees[0];
+    let t2 = &instance.trees[1];
     let leaf_sets = compute_leaf_sets(t1, n);
     let tw12 = compute_twins(t1, t2);
     let tw21 = compute_twins(t2, t1);
 
-    // 1. Find all cluster points (relaxed, with rspr child filter).
+    // 1. Find strict/common cluster points, with the same child filter rspr
+    // uses for cluster points.  This intentionally does NOT use relaxed
+    // depth-only cluster points: those require the full rspr ClusterInstance
+    // boundary/rho/component-zero machinery during join.
     let mut is_cl = vec![false; t1.num_nodes()];
     let mut pts = Vec::new();
     for node in t1.post_order() {
-        if t1.is_leaf(node) || t1.is_root(node) { continue; }
+        if t1.is_leaf(node) || t1.is_root(node) {
+            continue;
+        }
         let sz = leaf_sets[node as usize].count_ones(..);
-        if sz < 2 || sz > n - 2 { continue; }
+        if sz < 2 || sz > n - 2 {
+            continue;
+        }
         let t2t = tw12[node as usize];
-        if t2t == NONE { continue; }
+        if t2t == NONE {
+            continue;
+        }
         let depth_node = t1.depth[node as usize];
-        if depth_node > t1.depth[tw21[t2t as usize] as usize] { continue; }
+        let round_trip = tw21[t2t as usize];
+        if round_trip == NONE || depth_node > t1.depth[round_trip as usize] {
+            continue;
+        }
+        if round_trip != node {
+            continue;
+        }
+        if t2.is_root(t2t) {
+            continue;
+        }
         // rspr filter: if all children are cluster points, this node is just
         // their union, not a separate cluster.
         if let Some((l, r)) = t1.children(node) {
-            if is_cl[l as usize] && is_cl[r as usize] { continue; }
+            if is_cl[l as usize] && is_cl[r as usize] {
+                continue;
+            }
         }
         is_cl[node as usize] = true;
         pts.push((node, sz.min(n - sz)));
     }
     pts.sort_by_key(|(_, s)| -(*s as isize));
-    if pts.is_empty() { return None; }
+    if pts.is_empty() {
+        return None;
+    }
 
     // Select a maximal disjoint set (greedy, most-balanced first).
     let cap = leaf_sets.first().map(|l| l.len()).unwrap_or(0);
@@ -175,55 +303,127 @@ where F: FnMut(&Instance) -> Option<Vec<Tree>>
     let mut sel = Vec::new();
     for (i, (node, _)) in pts.iter().enumerate() {
         let ls = &leaf_sets[*node as usize];
-        if !taken.is_disjoint(ls) { continue; }
-        taken.union_with(ls); sel.push(i);
+        if !taken.is_disjoint(ls) {
+            continue;
+        }
+        taken.union_with(ls);
+        sel.push(i);
     }
-    if sel.is_empty() { return None; }
+    if sel.is_empty() {
+        return None;
+    }
 
-    // 2. Solve inner instances for selected clusters.
-    let mut solved: Vec<(FixedBitSet, Vec<u32>, Vec<Tree>, u32)> = Vec::with_capacity(sel.len());
+    #[derive(Clone)]
+    struct SolvedBatchCluster {
+        leaves: FixedBitSet,
+        p_label: u32,
+        anchor: Option<Tree>,
+        non_anchor: Vec<Tree>,
+    }
+
+    // 2. Solve boundary-aware inner instances for selected clusters.
+    //
+    // This mirrors the useful part of rspr's ClusterInstance contract: the
+    // component connected to the cut boundary must remain distinguishable after
+    // the sub-solve.  The C++ code keeps that as forest component 0 / rho
+    // state; in the immutable Tree API we attach a temporary rho leaf above
+    // the cluster root and later use the rho-containing solution component as
+    // the anchor to be joined to the outer placeholder.
+    let mut solved: Vec<SolvedBatchCluster> = Vec::with_capacity(sel.len());
     let mut all_clustered = FixedBitSet::with_capacity(n + 1);
     let mut next_p: u32 = n as u32 + 1;
     for &ci in &sel {
         let (cnode, _) = pts[ci];
         let leaves = leaf_sets[cnode as usize].clone();
         let csize = leaves.count_ones(..);
-        if csize < 2 { continue; }
+        if csize < 2 {
+            continue;
+        }
         let t2t = tw12[cnode as usize];
-        if t2t == NONE || t2.is_root(t2t) { continue; }
-        // For relaxed clusters, twin may have extra leaves — that's OK.
+        if t2t == NONE || t2.is_root(t2t) {
+            continue;
+        }
         all_clustered.union_with(&leaves);
-        let mut imap = vec![0u32; n + 1]; let mut ito = vec![0u32; csize + 1]; let mut l = 1u32;
-        for leaf in leaves.ones() { imap[leaf] = l; ito[l as usize] = leaf as u32; l += 1; }
-        solved.push((leaves, ito, solve(&Instance::new(vec![
-            t1.relabel(&imap, csize as u32), t2.relabel(&imap, csize as u32)
-        ], csize as u32))?, next_p));
+        let mut imap = vec![0u32; n + 1];
+        let marker_label = csize as u32 + 1;
+        let mut ito = vec![0u32; csize + 2];
+        let mut l = 1u32;
+        for leaf in leaves.ones() {
+            imap[leaf] = l;
+            ito[l as usize] = leaf as u32;
+            l += 1;
+        }
+        // The marker is deliberately not mapped back to an original label.
+        ito[marker_label as usize] = 0;
+
+        let inner_t1 = attach_rho(&t1.relabel(&imap, csize as u32), marker_label);
+        let inner_t2 = attach_rho(&t2.relabel(&imap, csize as u32), marker_label);
+        let mut inner_instance = Instance::new(vec![inner_t1, inner_t2], marker_label);
+        inner_instance.protected_labels = vec![marker_label];
+        let inner_solution = solve(&inner_instance)?;
+
+        let mut anchor: Option<Tree> = None;
+        let mut non_anchor = Vec::new();
+        for component in inner_solution {
+            let has_marker = component_contains_label(&component, marker_label);
+            let decoded = component.relabel(&ito, instance.num_leaves);
+            let decoded_has_leaves = decoded.root != NONE && decoded.leaves().next().is_some();
+            if has_marker {
+                if decoded_has_leaves {
+                    anchor = Some(decoded);
+                }
+            } else if decoded_has_leaves {
+                non_anchor.push(decoded);
+            }
+        }
+
+        solved.push(SolvedBatchCluster {
+            leaves,
+            anchor,
+            non_anchor,
+            p_label: next_p,
+        });
         next_p += 1;
     }
-    if solved.is_empty() { return None; }
+    if solved.is_empty() {
+        return None;
+    }
     let max_p = next_p - 1;
 
     // 3. Build remaining trees (bottom-up LCA check).
     let mut t1_p = vec![0u32; t1.num_nodes()];
     let mut t2_p = vec![0u32; t2.num_nodes()];
     for s in &solved {
-        let lca1 = lca_of_labels(t1, &s.0);
-        let lca2 = lca_of_labels(t2, &s.0);
-        if lca1 != NONE { t1_p[lca1 as usize] = s.3; }
-        // Only mark T2 LCA if the twin has exactly the cluster leaves (strict).
-        // Relaxed clusters need P inserted differently.
-        if lca2 != NONE && leaf_set_under(t2, lca2, n) == s.0 {
-            t2_p[lca2 as usize] = s.3;
+        let lca1 = lca_of_labels(t1, &s.leaves);
+        let lca2 = lca_of_labels(t2, &s.leaves);
+        if lca1 != NONE {
+            t1_p[lca1 as usize] = s.p_label;
+        }
+        if lca2 != NONE && leaf_set_under(t2, lca2, n) == s.leaves {
+            t2_p[lca2 as usize] = s.p_label;
         }
     }
     fn build(src: &Tree, node_to_p: &[u32], clustered: &FixedBitSet) -> Tree {
-        fn walk(src: &Tree, n2p: &[u32], cl: &FixedBitSet, out: &mut Tree, node: NodeId) -> Option<NodeId> {
+        fn walk(
+            src: &Tree,
+            n2p: &[u32],
+            cl: &FixedBitSet,
+            out: &mut Tree,
+            node: NodeId,
+        ) -> Option<NodeId> {
             if src.is_leaf(node) {
                 let lbl = src.label[node as usize];
-                if lbl == 0 || cl.contains(lbl as usize) { return None; }
+                if lbl == 0 || cl.contains(lbl as usize) {
+                    return None;
+                }
                 let id = out.parent.len() as NodeId;
-                out.parent.push(NONE); out.left.push(NONE); out.right.push(NONE); out.label.push(lbl);
-                while out.label_to_node.len() <= lbl as usize { out.label_to_node.push(NONE); }
+                out.parent.push(NONE);
+                out.left.push(NONE);
+                out.right.push(NONE);
+                out.label.push(lbl);
+                while out.label_to_node.len() <= lbl as usize {
+                    out.label_to_node.push(NONE);
+                }
                 out.label_to_node[lbl as usize] = id;
                 return Some(id);
             }
@@ -233,49 +433,81 @@ where F: FnMut(&Instance) -> Option<Vec<Tree>>
             let p = n2p[node as usize];
             if p != 0 {
                 let id = out.parent.len() as NodeId;
-                out.parent.push(NONE); out.left.push(NONE); out.right.push(NONE); out.label.push(p);
-                while out.label_to_node.len() <= p as usize { out.label_to_node.push(NONE); }
+                out.parent.push(NONE);
+                out.left.push(NONE);
+                out.right.push(NONE);
+                out.label.push(p);
+                while out.label_to_node.len() <= p as usize {
+                    out.label_to_node.push(NONE);
+                }
                 out.label_to_node[p as usize] = id;
                 return Some(id);
             }
             match (lc, rc) {
-                (None, None) => None, (Some(c),None)|(None,Some(c)) => Some(c),
+                (None, None) => None,
+                (Some(c), None) | (None, Some(c)) => Some(c),
                 (Some(lc), Some(rc)) => {
                     let id = out.parent.len() as NodeId;
-                    out.parent.push(NONE); out.left.push(lc); out.right.push(rc); out.label.push(0);
-                    out.parent[lc as usize] = id; out.parent[rc as usize] = id; Some(id)
+                    out.parent.push(NONE);
+                    out.left.push(lc);
+                    out.right.push(rc);
+                    out.label.push(0);
+                    out.parent[lc as usize] = id;
+                    out.parent[rc as usize] = id;
+                    Some(id)
                 }
             }
         }
         let maxp = node_to_p.iter().max().copied().unwrap_or(0);
         let mut out = Tree::with_capacity(src.num_leaves.max(maxp));
-        if src.root != NONE { if let Some(r) = walk(src, node_to_p, clustered, &mut out, src.root) { out.root = r; } }
-        out.compute_metadata(); out
+        if src.root != NONE {
+            if let Some(r) = walk(src, node_to_p, clustered, &mut out, src.root) {
+                out.root = r;
+            }
+        }
+        out.compute_metadata();
+        out
     }
     let rem_t1 = build(t1, &t1_p, &all_clustered);
 
-    // T2: for relaxed clusters (where twin has extra leaves), P must be
-    // inserted under the twin, sibling to the extra leaves.
-    // In rspr, extra F2 components stay in the remaining F2 — there's no P.
-    // In our tree model, we reconstruct T2 by: skip cluster leaves, keep
-    // extra leaves, and insert P under the twin's position.
+    // T2 builder.  The `relaxed_p` hook is deliberately unused by the strict
+    // batch path; it remains here only because the old experimental relaxed
+    // code used this helper.
     fn build_t2(
-        src: &Tree, node_to_p: &[u32], clustered: &FixedBitSet,
-        relaxed_p: &[(NodeId, u32)]  // (twin_node, p_label) for relaxed clusters
+        src: &Tree,
+        node_to_p: &[u32],
+        clustered: &FixedBitSet,
+        relaxed_p: &[(NodeId, u32)], // (twin_node, p_label) for relaxed clusters
     ) -> Tree {
         // marks: twin_node -> p_label AND no_children_from=cluster_lca for relaxed
         let mut p_at: Vec<u32> = vec![0; src.num_nodes()];
-        for &(twin, p) in relaxed_p { p_at[twin as usize] = p; }
+        for &(twin, p) in relaxed_p {
+            p_at[twin as usize] = p;
+        }
 
-        fn walk(src: &Tree, n2p: &[u32], cl: &FixedBitSet, p_at: &[u32],
-                out: &mut Tree, node: NodeId) -> Option<NodeId> {
+        fn walk(
+            src: &Tree,
+            n2p: &[u32],
+            cl: &FixedBitSet,
+            p_at: &[u32],
+            out: &mut Tree,
+            node: NodeId,
+        ) -> Option<NodeId> {
             if src.is_leaf(node) {
                 let lbl = src.label[node as usize];
-                if lbl == 0 || cl.contains(lbl as usize) { return None; }
+                if lbl == 0 || cl.contains(lbl as usize) {
+                    return None;
+                }
                 let id = out.parent.len() as NodeId;
-                out.parent.push(NONE); out.left.push(NONE); out.right.push(NONE); out.label.push(lbl);
-                while out.label_to_node.len() <= lbl as usize { out.label_to_node.push(NONE); }
-                out.label_to_node[lbl as usize] = id; return Some(id);
+                out.parent.push(NONE);
+                out.left.push(NONE);
+                out.right.push(NONE);
+                out.label.push(lbl);
+                while out.label_to_node.len() <= lbl as usize {
+                    out.label_to_node.push(NONE);
+                }
+                out.label_to_node[lbl as usize] = id;
+                return Some(id);
             }
             let (l, r) = src.children(node).unwrap();
             let lc = walk(src, n2p, cl, p_at, out, l);
@@ -284,144 +516,267 @@ where F: FnMut(&Instance) -> Option<Vec<Tree>>
             let p = n2p[node as usize];
             if p != 0 {
                 let id = out.parent.len() as NodeId;
-                out.parent.push(NONE); out.left.push(NONE); out.right.push(NONE); out.label.push(p);
-                while out.label_to_node.len() <= p as usize { out.label_to_node.push(NONE); }
-                out.label_to_node[p as usize] = id; return Some(id);
+                out.parent.push(NONE);
+                out.left.push(NONE);
+                out.right.push(NONE);
+                out.label.push(p);
+                while out.label_to_node.len() <= p as usize {
+                    out.label_to_node.push(NONE);
+                }
+                out.label_to_node[p as usize] = id;
+                return Some(id);
             }
             // Relaxed cluster: twin has extra leaves. Attach P as sibling if needed.
             let rp = p_at[node as usize];
             match (lc, rc) {
-                (None, None) => { if rp != 0 { let id = out.parent.len() as NodeId; out.parent.push(NONE); out.left.push(NONE); out.right.push(NONE); out.label.push(rp); while out.label_to_node.len() <= rp as usize { out.label_to_node.push(NONE); } out.label_to_node[rp as usize] = id; Some(id) } else { None }},
+                (None, None) => {
+                    if rp != 0 {
+                        let id = out.parent.len() as NodeId;
+                        out.parent.push(NONE);
+                        out.left.push(NONE);
+                        out.right.push(NONE);
+                        out.label.push(rp);
+                        while out.label_to_node.len() <= rp as usize {
+                            out.label_to_node.push(NONE);
+                        }
+                        out.label_to_node[rp as usize] = id;
+                        Some(id)
+                    } else {
+                        None
+                    }
+                }
                 (Some(c), None) | (None, Some(c)) => {
                     if rp != 0 {
-                        let pid = out.parent.len() as NodeId; out.parent.push(NONE); out.left.push(NONE); out.right.push(NONE); out.label.push(rp);
-                        while out.label_to_node.len() <= rp as usize { out.label_to_node.push(NONE); } out.label_to_node[rp as usize] = pid;
-                        let id = out.parent.len() as NodeId; out.parent.push(NONE); out.left.push(c); out.right.push(pid); out.label.push(0);
-                        out.parent[c as usize] = id; out.parent[pid as usize] = id; Some(id)
-                    } else { Some(c) }
-                },
+                        let pid = out.parent.len() as NodeId;
+                        out.parent.push(NONE);
+                        out.left.push(NONE);
+                        out.right.push(NONE);
+                        out.label.push(rp);
+                        while out.label_to_node.len() <= rp as usize {
+                            out.label_to_node.push(NONE);
+                        }
+                        out.label_to_node[rp as usize] = pid;
+                        let id = out.parent.len() as NodeId;
+                        out.parent.push(NONE);
+                        out.left.push(c);
+                        out.right.push(pid);
+                        out.label.push(0);
+                        out.parent[c as usize] = id;
+                        out.parent[pid as usize] = id;
+                        Some(id)
+                    } else {
+                        Some(c)
+                    }
+                }
                 (Some(lc), Some(rc)) => {
                     if rp != 0 {
-                        let pid = out.parent.len() as NodeId; out.parent.push(NONE); out.left.push(NONE); out.right.push(NONE); out.label.push(rp);
-                        while out.label_to_node.len() <= rp as usize { out.label_to_node.push(NONE); } out.label_to_node[rp as usize] = pid;
-                        let id2 = out.parent.len() as NodeId; out.parent.push(NONE); out.left.push(lc); out.right.push(pid); out.label.push(0);
-                        out.parent[lc as usize] = id2; out.parent[pid as usize] = id2;
-                        let id = out.parent.len() as NodeId; out.parent.push(NONE); out.left.push(id2); out.right.push(rc); out.label.push(0);
-                        out.parent[id2 as usize] = id; out.parent[rc as usize] = id; Some(id)
+                        let pid = out.parent.len() as NodeId;
+                        out.parent.push(NONE);
+                        out.left.push(NONE);
+                        out.right.push(NONE);
+                        out.label.push(rp);
+                        while out.label_to_node.len() <= rp as usize {
+                            out.label_to_node.push(NONE);
+                        }
+                        out.label_to_node[rp as usize] = pid;
+                        let id2 = out.parent.len() as NodeId;
+                        out.parent.push(NONE);
+                        out.left.push(lc);
+                        out.right.push(pid);
+                        out.label.push(0);
+                        out.parent[lc as usize] = id2;
+                        out.parent[pid as usize] = id2;
+                        let id = out.parent.len() as NodeId;
+                        out.parent.push(NONE);
+                        out.left.push(id2);
+                        out.right.push(rc);
+                        out.label.push(0);
+                        out.parent[id2 as usize] = id;
+                        out.parent[rc as usize] = id;
+                        Some(id)
                     } else {
-                        let id = out.parent.len() as NodeId; out.parent.push(NONE); out.left.push(lc); out.right.push(rc); out.label.push(0);
-                        out.parent[lc as usize] = id; out.parent[rc as usize] = id; Some(id)
+                        let id = out.parent.len() as NodeId;
+                        out.parent.push(NONE);
+                        out.left.push(lc);
+                        out.right.push(rc);
+                        out.label.push(0);
+                        out.parent[lc as usize] = id;
+                        out.parent[rc as usize] = id;
+                        Some(id)
                     }
                 }
             }
         }
-        let maxp = node_to_p.iter().max().copied().unwrap_or(0).max(p_at.iter().max().copied().unwrap_or(0));
+        let maxp = node_to_p
+            .iter()
+            .max()
+            .copied()
+            .unwrap_or(0)
+            .max(p_at.iter().max().copied().unwrap_or(0));
         let mut out = Tree::with_capacity(src.num_leaves.max(maxp));
-        if src.root != NONE { if let Some(r) = walk(src, node_to_p, clustered, &p_at, &mut out, src.root) { out.root = r; } }
-        out.compute_metadata(); out
+        if src.root != NONE {
+            if let Some(r) = walk(src, node_to_p, clustered, &p_at, &mut out, src.root) {
+                out.root = r;
+            }
+        }
+        out.compute_metadata();
+        out
     }
 
-    // Collect relaxed T2 clusters (twin has extra leaves).
-    let mut relaxed_t2: Vec<(NodeId, u32)> = Vec::new();
-    for s in &solved {
-        let lca2 = lca_of_labels(t2, &s.0);
-        if lca2 != NONE && t2_p[lca2 as usize] == 0 {
-            relaxed_t2.push((lca2, s.3));
-        }
-    }
+    let relaxed_t2: Vec<(NodeId, u32)> = Vec::new();
     let rem_t2 = build_t2(t2, &t2_p, &all_clustered, &relaxed_t2);
 
     // 4. Compact and solve remaining.
-    let rem_leaves = (1..=n as u32).filter(|l| !all_clustered.contains(*l as usize)).count();
+    let rem_leaves = (1..=n as u32)
+        .filter(|l| !all_clustered.contains(*l as usize))
+        .count();
     let rem_n = rem_leaves as u32 + solved.len() as u32;
     let mut cmap = vec![0u32; max_p as usize + 1];
     let mut crev = vec![0u32; rem_n as usize + 1];
     let mut nc: u32 = 1;
     for lbl in 1..=n as u32 {
-        if !all_clustered.contains(lbl as usize) { cmap[lbl as usize] = nc; crev[nc as usize] = lbl; nc += 1; }
+        if !all_clustered.contains(lbl as usize) {
+            cmap[lbl as usize] = nc;
+            crev[nc as usize] = lbl;
+            nc += 1;
+        }
     }
-    for i in 0..solved.len() { cmap[solved[i].3 as usize] = nc; solved[i].3 = nc; nc += 1; }
-    let prot: Vec<u32> = solved.iter().map(|s| s.3).collect();
-    let mut ri = Instance::new(vec![rem_t1.relabel(&cmap, rem_n), rem_t2.relabel(&cmap, rem_n)], rem_n);
+    for i in 0..solved.len() {
+        cmap[solved[i].p_label as usize] = nc;
+        solved[i].p_label = nc;
+        nc += 1;
+    }
+    let prot: Vec<u32> = solved.iter().map(|s| s.p_label).collect();
+    let mut ri = Instance::new(
+        vec![rem_t1.relabel(&cmap, rem_n), rem_t2.relabel(&cmap, rem_n)],
+        rem_n,
+    );
     ri.protected_labels = prot;
 
     let rem_comps = solve(&ri)?;
 
     // 5. Join: sequential P processing. Before each fuse, strip other P labels
     //    from current to keep label_to_node bounded by instance.num_leaves+1.
-    let mut result: Vec<Tree> = Vec::new();
-    let p_decoded = instance.num_leaves + 1;
+    let mut result: Vec<Tree> = solved
+        .iter()
+        .flat_map(|s| s.non_anchor.iter().cloned())
+        .collect();
     let big_n = instance.num_leaves + solved.len() as u32 + 100;
     for comp in &rem_comps {
-        let p_is: Vec<usize> = (0..solved.len()).filter(|&i| component_contains_label(comp, solved[i].3)).collect();
+        let p_is: Vec<usize> = (0..solved.len())
+            .filter(|&i| component_contains_label(comp, solved[i].p_label))
+            .collect();
         if p_is.is_empty() {
-            result.push(comp.relabel(&crev, instance.num_leaves)); continue;
+            result.push(comp.relabel(&crev, instance.num_leaves));
+            continue;
         }
         // Decode non-P via crev, map P's to > n.
         let mut fmap0 = vec![0u32; big_n as usize + 1];
         for lbl in 1..=comp.num_leaves {
             let l = lbl as usize;
-            if l < crev.len() && crev[l] != 0 { fmap0[l] = crev[l]; }
-            else { for (ii, s) in solved.iter().enumerate() { if l as u32 == s.3 { fmap0[l] = instance.num_leaves + ii as u32 + 2; break; } } }
+            if l < crev.len() && crev[l] != 0 {
+                fmap0[l] = crev[l];
+            } else {
+                for (ii, s) in solved.iter().enumerate() {
+                    if l as u32 == s.p_label {
+                        fmap0[l] = instance.num_leaves + ii as u32 + 2;
+                        break;
+                    }
+                }
+            }
         }
         let mut current = comp.relabel(&fmap0, big_n);
 
         for &si in &p_is {
             let p_cur = instance.num_leaves + si as u32 + 2;
-            let (_, ref ito, ref inner, _) = solved[si];
-            let decoded: Vec<Tree> = inner.iter().map(|c| c.relabel(ito, instance.num_leaves)).collect();
+            let Some(anchor) = solved[si].anchor.as_ref() else {
+                // Boundary was cut in the marker solve.  Leave the placeholder
+                // in `current`; it will be stripped below.
+                continue;
+            };
 
-            // Strip labels > instance.num_leaves from current (except p_cur).
+            // Strip impossible labels from current, but keep *all* placeholder
+            // labels that are present in this outer component.  The previous
+            // experimental code kept only p_cur, which silently dropped other
+            // placeholders when one outer component contained multiple P_i.
             let mut strip_map = vec![0u32; big_n as usize + 1];
             let mut max_kept: u32 = 0;
+            let keep_placeholders: Vec<u32> = p_is
+                .iter()
+                .map(|&idx| instance.num_leaves + idx as u32 + 2)
+                .collect();
             for lbl in current.leaves() {
-                if lbl <= instance.num_leaves || lbl == p_cur {
-                    strip_map[lbl as usize] = lbl; max_kept = max_kept.max(lbl);
+                if lbl <= instance.num_leaves || keep_placeholders.contains(&lbl) {
+                    strip_map[lbl as usize] = lbl;
+                    max_kept = max_kept.max(lbl);
                 }
             }
-            if max_kept == 0 { continue; }
-            let stripped = current.relabel(&strip_map, max_kept);
-            // Remap p_cur -> p_decoded for fuse.
-            let mut fmap = vec![0u32; (max_kept + 5) as usize];
-            for lbl in 1..=stripped.num_leaves { let l = lbl as usize; fmap[l] = if l as u32 == p_cur { p_decoded } else { l as u32 }; }
-            let cur_remap = stripped.relabel(&fmap, instance.num_leaves + 1);
-
-            let mut ok = false;
-            for ai in 0..decoded.len() {
-                let al = decoded[ai].leaves().next().unwrap();
-                let fused = fuse_at_label(&cur_remap, &decoded[ai], p_decoded, al, instance.num_leaves);
-                for j in 0..decoded.len() { if j != ai { result.push(decoded[j].clone()); } }
-                current = fused; ok = true; break;
+            if max_kept == 0 {
+                continue;
             }
-            if !ok { result.extend(decoded); }
+            let stripped = current.relabel(&strip_map, max_kept);
+
+            let al = anchor.leaves().next().unwrap();
+            current = fuse_at_label(&stripped, anchor, p_cur, al, big_n);
         }
         // Strip remaining P labels from current.
         let mut smap = vec![0u32; big_n as usize + 1];
         let mut smax: u32 = 0;
         for lbl in current.leaves() {
-            if lbl <= instance.num_leaves { smap[lbl as usize] = lbl; smax = smax.max(lbl); }
+            if lbl <= instance.num_leaves {
+                smap[lbl as usize] = lbl;
+                smax = smax.max(lbl);
+            }
         }
-        if smax > 0 { result.push(current.relabel(&smap, smax)); }
+        if smax > 0 {
+            result.push(current.relabel(&smap, smax));
+        }
     }
-    if result.is_empty() { return None; }
-    if !validate_agreement_forest(instance, &result).is_ok() { return None; }
-    eprintln!("[whidden] batch n={}: {} clusters -> {} comps", n, solved.len(), result.len());
+    if result.is_empty() {
+        return None;
+    }
+    let validation = validate_agreement_forest(instance, &result);
+    if !validation.is_ok() {
+        if env_flag("KLADOS_WHIDDEN_DEBUG") {
+            let sizes: Vec<usize> = solved.iter().map(|s| s.leaves.count_ones(..)).collect();
+            eprintln!(
+                "[whidden] batch n={}: validation failed for {} clusters sizes={:?}: {:?}",
+                n,
+                solved.len(),
+                sizes,
+                validation
+            );
+        }
+        return None;
+    }
+    eprintln!(
+        "[whidden] batch n={}: {} clusters -> {} comps",
+        n,
+        solved.len(),
+        result.len()
+    );
     Some(result)
 }
 
 fn lca_of_labels(tree: &Tree, leafset: &FixedBitSet) -> NodeId {
     let mut iter = leafset.ones();
-    let first = match iter.next() { Some(l) => l as Label, None => return NONE };
+    let first = match iter.next() {
+        Some(l) => l as Label,
+        None => return NONE,
+    };
     let mut acc = tree.label_to_node[first as usize];
     for lbl in iter {
         let n = tree.label_to_node[lbl as Label as usize];
-        if n != NONE { acc = tree.nearest_common_ancestor(acc, n); }
+        if n != NONE {
+            acc = tree.nearest_common_ancestor(acc, n);
+        }
     }
     acc
 }
 
 fn try_single_decomp<F>(instance: &Instance, solve: &mut F) -> Option<Vec<Tree>>
-where F: FnMut(&Instance) -> Option<Vec<Tree>>
+where
+    F: FnMut(&Instance) -> Option<Vec<Tree>>,
 {
     if instance.num_trees() != 2 {
         return None;
@@ -438,13 +793,7 @@ where F: FnMut(&Instance) -> Option<Vec<Tree>>
     let twin_t1_to_t2 = compute_twins(t1, t2);
     let twin_t2_to_t1 = compute_twins(t2, t1);
 
-    let cluster = find_best_cluster_point(
-        t1,
-        &leaf_sets_t1,
-        &twin_t1_to_t2,
-        &twin_t2_to_t1,
-        n,
-    )?;
+    let cluster = find_best_cluster_point(t1, &leaf_sets_t1, &twin_t1_to_t2, &twin_t2_to_t1, n)?;
 
     let cluster_leaves = &leaf_sets_t1[cluster as usize];
     let cluster_size = cluster_leaves.count_ones(..);
@@ -502,10 +851,18 @@ where F: FnMut(&Instance) -> Option<Vec<Tree>>
 
     // Build outer sub-instance: replace cluster subtree with single leaf P.
     let outer_t1 = replace_and_relabel(
-        t1, cluster, outer_p_label, &outer_label_map, outer_new_num_leaves,
+        t1,
+        cluster,
+        outer_p_label,
+        &outer_label_map,
+        outer_new_num_leaves,
     );
     let outer_t2 = replace_and_relabel(
-        t2, twin_in_t2, outer_p_label, &outer_label_map, outer_new_num_leaves,
+        t2,
+        twin_in_t2,
+        outer_p_label,
+        &outer_label_map,
+        outer_new_num_leaves,
     );
     let mut outer_instance = Instance::new(vec![outer_t1, outer_t2], outer_new_num_leaves);
     outer_instance.protected_labels = vec![outer_p_label];
@@ -527,8 +884,12 @@ where F: FnMut(&Instance) -> Option<Vec<Tree>>
         .expect("P must appear in some outer component");
 
     let p_decoded = instance.num_leaves + 1;
-    let outer_p_comp_decoded =
-        decode_outer_keeping_placeholder(&outer_components[outer_p_idx], &outer_to_orig, outer_p_label, instance.num_leaves);
+    let outer_p_comp_decoded = decode_outer_keeping_placeholder(
+        &outer_components[outer_p_idx],
+        &outer_to_orig,
+        outer_p_label,
+        instance.num_leaves,
+    );
 
     let decoded_outer_non_p: Vec<Tree> = outer_components
         .iter()
@@ -565,7 +926,12 @@ where F: FnMut(&Instance) -> Option<Vec<Tree>>
         if validate_agreement_forest(instance, &candidate).is_ok() {
             eprintln!(
                 "[whidden] decomp n={}: inner={} outer={} (cluster_node={}, anchor_idx={}, {} comps)",
-                n, cluster_size, outer_size + 1, cluster, anchor_idx, candidate.len()
+                n,
+                cluster_size,
+                outer_size + 1,
+                cluster,
+                anchor_idx,
+                candidate.len()
             );
             return Some(candidate);
         }
@@ -574,7 +940,10 @@ where F: FnMut(&Instance) -> Option<Vec<Tree>>
     // No valid anchor — decomposition fails for this cluster point.
     eprintln!(
         "[whidden] decomp n={}: inner={} outer={} — no valid anchor among {} inner components",
-        n, cluster_size, outer_size + 1, decoded_inner.len()
+        n,
+        cluster_size,
+        outer_size + 1,
+        decoded_inner.len()
     );
     None
 }
@@ -879,7 +1248,9 @@ fn fuse_at_label(
     }
 
     if outer_comp.root != NONE {
-        if let Some(root) = copy_outer_with_splice(outer_comp, inner_comp, p_label, &mut out, outer_comp.root) {
+        if let Some(root) =
+            copy_outer_with_splice(outer_comp, inner_comp, p_label, &mut out, outer_comp.root)
+        {
             out.root = root;
             out.parent[root as usize] = NONE;
         }
@@ -985,8 +1356,7 @@ fn debug_assert_valid_tree(tree: &Tree, name: &str) {
         tree.parent.len()
     );
     assert_eq!(
-        tree.parent[tree.root as usize],
-        NONE,
+        tree.parent[tree.root as usize], NONE,
         "{}: root has parent",
         name
     );
@@ -1193,15 +1563,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_strict_batch_identical_trees_no_cuts() {
+        let t = make_balanced_6();
+        let inst = Instance::new(vec![t.clone(), t.clone()], 6);
+        let result = try_batch_decomp(&inst, &mut |sub| {
+            // Identical => single component containing all leaves.
+            Some(vec![sub.trees[0].clone()])
+        });
+        let comps = result.expect("strict batch decomp should fire");
+        assert_eq!(comps.len(), 1, "identical trees: 1 component expected");
+        assert!(validate_agreement_forest(&inst, &comps).is_ok());
+    }
+
     /// T1: (((1,2),(3,4)),(5,6)), T2: ((1,3),((2,4),(5,6)))
     /// {5,6} is a common cherry in both trees (cluster point).
     /// Optimal MAF = 3: {1,2}, {3,4}, {5,6} (exchange 1↔3).
     #[test]
     fn test_common_cluster_point_decomposition() {
-        use klados_core::af_validator::validate_agreement_forest;
-        use klados_core::brute_maf::brute_force_maf;
         use crate::ExactSolver;
         use crate::maf_branch_price_multi::MafBranchPriceMultiSolver;
+        use klados_core::af_validator::validate_agreement_forest;
+        use klados_core::brute_maf::brute_force_maf;
 
         // T1: (((1,2),(3,4)),(5,6))
         let mut t1 = Tree::with_capacity(6);

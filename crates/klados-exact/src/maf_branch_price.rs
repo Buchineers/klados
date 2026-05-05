@@ -25,9 +25,9 @@ use highs::{ColProblem, HighsModelStatus, Model, Row};
 use klados_core::lower_bound::maf_bounds;
 use klados_core::{Instance, SolverStats, Tree};
 
+use crate::ExactSolver;
 use crate::cluster_reduction::{self, ClusterReductionResult};
 use crate::kernelize::{self, KernelizeConfig};
-use crate::ExactSolver;
 
 // ---------------------------------------------------------------------------
 // Solver struct
@@ -90,7 +90,7 @@ impl ExactSolver for MafBranchPriceSolver {
 // ---------------------------------------------------------------------------
 
 struct BpColumn {
-    labels: Vec<u32>,            // sorted leaf labels in this block
+    labels: Vec<u32>, // sorted leaf labels in this block
     covered_internal_nodes: Vec<Vec<usize>>,
     total_internal_count: usize, // cached sum of covered internal nodes across trees
 }
@@ -215,7 +215,10 @@ fn solve_branch_price(instance: &Instance, stats: &mut SolverStats) -> Option<Ve
     if let Some(partition) = &bounds.best_partition {
         let mut comp_labels: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
         for (leaf_idx, &comp_id) in partition.iter().enumerate() {
-            comp_labels.entry(comp_id).or_default().push((leaf_idx + 1) as u32);
+            comp_labels
+                .entry(comp_id)
+                .or_default()
+                .push((leaf_idx + 1) as u32);
         }
         let num_components = comp_labels.len();
         let mut values = vec![0.0; columns.len()];
@@ -237,7 +240,10 @@ fn solve_branch_price(instance: &Instance, stats: &mut SolverStats) -> Option<Ve
         }
         best_solution = Some(values);
         best_ub = num_components.min(n);
-        eprintln!("[maf-bp] seeded best_solution from greedy partition (UB={})", best_ub);
+        eprintln!(
+            "[maf-bp] seeded best_solution from greedy partition (UB={})",
+            best_ub
+        );
     } else {
         // Fallback: seed best_solution with the trivial all-singletons solution
         // so LP pruning works even when the greedy partition isn't available.
@@ -292,7 +298,9 @@ fn solve_branch_price(instance: &Instance, stats: &mut SolverStats) -> Option<Ve
                 let branch_labels = &state.columns[branch_col].labels;
                 eprintln!(
                     "[maf-bp] branching on column {} (|Y|={}, depth={})",
-                    branch_col, branch_labels.len(), node.depth,
+                    branch_col,
+                    branch_labels.len(),
+                    node.depth,
                 );
 
                 // Right child: exclude branch_col (a_Y = 0)
@@ -412,7 +420,9 @@ fn solve_bp_node(
             &beta,
             &blocked_leaves,
         ) {
-            Ok(Some((score, labels))) if score > 1.0 + 1e-8 && forbidden_labels.contains(&labels) => {
+            Ok(Some((score, labels)))
+                if score > 1.0 + 1e-8 && forbidden_labels.contains(&labels) =>
+            {
                 match price_best_new_compatible_column(
                     pricer_ws,
                     &trees[0],
@@ -607,7 +617,7 @@ struct NodeRmp {
     model: Option<Model>,
     active_global_cols: Vec<usize>,
     leaf_rows: Vec<Row>,
-    leaf_row_idx: Vec<usize>,    // usize indices for dual extraction
+    leaf_row_idx: Vec<usize>, // usize indices for dual extraction
     node_rows: Vec<Vec<Option<Row>>>,
     node_row_idx: Vec<Vec<Option<usize>>>, // usize indices for dual extraction
 }
@@ -721,17 +731,18 @@ impl NodeRmp {
         // Leaf cover rows are = 1 (both lb and ub), dual is direct.
         // Node pack rows are <= 1 (ub only), beta = -row_dual.
         let dual_rows = solution.dual_rows();
-        let leaf_duals = self.leaf_row_idx.iter().map(|&ri| clean_dual(dual_rows[ri])).collect();
+        let leaf_duals = self
+            .leaf_row_idx
+            .iter()
+            .map(|&ri| clean_dual(dual_rows[ri]))
+            .collect();
         let node_duals = self
             .node_row_idx
             .iter()
             .map(|tree_idxs| {
                 tree_idxs
                     .iter()
-                    .map(|opt| {
-                        opt.map(|ri| clean_dual(-dual_rows[ri]))
-                            .unwrap_or(0.0)
-                    })
+                    .map(|opt| opt.map(|ri| clean_dual(-dual_rows[ri])).unwrap_or(0.0))
                     .collect()
             })
             .collect();
@@ -750,11 +761,7 @@ impl NodeRmp {
 // Solution reconstruction
 // ---------------------------------------------------------------------------
 
-fn support_is_integral_partition(
-    columns: &[BpColumn],
-    values: &[f64],
-    num_leaves: usize,
-) -> bool {
+fn support_is_integral_partition(columns: &[BpColumn], values: &[f64], num_leaves: usize) -> bool {
     const ACTIVE_EPS: f64 = 1.0e-9;
 
     let mut cover_count = vec![0usize; num_leaves + 1];
@@ -774,11 +781,7 @@ fn support_is_integral_partition(
     (1..=num_leaves).all(|leaf| cover_count[leaf] == 1)
 }
 
-fn reconstruct_components(
-    columns: &[BpColumn],
-    values: &[f64],
-    instance: &Instance,
-) -> Vec<Tree> {
+fn reconstruct_components(columns: &[BpColumn], values: &[f64], instance: &Instance) -> Vec<Tree> {
     let n = instance.num_leaves;
     let mut covered = FixedBitSet::with_capacity(n as usize + 1);
     let mut components = Vec::new();
@@ -859,16 +862,13 @@ fn make_leafset(labels: &[u32], num_leaves: u32) -> FixedBitSet {
 }
 
 fn clean_dual(value: f64) -> f64 {
-    if value.abs() <= 1.0e-9 {
-        0.0
-    } else {
-        value
-    }
+    if value.abs() <= 1.0e-9 { 0.0 } else { value }
 }
 
 fn make_bp_column(labels: Vec<u32>, trees: &[Tree]) -> BpColumn {
     let covered_internal_nodes = if labels.len() >= 2 {
-        trees.iter()
+        trees
+            .iter()
             .map(|tree| {
                 let cover = mark_component_nodes(tree, &labels);
                 cover
@@ -878,9 +878,7 @@ fn make_bp_column(labels: Vec<u32>, trees: &[Tree]) -> BpColumn {
             })
             .collect::<Vec<_>>()
     } else {
-        trees.iter()
-            .map(|_| Vec::new())
-            .collect::<Vec<_>>()
+        trees.iter().map(|_| Vec::new()).collect::<Vec<_>>()
     };
     let total_internal_count = covered_internal_nodes.iter().map(|n| n.len()).sum();
     BpColumn {
@@ -939,11 +937,7 @@ fn price_best_new_compatible_column(
         .filter(|&label| !blocked_leaves[label as usize])
         .collect::<Vec<_>>();
     let ordinary_upper = alpha.iter().map(|&value| value.max(0.0)).sum::<f64>();
-    let beta_sum = beta
-        .iter()
-        .flat_map(|row| row.iter())
-        .copied()
-        .sum::<f64>();
+    let beta_sum = beta.iter().flat_map(|row| row.iter()).copied().sum::<f64>();
     let required_bonus = ordinary_upper + beta_sum + 1.0;
 
     // Single-flip heuristic: force the first free label in/out and run the
@@ -953,8 +947,14 @@ fn price_best_new_compatible_column(
         // Force label IN
         if let Some(node) = solve_pricing_prefix_subproblem(
             pricer_ws,
-            t1, t2, alpha, beta, blocked_leaves,
-            &free_labels, &[true], required_bonus,
+            t1,
+            t2,
+            alpha,
+            beta,
+            blocked_leaves,
+            &free_labels,
+            &[true],
+            required_bonus,
         )? {
             if !forbidden.contains(&node.labels) {
                 return Ok(Some((node.score, node.labels)));
@@ -963,8 +963,14 @@ fn price_best_new_compatible_column(
         // Force label OUT
         if let Some(node) = solve_pricing_prefix_subproblem(
             pricer_ws,
-            t1, t2, alpha, beta, blocked_leaves,
-            &free_labels, &[false], required_bonus,
+            t1,
+            t2,
+            alpha,
+            beta,
+            blocked_leaves,
+            &free_labels,
+            &[false],
+            required_bonus,
         )? {
             if !forbidden.contains(&node.labels) {
                 return Ok(Some((node.score, node.labels)));
@@ -1130,8 +1136,8 @@ pub(crate) struct PricerWorkspace {
     internal1: Vec<u32>,
     internal2: Vec<u32>,
     // Scratch buffers (reused, not reallocated)
-    live1: Vec<u32>,  // unblocked leaf count per node in t1
-    live2: Vec<u32>,  // unblocked leaf count per node in t2
+    live1: Vec<u32>, // unblocked leaf count per node in t1
+    live2: Vec<u32>, // unblocked leaf count per node in t2
     n2: usize,
     table_size: usize,
 }
@@ -1200,7 +1206,11 @@ impl PricerWorkspace {
         // t1: leaves first (already in post-order, leaves come before internals)
         for &u in &self.leaves1 {
             let lbl = t1.label[u as usize];
-            self.live1[u as usize] = if blocked.get(lbl as usize).copied().unwrap_or(false) { 0 } else { 1 };
+            self.live1[u as usize] = if blocked.get(lbl as usize).copied().unwrap_or(false) {
+                0
+            } else {
+                1
+            };
         }
         for &u in &self.internal1 {
             let (ul, ur) = t1.children_pair(u);
@@ -1209,7 +1219,11 @@ impl PricerWorkspace {
         // t2
         for &v in &self.leaves2 {
             let lbl = t2.label[v as usize];
-            self.live2[v as usize] = if blocked.get(lbl as usize).copied().unwrap_or(false) { 0 } else { 1 };
+            self.live2[v as usize] = if blocked.get(lbl as usize).copied().unwrap_or(false) {
+                0
+            } else {
+                1
+            };
         }
         for &v in &self.internal2 {
             let (vl, vr) = t2.children_pair(v);

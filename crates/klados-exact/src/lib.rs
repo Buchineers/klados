@@ -7,13 +7,13 @@ pub use klados_core::cluster_reduction;
 pub use klados_core::kernelize;
 pub use klados_core::lower_bound;
 pub mod chen_rspr;
-pub mod whidden_cluster;
 pub mod maf_branch_price;
 pub mod maf_branch_price_multi;
 pub mod maf_ilp;
 pub mod maf_sat;
 pub mod shi_mestel;
 pub mod whidden;
+pub mod whidden_cluster;
 
 use klados_core::{Instance, SolverStats, Tree};
 

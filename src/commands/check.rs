@@ -17,9 +17,10 @@ use pace26io::pace::simplified::Instance as PaceInstance;
 
 pub fn run(list_file: &PathBuf, scores_file: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     // Load known scores
-    let scores_data: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(scores_file)?)?;
-    let scores_arr = scores_data.as_array().ok_or("pace_summary.json is not an array")?;
+    let scores_data: serde_json::Value = serde_json::from_str(&fs::read_to_string(scores_file)?)?;
+    let scores_arr = scores_data
+        .as_array()
+        .ok_or("pace_summary.json is not an array")?;
     let mut known_scores: HashMap<String, usize> = HashMap::new();
     for entry in scores_arr {
         if let (Some(id), Some(score)) = (
@@ -34,15 +35,36 @@ pub fn run(list_file: &PathBuf, scores_file: &PathBuf) -> Result<(), Box<dyn std
     let lines: Vec<&str> = content.lines().collect();
     let base_dir = list_file.parent().unwrap_or(std::path::Path::new("."));
 
-    let total = lines.iter().filter(|l| {
-        let l = l.trim();
-        !l.is_empty() && !l.starts_with('#')
-    }).count();
+    let total = lines
+        .iter()
+        .filter(|l| {
+            let l = l.trim();
+            !l.is_empty() && !l.starts_with('#')
+        })
+        .count();
 
-    eprintln!("Validating bounds on {} instances vs {}\n", total, scores_file.display());
+    eprintln!(
+        "Validating bounds on {} instances vs {}\n",
+        total,
+        scores_file.display()
+    );
 
-    println!("{:>16} {:>5} {:>5} | {:>5} {:>6} | {:>5} {:>5} {:>6} | {:>5} {:>5} {:>6} | {:>5} {:>4}",
-        "Instance", "n", "kern", "w3LB", "t_ms", "a1LB", "a1UB", "t_ms", "chLB", "chUB", "t_ms", "OPT", "ok");
+    println!(
+        "{:>16} {:>5} {:>5} | {:>5} {:>6} | {:>5} {:>5} {:>6} | {:>5} {:>5} {:>6} | {:>5} {:>4}",
+        "Instance",
+        "n",
+        "kern",
+        "w3LB",
+        "t_ms",
+        "a1LB",
+        "a1UB",
+        "t_ms",
+        "chLB",
+        "chUB",
+        "t_ms",
+        "OPT",
+        "ok"
+    );
     println!("{}", "-".repeat(96));
 
     let mut processed = 0;
@@ -60,28 +82,54 @@ pub fn run(list_file: &PathBuf, scores_file: &PathBuf) -> Result<(), Box<dyn std
 
     for line in &lines {
         let line = line.trim();
-        if line.is_empty() || line.starts_with('#') { continue; }
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
         let digest = line.strip_prefix("s:").unwrap_or(line);
         let short = &digest[..16.min(digest.len())];
 
         let rel = format!(
             "stride-downloads/{}/{}/{}",
-            &digest[..2], &digest[2..4], &digest[4..]
+            &digest[..2],
+            &digest[2..4],
+            &digest[4..]
         );
-        let path: PathBuf = { let p = base_dir.join(&rel); if p.exists() { p } else { PathBuf::from(&rel) } };
-        if !path.exists() { errors += 1; continue; }
-        let fc = match fs::read_to_string(&path) { Ok(c) => c, Err(_) => { errors += 1; continue; } };
+        let path: PathBuf = {
+            let p = base_dir.join(&rel);
+            if p.exists() { p } else { PathBuf::from(&rel) }
+        };
+        if !path.exists() {
+            errors += 1;
+            continue;
+        }
+        let fc = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => {
+                errors += 1;
+                continue;
+            }
+        };
         let reader = BufReader::new(fc.as_bytes());
         let mut builder = IndexedBinTreeBuilder::default();
-        let pace = match PaceInstance::try_read(reader, &mut builder) { Ok(p) => p, Err(_) => { errors += 1; continue; } };
+        let pace = match PaceInstance::try_read(reader, &mut builder) {
+            Ok(p) => p,
+            Err(_) => {
+                errors += 1;
+                continue;
+            }
+        };
 
         let num_leaves = pace.num_leaves as u32;
-        let trees: Vec<_> = pace.trees.iter()
+        let trees: Vec<_> = pace
+            .trees
+            .iter()
             .map(|t| klados_core::Tree::from_cursor(t.top_down(), num_leaves))
             .collect();
         let instance = Instance::new(trees, num_leaves);
         let m = instance.num_trees();
-        if m != 2 { continue; }
+        if m != 2 {
+            continue;
+        }
 
         let kern = kernelize::kernelize(&instance, &kern_config);
         let reduced = &kern.instance;
@@ -92,7 +140,9 @@ pub fn run(list_file: &PathBuf, scores_file: &PathBuf) -> Result<(), Box<dyn std
 
         // Whidden 3-approx (LB only)
         let t0 = Instant::now();
-        let w3_cuts = approx_3_for_instance(&reduced.trees[0], &reduced.trees[1], reduced.num_leaves) as usize;
+        let w3_cuts =
+            approx_3_for_instance(&reduced.trees[0], &reduced.trees[1], reduced.num_leaves)
+                as usize;
         let w3_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let w3_lb = w3_cuts.div_ceil(3) + 1 + pr;
 
@@ -114,21 +164,68 @@ pub fn run(list_file: &PathBuf, scores_file: &PathBuf) -> Result<(), Box<dyn std
         a1_total_ms += a1_ms;
         ch_total_ms += ch_ms;
 
-        let ok_w3 = if let Some(o) = opt { let v = w3_lb <= o; if !v { w3_viol += 1; } v } else { true };
-        let ok_a1 = if let Some(o) = opt { let v = a1_lb <= o && o <= a1_ub; if !v { a1_viol += 1; } if o > 0 { a1_ratios.push(a1_ub as f64 / o as f64); } v } else { true };
-        let ok_ch = if let Some(o) = opt { let v = ch_lb <= o && o <= ch_ub; if !v { ch_viol += 1; } if o > 0 { ch_ratios.push(ch_ub as f64 / o as f64); } v } else { true };
+        let ok_w3 = if let Some(o) = opt {
+            let v = w3_lb <= o;
+            if !v {
+                w3_viol += 1;
+            }
+            v
+        } else {
+            true
+        };
+        let ok_a1 = if let Some(o) = opt {
+            let v = a1_lb <= o && o <= a1_ub;
+            if !v {
+                a1_viol += 1;
+            }
+            if o > 0 {
+                a1_ratios.push(a1_ub as f64 / o as f64);
+            }
+            v
+        } else {
+            true
+        };
+        let ok_ch = if let Some(o) = opt {
+            let v = ch_lb <= o && o <= ch_ub;
+            if !v {
+                ch_viol += 1;
+            }
+            if o > 0 {
+                ch_ratios.push(ch_ub as f64 / o as f64);
+            }
+            v
+        } else {
+            true
+        };
 
         processed += 1;
 
-        let ok = if ok_w3 && ok_a1 && ok_ch { "✓".to_string() }
-            else { format!("!{}{}{}", if !ok_w3 { "w" } else { "" }, if !ok_a1 { "a" } else { "" }, if !ok_ch { "c" } else { "" }) };
+        let ok = if ok_w3 && ok_a1 && ok_ch {
+            "✓".to_string()
+        } else {
+            format!(
+                "!{}{}{}",
+                if !ok_w3 { "w" } else { "" },
+                if !ok_a1 { "a" } else { "" },
+                if !ok_ch { "c" } else { "" }
+            )
+        };
 
-        println!("{:>16} {:>5} {:>5} | {:>5} {:>5.0} | {:>5} {:>5} {:>5.0} | {:>5} {:>5} {:>5.0} | {:>5} {:>4}",
-            short, num_leaves, n_kern,
-            w3_lb, w3_ms,
-            a1_lb, a1_ub, a1_ms,
-            ch_lb, ch_ub, ch_ms,
-            opt.unwrap_or(0), ok,
+        println!(
+            "{:>16} {:>5} {:>5} | {:>5} {:>5.0} | {:>5} {:>5} {:>5.0} | {:>5} {:>5} {:>5.0} | {:>5} {:>4}",
+            short,
+            num_leaves,
+            n_kern,
+            w3_lb,
+            w3_ms,
+            a1_lb,
+            a1_ub,
+            a1_ms,
+            ch_lb,
+            ch_ub,
+            ch_ms,
+            opt.unwrap_or(0),
+            ok,
         );
     }
 
@@ -137,12 +234,26 @@ pub fn run(list_file: &PathBuf, scores_file: &PathBuf) -> Result<(), Box<dyn std
         let avg_w3 = w3_total_ms / processed as f64;
         let avg_a1 = a1_total_ms / processed as f64;
         let avg_ch = ch_total_ms / processed as f64;
-        println!("\n{:>16} {:>5} {:>5} | {:>5} {:>5.0} | {:>5} {:>5} {:>5.0} | {:>5} {:>5} {:>5.0} |",
-            "AVG (ms)", "", "", "", avg_w3, "", "", avg_a1, "", "", avg_ch);
+        println!(
+            "\n{:>16} {:>5} {:>5} | {:>5} {:>5.0} | {:>5} {:>5} {:>5.0} | {:>5} {:>5} {:>5.0} |",
+            "AVG (ms)", "", "", "", avg_w3, "", "", avg_a1, "", "", avg_ch
+        );
         println!("{} instances | errors: {}", processed, errors);
-        if w3_viol > 0 { println!("W3  violations: {}", w3_viol); } else { println!("W3:  all valid ✓"); }
-        if a1_viol > 0 { println!("App1 violations: {}", a1_viol); } else { println!("App1: all valid ✓"); }
-        if ch_viol > 0 { println!("Chen violations: {}", ch_viol); } else { println!("Chen: all valid ✓"); }
+        if w3_viol > 0 {
+            println!("W3  violations: {}", w3_viol);
+        } else {
+            println!("W3:  all valid ✓");
+        }
+        if a1_viol > 0 {
+            println!("App1 violations: {}", a1_viol);
+        } else {
+            println!("App1: all valid ✓");
+        }
+        if ch_viol > 0 {
+            println!("Chen violations: {}", ch_viol);
+        } else {
+            println!("Chen: all valid ✓");
+        }
         if !a1_ratios.is_empty() {
             let avg = a1_ratios.iter().sum::<f64>() / a1_ratios.len() as f64;
             let max = a1_ratios.iter().cloned().fold(0.0, f64::max);
@@ -151,8 +262,12 @@ pub fn run(list_file: &PathBuf, scores_file: &PathBuf) -> Result<(), Box<dyn std
         if !ch_ratios.is_empty() {
             let avg = ch_ratios.iter().sum::<f64>() / ch_ratios.len() as f64;
             let max = ch_ratios.iter().cloned().fold(0.0, f64::max);
-            println!("Chen UB/OPT: avg={:.2} max={:.2} (2-approx ≤2.0{})",
-                avg, max, if max <= 2.0 { " ✓" } else { " ✗" });
+            println!(
+                "Chen UB/OPT: avg={:.2} max={:.2} (2-approx ≤2.0{})",
+                avg,
+                max,
+                if max <= 2.0 { " ✓" } else { " ✗" }
+            );
         }
     }
 
