@@ -15,6 +15,7 @@
 //!   the full Theorem 3.1 good-cut oracle from Section 6.3.
 
 use fixedbitset::FixedBitSet;
+use fxhash::FxHashMap;
 use klados_core::tree::{Label, NONE, NodeId};
 use klados_core::twin_tree::forest::{T1, T2, TwinForest};
 use klados_core::twin_tree::undo;
@@ -44,110 +45,6 @@ pub fn chen_pair_bounds(t1: &Tree, t2: &Tree) -> (usize, usize) {
          bounds.upper.min(n.saturating_sub(1) as usize))
     };
     (lower, upper)
-}
-
-/// Extract the Chen 2-approximation agreement forest component leaf-sets
-/// for a tree pair. Returns one `Vec<u32>` per agreement forest component,
-/// where each `Vec<u32>` contains the leaf labels in that component.
-///
-/// The returned forest is guaranteed to be a valid agreement forest for
-/// the two input trees, with size ≤ 2·OPT.
-pub fn chen_agreement_forest_leafsets(t1: &Tree, t2: &Tree) -> Vec<Vec<u32>> {
-    let n = t1.num_leaves;
-    let tf = TwinForest::from_trees(t1, t2, n);
-    // Run the app2 bounds — this populates cut lists in the state
-    let state = ChenAppState::from_twin(&tf);
-    let mut state = state;
-    // Run the stopper-driven cuts
-    let mut bounds = AppBounds::default();
-    let mut guard = state.num_nodes[T1] * 8 + state.num_nodes[T2] * 8;
-    while guard > 0 {
-        guard -= 1;
-        state.cut_tree1_singletons();
-        state.shrink_common_cherries();
-        state.cut_tree1_singletons();
-        state.drop_t2_leaf_roots();
-
-        let Some(root) = state.first_t1_root() else { break };
-        if !state.has_t1_cherry() { break };
-
-        if let Some(cut) = state.find_optimal_cut() {
-            state.cut_forest2(cut);
-            bounds.lower += 1;
-            bounds.upper += 1;
-            continue;
-        }
-
-        let Some(mut stopper) = ChenKey::find_stopper(root, &state) else { break };
-        if stopper.stopper.is_none() {
-            bounds.lower += stopper.lower_bound;
-            bounds.upper += stopper.upper_bound;
-            break;
-        }
-        stopper.cut_stopper(&mut state, &mut bounds);
-    }
-
-    // Reconstruct the agreement forest from the cut state
-    let mut locked = [
-        vec![true; state.num_nodes[T1]],
-        vec![true; state.num_nodes[T2]],
-    ];
-    for &cut in &state.t1_cut_list {
-        if cut != NONE && (cut as usize) < locked[T1].len() {
-            locked[T1][cut as usize] = false;
-        }
-    }
-    for &cut in &state.f2_cut_list {
-        if cut != NONE && (cut as usize) < locked[T2].len() {
-            locked[T2][cut as usize] = false;
-        }
-    }
-    if let Some(root) = state.first_t1_root() {
-        merge_components_by_lock(root, &state, &mut locked);
-    }
-
-    // Apply cuts to original tree and extract leaf sets
-    let mut work = tf.clone();
-    let mut um = undo::UndoMachine::new();
-    let mut cut_order = Vec::new();
-    for &root in &state.components[T2] {
-        collect_vertices_preorder(T2, root, &state, &mut cut_order);
-    }
-    for cut in cut_order {
-        if cut != NONE
-            && unlocked_check(&locked, T2, cut)
-            && (cut as usize) < work.num_nodes[T2]
-            && work.parent[T2][cut as usize] != NONE
-        {
-            cut_t2_node(&mut work, cut, &mut um);
-        }
-    }
-
-    // Process singletons and shrink to finalize
-    loop {
-        let before_hash = work.state_hash;
-        let mut dummy_k = i32::MAX / 4;
-        if !process_singletons(&mut work, &mut dummy_k, &mut um) { break; }
-        shrink_common_cherries(&mut work, &mut um);
-        if before_hash == work.state_hash { break; }
-    }
-
-    // Collect leaf sets from T1 components
-    let mut result = Vec::new();
-    for &root in &work.components[T1] {
-        let mut labels = Vec::new();
-        collect_labels(&work, root, &mut labels);
-        if !labels.is_empty() {
-            result.push(labels);
-        }
-    }
-    result
-}
-
-/// Helper: check if a node is NOT locked (i.e., should be cut).
-#[inline]
-fn unlocked_check(locked: &[Vec<bool>; 2], ti: usize, node: NodeId) -> bool {
-    node != NONE && (node as usize) < locked[ti].len() && !locked[ti][node as usize]
 }
 
 pub struct ChenRsprSolver {
@@ -759,70 +656,55 @@ fn chen_lower_bound(tf: &TwinForest, ctx: &mut ChenSearchCtx) -> usize {
     lb
 }
 
-/// Reconstruct the Chen 2-approximation agreement forest leaf-sets from
-/// the cut lists produced by `chen_app2_bounds_with_options`.
-fn chen_agreement_leafsets_from_cut_lists(
-    tf: &TwinForest,
-    t1_cuts: &[NodeId],
-    f2_cuts: &[NodeId],
+fn uf_find(uf: &mut [u32], mut x: u32) -> u32 {
+    while uf[x as usize] != x {
+        let p = uf[x as usize];
+        let pp = uf[p as usize];
+        uf[x as usize] = pp;
+        x = pp;
+    }
+    x
+}
+
+fn uf_union(uf: &mut [u32], a: u32, b: u32) {
+    let ra = uf_find(uf, a);
+    let rb = uf_find(uf, b);
+    if ra != rb {
+        uf[ra as usize] = rb;
+    }
+}
+
+/// Reconstruct the Chen 2-approximation agreement forest leaf-sets from the
+/// LIVE state of the Chen algorithm.
+///
+/// `state.components[T2]` holds the roots of the live T2 forest after the
+/// algorithm finishes. Each live "leaf" of these subtrees represents either
+/// a single original leaf (label != 0) or a cherry-contracted internal node
+/// (label == 0) standing in for the set of original leaves in its original-T2
+/// subtree. Leaves that were dropped from the live forest by
+/// `cut_tree1_singletons` / `drop_t2_leaf_roots` form their own singleton
+/// components.
+///
+/// We use the live state (not just `f2_cut_list`) because the algorithm's
+/// stopper machinery sometimes calls `unrecord_f2_cut` to re-assemble cut
+/// pieces (e.g. `cut_complex_key`); those re-assemblies only show in the
+/// live structure.
+fn chen_agreement_leafsets_from_state(
+    _tf: &TwinForest,
+    state: &ChenAppState,
 ) -> Vec<Vec<u32>> {
-    let state = ChenAppState::from_twin(tf);
-    let mut locked = [
-        vec![true; state.num_nodes[T1]],
-        vec![true; state.num_nodes[T2]],
-    ];
-    for &cut in t1_cuts {
-        if cut != NONE && (cut as usize) < locked[T1].len() {
-            locked[T1][cut as usize] = false;
-        }
+    let n = state.num_leaves;
+    let mut uf = state.leaf_uf.clone();
+    let mut groups: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    for lbl in 1..=n {
+        let r = uf_find(&mut uf, lbl);
+        groups.entry(r).or_default().push(lbl);
     }
-    for &cut in f2_cuts {
-        if cut != NONE && (cut as usize) < locked[T2].len() {
-            locked[T2][cut as usize] = false;
-        }
+    let mut result: Vec<Vec<u32>> = groups.into_values().collect();
+    for v in result.iter_mut() {
+        v.sort_unstable();
     }
-    if let Some(root) = state.first_t1_root() {
-        merge_components_by_lock(root, &state, &mut locked);
-    }
-
-    let mut work = tf.clone();
-    let mut um = undo::UndoMachine::new();
-    let mut cut_order = Vec::new();
-    for &root in &state.components[T2] {
-        collect_vertices_preorder(T2, root, &state, &mut cut_order);
-    }
-    for cut in cut_order {
-        if cut != NONE
-            && (cut as usize) < locked[T2].len()
-            && !locked[T2][cut as usize]
-            && (cut as usize) < work.num_nodes[T2]
-            && work.parent[T2][cut as usize] != NONE
-        {
-            cut_t2_node(&mut work, cut, &mut um);
-        }
-    }
-
-    loop {
-        let before_hash = work.state_hash;
-        let mut dummy_k = i32::MAX / 4;
-        if !process_singletons(&mut work, &mut dummy_k, &mut um) {
-            break;
-        }
-        shrink_common_cherries(&mut work, &mut um);
-        if before_hash == work.state_hash {
-            break;
-        }
-    }
-
-    let mut result = Vec::new();
-    for &root in &work.components[T1] {
-        let mut labels = Vec::new();
-        collect_labels(&work, root, &mut labels);
-        if !labels.is_empty() {
-            labels.sort_unstable();
-            result.push(labels);
-        }
-    }
+    result.sort();
     result
 }
 
@@ -874,267 +756,17 @@ pub fn chen_pair_agreement(
         stopper.cut_stopper(&mut state, &mut bounds);
     }
 
-    // Reconstruct the leaf-sets from the accumulated cut lists.
-    let leafsets = chen_agreement_leafsets_from_cut_lists(
-        &tf, &state.t1_cut_list, &state.f2_cut_list,
-    );
-
-    // Ensure complete coverage: add singletons for any leaves not in
-    // any extracted component.
-    let mut covered = FixedBitSet::with_capacity(n as usize + 1);
-    for ls in &leafsets {
-        for &lbl in ls {
-            if (lbl as usize) <= n as usize {
-                covered.insert(lbl as usize);
-            }
-        }
-    }
-    let mut complete = leafsets;
-    for lbl in 1..=n {
-        if !covered.contains(lbl as usize) {
-            complete.push(vec![lbl]);
-        }
-    }
+    let leafsets = chen_agreement_leafsets_from_state(&tf, &state);
 
     (
         bounds.lower.min(n.saturating_sub(1) as usize),
         bounds.upper.min(n.saturating_sub(1) as usize),
-        complete,
+        leafsets,
     )
 }
 
-fn improved_upper_from_cut_lists(tf: &TwinForest, t1_cuts: &[NodeId], f2_cuts: &[NodeId]) -> usize {
-    chen_agreement_leafsets_from_cut_lists(tf, t1_cuts, f2_cuts).len().saturating_sub(1)
-}
-
-fn merge_components_by_lock(t1v: NodeId, state: &ChenAppState, locked: &mut [Vec<bool>; 2]) {
-    if t1v == NONE || state.is_leaf(T1, t1v) {
-        return;
-    }
-    let t1l_root = state.left[T1][t1v as usize];
-    let t1r_root = state.right[T1][t1v as usize];
-
-    if t1l_root != NONE && !is_locked(locked, T1, t1l_root) {
-        let mut t1_leaf_list = Vec::new();
-        let mut v = t1v;
-        while v != NONE && t1_leaf_list.is_empty() {
-            collect_leaves_by_lock(T1, v, state, locked, &mut t1_leaf_list);
-            v = state.parent[T1][v as usize];
-        }
-        if !t1_leaf_list.is_empty() {
-            let t1l_leaf = find_leaf_by_lock(T1, t1l_root, state, locked);
-            if t1l_leaf != NONE {
-                let f2l_leaf = state.twin[T1][t1l_leaf as usize];
-                let mut f2l_root = find_root_by_lock(T2, f2l_leaf, state, locked);
-                let mut f2v = if f2l_root != NONE {
-                    state.parent[T2][f2l_root as usize]
-                } else {
-                    NONE
-                };
-                if f2v != NONE {
-                    let mut f2_leaf_list = Vec::new();
-                    collect_leaves_by_lock(T2, f2v, state, locked, &mut f2_leaf_list);
-                    while f2v != NONE
-                        && state.parent[T2][f2v as usize] != NONE
-                        && f2_leaf_list.is_empty()
-                    {
-                        f2v = state.parent[T2][f2v as usize];
-                        collect_leaves_by_lock(T2, f2v, state, locked, &mut f2_leaf_list);
-                    }
-                    if !f2_leaf_list.is_empty()
-                        && has_same_leaves_by_lock(&t1_leaf_list, &f2_leaf_list, state)
-                    {
-                        locked[T1][t1l_root as usize] = true;
-                        while f2l_root != NONE && f2l_root != f2v {
-                            locked[T2][f2l_root as usize] = true;
-                            f2l_root = state.parent[T2][f2l_root as usize];
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if t1r_root != NONE && !is_locked(locked, T1, t1r_root) {
-        let mut t1_leaf_list = Vec::new();
-        let mut v = t1v;
-        while v != NONE && t1_leaf_list.is_empty() {
-            collect_leaves_by_lock(T1, v, state, locked, &mut t1_leaf_list);
-            v = state.parent[T1][v as usize];
-        }
-        if !t1_leaf_list.is_empty() {
-            let t1r_leaf = find_leaf_by_lock(T1, t1r_root, state, locked);
-            if t1r_leaf != NONE {
-                let f2r_leaf = state.twin[T1][t1r_leaf as usize];
-                let mut f2r_root = find_root_by_lock(T2, f2r_leaf, state, locked);
-                let mut f2v = if f2r_root != NONE {
-                    state.parent[T2][f2r_root as usize]
-                } else {
-                    NONE
-                };
-                if f2v != NONE {
-                    let mut f2_leaf_list = Vec::new();
-                    collect_leaves_by_lock(T2, f2v, state, locked, &mut f2_leaf_list);
-                    while f2v != NONE
-                        && state.parent[T2][f2v as usize] != NONE
-                        && f2_leaf_list.is_empty()
-                    {
-                        f2v = state.parent[T2][f2v as usize];
-                        collect_leaves_by_lock(T2, f2v, state, locked, &mut f2_leaf_list);
-                    }
-                    if !f2_leaf_list.is_empty()
-                        && has_same_leaves_by_lock(&t1_leaf_list, &f2_leaf_list, state)
-                    {
-                        locked[T1][t1r_root as usize] = true;
-                        while f2r_root != NONE && f2r_root != f2v {
-                            locked[T2][f2r_root as usize] = true;
-                            f2r_root = state.parent[T2][f2r_root as usize];
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if t1l_root != NONE
-        && t1r_root != NONE
-        && !is_locked(locked, T1, t1l_root)
-        && !is_locked(locked, T1, t1r_root)
-    {
-        let mut t1_right_leaf_list = Vec::new();
-        collect_leaves_by_lock(T1, t1r_root, state, locked, &mut t1_right_leaf_list);
-        let t1l_leaf = find_leaf_by_lock(T1, t1l_root, state, locked);
-        if t1l_leaf != NONE {
-            let f2l_leaf = state.twin[T1][t1l_leaf as usize];
-            let f2l_root = find_root_by_lock(T2, f2l_leaf, state, locked);
-            let f2v = if f2l_root != NONE {
-                state.parent[T2][f2l_root as usize]
-            } else {
-                NONE
-            };
-            let f2r_root = if f2v == NONE {
-                NONE
-            } else {
-                state.sibling(T2, f2l_root)
-            };
-            if f2r_root != NONE {
-                let mut f2_right_leaf_list = Vec::new();
-                collect_leaves_by_lock(T2, f2r_root, state, locked, &mut f2_right_leaf_list);
-                if has_same_leaves_by_lock(&t1_right_leaf_list, &f2_right_leaf_list, state) {
-                    locked[T1][t1l_root as usize] = true;
-                    locked[T1][t1r_root as usize] = true;
-                    locked[T2][f2l_root as usize] = true;
-                    locked[T2][f2r_root as usize] = true;
-                    locked[T1][t1v as usize] = false;
-                    locked[T2][f2v as usize] = false;
-                }
-            }
-        }
-    }
-
-    merge_components_by_lock(t1l_root, state, locked);
-    merge_components_by_lock(t1r_root, state, locked);
-}
-
-fn collect_vertices_preorder(ti: usize, node: NodeId, state: &ChenAppState, out: &mut Vec<NodeId>) {
-    if node == NONE {
-        return;
-    }
-    out.push(node);
-    collect_vertices_preorder(ti, state.left[ti][node as usize], state, out);
-    collect_vertices_preorder(ti, state.right[ti][node as usize], state, out);
-}
-
-fn collect_leaves_by_lock(
-    ti: usize,
-    node: NodeId,
-    state: &ChenAppState,
-    locked: &[Vec<bool>; 2],
-    out: &mut Vec<NodeId>,
-) {
-    if node == NONE {
-        return;
-    }
-    if state.is_leaf(ti, node) {
-        out.push(node);
-        return;
-    }
-    let left = state.left[ti][node as usize];
-    if is_locked(locked, ti, left) {
-        collect_leaves_by_lock(ti, left, state, locked, out);
-    }
-    let right = state.right[ti][node as usize];
-    if is_locked(locked, ti, right) {
-        collect_leaves_by_lock(ti, right, state, locked, out);
-    }
-}
-
-fn find_leaf_by_lock(
-    ti: usize,
-    node: NodeId,
-    state: &ChenAppState,
-    locked: &[Vec<bool>; 2],
-) -> NodeId {
-    if node == NONE {
-        return NONE;
-    }
-    if state.is_leaf(ti, node) {
-        return node;
-    }
-    let left = state.left[ti][node as usize];
-    if is_locked(locked, ti, left) {
-        let found = find_leaf_by_lock(ti, left, state, locked);
-        if found != NONE {
-            return found;
-        }
-    }
-    let right = state.right[ti][node as usize];
-    if is_locked(locked, ti, right) {
-        return find_leaf_by_lock(ti, right, state, locked);
-    }
-    NONE
-}
-
-fn find_root_by_lock(
-    ti: usize,
-    mut node: NodeId,
-    state: &ChenAppState,
-    locked: &[Vec<bool>; 2],
-) -> NodeId {
-    while node != NONE && is_locked(locked, ti, node) {
-        let parent = state.parent[ti][node as usize];
-        if parent == NONE {
-            return node;
-        }
-        node = parent;
-    }
-    node
-}
-
-fn has_same_leaves_by_lock(
-    t1_leaves: &[NodeId],
-    f2_leaves: &[NodeId],
-    state: &ChenAppState,
-) -> bool {
-    if t1_leaves.len() != f2_leaves.len() {
-        return false;
-    }
-    let mut seen = vec![false; state.num_nodes[T1]];
-    for &leaf in t1_leaves {
-        if leaf != NONE && (leaf as usize) < seen.len() {
-            seen[leaf as usize] = true;
-        }
-    }
-    f2_leaves.iter().all(|&leaf| {
-        leaf != NONE && {
-            let mate = state.twin[T2][leaf as usize];
-            mate != NONE && (mate as usize) < seen.len() && seen[mate as usize]
-        }
-    })
-}
-
-fn is_locked(locked: &[Vec<bool>; 2], ti: usize, node: NodeId) -> bool {
-    node != NONE && (node as usize) < locked[ti].len() && locked[ti][node as usize]
+fn improved_upper_from_state(tf: &TwinForest, state: &ChenAppState) -> usize {
+    chen_agreement_leafsets_from_state(tf, state).len().saturating_sub(1)
 }
 
 /// Native approximation bound oracle matching the simple cut loop used as the
@@ -1281,7 +913,7 @@ fn chen_app2_bounds_with_options(tf: &TwinForest, improve_upper: bool) -> AppBou
     if improve_upper {
         let raw_bounds = bounds;
         let improved_upper =
-            improved_upper_from_cut_lists(tf, &state.t1_cut_list, &state.f2_cut_list);
+            improved_upper_from_state(tf, &state);
         bounds.upper = bounds.upper.min(improved_upper);
         if trace_stoppers {
             eprintln!(
@@ -1304,10 +936,31 @@ struct ChenAppState {
     num_nodes: [usize; 2],
     t1_cut_list: Vec<NodeId>,
     f2_cut_list: Vec<NodeId>,
+
+    // --- AF reconstruction (mirrors Java MafApp's `mergeComponents` logic) ---
+    //
+    // `leaf_uf` is a union-find over leaf labels 1..=num_leaves. Two labels
+    // share a representative iff they were merged into the same agreement-
+    // forest component by `shrink_common_cherries` (the only operation that
+    // groups leaves; cuts only separate, never merge).
+    //
+    // `node_repr_t1[v]` is a "delegate" leaf label for the current live T1
+    // subtree rooted at node `v` — initially the leaf's own label for leaves
+    // and 0 for internal nodes. Each cherry contraction promotes one of the
+    // children's delegate to the parent so subsequent contractions can union
+    // through nested cherry merges.
+    num_leaves: u32,
+    leaf_uf: Vec<u32>,
+    node_repr_t1: Vec<Label>,
 }
 
 impl ChenAppState {
     fn from_twin(tf: &TwinForest) -> Self {
+        let n = tf.num_leaves;
+        let mut node_repr_t1 = vec![0 as Label; tf.num_nodes[T1]];
+        for v in 0..tf.num_nodes[T1] {
+            node_repr_t1[v] = tf.label[T1][v];
+        }
         let mut state = Self {
             parent: tf.parent.clone(),
             orig_parent: [tf.orig_parent.clone(), tf.orig_t2_parent.clone()],
@@ -1318,6 +971,9 @@ impl ChenAppState {
             num_nodes: tf.num_nodes,
             t1_cut_list: Vec::new(),
             f2_cut_list: Vec::new(),
+            num_leaves: n,
+            leaf_uf: (0..=n).collect(),
+            node_repr_t1,
         };
         // The exact search's undo contract deliberately leaves stale topology
         // on contracted-away nodes (for speed / hash stability).  Java's
@@ -1484,6 +1140,18 @@ impl ChenAppState {
             let Some((t1_parent, t2_parent)) = target else {
                 break;
             };
+            // Track the merge for AF extraction. The two T1 children's
+            // delegate leaf labels are joined; the parent inherits one as
+            // its new delegate so a cascading contraction can keep unioning.
+            let lc = self.left[T1][t1_parent as usize];
+            let rc = self.right[T1][t1_parent as usize];
+            let lr = if lc != NONE { self.node_repr_t1[lc as usize] } else { 0 };
+            let rr = if rc != NONE { self.node_repr_t1[rc as usize] } else { 0 };
+            if lr != 0 && rr != 0 {
+                uf_union(&mut self.leaf_uf, lr, rr);
+            }
+            let promoted = if lr != 0 { lr } else { rr };
+            self.node_repr_t1[t1_parent as usize] = promoted;
             self.contract_sibling_pair(T1, t1_parent);
             self.contract_sibling_pair(T2, t2_parent);
             self.twin[T1][t1_parent as usize] = t2_parent;
