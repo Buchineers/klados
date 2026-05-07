@@ -1759,13 +1759,9 @@ impl<'a> PairDpPricer<'a> {
 
         // `descendant_leaves` is `&'a [...]` (Copy), so this does not reborrow self.
         let desc: &[Vec<FixedBitSet>] = self.descendant_leaves;
-        // SAFETY: `active_mask` is never mutated while solve_pair recurses — it's
-        // fixed for the lifetime of this pricer. Extending the lifetime here lets us
-        // iterate it while also calling `&mut self.solve_pair`.
-        let am: &[usize] = unsafe {
-            let s = self.active_mask.as_slice();
-            std::slice::from_raw_parts(s.as_ptr(), s.len())
-        };
+        // Clone the active mask so we can borrow it while calling &mut self methods.
+        let am = self.active_mask.clone();
+        let am_slice = am.as_slice();
         // Cache per-tree side-node indices on stack (assumes num_trees <= 64).
         let mut side_nodes = [0u32; 64];
         debug_assert!(num_trees <= 64);
@@ -1773,15 +1769,19 @@ impl<'a> PairDpPricer<'a> {
             side_nodes[ti] = self.side_child[ti][pair_ix];
         }
 
+        const BLOCK_BITS: usize = std::mem::size_of::<usize>() * 8;
+        const BLOCK_SHIFT: usize = BLOCK_BITS.trailing_zeros() as usize;
+        const BLOCK_MASK: usize = BLOCK_BITS - 1;
+
         let la = label_a as usize;
         let lb = label_b as usize;
-        let la_w = la >> 6;
-        let la_m = 1usize << (la & 63);
-        let lb_w = lb >> 6;
-        let lb_m = 1usize << (lb & 63);
+        let la_w = la >> BLOCK_SHIFT;
+        let la_m = 1usize << (la & BLOCK_MASK);
+        let lb_w = lb >> BLOCK_SHIFT;
+        let lb_m = 1usize << (lb & BLOCK_MASK);
         let d0 = desc[0][side_nodes[0] as usize].as_slice();
         for wi in 0..d0.len() {
-            let mut w = d0[wi] & am[wi];
+            let mut w = d0[wi] & am_slice[wi];
             for ti in 1..num_trees {
                 w &= desc[ti][side_nodes[ti] as usize].as_slice()[wi];
             }
@@ -1794,7 +1794,7 @@ impl<'a> PairDpPricer<'a> {
             while w != 0 {
                 let bit = w.trailing_zeros() as usize;
                 w &= w - 1;
-                let c_label = (wi << 6) + bit;
+                let c_label = (wi << BLOCK_SHIFT) + bit;
                 let c = self.label_to_active_idx[c_label] as usize;
                 let child_score = self.solve_pair(a, c);
                 if child_score <= NEG_INF / 2.0 {
