@@ -74,6 +74,21 @@ impl ExactSolver for ChenRsprSolver {
         "chen-rspr"
     }
 
+    fn description(&self) -> &'static str {
+        "Chen-style rSPR branch-and-bound (2-tree only)"
+    }
+
+    fn options(&self) -> &'static [(&'static str, &'static str)] {
+        &[
+            ("KLADOS_CHEN_JAR_DUMMY", "enable jar-dummy leaf attachment"),
+            ("KLADOS_CHEN_BOUNDS", "print bound details"),
+            ("KLADOS_CHEN_TRACE_K", "trace k-search"),
+            ("KLADOS_CHEN_NO_RECURSIVE_LB", "disable recursive lower bound"),
+            ("KLADOS_CHEN_USE_FORCED", "enable forced-cut pre-branch rules"),
+            ("KLADOS_CHEN_STOPPERS", "trace stopper classifications"),
+        ]
+    }
+
     fn solve(&mut self, instance: &Instance) -> Option<Vec<Tree>> {
         if instance.num_trees() != 2 {
             eprintln!(

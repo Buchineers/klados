@@ -505,7 +505,15 @@ impl MafBranchPriceMultiSolver {
 
 impl ExactSolver for MafBranchPriceMultiSolver {
     fn name(&self) -> &'static str {
-        "maf-bp-multi"
+        "bp-multi"
+    }
+
+    fn description(&self) -> &'static str {
+        "Branch & Price for multi-tree MAF (default exact solver)"
+    }
+
+    fn options(&self) -> &'static [(&'static str, &'static str)] {
+        &[]
     }
 
     fn solve(&mut self, instance: &Instance) -> Option<Vec<Tree>> {
@@ -707,7 +715,7 @@ fn solve_branch_price_multi(instance: &Instance, stats: &mut SolverStats) -> Opt
     let result = solve_branch_price_multi_cached(instance, stats, &mut memo);
     if memo.hits > 0 || memo.stores > 0 || memo.skipped_ambiguous > 0 {
         eprintln!(
-            "[maf-bp-multi] memo: hits={} stores={} entries={} skipped_ambiguous={}",
+            "[bp-multi] memo: hits={} stores={} entries={} skipped_ambiguous={}",
             memo.hits,
             memo.stores,
             memo.solutions.len(),
@@ -732,7 +740,7 @@ fn solve_branch_price_multi_cached(
     let reduced = &kern.instance;
 
     eprintln!(
-        "[maf-bp-multi] kernelized {} -> {} leaves (m={})",
+        "[bp-multi] kernelized {} -> {} leaves (m={})",
         instance.num_leaves,
         reduced.num_leaves,
         reduced.num_trees(),
@@ -815,7 +823,7 @@ fn solve_branch_price_multi_cached(
                 instance.num_leaves,
             );
             eprintln!(
-                "[maf-bp-multi] optimal: {} components (whidden strict cluster decomp, n={}), {:.1}ms total",
+                "[bp-multi] optimal: {} components (whidden strict cluster decomp, n={}), {:.1}ms total",
                 components.len(),
                 reduced.num_leaves,
                 t_total.elapsed().as_secs_f64() * 1000.0,
@@ -843,7 +851,7 @@ fn solve_branch_price_multi_cached(
                 instance.num_leaves,
             );
             eprintln!(
-                "[maf-bp-multi] optimal: {} components (rspr cluster decomp), {:.1}ms total",
+                "[bp-multi] optimal: {} components (rspr cluster decomp), {:.1}ms total",
                 components.len(),
                 t_total.elapsed().as_secs_f64() * 1000.0,
             );
@@ -870,7 +878,7 @@ fn solve_branch_price_multi_cached(
                 instance.num_leaves,
             );
             eprintln!(
-                "[maf-bp-multi] optimal: {} components (cluster decomp), {:.1}ms total",
+                "[bp-multi] optimal: {} components (cluster decomp), {:.1}ms total",
                 components.len(),
                 t_total.elapsed().as_secs_f64() * 1000.0,
             );
@@ -948,7 +956,7 @@ fn solve_branch_price_multi_cached(
             chen_columns_added += 1;
         }
         eprintln!(
-            "[maf-bp-multi] chen seed: {} columns in {:.1}ms",
+            "[bp-multi] chen seed: {} columns in {:.1}ms",
             chen_columns_added,
             chen_t0.elapsed().as_secs_f64() * 1000.0,
         );
@@ -998,7 +1006,7 @@ fn solve_branch_price_multi_cached(
                     best_ub = incumbent.len();
                     best_solution = Some(values);
                     eprintln!(
-                        "[maf-bp-multi] relaxed whidden incumbent: {} components, {} cols added, {:.1}ms",
+                        "[bp-multi] relaxed whidden incumbent: {} components, {} cols added, {:.1}ms",
                         best_ub,
                         added,
                         relaxed_t0.elapsed().as_secs_f64() * 1000.0,
@@ -1041,7 +1049,7 @@ fn solve_branch_price_multi_cached(
     let mut rmp = match PersistentRmp::new(&state.columns, trees, n) {
         Ok(rmp) => rmp,
         Err(err) => {
-            eprintln!("[maf-bp-multi] failed to build persistent RMP: {}", err);
+            eprintln!("[bp-multi] failed to build persistent RMP: {}", err);
             return None;
         }
     };
@@ -1061,7 +1069,7 @@ fn solve_branch_price_multi_cached(
             NodeResult::Integral(obj, values) => {
                 if obj < state.best_ub {
                     eprintln!(
-                        "[maf-bp-multi] new incumbent: {} components (depth={}, nodes={})",
+                        "[bp-multi] new incumbent: {} components (depth={}, nodes={})",
                         obj, node.depth, state.nodes_explored,
                     );
                     state.best_ub = obj;
@@ -1126,7 +1134,7 @@ fn solve_branch_price_multi_cached(
     stats.lower_bound = components.len();
     let total_ms = t_total.elapsed().as_secs_f64() * 1000.0;
     eprintln!(
-        "[maf-bp-multi] optimal: {} components, {} B&B nodes, {} CG iters, {} cols, {:.1}ms total",
+        "[bp-multi] optimal: {} components, {} B&B nodes, {} CG iters, {} cols, {:.1}ms total",
         components.len(),
         state.nodes_explored,
         state.cg_iterations_total,
@@ -1134,7 +1142,7 @@ fn solve_branch_price_multi_cached(
         total_ms,
     );
     eprintln!(
-        "[maf-bp-multi] timings ms: pricer_new={:.1} pricer_solve={:.1} collect={:.1} apply_bounds={:.1} lp_solve={:.1} add_col={:.1} cuts={:.1} cuts_added={}",
+        "[bp-multi] timings ms: pricer_new={:.1} pricer_solve={:.1} collect={:.1} apply_bounds={:.1} lp_solve={:.1} add_col={:.1} cuts={:.1} cuts_added={}",
         state.t_pricer_new * 1000.0,
         state.t_pricer_solve * 1000.0,
         state.t_pricer_collect * 1000.0,
@@ -1390,7 +1398,7 @@ fn solve_bp_node(
         };
         state.t_lp_solve += t_solve.elapsed().as_secs_f64();
         if num_leaves > 500 && state.cg_iterations_total % 50 == 0 {
-            eprintln!("[maf-bp-multi] CG iter {} cols={} obj={:.4} (lp_solve={:.1}ms)", 
+            eprintln!("[bp-multi] CG iter {} cols={} obj={:.4} (lp_solve={:.1}ms)", 
                 state.cg_iterations_total, state.columns.len(), lp.objective, state.t_lp_solve * 1000.0);
         }
 

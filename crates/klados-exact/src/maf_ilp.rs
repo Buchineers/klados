@@ -22,10 +22,6 @@ use highs::{Col, HighsModelStatus, RowProblem, Sense};
 use klados_core::tree::{Label, NONE, NodeId, Tree};
 use klados_core::{Instance, SolverStats};
 
-// ---------------------------------------------------------------------------
-// Index helpers
-// ---------------------------------------------------------------------------
-
 /// Triangular index for unordered pair (x, y) with 1 ≤ x < y ≤ n.
 /// Maps to a contiguous range 0..n*(n-1)/2.
 /// (1,2)->0, (1,3)->1, (2,3)->2, (1,4)->3, (2,4)->4, (3,4)->5, ...
@@ -44,10 +40,6 @@ fn num_pairs(n: u32) -> usize {
     let n = n as usize;
     n * (n - 1) / 2
 }
-
-// ---------------------------------------------------------------------------
-// LCA and path computation
-// ---------------------------------------------------------------------------
 
 /// Compute LCA of two nodes in a tree using naive depth-walk.
 /// O(depth) time. Fine for balanced trees up to n~1000.
@@ -102,10 +94,6 @@ fn path_nodes(tree: &Tree, x: Label, y: Label) -> Vec<NodeId> {
 
     result
 }
-
-// ---------------------------------------------------------------------------
-// Triplet topology and conflict detection
-// ---------------------------------------------------------------------------
 
 /// Determine the rooted triplet topology of (x, y, z) in `tree`.
 /// Returns 0 if xy|z (x,y are the cherry), 1 if xz|y, 2 if yz|x,
@@ -524,13 +512,21 @@ impl MafIlpSolver {
 
 impl super::ExactSolver for MafIlpSolver {
     fn name(&self) -> &'static str {
-        "maf-ilp"
+        "ilp"
+    }
+
+    fn description(&self) -> &'static str {
+        "Integer Linear Programming via HiGHS (pairwise conflict triple cover)"
+    }
+
+    fn options(&self) -> &'static [(&'static str, &'static str)] {
+        &[]
     }
 
     fn solve(&mut self, instance: &Instance) -> Option<Vec<Tree>> {
         if instance.num_leaves > self.max_leaves {
             eprintln!(
-                "maf-ilp: instance has {} leaves, exceeding limit of {}",
+                "ILP: instance has {} leaves, exceeding limit of {}",
                 instance.num_leaves, self.max_leaves
             );
             return None;
@@ -547,7 +543,7 @@ impl super::ExactSolver for MafIlpSolver {
                 Some(components)
             }
             None => {
-                eprintln!("maf-ilp: solver did not find optimal solution");
+                eprintln!("ILP: solver did not find optimal solution");
                 None
             }
         }

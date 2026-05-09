@@ -534,7 +534,7 @@ fn exact_local_solve(region_instance: &Instance) -> Option<(Vec<Tree>, &'static 
     }
 
     let mut sat = MafSatSolver::new();
-    ExactSolver::solve(&mut sat, region_instance).map(|sol| (sol, "maf-sat"))
+    ExactSolver::solve(&mut sat, region_instance).map(|sol| (sol, "sat"))
 }
 
 fn apply_exact_region_if_improves(
@@ -1034,7 +1034,7 @@ fn exact_region_reoptimization_pass(
         if solver_name == "whidden" {
             stats.whidden_attempts += 1;
         }
-        if solver_name == "maf-sat" {
+        if solver_name == "sat" {
             stats.maf_sat_attempts += 1;
         }
 
@@ -1398,7 +1398,7 @@ impl AgglomerativeSolver {
                 }
 
                 eprintln!(
-                    "[agglo] cycle {} region-reopt: attempts={} accepted={} rejected={} delta={} best-delta={} whidden={} maf-sat={} no-improve-streak={} comps={} t={:.1}s",
+                    "[agglo] cycle {} region-reopt: attempts={} accepted={} rejected={} delta={} best-delta={} whidden={} sat={} no-improve-streak={} comps={} t={:.1}s",
                     cycle,
                     region_stats.attempts,
                     region_stats.accepted,
@@ -1460,7 +1460,7 @@ impl AgglomerativeSolver {
         let total_time = start.elapsed().as_secs_f64();
         let total_merges = cherry_merges + phase2_merges + region_stats_total.merges;
         eprintln!(
-            "[agglo] Final: {} components (score={}) in {:.2}s [{} p1 + {} p2 + {} region-merges = {} merges | region attempts={} accepted={} rejected={} best-delta={} whidden={} maf-sat={} | plateau episodes={} expanded={} deduped={} accepted={} best-delta={}]",
+            "[agglo] Final: {} components (score={}) in {:.2}s [{} p1 + {} p2 + {} region-merges = {} merges | region attempts={} accepted={} rejected={} best-delta={} whidden={} sat={} | plateau episodes={} expanded={} deduped={} accepted={} best-delta={}]",
             num_components,
             num_components.saturating_sub(1),
             total_time,
@@ -1513,6 +1513,14 @@ impl AgglomerativeSolver {
 impl HeuristicSolver for AgglomerativeSolver {
     fn name(&self) -> &'static str {
         "agglomerative"
+    }
+
+    fn description(&self) -> &'static str {
+        "Agglomerative clustering heuristic via conflict-graph merging"
+    }
+
+    fn options(&self) -> &'static [(&'static str, &'static str)] {
+        &[]
     }
 
     fn solve(&mut self, instance: &Instance) -> Option<Vec<Tree>> {

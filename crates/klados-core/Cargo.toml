@@ -9,6 +9,7 @@ license = "GPL-3.0-or-later"
 pace26io = { workspace = true }
 fixedbitset = { workspace = true }
 fxhash = { workspace = true }
+clap = { workspace = true }
 
 [dev-dependencies]
 iai-callgrind = "0.16"
