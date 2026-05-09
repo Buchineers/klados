@@ -8,13 +8,16 @@ pub mod brute_maf;
 pub mod cluster_decomposition;
 pub mod cluster_reduction;
 pub mod instance;
+pub mod instance_list;
 pub mod kernelize;
 pub mod lower_bound;
+pub mod solve_pipeline;
 pub mod tree;
 pub mod twin_tree;
 pub mod xforest;
 
 pub use instance::Instance;
+pub use instance_list::{InstanceEntry, parse_list_file};
 pub use tree::{Label, NONE, NodeId, Tree};
 pub use xforest::XForest;
 

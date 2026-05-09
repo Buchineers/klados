@@ -12,19 +12,10 @@ pub fn run(
     chain: bool,
     chain32: bool,
     chain32_multi: bool,
-    strategy: &str,
+    victim_strategy: VictimStrategy,
     max_partners: usize,
     verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let victim_strategy = match strategy {
-        "first" => VictimStrategy::First,
-        "last" => VictimStrategy::Last,
-        "max-cascade" => VictimStrategy::MaxCascade,
-        other => {
-            eprintln!("Unknown strategy '{}', using 'first'", other);
-            VictimStrategy::First
-        }
-    };
 
     let config = KernelizeConfig {
         subtree,

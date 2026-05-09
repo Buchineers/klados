@@ -105,7 +105,7 @@ impl WhiddenSolver {
         // Whidden is 2-tree only; fall back to SAT solver for multi-tree instances.
         if instance.num_trees() != 2 {
             eprintln!(
-                "[whidden] m={}, falling back to maf-sat",
+                "[whidden] m={}, falling back to sat",
                 instance.num_trees()
             );
             let mut sat = crate::maf_sat::MafSatSolver::new();
@@ -181,6 +181,18 @@ impl WhiddenSolver {
 impl super::ExactSolver for WhiddenSolver {
     fn name(&self) -> &'static str {
         "whidden"
+    }
+
+    fn description(&self) -> &'static str {
+        "Whidden 3-way branch-and-bound (2-tree only)"
+    }
+
+    fn options(&self) -> &'static [(&'static str, &'static str)] {
+        &[
+            ("KLADOS_WHIDDEN_BATCH_STRICT", "use strict cluster point detection"),
+            ("KLADOS_WHIDDEN_RSPR_GREEDY", "use greedy rSPR decomposition"),
+            ("KLADOS_WHIDDEN_DEBUG", "enable debug output"),
+        ]
     }
 
     fn solve(&mut self, instance: &Instance) -> Option<Vec<Tree>> {

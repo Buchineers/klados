@@ -2936,6 +2936,16 @@ impl HeuristicSolver for PartitionHeuristicSolver {
         self.mode_name()
     }
 
+    fn description(&self) -> &'static str {
+        "Greedy partition heuristic with union-add-one refinement"
+    }
+
+    fn options(&self) -> &'static [(&'static str, &'static str)] {
+        &[
+            ("KLADOS_HEURISTIC_TEST_MODE", "enable extended search budget (set to 1)"),
+        ]
+    }
+
     fn solve(&mut self, instance: &Instance) -> Option<Vec<Tree>> {
         PartitionHeuristicSolver::solve(self, instance)
     }

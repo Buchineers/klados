@@ -148,7 +148,18 @@ impl MafSatSolver {
 
 impl ExactSolver for MafSatSolver {
     fn name(&self) -> &'static str {
-        "maf-sat"
+        "sat"
+    }
+
+    fn description(&self) -> &'static str {
+        "SAT-based encoding via rustsat/cadical with component extraction"
+    }
+
+    fn options(&self) -> &'static [(&'static str, &'static str)] {
+        &[
+            ("KLADOS_MAF_SAT_H4", "H4 mode: full, lazy, seeded-lazy, staged"),
+            ("KLADOS_MAF_SAT_COMPONENT_TRACE", "enable component trace (set to 1)"),
+        ]
     }
 
     fn solve(&mut self, instance: &Instance) -> Option<Vec<Tree>> {
@@ -189,7 +200,18 @@ impl MafSatOlverSolver {
 
 impl ExactSolver for MafSatOlverSolver {
     fn name(&self) -> &'static str {
-        "maf-sat-olver"
+        "sat-olver"
+    }
+
+    fn description(&self) -> &'static str {
+        "SAT-based with Olver 2-approx LB for seeding and pruning"
+    }
+
+    fn options(&self) -> &'static [(&'static str, &'static str)] {
+        &[
+            ("KLADOS_MAF_SAT_H4", "H4 mode: full, lazy, seeded-lazy, staged"),
+            ("KLADOS_MAF_SAT_H4_PROMOTE_MS", "promote MaxSAT solution as incumbent"),
+        ]
     }
 
     fn solve(&mut self, instance: &Instance) -> Option<Vec<Tree>> {

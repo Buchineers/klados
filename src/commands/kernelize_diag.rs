@@ -2,7 +2,7 @@
 //! but not detected by current reduction rules.
 //!
 //! This identifies the "gap" between our kernelization and the theoretical optimum
-//! for each specific instance.
+//! for each instance.
 
 use std::time::Instant;
 
@@ -33,7 +33,7 @@ pub fn run(instance: &Instance) -> Result<(), Box<dyn std::error::Error>> {
 
     // Step 2: Solve the original instance exactly
     let solve_start = Instant::now();
-    let mut solver = klados_exact::solver_by_name("maf-sat").expect("maf-sat solver not available");
+    let mut solver = klados_exact::solver_by_name("bp-multi").expect("B&P solver not available");
     let components = match solver.solve(instance) {
         Some(c) => c,
         None => {

@@ -15,7 +15,7 @@ pub enum ReductionAction {
 }
 
 /// Strategy for selecting among multiple candidates in parameter-reducing rules.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum VictimStrategy {
     /// Return the first candidate found (fast, deterministic by label order).
     #[default]
