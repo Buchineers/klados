@@ -27,56 +27,80 @@ pub trait BranchSelector {
 const ACTIVE_EPS: f64 = 1.0e-9;
 const FRACTIONAL_EPS: f64 = 1.0e-6;
 
-/// Compute, for each leaf pair (a,b), `Σ_{c ⊇ {a,b}} x_c`. Indexed
-/// `together[a*stride + b]` with `stride = num_leaves + 1`.
-fn pair_together_mass(columns: &[AfColumn], values: &[f64], num_leaves: usize) -> Vec<f64> {
+/// Compute, for each leaf pair (a,b), `Σ_{c ⊇ {a,b}} x_c` and the number
+/// of columns contributing to that sum (support count for tie-breaking).
+/// Indexed `together[a*stride + b]` with `stride = num_leaves + 1`.
+fn pair_mass_and_support(
+    columns: &[AfColumn],
+    values: &[f64],
+    num_leaves: usize,
+) -> (Vec<f64>, Vec<usize>) {
     let stride = num_leaves + 1;
     let mut together = vec![0.0_f64; stride * stride];
+    let mut support = vec![0usize; stride * stride];
     for (ci, &x) in values.iter().enumerate() {
         if x <= ACTIVE_EPS {
             continue;
         }
         let labels = columns[ci].labels();
         for i in 0..labels.len() {
+            let a = labels[i] as usize;
+            let row = a * stride;
             for j in (i + 1)..labels.len() {
-                let a = labels[i] as usize;
                 let b = labels[j] as usize;
-                together[a * stride + b] += x;
+                let idx = row + b;
+                together[idx] += x;
+                support[idx] += 1;
                 together[b * stride + a] += x;
+                support[b * stride + a] += 1;
             }
         }
     }
-    together
+    (together, support)
 }
 
-/// All pairs in the fractional band, sorted by closeness to 0.5 (most
-/// fractional first).
-fn fractional_pairs(together: &[f64], num_leaves: usize) -> Vec<(LeafPair, f64)> {
+/// Pairs in the fractional band, sorted by closeness to 0.5, then by
+/// support count (more columns → more structurally informative branch).
+fn fractional_pairs(
+    together: &[f64],
+    support: &[usize],
+    num_leaves: usize,
+) -> Vec<(LeafPair, f64, usize)> {
     let stride = num_leaves + 1;
-    let mut pairs: Vec<(LeafPair, f64)> = Vec::new();
+    let mut pairs: Vec<(LeafPair, f64, usize)> = Vec::new();
     for a in 1..=num_leaves {
         for b in (a + 1)..=num_leaves {
-            let mass = together[a * stride + b];
+            let idx = a * stride + b;
+            let mass = together[idx];
             if mass <= FRACTIONAL_EPS || mass >= 1.0 - FRACTIONAL_EPS {
                 continue;
             }
-            pairs.push((LeafPair::new(a as u32, b as u32), (mass - 0.5).abs()));
+            pairs.push((
+                LeafPair::new(a as u32, b as u32),
+                (mass - 0.5).abs(),
+                support[idx],
+            ));
         }
     }
-    pairs.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    pairs.sort_by(|a, b| {
+        a.1.partial_cmp(&b.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.2.cmp(&a.2))
+    });
     pairs
 }
 
 /// Default: pick the leaf pair `(a,b)` whose "together mass"
-/// `Σ_{c ⊇ {a,b}} x_c` is closest to `0.5`. This is the standard
-/// most-fractional Ryan-Foster choice — strongest among cheap heuristics.
+/// `Σ_{c ⊇ {a,b}} x_c` is closest to `0.5`, with support-count
+/// tie-breaking (more columns supporting the pair → more informative branch).
 pub struct MostFractionalPair;
 
 impl BranchSelector for MostFractionalPair {
     fn select(&mut self, ctx: &SelectionContext, _rmp: &mut Rmp) -> Option<LeafPair> {
-        let together = pair_together_mass(ctx.columns, ctx.values, ctx.num_leaves);
-        let pairs = fractional_pairs(&together, ctx.num_leaves);
-        pairs.into_iter().next().map(|(p, _)| p)
+        let (together, support) =
+            pair_mass_and_support(ctx.columns, ctx.values, ctx.num_leaves);
+        let pairs = fractional_pairs(&together, &support, ctx.num_leaves);
+        pairs.into_iter().next().map(|(p, _, _)| p)
     }
 }
 
@@ -110,12 +134,12 @@ impl Default for StrongBranching {
 
 impl BranchSelector for StrongBranching {
     fn select(&mut self, ctx: &SelectionContext, rmp: &mut Rmp) -> Option<LeafPair> {
-        let together = pair_together_mass(ctx.columns, ctx.values, ctx.num_leaves);
-        let candidates = fractional_pairs(&together, ctx.num_leaves);
+        let (together, support) =
+            pair_mass_and_support(ctx.columns, ctx.values, ctx.num_leaves);
+        let candidates = fractional_pairs(&together, &support, ctx.num_leaves);
         if candidates.is_empty() {
             return None;
         }
-        // With ≤1 candidate, strong branching reduces to most-fractional.
         if candidates.len() == 1 {
             return Some(candidates[0].0);
         }
@@ -123,11 +147,9 @@ impl BranchSelector for StrongBranching {
         let pool = std::cmp::min(self.candidates, candidates.len());
         let mut best: Option<(LeafPair, f64)> = None;
 
-        for &(pair, _) in candidates.iter().take(pool) {
+        for &(pair, _, _) in candidates.iter().take(pool) {
             let lp_ml = simulate_child(rmp, ctx, pair, true);
             let lp_cl = simulate_child(rmp, ctx, pair, false);
-            // Prune-fail score: LPs after each child. Higher = better
-            // (subtree more aggressively bounded).
             let lp_min = match (lp_ml, lp_cl) {
                 (Some(a), Some(b)) => a.min(b),
                 (Some(a), None) | (None, Some(a)) => a,
@@ -138,7 +160,6 @@ impl BranchSelector for StrongBranching {
             }
         }
 
-        // Restore parent RMP state for the actual branching to follow.
         rmp.apply_bounds(ctx.columns, ctx.branchings);
         best.map(|(p, _)| p)
     }

@@ -7,7 +7,6 @@
 use klados_core::Tree;
 
 use crate::bp::column::AfColumn;
-use crate::bp::search::branchings::LeafPair;
 
 use super::{Pricer, PricerScratch, PricingContext, PricingResult};
 
@@ -49,10 +48,10 @@ fn price_pairs(ctx: &PricingContext, scratch: &mut PricerScratch, out: &mut Vec<
             if ctx.seen.contains(&labels) {
                 continue;
             }
-            if ctx.branchings.cannot_link().contains(&LeafPair::new(a, b)) {
+            let column = scratch.builder.build_unchecked(labels, ctx.trees);
+            if ctx.branchings.forbids(&column) {
                 continue;
             }
-            let column = scratch.builder.build_unchecked(labels, ctx.trees);
             let score = column.pricing_score(ctx.alpha, ctx.beta);
             if score > 1.0 + PRICING_EPS {
                 out.push((score, column));

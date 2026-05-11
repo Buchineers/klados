@@ -1,15 +1,16 @@
 //! Composite tiered pricer.
 //!
-//! Wraps a list of tier pricers. Calls them in order until one of:
-//! - returns [`PricingResult::Found`] (continue CG with new columns)
-//! - returns [`PricingResult::Converged`] (sound proof — short-circuit)
+//! Two-tier design for m=2:
+//! 1. [`LeafPairDpPricer`] — column generation.  Evaluates all pairs with
+//!    `pair_ub − root_penalty > 1+ε` (sound upper bound on RC).  No
+//!    artificial trial limits.  Branch-aware (checks cannot-link/must-link
+//!    during solve_side).
+//! 2. [`ExactPairDpPricer`] — convergence proof.  Only fires when the
+//!    leaf-pair DP returns `Exhausted`.  Proves no positive-RC column
+//!    exists in O(n²) time, terminating column generation.
 //!
-//! Tiers returning [`PricingResult::Exhausted`] cascade to the next tier.
-//! If every tier exhausts, the composite returns `Exhausted` (heuristic).
-//!
-//! Soundness composes naturally: any tier proving convergence is itself a
-//! valid proof. If the cheap tier hits an easy state (`max α-β ≤ 1` over
-//! some restricted view), that's still a sound proof when applicable.
+//! For m≥3: single tier `LeafPairDpPricer` with multi-tree bitmask
+//! intersection.  Heuristic — no convergence proof.
 
 use klados_core::Tree;
 use log::trace;
@@ -56,32 +57,18 @@ impl Pricer for CompositePricer {
     }
 }
 
-/// Build a default tier list for an instance.
-/// - m=2: `[LeafPairDp(trial_limit=256), ExactPairDp]`. Tier 1 (leaf-pair DP
-///   with limited pair evaluation, matching bp-multi's FastPricer) provides
-///   column diversity without flooding the LP. Tier 2 is the faithful port of
-///   bp-multi's exact two-tree bottom-up DP and provides the convergence proof.
-/// - m≥3: `[LeafPairDp]`. Leaf-pair DP with multi-tree bitmask intersection
-///   emits valid columns by construction across all m trees. Heuristic —
-///   does not prove convergence. Full pair evaluation (no trial limit) since
-///   there's no sound fallback tier.
 pub fn dispatch_by_m(trees: &[Tree]) -> CompositePricer {
     let mut tiers: Vec<Box<dyn Pricer>> = Vec::new();
     if trees.len() == 2 {
-        tiers.push(Box::new(
-            LeafPairDpPricer::new(trees)
-                .with_pair_trial_limit(256)
-                .with_max_per_call(16),
-        ));
-        tiers.push(Box::new(
-            LeafPairDpPricer::new(trees)
-                .with_pair_trial_limit(2048)
-                .with_max_per_call(32),
-        ));
-        tiers.push(Box::new(ExactPairDpPricer::new(trees)));
-        // Unlimited LeafPairDpPricer matches bp-multi's
-        // collect_profitable_columns when constraints are present.
-        tiers.push(Box::new(LeafPairDpPricer::new(trees)));
+        tiers.push(Box::new(LeafPairDpPricer::new(trees).with_max_per_call(32)));
+        // The exact DP's O(n²) table is infeasible above ~1000 leaves
+        // (~1M cells, 16MB).  On large instances the leaf-pair DP's
+        // `pair_ub` bound provides the convergence proof.
+        let n0 = trees[0].num_nodes();
+        let n1 = trees[1].num_nodes();
+        if n0 * n1 <= 1_000_000 {
+            tiers.push(Box::new(ExactPairDpPricer::new(trees)));
+        }
     } else {
         tiers.push(Box::new(LeafPairDpPricer::new(trees)));
     }
