@@ -1,11 +1,28 @@
-//! Branch-and-Price solver for multi-tree MAF — type-disciplined rewrite.
+//! Branch-and-Price solver for multi-tree MAF.
+//!
+//! ## Architecture
+//!
+//! The solver wraps the core B&P in a recursive decomposition pipeline:
+//! kernelize → Whidden strict cluster decomp → pipeline (cluster reduction
+//! → cluster decomposition) → inner B&P.  Each sub-instance that can't be
+//! decomposed further is handed to [`solver::solve_inner`].
+//!
+//! The inner B&P uses a tiered pricer ([`pricer`]), a HiGHS-backed RMP with
+//! lazy node-row separation ([`rmp`]), leaf-pair-only B&B ([`search`]), and
+//! validity-by-construction column types ([`column`]).
 //!
 //! ## Module map
-//! - [`column`] — `AfColumn` (validity-by-construction), builder, dedup set.
-//! - [`search`] — `Branchings` (pair-only), `SearchState`, selection, telemetry.
-//! - [`rmp`]    — HiGHS-backed RMP, eager rows, branchings-derived bounds.
-//! - [`pricer`] — `Pricer` trait + `BrutePairsPricer` (stage 2 default).
-//! - [`solver`] — search loop and node solver.
+//! - [`column`] — `AfColumn` (validity-by-construction), `ColumnBuilder`, `ColumnSet`.
+//! - [`search`] — `Branchings` (pair-only), `SearchState`, `Incumbent`, selection, telemetry.
+//! - [`rmp`]    — HiGHS-backed restricted master, lazy node rows, branchings-derived bounds.
+//! - [`pricer`] — `Pricer` trait, tiered `CompositePricer`, per-tier implementations.
+//! - [`solver`] — search loop, node solver, primal heuristics, incumbent construction.
+//!
+//! ## Solvers
+//!
+//! [`BpSolver`] implements [`crate::ExactSolver`].  By default it enables
+//! kernelization and cluster reduction.  Set `KLADOS_BP_NO_DECOMP=1` to
+//! disable all decomposition (useful for debugging the core algorithm).
 
 pub mod column;
 pub mod pricer;
@@ -126,15 +143,15 @@ impl ExactSolver for BpSolver {
     }
 }
 
-/// Recursive solve entry: tries strategies in order of effectiveness for
-/// each instance shape, falling through on failure.
-///
-/// Exposed `pub(crate)` so `solver::solve_inner` can call it back as the
-/// recursion target for primal heuristics that solve sub-instances.
-pub(crate) fn _solve_recursive_alias(instance: &Instance, cfg: &BpConfig) -> Option<Vec<Tree>> {
+/// Re-entry point for primal heuristics that need to recursively solve
+/// sub-instances (e.g. Whidden relaxed decomposition).  Exposed `pub(crate)`
+/// so [`solver::solve_inner`] can call it.
+pub(crate) fn solve_subinstance(instance: &Instance, cfg: &BpConfig) -> Option<Vec<Tree>> {
     solve_recursive(instance, cfg)
 }
 
+/// Recursive solve: tries decomposition strategies in effectiveness order,
+/// falling through to the inner B&P when no decomposition applies.
 ///
 /// Order:
 /// 1. **Trivial** (m≤1, n≤1) — short-circuit.

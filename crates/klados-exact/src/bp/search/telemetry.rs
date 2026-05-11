@@ -14,10 +14,10 @@ pub struct Telemetry {
     pub bound_prunes: usize,
     pub cuts_added: usize,
     pub timings: Timings,
-    /// Set by the search loop when a pricer reports `Exhausted`. If any node
-    /// terminated CG without a `Converged` proof, the LP-bound prune used at
-    /// that node was technically heuristic. Useful for soundness audits.
-    pub had_unsound_prune: bool,
+    /// True if the pricer ever returned `Converged` (proved no positive-RC
+    /// columns exist) at any node.  Indicates the LP-bound prune was backed
+    /// by a pricing optimality proof at least once.
+    pub had_converged: bool,
 }
 
 #[derive(Default, Debug)]

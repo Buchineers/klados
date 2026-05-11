@@ -1,10 +1,11 @@
-//! Exact bottom-up DP pricer for two trees.
+//! Faithful port of the legacy `ExactPricer2Tree` from `maf_branch_price_multi.rs`.
 //!
-//! This is the faithful module-split port of `ExactPricer2Tree` from
-//! `maf_branch_price_multi.rs`.  It is intentionally kept separate from the
-//! newer Steel-Warnow-style `pair_dp` implementation: the latter is useful as
-//! a heuristic under branching, but its recurrence is not equivalent to the
-//! old exact root pricer and can miss columns needed by the pool MIP.
+//! This is the **exact bottom-up DP for m=2** — the same recurrence used by
+//! the proven-correct `bp-multi` solver.  It is the convergence-proving tier
+//! in [`super::dispatch_by_m`] for m=2.
+//!
+//! Separate from the heuristic [`super::PairDpPricer`] (Steel-Warnow style)
+//! whose recurrence is not equivalent and can miss columns.
 
 use klados_core::{NONE, Tree};
 
