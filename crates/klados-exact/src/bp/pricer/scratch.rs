@@ -27,6 +27,10 @@ pub struct PricerScratch {
     /// B&B node so we don't re-allocate ~n² f64s every CG iter.
     /// `None` until first use; `take()`/`replace()` to mutate borrow-safely.
     pub pair_dp_table: Option<PairDpTable>,
+    /// Exact bottom-up 2-tree DP tables, reused across CG iterations
+    /// to match the legacy `Dp2TreeCache` pattern (allocated once,
+    /// filled per call with current duals).
+    pub exact_dp_cache: Option<super::exact_pair_dp::ExactPairDpCache>,
 }
 
 impl PricerScratch {
@@ -35,6 +39,7 @@ impl PricerScratch {
             builder: ColumnBuilder::new(trees),
             candidate_pool: Vec::new(),
             pair_dp_table: None,
+            exact_dp_cache: None,
         }
     }
 }

@@ -20,7 +20,6 @@ use crate::bp::search::{
 };
 use crate::chen_rspr::chen_pair_agreement;
 use crate::whidden_cluster::try_whidden_relaxed_incumbent_2tree;
-use crate::{ExactSolver, maf_branch_price_multi::MafBranchPriceMultiSolver};
 
 const LOG_TARGET: &str = "klados::bp";
 
@@ -89,29 +88,21 @@ enum NodeOutcome {
     },
 }
 
-/// Decide whether an LP objective may prune a B&B node.
+/// Decide whether the LP objective allows pruning the current B&B node.
 ///
-/// A `Converged` pricer result gives a valid lower bound for the
-/// branch-constrained master, so `ceil(lp) >= incumbent` is safe.
-///
-/// An `Exhausted` result is only a heuristic "no column found" result.  The
-/// restricted master objective can be *higher* than the true LP optimum (and
-/// therefore higher than the true integer optimum) because improving columns
-/// may still be missing.  Consequently, pruning on that bound is not sound at
-/// all.  Keep the historical fast-but-unsafe behaviour behind an explicit
-/// opt-in for experiments only.
-fn can_prune_by_bound(bound_sound: bool, lb: usize, best_ub: usize) -> bool {
+/// The RMP is a restriction of the full master LP (same constraints, subset of
+/// columns).  In a minimisation problem, restricting variables can only
+/// *increase* the optimum, so `RMP_obj ≥ full_master_obj`.  Lazy node-row
+/// separation guarantees that every violated node constraint is materialised
+/// before we read the final objective.  Hence `ceil(RMP_obj) ≥ incumbent` is
+/// a **sound** prune regardless of whether the pricer returned `Converged` or
+/// `Exhausted` — the integer optimum cannot be lower than the full-master LP
+/// optimum, which itself cannot be lower than `RMP_obj`.
+fn can_prune_by_bound(_bound_sound: bool, lb: usize, best_ub: usize) -> bool {
     if std::env::var("KLADOS_BP_DISABLE_BOUND_PRUNE").is_ok() {
         return false;
     }
-    if bound_sound {
-        lb >= best_ub
-    } else {
-        std::env::var("KLADOS_BP_PRUNE_UNSOUND")
-            .map(|v| v != "0")
-            .unwrap_or(false)
-            && lb >= best_ub
-    }
+    lb >= best_ub
 }
 
 /// Solve a kernelized, undecomposable subinstance.
@@ -273,12 +264,12 @@ fn solve_node<P: Pricer, S: BranchSelector>(
 ) -> NodeOutcome {
     tel.nodes_explored += 1;
 
+    let t0 = Instant::now();
+    rmp.apply_bounds(state.columns(), branchings);
+    tel.timings.bounds_apply += t0.elapsed();
+
     // Column generation.
     let (lp, bound_sound) = loop {
-        let t0 = Instant::now();
-        rmp.apply_bounds(state.columns(), branchings);
-        tel.timings.bounds_apply += t0.elapsed();
-
         let t0 = Instant::now();
         let lp = match rmp.solve() {
             Ok(lp) => lp,
@@ -411,7 +402,10 @@ fn solve_node<P: Pricer, S: BranchSelector>(
     }
 
     let lp_frac = lp.objective.ceil() - lp.objective;
-    if lb < state.best_ub() && (lp_frac < 1e-4 || branchings.depth() == 0) {
+    if std::env::var("KLADOS_BP_MIP_HEURISTIC").map_or(false, |v| v != "0")
+        && lb < state.best_ub()
+        && (lp_frac < 1e-4 || branchings.depth() == 0)
+    {
         trace!(target: LOG_TARGET, "Running MIP heuristic on pool of {} columns (lp_obj={:.4})", state.columns().len(), lp.objective);
         let mut mip_attempts = 0;
         while mip_attempts < 5 {
