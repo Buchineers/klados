@@ -1,24 +1,11 @@
-//! Tier-2 pricer for **m ≥ 3** — pair-DP between `(T₀, T₁)` plus AF-validity
-//! filter against `T₂..Tₘ₋₁`.
+//! Pair-DP filter pricer for **m ≥ 3** — heuristic, not in default dispatch.
 //!
-//! ## Heuristic, not sound
+//! Runs pair-DP between `(T₀, T₁)` and post-filters against `T₂..Tₘ₋₁` for
+//! AF validity.  The DP only sees `β` from trees 0 and 1, so it can miss
+//! columns whose true multi-tree RC is positive.
 //!
-//! Runs the same DP machinery as [`super::PairDpPricer`] but:
-//! 1. The DP optimises reduced cost using only `α` and `β` from trees 0 and 1.
-//!    `β` from trees 2..m is not in the objective, so the DP can miss
-//!    columns whose true RC (over all m trees) is positive.
-//! 2. Emitted columns are **filtered** by topology agreement in trees 2..m
-//!    via [`crate::bp::column::ColumnBuilder::try_build`]. Only columns that
-//!    are valid AF components for *every* tree are kept.
-//!
-//! Returns [`super::PricingResult::Found`] when at least one column survives
-//! filtering, [`super::PricingResult::Exhausted`] otherwise. **Never returns
-//! `Converged`** — for m≥3 we don't certify the absence of positive-RC
-//! columns; the LP-bound prune is unsound at every node where this tier was
-//! the last to run.
-//!
-//! Matches bp-multi's `m≥3` pricer pattern. A future tier-3 LP oracle is
-//! what would lift this to soundness.
+//! Never returns `Converged`.  For m≥3 the default dispatch uses
+//! [`super::LeafPairDpPricer`] (multi-tree bitmask intersection) instead.
 
 use klados_core::Tree;
 

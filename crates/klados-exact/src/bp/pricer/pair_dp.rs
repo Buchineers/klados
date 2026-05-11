@@ -1,4 +1,9 @@
-//! Tier-2 pricer — exact pair-DP for **m = 2** (Steel-Warnow style).
+//! Steel-Warnow-style pair-DP pricer for **m = 2**.
+//!
+//! **Not equivalent to the legacy exact DP** ([`super::ExactPairDpPricer`]).
+//! This recurrence is heuristic — it can miss columns that the legacy exact
+//! DP would find.  Kept as a separate code path for experimentation; not used
+//! in the default dispatch ([`super::dispatch_by_m`]).
 //!
 //! Two DP tables in shared scratch (storage reused across calls):
 //!

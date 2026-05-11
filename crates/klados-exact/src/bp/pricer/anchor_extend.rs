@@ -1,23 +1,8 @@
-//! Tier-1 pricer — anchor-and-extend.
+//! Anchor-and-extend pricer — cheap heuristic, not in default dispatch.
 //!
-//! Cheap, heuristic, fast. Always tried first in the [`super::CompositePricer`].
-//! Most CG iterations have obvious positive-RC columns and never need the
-//! more expensive tiers. Two passes per call:
-//!
-//! 1. **Pairs** — every leaf pair `{a, b}` is a trivially-valid AF column
-//!    (any 2-leaf restriction is consistent across all trees). Score them
-//!    against current duals; keep the top-K by reduced cost.
-//!
-//! 2. **Greedy extension** — for each existing multi-leaf column with
-//!    positive RC, try extending by every leaf not already in it. The
-//!    extension may break topology agreement, so validation is via the
-//!    public [`crate::bp::column::ColumnBuilder::try_build`] path.
-//!
-//! Returns [`PricingResult::Exhausted`] when no positive-RC column is
-//! discovered. This is **not** a convergence proof — multi-leaf agreement
-//! components with no positive-RC sub-pair can still exist; later tiers
-//! may catch them. The LP-bound prune is unsound at any node where this
-//! tier was the last to run.
+//! Two passes per call: enumerate all leaf pairs, then greedily extend
+//! existing columns.  Useful for experiments; the default resolve path
+//! uses [`super::dispatch_by_m`] which does not include this tier.
 
 use klados_core::Tree;
 

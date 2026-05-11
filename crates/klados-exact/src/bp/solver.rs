@@ -79,26 +79,23 @@ fn install_incumbent(
 enum NodeOutcome {
     Pruned,
     Integral(Incumbent),
-    /// LP is fractional; branch on `pair`. `lp_obj` is the (possibly
-    /// heuristic, see `bound_sound`) lower bound at this node.
+    /// LP is fractional; branch on `pair`.
     Branch {
         lp_obj: f64,
         pair: crate::bp::search::LeafPair,
-        bound_sound: bool,
     },
 }
 
 /// Decide whether the LP objective allows pruning the current B&B node.
 ///
-/// The RMP is a restriction of the full master LP (same constraints, subset of
-/// columns).  In a minimisation problem, restricting variables can only
+/// The RMP is a restriction of the full master LP (same constraints, subset
+/// of columns).  In a minimisation problem, restricting variables can only
 /// *increase* the optimum, so `RMP_obj ≥ full_master_obj`.  Lazy node-row
-/// separation guarantees that every violated node constraint is materialised
+/// separation guarantees every violated node constraint is materialised
 /// before we read the final objective.  Hence `ceil(RMP_obj) ≥ incumbent` is
-/// a **sound** prune regardless of whether the pricer returned `Converged` or
-/// `Exhausted` — the integer optimum cannot be lower than the full-master LP
-/// optimum, which itself cannot be lower than `RMP_obj`.
-fn can_prune_by_bound(_bound_sound: bool, lb: usize, best_ub: usize) -> bool {
+/// a sound prune — the integer optimum cannot be lower than the full-master
+/// LP optimum, which itself cannot be lower than `RMP_obj`.
+fn can_prune_by_bound(lb: usize, best_ub: usize) -> bool {
     if std::env::var("KLADOS_BP_DISABLE_BOUND_PRUNE").is_ok() {
         return false;
     }
@@ -167,7 +164,7 @@ pub fn solve_inner(reduced: &Instance) -> Option<Vec<Tree>> {
     // explains the recurring "LP=optimum but support fractional" gap.
     if trees.len() >= 2 && reduced.num_leaves >= 20 {
         if let Some(incumbent_forest) = try_whidden_relaxed_incumbent_2tree(reduced, &mut |sub| {
-            crate::bp::_solve_recursive_alias(sub, &crate::bp::BpConfig::default())
+            crate::bp::solve_subinstance(sub, &crate::bp::BpConfig::default())
         }) {
             install_incumbent(
                 &mut state,
@@ -216,19 +213,9 @@ pub fn solve_inner(reduced: &Instance) -> Option<Vec<Tree>> {
             NodeOutcome::Branch {
                 lp_obj,
                 pair,
-                bound_sound,
             } => {
-                if !bound_sound {
-                    tel.had_unsound_prune = true;
-                }
                 let lb = (lp_obj - 1e-6).ceil() as usize;
-
-                // If we haven't formally converged (bound_sound=false), the LP objective
-                // is not a valid lower bound: the restricted master may still
-                // be missing improving columns. Only prune by bound after a
-                // sound convergence proof (unless explicitly opted into the
-                // historical unsafe mode for experiments).
-                if can_prune_by_bound(bound_sound, lb, state.best_ub()) {
+                if can_prune_by_bound(lb, state.best_ub()) {
                     tel.bound_prunes += 1;
                     continue;
                 }
@@ -243,10 +230,9 @@ pub fn solve_inner(reduced: &Instance) -> Option<Vec<Tree>> {
     let components = reconstruct_components(inc, state.columns(), reduced);
     info!(
         target: LOG_TARGET,
-        "bp done: n={} m={} k={} nodes={} cg_iters={} cols={} cuts={} unsound_prune={}",
+        "bp done: n={} m={} k={} nodes={} cg_iters={} cols={} cuts={}",
         reduced.num_leaves, trees.len(), components.len(),
         tel.nodes_explored, tel.cg_iters, tel.columns_added, tel.cuts_added,
-        tel.had_unsound_prune,
     );
     Some(components)
 }
@@ -269,7 +255,7 @@ fn solve_node<P: Pricer, S: BranchSelector>(
     tel.timings.bounds_apply += t0.elapsed();
 
     // Column generation.
-    let (lp, bound_sound) = loop {
+    let lp = loop {
         let t0 = Instant::now();
         let lp = match rmp.solve() {
             Ok(lp) => lp,
@@ -331,48 +317,27 @@ fn solve_node<P: Pricer, S: BranchSelector>(
                 );
                 continue;
             }
-            PricingResult::Exhausted => break (lp, false),
-            PricingResult::Converged => break (lp, true),
+            PricingResult::Exhausted => break lp,
+            PricingResult::Converged => { tel.had_converged = true; break lp; }
         }
     };
 
     let lb = (lp.objective - 1e-6).ceil() as usize;
-    if !bound_sound {
-        tel.had_unsound_prune = true;
-    }
 
-    if can_prune_by_bound(bound_sound, lb, state.best_ub()) {
+    if can_prune_by_bound(lb, state.best_ub()) {
         debug!(
             target: LOG_TARGET,
-            "node pruned by bound (sound={}): lp={:.4} ub={}",
-            bound_sound, lp.objective, state.best_ub(),
+            "node pruned by bound: lp={:.4} ub={}",
+            lp.objective, state.best_ub(),
         );
         tel.bound_prunes += 1;
         return NodeOutcome::Pruned;
     }
 
     if let Some(inc) = try_integral(state, &lp.column_values) {
-        if !bound_sound {
-            debug!(
-                target: LOG_TARGET,
-                "integer restricted-master solution without pricing proof: k={} depth={} ub={}",
-                inc.k,
-                branchings.depth(),
-                state.best_ub(),
-            );
-        }
         return NodeOutcome::Integral(inc);
     }
     if let Some(inc) = try_support_partition(state, &lp.column_values, reduced) {
-        if !bound_sound {
-            debug!(
-                target: LOG_TARGET,
-                "support-partition incumbent without pricing proof: k={} depth={} ub={}",
-                inc.k,
-                branchings.depth(),
-                state.best_ub(),
-            );
-        }
         return NodeOutcome::Integral(inc);
     }
 
@@ -393,7 +358,7 @@ fn solve_node<P: Pricer, S: BranchSelector>(
                     state.best_ub(), tel.cg_iters,
                 );
 
-                if can_prune_by_bound(bound_sound, lb, state.best_ub()) {
+                if can_prune_by_bound(lb, state.best_ub()) {
                     tel.bound_prunes += 1;
                     return NodeOutcome::Pruned;
                 }
@@ -432,7 +397,7 @@ fn solve_node<P: Pricer, S: BranchSelector>(
                                 state.best_ub(), tel.cg_iters, branchings.depth(),
                             );
 
-                            if can_prune_by_bound(bound_sound, lb, state.best_ub()) {
+                            if can_prune_by_bound(lb, state.best_ub()) {
                                 tel.bound_prunes += 1;
                                 return NodeOutcome::Pruned;
                             }
@@ -463,7 +428,6 @@ fn solve_node<P: Pricer, S: BranchSelector>(
         Some(pair) => NodeOutcome::Branch {
             lp_obj: lp.objective,
             pair,
-            bound_sound,
         },
         None => {
             debug!(target: LOG_TARGET, "selector returned None, but not integral. Pruning fractional solution!");

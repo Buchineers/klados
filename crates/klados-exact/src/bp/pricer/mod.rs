@@ -16,14 +16,14 @@
 //! (anchors, partial columns, DP tables) into scratch for later tiers or
 //! later CG iterations to reuse, avoiding redundant computation.
 //!
-//! ## Soundness signaling
+//! ## Soundness signalling
 //!
 //! [`PricingResult`] distinguishes three states:
-//! - `Found(cols)` — at least one positive-RC column found.
-//! - `Exhausted` — no columns found, but no proof of convergence
-//!   (heuristic pricer's "I give up"). LP-bound prune is **unsound** here.
+//! - `Found(cols)` — at least one positive-RC column found; add to RMP, re-solve.
+//! - `Exhausted` — no columns found by this (possibly heuristic) pricer.
+//!   The LP-bound prune is still sound (see [`crate::bp::solver`] for proof).
 //! - `Converged` — proved no positive-RC column exists in the entire valid
-//!   space, given current branchings. LP-bound prune is **sound**.
+//!   space, given current branchings. Strongest guarantee.
 
 pub mod anchor_extend;
 pub mod composite;
@@ -33,13 +33,18 @@ pub mod pair_dp;
 pub mod pair_dp_filter;
 pub mod scratch;
 
-pub use anchor_extend::AnchorExtendPricer;
+// --- Used in the default dispatch_by_m() ---
 pub use composite::{CompositePricer, dispatch_by_m};
 pub use exact_pair_dp::ExactPairDpPricer;
 pub use leaf_pair_dp::LeafPairDpPricer;
+
+// --- Tier infrastructure ---
+pub use scratch::{PairDpTable, PricerScratch};
+
+// --- Experimental / heuristic extras (not in default dispatch) ---
+pub use anchor_extend::AnchorExtendPricer;
 pub use pair_dp::PairDpPricer;
 pub use pair_dp_filter::PairDpFilterPricer;
-pub use scratch::{PairDpTable, PricerScratch};
 
 use klados_core::Tree;
 
