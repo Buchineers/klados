@@ -812,6 +812,7 @@ dependencies = [
  "highs",
  "highs-sys",
  "klados-core",
+ "log",
  "rustsat",
  "rustsat-cadical",
 ]

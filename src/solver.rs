@@ -15,6 +15,8 @@ use std::io::{self, Write};
 pub enum SolverChoice {
     #[value(name = "bp-multi")]
     BpMulti,
+    #[value(name = "bp")]
+    Bp,
     #[value(name = "chen-rspr")]
     ChenRspr,
     #[value(name = "sat")]
@@ -49,6 +51,7 @@ impl SolverChoice {
             ChenRspr => "Chen-style rSPR branch-and-bound (2-tree only)",
             Whidden => "Whidden 3-way branch-and-bound (2-tree only)",
             BpMulti => "Branch & Price for multi-tree MAF (default)",
+            Bp => "Branch & Price (rewrite, in progress)",
             GreedyPartition => "Greedy partition heuristic with union-add-one refinement",
             Agglomerative => "Agglomerative clustering heuristic",
         }
@@ -80,6 +83,7 @@ impl SolverChoice {
                 ("KLADOS_WHIDDEN_DEBUG", "enable debug output"),
             ],
             BpMulti => &[],
+            Bp => &[],
             GreedyPartition => &[
                 ("KLADOS_HEURISTIC_TEST_MODE", "extended search budget"),
             ],
@@ -95,6 +99,7 @@ impl SolverChoice {
             SolverChoice::ChenRspr => from_exact(klados_exact::chen_rspr::ChenRsprSolver::new()),
             SolverChoice::Whidden => from_exact(klados_exact::whidden::WhiddenSolver::new()),
             SolverChoice::BpMulti => from_exact(klados_exact::maf_branch_price_multi::MafBranchPriceMultiSolver::new()),
+            SolverChoice::Bp => from_exact(klados_exact::bp::BpSolver::new()),
             SolverChoice::GreedyPartition => from_heuristic(klados_heuristic::partition::PartitionHeuristicSolver::greedy_union_add_one()),
             SolverChoice::Agglomerative => from_heuristic(klados_heuristic::agglomerative::AgglomerativeSolver::new()),
         }

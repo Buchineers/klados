@@ -6,6 +6,7 @@ pub use klados_core::cluster_reduction;
 // kernelize and lower_bound now live in klados-core; re-export for backward compatibility
 pub use klados_core::kernelize;
 pub use klados_core::lower_bound;
+pub mod bp;
 pub mod chen_rspr;
 pub mod maf_branch_price_multi;
 pub mod maf_ilp;
@@ -42,6 +43,7 @@ pub fn available_solvers() -> Vec<Box<dyn ExactSolver>> {
         Box::new(chen_rspr::ChenRsprSolver::new()),
         Box::new(whidden::WhiddenSolver::new()),
         Box::new(maf_branch_price_multi::MafBranchPriceMultiSolver::new()),
+        Box::new(bp::BpSolver::new()),
     ]
 }
 
@@ -78,6 +80,12 @@ mod tests {
     #[test]
     fn test_registry_has_maf_bp_multi() {
         let solver = solver_by_name("bp-multi");
+        assert!(solver.is_some());
+    }
+
+    #[test]
+    fn test_registry_has_bp() {
+        let solver = solver_by_name("bp");
         assert!(solver.is_some());
     }
 
