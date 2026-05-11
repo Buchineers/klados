@@ -45,6 +45,40 @@ impl Default for DpOpen {
     }
 }
 
+/// Persistent DP-table storage reused across CG iterations within a B&B node.
+/// Avoids the ~20 MB allocation + zeroing of `n0 × n1` cell arrays on every
+/// CG call — exactly matching the legacy `Dp2TreeCache` pattern.
+#[derive(Clone)]
+pub struct ExactPairDpCache {
+    dp_closed: Vec<DpClosed>,
+    dp_open: Vec<DpOpen>,
+    active_labels: Vec<bool>,
+    t0_active: Vec<bool>,
+    t1_active: Vec<bool>,
+    best_l0: Vec<(f64, u32)>,
+    best_r0: Vec<(f64, u32)>,
+}
+
+impl ExactPairDpCache {
+    pub fn new(n0: usize, n1: usize, num_leaves: usize) -> Self {
+        Self {
+            dp_closed: vec![DpClosed::default(); n0 * n1],
+            dp_open: vec![DpOpen::default(); n0 * n1],
+            active_labels: vec![false; num_leaves + 1],
+            t0_active: vec![false; n0],
+            t1_active: vec![false; n1],
+            best_l0: vec![(NEG_INF, 0u32); n1],
+            best_r0: vec![(NEG_INF, 0u32); n1],
+        }
+    }
+
+    fn fits(&self, n0: usize, n1: usize, num_leaves: usize) -> bool {
+        self.t0_active.len() == n0
+            && self.t1_active.len() == n1
+            && self.active_labels.len() == num_leaves + 1
+    }
+}
+
 pub struct ExactPairDpPricer {
     max_per_call: usize,
 }
@@ -72,7 +106,20 @@ fn price_exact_pair_dp(
     scratch: &mut PricerScratch,
     max_per_call: usize,
 ) -> PricingResult {
-    let candidates = collect_positive_columns(ctx);
+    let t0 = &ctx.trees[0];
+    let t1 = &ctx.trees[1];
+    let n0 = t0.num_nodes();
+    let n1 = t1.num_nodes();
+    let nl = ctx.num_leaves;
+
+    let mut cache = scratch
+        .exact_dp_cache
+        .take()
+        .filter(|c| c.fits(n0, n1, nl))
+        .unwrap_or_else(|| ExactPairDpCache::new(n0, n1, nl));
+    let candidates = collect_positive_columns(ctx, &mut cache);
+    scratch.exact_dp_cache = Some(cache);
+
     if candidates.is_empty() {
         return PricingResult::Converged;
     }
@@ -82,11 +129,6 @@ fn price_exact_pair_dp(
     for (_, labels) in candidates {
         let column = scratch.builder.build_unchecked(labels, ctx.trees);
         if ctx.branchings.forbids(&column) {
-            // Even if this labelset is already in the global pool, it is
-            // bound to zero in the current branch.  A positive best state
-            // hidden behind a forbidden seen column is not a convergence
-            // proof: there may be a second-best allowed column for the same
-            // state that the one-best DP did not emit.
             blocked_positive = true;
             continue;
         }
@@ -102,27 +144,37 @@ fn price_exact_pair_dp(
     if !found.is_empty() {
         PricingResult::Found(found)
     } else if blocked_positive {
-        // There were positive columns in the unconstrained two-tree space,
-        // but every newly emitted one was forbidden by branch constraints.
-        // The one-best-per-state DP is not a proof that no alternative
-        // positive allowed column exists for those states.
         PricingResult::Exhausted
     } else {
-        // All positive candidates were already present in the master.
         PricingResult::Converged
     }
 }
 
-fn collect_positive_columns(ctx: &PricingContext) -> Vec<(f64, Vec<u32>)> {
+fn collect_positive_columns(
+    ctx: &PricingContext,
+    cache: &mut ExactPairDpCache,
+) -> Vec<(f64, Vec<u32>)> {
     let t0 = &ctx.trees[0];
     let t1 = &ctx.trees[1];
     let n0 = t0.num_nodes();
     let n1 = t1.num_nodes();
+    let idx = |u: usize, v: usize| -> usize { u * n1 + v };
 
-    let mut active_labels = vec![false; ctx.num_leaves + 1];
-    let mut t0_active = vec![false; n0];
-    let mut t1_active = vec![false; n1];
-    for label in 1..=ctx.num_leaves {
+    let active_labels = &mut cache.active_labels;
+    let t0_active = &mut cache.t0_active;
+    let t1_active = &mut cache.t1_active;
+    let dp_closed = &mut cache.dp_closed;
+    let dp_open = &mut cache.dp_open;
+    let best_l0 = &mut cache.best_l0;
+    let best_r0 = &mut cache.best_r0;
+
+    let nl = ctx.num_leaves;
+    active_labels[..=nl].fill(false);
+    t0_active.fill(false);
+    t1_active.fill(false);
+    best_l0.fill((NEG_INF, 0u32));
+    best_r0.fill((NEG_INF, 0u32));
+    for label in 1..=nl {
         if ctx.alpha[label] <= 1.0e-12 {
             continue;
         }
@@ -147,11 +199,10 @@ fn collect_positive_columns(ctx: &PricingContext) -> Vec<(f64, Vec<u32>)> {
         return Vec::new();
     }
 
-    let mut dp_closed = vec![DpClosed::default(); n0 * n1];
-    let mut dp_open = vec![DpOpen::default(); n0 * n1];
-    let idx = |u: usize, v: usize| -> usize { u * n1 + v };
-    let mut best_l0 = vec![(NEG_INF, 0u32); n1];
-    let mut best_r0 = vec![(NEG_INF, 0u32); n1];
+    // Reset DP tables only for entries we will read (children of visited nodes).
+    // We start from defaults; nodes not visited remain NEG_INF.
+    best_l0.fill((NEG_INF, 0u32));
+    best_r0.fill((NEG_INF, 0u32));
 
     for &u in &t0_post {
         let u_idx = u as usize;
@@ -338,8 +389,8 @@ fn collect_positive_columns(ctx: &PricingContext) -> Vec<(f64, Vec<u32>)> {
                     u as u32,
                     v as u32,
                     t0,
-                    &dp_closed,
-                    &dp_open,
+                    dp_closed,
+                    dp_open,
                     n1,
                     &mut labels,
                 );

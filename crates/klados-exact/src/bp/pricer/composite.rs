@@ -73,10 +73,14 @@ pub fn dispatch_by_m(trees: &[Tree]) -> CompositePricer {
                 .with_pair_trial_limit(256)
                 .with_max_per_call(16),
         ));
+        tiers.push(Box::new(
+            LeafPairDpPricer::new(trees)
+                .with_pair_trial_limit(2048)
+                .with_max_per_call(32),
+        ));
         tiers.push(Box::new(ExactPairDpPricer::new(trees)));
-        // Add unlimited LeafPairDpPricer to match bp-multi's collect_profitable_columns.
-        // PairDpPricer shadows columns when constraints are present. bp-multi
-        // fell back to unlimited Leaf-Pair DP when constraints existed.
+        // Unlimited LeafPairDpPricer matches bp-multi's
+        // collect_profitable_columns when constraints are present.
         tiers.push(Box::new(LeafPairDpPricer::new(trees)));
     } else {
         tiers.push(Box::new(LeafPairDpPricer::new(trees)));
