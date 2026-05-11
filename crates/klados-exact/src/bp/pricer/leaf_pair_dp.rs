@@ -95,6 +95,9 @@ pub struct LeafPairDpPricer {
     memo_pair: Vec<f64>,
     memo_side_score: Vec<f64>,
     memo_side_split: Vec<u32>,
+    /// Cached reconstructed label vectors per pair, to avoid redundant
+    /// reconstruction when the same pair is visited from multiple parents.
+    memo_pair_labels: Vec<Option<Vec<u32>>>,
 
     num_leaves: usize,
     num_trees: usize,
@@ -103,6 +106,18 @@ pub struct LeafPairDpPricer {
     /// call (unlimited = u32::MAX). Limits the DP work and matches bp-multi's
     /// FASTPRICER_PAIR_TRIALS / WIDEPRICER_PAIR_TRIALS behaviour.
     pair_trial_limit: u32,
+    /// Skip the pricer entirely when active_labels < this threshold (0 = always
+    /// active).  Matches bp-multi's WIDEPRICER_MIN_ACTIVE_LABELS gate.
+    min_active_labels: usize,
+    /// ── Branch-awareness (set at each `price()` call) ──
+    /// `cannot_pair[l]` = partner that cannot appear in the same column as l,
+    /// or 0 if none.  Checked during `solve_side` to skip extension candidates
+    /// that would produce a forbidden column.
+    cannot_pair: Vec<u32>,
+    /// `must_pair[l]` = partner that must appear in the same column as l,
+    /// or 0 if none.  Checked during `solve_pair` to reject anchor pairs that
+    /// separate must-linked leaves.
+    must_pair: Vec<u32>,
 }
 
 impl LeafPairDpPricer {
@@ -115,6 +130,11 @@ impl LeafPairDpPricer {
 
     pub fn with_pair_trial_limit(mut self, limit: u32) -> Self {
         self.pair_trial_limit = limit;
+        self
+    }
+
+    pub fn with_min_active_labels(mut self, n: usize) -> Self {
+        self.min_active_labels = n;
         self
     }
 
@@ -215,35 +235,25 @@ impl LeafPairDpPricer {
             memo_pair: Vec::new(),
             memo_side_score: Vec::new(),
             memo_side_split: Vec::new(),
+            memo_pair_labels: Vec::new(),
             num_leaves,
             num_trees,
             max_per_call: 64,
             pair_trial_limit: u32::MAX,
+            min_active_labels: 0,
+            cannot_pair: Vec::new(),
+            must_pair: Vec::new(),
         }
     }
 
-    /// Refresh active labels and dual-dependent tables for the current
-    /// pricing call. Called once at the top of `price()`.
-    fn refresh(
-        &mut self,
-        trees: &[Tree],
-        alpha: &[f64],
-        beta: &[Vec<f64>],
-        branchings: &crate::bp::search::Branchings,
-    ) {
-        // Active labels = α > 0 AND not blocked by a fully-decided must-link
-        // partner. (Cannot-link / must-link don't gate single labels here;
-        // pairs handled at column emission via branchings.forbids.)
-        self.active_labels.clear();
+    /// Collect active labels from alpha. Returns `true` if the set changed
+    /// since the last call.
+    fn ensure_active_labels(&mut self, alpha: &[f64]) -> bool {
+        let prev: Vec<u32> = std::mem::take(&mut self.active_labels);
         self.active_mask.clear();
         for v in self.label_to_active_idx.iter_mut() {
             *v = u32::MAX;
         }
-        // Determine "blocked" leaves: those forced as singletons by some
-        // fixed_to_one column. We don't track fixed_to_one in branchings
-        // (leaf-pair only), so blocked is empty here. Future: thread blocked
-        // through ctx if needed.
-        let _ = branchings; // currently unused — branchings filtered at emit time
         for label in 1..=self.num_leaves as u32 {
             if alpha[label as usize] > 1.0e-12 {
                 self.active_mask.insert(label as usize);
@@ -251,10 +261,14 @@ impl LeafPairDpPricer {
                 self.active_labels.push(label);
             }
         }
+        self.active_labels != prev
+    }
+
+    /// Rebuild per-pair LCA / side-child tables (expensive — O(p²·m)).
+    /// Only called when the active label set changes.
+    fn rebuild_pair_tables(&mut self, trees: &[Tree]) {
         let p = self.active_labels.len();
         let pair_count = p * p;
-
-        // Per-tree pair_root / pair_side_child for active pairs.
         for ti in 0..self.num_trees {
             self.pair_root[ti].clear();
             self.pair_root[ti].resize(pair_count, 0);
@@ -272,10 +286,21 @@ impl LeafPairDpPricer {
                 }
             }
         }
-        // pair_side_parent_prefix_beta filled in after prefix_beta is rebuilt
-        // (uses parent[side_child] -> prefix_beta lookup).
+    }
 
-        // prefix_beta and sum_alpha per tree.
+    /// Recompute dual-dependent tables in-place (prefix-β, subtree-α, pair
+    /// penalties).  Much cheaper than `rebuild_pair_tables` — O(n·m + p²·m)
+    /// but no LCA lookups.  Called on every CG call.
+    fn refresh_dual_tables(
+        &mut self,
+        trees: &[Tree],
+        alpha: &[f64],
+        beta: &[Vec<f64>],
+    ) {
+        let p = self.active_labels.len();
+        let pair_count = p * p;
+
+        // --- prefix_beta & sum_alpha (per tree, O(n)) ---
         for ti in 0..self.num_trees {
             let tree = &trees[ti];
             for node in tree.post_order_vec() {
@@ -304,7 +329,7 @@ impl LeafPairDpPricer {
             }
         }
 
-        // pair_side_parent_prefix_beta — needs prefix_beta fully built.
+        // pair_side_parent_prefix_beta (O(p²·m), no tree traversal)
         for ti in 0..self.num_trees {
             self.pair_side_parent_prefix_beta[ti].clear();
             self.pair_side_parent_prefix_beta[ti].resize(pair_count, 0.0);
@@ -320,7 +345,7 @@ impl LeafPairDpPricer {
             }
         }
 
-        // pair_penalty, pair_ub, pair_singleton_penalty.
+        // pair_penalty, pair_ub, pair_singleton_penalty (O(p²·m))
         self.pair_penalty.clear();
         self.pair_penalty.resize(pair_count, 0.0);
         self.pair_ub.clear();
@@ -330,7 +355,6 @@ impl LeafPairDpPricer {
 
         for ti in 0..self.num_trees {
             let tree = &trees[ti];
-            // node_parent_sum[v] = prefix_beta at parent(v), or 0 if v is root.
             let mut nps = vec![0.0; tree.num_nodes()];
             for node in 0..tree.num_nodes() {
                 let parent = tree.parent[node];
@@ -351,7 +375,6 @@ impl LeafPairDpPricer {
                         self.pair_ub[idx] = self.sum_alpha[ti][r];
                     }
 
-                    // Singleton penalty: β cost between leaf a's path and the side_child anchor.
                     let anc = self.pair_side_child[ti][idx];
                     let upper = if leaf_a_node != NONE {
                         let dp = tree.parent[leaf_a_node as usize];
@@ -380,14 +403,18 @@ impl LeafPairDpPricer {
                 }
             }
         }
+    }
 
-        // Reset memos.
+    fn reset_memos(&mut self) {
+        let pair_count = self.active_labels.len() * self.active_labels.len();
         self.memo_pair.clear();
         self.memo_pair.resize(pair_count, f64::NAN);
         self.memo_side_score.clear();
         self.memo_side_score.resize(pair_count, f64::NAN);
         self.memo_side_split.clear();
         self.memo_side_split.resize(pair_count, u32::MAX);
+        self.memo_pair_labels.clear();
+        self.memo_pair_labels.resize(pair_count, None);
     }
 
     fn pair_idx(&self, a: usize, b: usize) -> usize {
@@ -507,6 +534,13 @@ impl LeafPairDpPricer {
                 let c_label = (wi << BLOCK_SHIFT) + bit;
                 let c = self.label_to_active_idx[c_label] as usize;
 
+                // Branch-aware: skip extension candidate that would violate
+                // cannot-link with the anchor leaf of this side.
+                let cannot_a = self.cannot_pair[label_a as usize] as u32;
+                if cannot_a != 0 && cannot_a == c_label as u32 {
+                    continue;
+                }
+
                 let idx_c = a * p + c;
                 let pen = self.pair_penalty[idx_c] - b_penalty_sum;
                 let ub = self.pair_ub[idx_c];
@@ -574,10 +608,15 @@ impl LeafPairDpPricer {
     }
 
     fn pair_labels(&mut self, a: usize, b: usize, alpha: &[f64], beta: &[Vec<f64>]) -> Vec<u32> {
+        let idx = self.pair_idx(a, b);
+        if let Some(cached) = self.memo_pair_labels[idx].clone() {
+            return cached;
+        }
         let mut labels = Vec::new();
         self.collect_pair(a, b, alpha, beta, &mut labels);
         labels.sort_unstable();
         labels.dedup();
+        self.memo_pair_labels[idx] = Some(labels.clone());
         labels
     }
 
@@ -598,54 +637,92 @@ impl Pricer for LeafPairDpPricer {
     }
 
     fn price(&mut self, ctx: &PricingContext, scratch: &mut PricerScratch) -> PricingResult {
-        self.refresh(ctx.trees, ctx.alpha, ctx.beta, ctx.branchings);
+        // --- Pricer caching: only rebuild when active set changes ---
+        let changed = self.ensure_active_labels(ctx.alpha);
+        if changed {
+            self.rebuild_pair_tables(ctx.trees);
+        }
+        self.refresh_dual_tables(ctx.trees, ctx.alpha, ctx.beta);
+        self.reset_memos();
+
+        // --- Branch-awareness: build lookup maps from current branchings ---
+        self.cannot_pair.resize(self.num_leaves + 1, 0);
+        self.cannot_pair.fill(0);
+        self.must_pair.resize(self.num_leaves + 1, 0);
+        self.must_pair.fill(0);
+        for pair in ctx.branchings.cannot_link() {
+            self.cannot_pair[pair.a as usize] = pair.b;
+            self.cannot_pair[pair.b as usize] = pair.a;
+        }
+        for pair in ctx.branchings.must_link() {
+            self.must_pair[pair.a as usize] = pair.b;
+            self.must_pair[pair.b as usize] = pair.a;
+        }
+
         let p = self.active_labels.len();
-        if p < 2 {
+        if p < 2 || p < self.min_active_labels {
             return PricingResult::Exhausted;
         }
 
-        // Order pair candidates by quick proxy score (the 2-leaf base case
-        // RC). Multi-leaf columns anchored at a pair can score higher than
-        // the proxy, so we keep all pairs and filter via `pair_ub` below —
-        // proxy is just a heuristic ordering, not a feasibility cut.
+        // Collect all pairs where the tightest upper bound on RC exceeds
+        // 1+ε.  The bound `pair_ub[a,b] − root_penalty(a,b)` is sound:
+        // leaf gain ≤ pair_ub, node cost ≥ root_penalty (at minimum the
+        // LCA nodes in every tree).  Pairs below this threshold cannot
+        // yield a positive-RC column — skip them.
         let mut order: Vec<(f64, usize, usize)> = Vec::with_capacity(p * (p - 1) / 2);
+        let mut max_bound: f64 = NEG_INF;
         for a in 0..p {
             for b in (a + 1)..p {
-                if self.pair_ub[a * p + b] <= 1.0 + PRICING_EPS {
+                let idx = a * p + b;
+                let ub = self.pair_ub[idx];
+                let rp = self.root_penalty(a, b, ctx.beta);
+                let tight = ub - rp;
+                if tight > max_bound {
+                    max_bound = tight;
+                }
+                if tight <= 1.0 + PRICING_EPS {
                     continue;
                 }
                 let q = self.quick_proxy(a, b, ctx.alpha, ctx.beta);
                 order.push((q, a, b));
             }
         }
-        log::trace!(
-            target: "klados::bp::leaf_pair_dp",
-            "active_labels={} positive_proxy_pairs={} max_proxy={:.4}",
-            p, order.len(),
-            order.iter().map(|t| t.0).fold(NEG_INF, f64::max),
-        );
         if order.is_empty() {
+            let max_alpha = ctx.alpha.iter().copied().fold(NEG_INF, f64::max);
+            if max_alpha <= 1.0 + PRICING_EPS && max_bound <= 1.0 + PRICING_EPS {
+                return PricingResult::Converged;
+            }
             return PricingResult::Exhausted;
         }
         order.sort_unstable_by(|l, r| r.0.partial_cmp(&l.0).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Walk pair candidates; for each, run solve_pair and emit a column
-        // if the actual score (not just proxy) is positive and labels survive
-        // dedup + branching filters.
         let mut found: Vec<(f64, AfColumn)> = Vec::new();
-        let mut evaluated = 0usize;
         let target = self.max_per_call;
-        let trial_limit = (self.pair_trial_limit as usize).min(order.len());
 
-        for &(_, a, b) in order.iter().take(trial_limit) {
-            if found.len() >= target && evaluated >= 16 {
+        for &(_, a, b) in &order {
+            if found.len() >= target {
                 break;
             }
-            // Skip pairs already cut by upper bound.
+            // `pair_ub` may have tightened since we built the order (the
+            // bound is recomputed each call).  Double-check here.
             if self.pair_ub[a * p + b] <= 1.0 + PRICING_EPS {
                 continue;
             }
-            evaluated += 1;
+
+            // Branch-aware: skip anchor pairs that separate must-linked
+            // leaves or that are themselves cannot-linked.
+            let la = self.active_labels[a];
+            let lb = self.active_labels[b];
+            if self.must_pair[la as usize] != 0 && self.must_pair[la as usize] != lb {
+                continue;
+            }
+            if self.must_pair[lb as usize] != 0 && self.must_pair[lb as usize] != la {
+                continue;
+            }
+            if self.cannot_pair[la as usize] == lb {
+                continue;
+            }
+
             let score = self.solve_pair(a, b, ctx.alpha, ctx.beta);
             if score <= 1.0 + PRICING_EPS {
                 continue;
@@ -657,8 +734,6 @@ impl Pricer for LeafPairDpPricer {
             if ctx.seen.contains(&labels) {
                 continue;
             }
-            // The DP's bitmask intersection guarantees validity across all m
-            // trees, so unchecked construction is safe here.
             let column = scratch.builder.build_unchecked(labels, ctx.trees);
             if ctx.branchings.forbids(&column) {
                 continue;
@@ -667,6 +742,12 @@ impl Pricer for LeafPairDpPricer {
         }
 
         if found.is_empty() {
+            let max_alpha = ctx.alpha.iter().copied().fold(NEG_INF, f64::max);
+            if max_alpha <= 1.0 + PRICING_EPS {
+                // No positive singleton and no positive multi-leaf column
+                // anchored at any pair → truly converged.
+                return PricingResult::Converged;
+            }
             return PricingResult::Exhausted;
         }
         found.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
