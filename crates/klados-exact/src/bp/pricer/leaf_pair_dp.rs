@@ -76,8 +76,8 @@ pub struct LeafPairDpPricer {
     label_to_active_idx: Vec<u32>,
     active_mask: FixedBitSet,
     /// Indexed by `pair_idx(a, b) = a * p + b`.
-    pair_root: Vec<Vec<u32>>,                 // per tree
-    pair_side_child: Vec<Vec<u32>>,           // per tree
+    pair_root: Vec<Vec<u32>>, // per tree
+    pair_side_child: Vec<Vec<u32>>, // per tree
     /// `pair_side_parent_prefix_beta[ti][a*p+b]` = `prefix_beta[ti][parent(side_child[ti][a,b])]`,
     /// or 0.0 if side_child is the root. Used to correct `pair_penalty` for
     /// extension columns anchored below root (subtract β path from side_child
@@ -125,7 +125,11 @@ impl LeafPairDpPricer {
 
     fn new_raw(trees: &[Tree]) -> Self {
         // We assume all trees share the same `num_leaves`. Pull from the first.
-        let num_leaves = (trees.iter().flat_map(|t| t.label.iter().copied()).max().unwrap_or(0)) as usize;
+        let num_leaves = (trees
+            .iter()
+            .flat_map(|t| t.label.iter().copied())
+            .max()
+            .unwrap_or(0)) as usize;
         let stride = num_leaves + 1;
         let num_trees = trees.len();
 
@@ -220,7 +224,13 @@ impl LeafPairDpPricer {
 
     /// Refresh active labels and dual-dependent tables for the current
     /// pricing call. Called once at the top of `price()`.
-    fn refresh(&mut self, trees: &[Tree], alpha: &[f64], beta: &[Vec<f64>], branchings: &crate::bp::search::Branchings) {
+    fn refresh(
+        &mut self,
+        trees: &[Tree],
+        alpha: &[f64],
+        beta: &[Vec<f64>],
+        branchings: &crate::bp::search::Branchings,
+    ) {
         // Active labels = α > 0 AND not blocked by a fully-decided must-link
         // partner. (Cannot-link / must-link don't gate single labels here;
         // pairs handled at column emission via branchings.forbids.)
@@ -280,8 +290,16 @@ impl LeafPairDpPricer {
             }
             for node in tree.pre_order() {
                 let parent = tree.parent[node as usize];
-                let parent_sum = if parent == NONE { 0.0 } else { self.prefix_beta[ti][parent as usize] };
-                let own = if tree.is_leaf(node) { 0.0 } else { beta[ti][node as usize] };
+                let parent_sum = if parent == NONE {
+                    0.0
+                } else {
+                    self.prefix_beta[ti][parent as usize]
+                };
+                let own = if tree.is_leaf(node) {
+                    0.0
+                } else {
+                    beta[ti][node as usize]
+                };
                 self.prefix_beta[ti][node as usize] = parent_sum + own;
             }
         }
@@ -316,7 +334,11 @@ impl LeafPairDpPricer {
             let mut nps = vec![0.0; tree.num_nodes()];
             for node in 0..tree.num_nodes() {
                 let parent = tree.parent[node];
-                nps[node] = if parent == NONE { 0.0 } else { self.prefix_beta[ti][parent as usize] };
+                nps[node] = if parent == NONE {
+                    0.0
+                } else {
+                    self.prefix_beta[ti][parent as usize]
+                };
             }
             for a in 0..p {
                 let base = a * p;
@@ -333,13 +355,21 @@ impl LeafPairDpPricer {
                     let anc = self.pair_side_child[ti][idx];
                     let upper = if leaf_a_node != NONE {
                         let dp = tree.parent[leaf_a_node as usize];
-                        if dp != NONE { self.prefix_beta[ti][dp as usize] } else { 0.0 }
+                        if dp != NONE {
+                            self.prefix_beta[ti][dp as usize]
+                        } else {
+                            0.0
+                        }
                     } else {
                         0.0
                     };
                     let lower = if anc != NONE {
                         let ap = tree.parent[anc as usize];
-                        if ap != NONE { self.prefix_beta[ti][ap as usize] } else { 0.0 }
+                        if ap != NONE {
+                            self.prefix_beta[ti][ap as usize]
+                        } else {
+                            0.0
+                        }
                     } else {
                         0.0
                     };
@@ -375,7 +405,11 @@ impl LeafPairDpPricer {
         let idx = self.pair_idx(a, b);
         let val = self.memo_pair[idx];
         if !val.is_nan() {
-            return if val.is_infinite() && val.is_sign_positive() { NEG_INF } else { val };
+            return if val.is_infinite() && val.is_sign_positive() {
+                NEG_INF
+            } else {
+                val
+            };
         }
         // Sentinel during recursion to break cycles.
         self.memo_pair[idx] = f64::INFINITY;
@@ -397,7 +431,11 @@ impl LeafPairDpPricer {
         let idx = self.pair_idx(a, b);
         let val = self.memo_side_score[idx];
         if !val.is_nan() {
-            return if val.is_infinite() && val.is_sign_positive() { NEG_INF } else { val };
+            return if val.is_infinite() && val.is_sign_positive() {
+                NEG_INF
+            } else {
+                val
+            };
         }
         self.memo_side_score[idx] = f64::INFINITY;
 
@@ -448,10 +486,12 @@ impl LeafPairDpPricer {
 
         // Bitmask intersection of "descendants of side_child in every tree",
         // restricted to the active mask, excluding a and b themselves.
-        let n_blocks = self.descendant_leaves[0][side_nodes[0] as usize].as_slice().len();
+        let n_blocks = self.descendant_leaves[0][side_nodes[0] as usize]
+            .as_slice()
+            .len();
         for wi in 0..n_blocks {
-            let mut w = self.descendant_leaves[0][side_nodes[0] as usize].as_slice()[wi]
-                & am_blocks[wi];
+            let mut w =
+                self.descendant_leaves[0][side_nodes[0] as usize].as_slice()[wi] & am_blocks[wi];
             for ti in 1..self.num_trees {
                 w &= self.descendant_leaves[ti][side_nodes[ti] as usize].as_slice()[wi];
             }
@@ -476,7 +516,11 @@ impl LeafPairDpPricer {
 
                 let cached = self.memo_pair[idx_c];
                 let child = if !cached.is_nan() {
-                    if cached.is_infinite() && cached.is_sign_positive() { NEG_INF } else { cached }
+                    if cached.is_infinite() && cached.is_sign_positive() {
+                        NEG_INF
+                    } else {
+                        cached
+                    }
                 } else {
                     self.solve_pair(a, c, alpha, beta)
                 };
@@ -496,12 +540,26 @@ impl LeafPairDpPricer {
         best_score
     }
 
-    fn collect_pair(&mut self, a: usize, b: usize, alpha: &[f64], beta: &[Vec<f64>], out: &mut Vec<u32>) {
+    fn collect_pair(
+        &mut self,
+        a: usize,
+        b: usize,
+        alpha: &[f64],
+        beta: &[Vec<f64>],
+        out: &mut Vec<u32>,
+    ) {
         self.collect_side(a, b, alpha, beta, out);
         self.collect_side(b, a, alpha, beta, out);
     }
 
-    fn collect_side(&mut self, a: usize, b: usize, alpha: &[f64], beta: &[Vec<f64>], out: &mut Vec<u32>) {
+    fn collect_side(
+        &mut self,
+        a: usize,
+        b: usize,
+        alpha: &[f64],
+        beta: &[Vec<f64>],
+        out: &mut Vec<u32>,
+    ) {
         let idx = self.pair_idx(a, b);
         let s = self.memo_side_score[idx];
         if s.is_nan() || s.is_infinite() {

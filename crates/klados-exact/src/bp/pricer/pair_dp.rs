@@ -32,8 +32,7 @@
 use klados_core::Tree;
 
 use super::{
-    PairDpTable, Pricer, PricerScratch, PricingContext, PricingResult,
-    scratch::PairDpCell,
+    PairDpTable, Pricer, PricerScratch, PricingContext, PricingResult, scratch::PairDpCell,
 };
 
 const PRICING_EPS: f64 = 1.0e-8;
@@ -70,7 +69,12 @@ impl Pricer for PairDpPricer {
 
     fn price(&mut self, ctx: &PricingContext, scratch: &mut PricerScratch) -> PricingResult {
         debug_assert_eq!(ctx.trees.len(), 2);
-        run_pair_dp(ctx, scratch, /*allow_filter=*/ false, self.max_per_call)
+        run_pair_dp(
+            ctx,
+            scratch,
+            /*allow_filter=*/ false,
+            self.max_per_call,
+        )
     }
 }
 
@@ -90,7 +94,10 @@ pub(super) fn run_pair_dp(
     let n1 = t1.num_nodes();
 
     // Acquire / size the cached DP table.
-    let mut table = scratch.pair_dp_table.take().unwrap_or_else(|| PairDpTable::new(n0, n1));
+    let mut table = scratch
+        .pair_dp_table
+        .take()
+        .unwrap_or_else(|| PairDpTable::new(n0, n1));
     if !table.fits(n0, n1) {
         table = PairDpTable::new(n0, n1);
     }
@@ -183,7 +190,14 @@ pub(super) fn run_pair_dp(
     }
 }
 
-fn fill_cell(table: &mut PairDpTable, u: usize, v: usize, t0: &Tree, t1: &Tree, ctx: &PricingContext) {
+fn fill_cell(
+    table: &mut PairDpTable,
+    u: usize,
+    v: usize,
+    t0: &Tree,
+    t1: &Tree,
+    ctx: &PricingContext,
+) {
     let u_leaf = t0.is_leaf(u as u32);
     let v_leaf = t1.is_leaf(v as u32);
 
@@ -209,7 +223,11 @@ fn fill_cell(table: &mut PairDpTable, u: usize, v: usize, t0: &Tree, t1: &Tree, 
         if s_l == NEG_INF && s_r == NEG_INF {
             return;
         }
-        let (best, ch) = if s_l >= s_r { (s_l - bv, choice::SKIP_VR) } else { (s_r - bv, choice::SKIP_VL) };
+        let (best, ch) = if s_l >= s_r {
+            (s_l - bv, choice::SKIP_VR)
+        } else {
+            (s_r - bv, choice::SKIP_VL)
+        };
         let i = table.idx(u, v);
         table.cells[i].open_score = best;
         table.cells[i].open_choice = ch;
@@ -224,7 +242,11 @@ fn fill_cell(table: &mut PairDpTable, u: usize, v: usize, t0: &Tree, t1: &Tree, 
         if s_l == NEG_INF && s_r == NEG_INF {
             return;
         }
-        let (best, ch) = if s_l >= s_r { (s_l - bu, choice::SKIP_UR) } else { (s_r - bu, choice::SKIP_UL) };
+        let (best, ch) = if s_l >= s_r {
+            (s_l - bu, choice::SKIP_UR)
+        } else {
+            (s_r - bu, choice::SKIP_UL)
+        };
         let i = table.idx(u, v);
         table.cells[i].open_score = best;
         table.cells[i].open_choice = ch;
@@ -259,32 +281,54 @@ fn fill_cell(table: &mut PairDpTable, u: usize, v: usize, t0: &Tree, t1: &Tree, 
 
     // open: max over closed at (u,v) and four "confine to one side" cases.
     let mut best = closed_score;
-    let mut best_ch = if closed_score > NEG_INF { choice::VIA_CLOSED } else { choice::INFEASIBLE };
+    let mut best_ch = if closed_score > NEG_INF {
+        choice::VIA_CLOSED
+    } else {
+        choice::INFEASIBLE
+    };
     let try_update = |best: &mut f64, best_ch: &mut u8, cand: f64, ch: u8| {
-        if cand > *best { *best = cand; *best_ch = ch; }
+        if cand > *best {
+            *best = cand;
+            *best_ch = ch;
+        }
     };
     // SKIP_UR/UL: confine to ul or ur subtree; subtract beta[u] (the parent)
     // because we're "stepping over" the current node u.
     let s_skip_ur = table.cells[table.idx(ul as usize, v)].open_score;
-    if s_skip_ur != NEG_INF { try_update(&mut best, &mut best_ch, s_skip_ur - bu, choice::SKIP_UR); }
+    if s_skip_ur != NEG_INF {
+        try_update(&mut best, &mut best_ch, s_skip_ur - bu, choice::SKIP_UR);
+    }
     let s_skip_ul = table.cells[table.idx(ur as usize, v)].open_score;
-    if s_skip_ul != NEG_INF { try_update(&mut best, &mut best_ch, s_skip_ul - bu, choice::SKIP_UL); }
+    if s_skip_ul != NEG_INF {
+        try_update(&mut best, &mut best_ch, s_skip_ul - bu, choice::SKIP_UL);
+    }
     // SKIP_VR/VL: confine to vl or vr subtree; subtract beta[v] (the parent).
     let s_skip_vr = table.cells[table.idx(u, vl as usize)].open_score;
-    if s_skip_vr != NEG_INF { try_update(&mut best, &mut best_ch, s_skip_vr - bv, choice::SKIP_VR); }
+    if s_skip_vr != NEG_INF {
+        try_update(&mut best, &mut best_ch, s_skip_vr - bv, choice::SKIP_VR);
+    }
     let s_skip_vl = table.cells[table.idx(u, vr as usize)].open_score;
-    if s_skip_vl != NEG_INF { try_update(&mut best, &mut best_ch, s_skip_vl - bv, choice::SKIP_VL); }
+    if s_skip_vl != NEG_INF {
+        try_update(&mut best, &mut best_ch, s_skip_vl - bv, choice::SKIP_VL);
+    }
     let i = table.idx(u, v);
     table.cells[i].open_score = best;
     table.cells[i].open_choice = best_ch;
 }
 
 fn combine(a: f64, b: f64) -> f64 {
-    if a == NEG_INF || b == NEG_INF { NEG_INF } else { a + b }
+    if a == NEG_INF || b == NEG_INF {
+        NEG_INF
+    } else {
+        a + b
+    }
 }
 
 fn backtrack(table: &PairDpTable, u: usize, v: usize, t0: &Tree, t1: &Tree) -> Vec<u32> {
-    enum Frame { Closed(usize, usize), Open(usize, usize) }
+    enum Frame {
+        Closed(usize, usize),
+        Open(usize, usize),
+    }
     let mut labels = Vec::new();
     let mut stack = vec![Frame::Closed(u, v)];
 

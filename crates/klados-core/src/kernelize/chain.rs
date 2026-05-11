@@ -1,8 +1,8 @@
 //! Chain reduction rule.
 
-use crate::{NONE, Tree};
 use super::helpers::*;
 use super::rule::{ReductionAction, ReductionRule, RuleContext};
+use crate::{NONE, Tree};
 
 /// Chain reduction: compress common caterpillar chains.
 ///
@@ -26,9 +26,10 @@ impl ReductionRule for ChainRule {
         } else {
             let truncate_to = inst.trees.len() + 1;
             let collapses = find_common_chains(&inst.trees, inst.num_leaves, truncate_to);
-            collapses.into_iter().next().and_then(|(rep, removed)| {
-                removed.into_iter().next().map(|victim| (victim, rep))
-            })
+            collapses
+                .into_iter()
+                .next()
+                .and_then(|(rep, removed)| removed.into_iter().next().map(|victim| (victim, rep)))
         };
 
         let (victim, chain_neighbor) = found?;

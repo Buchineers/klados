@@ -13,10 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let lb = match default_lb_method() {
         "maf-bounds" => {
-            let bounds = klados_core::lower_bound::maf_bounds(
-                &instance.trees,
-                instance.num_leaves,
-            );
+            let bounds = klados_core::lower_bound::maf_bounds(&instance.trees, instance.num_leaves);
             bounds.lower
         }
         "red-blue" => {
@@ -28,24 +25,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         "chen-app1" => {
             if instance.num_trees() != 2 {
-                eprintln!("klados-lb: chen-app1 requires exactly 2 trees, got {}", instance.num_trees());
+                eprintln!(
+                    "klados-lb: chen-app1 requires exactly 2 trees, got {}",
+                    instance.num_trees()
+                );
                 std::process::exit(1);
             }
-            let (lb, _ub) = klados_exact::chen_rspr::chen_app1_bounds(
-                &instance.trees[0],
-                &instance.trees[1],
-            );
+            let (lb, _ub) =
+                klados_exact::chen_rspr::chen_app1_bounds(&instance.trees[0], &instance.trees[1]);
             lb + 1
         }
         "chen-pair" => {
             if instance.num_trees() != 2 {
-                eprintln!("klados-lb: chen-pair requires exactly 2 trees, got {}", instance.num_trees());
+                eprintln!(
+                    "klados-lb: chen-pair requires exactly 2 trees, got {}",
+                    instance.num_trees()
+                );
                 std::process::exit(1);
             }
-            let (lb, _ub) = klados_exact::chen_rspr::chen_pair_bounds(
-                &instance.trees[0],
-                &instance.trees[1],
-            );
+            let (lb, _ub) =
+                klados_exact::chen_rspr::chen_pair_bounds(&instance.trees[0], &instance.trees[1]);
             lb + 1
         }
         _ => {

@@ -17,7 +17,7 @@ pub use cherry::{
     cherry_reduce_ub, greedy_multi_tree_partition, greedy_multi_tree_ub,
     greedy_multi_tree_ub_seeded, pairwise_refine_ub,
 };
-pub use red_blue::{red_blue_approx, red_blue_approx_detailed, RedBlueResult};
+pub use red_blue::{RedBlueResult, red_blue_approx, red_blue_approx_detailed};
 
 pub struct MafBounds {
     pub lower: usize,
@@ -32,7 +32,11 @@ pub struct MafBounds {
 
 pub fn maf_bounds(trees: &[Tree], num_leaves: u32) -> MafBounds {
     if trees.len() <= 1 {
-        return MafBounds { lower: 1, upper: 1, best_partition: None };
+        return MafBounds {
+            lower: 1,
+            upper: 1,
+            best_partition: None,
+        };
     }
 
     let m = trees.len();
@@ -108,13 +112,7 @@ pub fn maf_bounds(trees: &[Tree], num_leaves: u32) -> MafBounds {
     if m >= 5 {
         eprintln!(
             "[bounds] pairwise m={}: total={:.1}ms (red_blue={:.1}ms/{}calls, cherry_reduce={:.1}ms, rb_skipped={}, best_lb={})",
-            m,
-            pairwise_total_ms,
-            t_rb_total_ms,
-            rb_calls,
-            t_cherry_total_ms,
-            rb_skipped,
-            best_lb,
+            m, pairwise_total_ms, t_rb_total_ms, rb_calls, t_cherry_total_ms, rb_skipped, best_lb,
         );
     }
 
@@ -161,7 +159,10 @@ pub fn maf_bounds(trees: &[Tree], num_leaves: u32) -> MafBounds {
         }
         let multi_ms = t_multi.elapsed().as_secs_f64() * 1000.0;
         if m >= 5 {
-            eprintln!("[bounds] greedy_multi_tree_ub_seeded ({}x21): {:.1}ms", m, multi_ms);
+            eprintln!(
+                "[bounds] greedy_multi_tree_ub_seeded ({}x21): {:.1}ms",
+                m, multi_ms
+            );
         }
 
         // (b) Pairwise-refine: start from best pair's partition, refine for all trees.
@@ -169,7 +170,9 @@ pub fn maf_bounds(trees: &[Tree], num_leaves: u32) -> MafBounds {
         let (pr_ub, pr_partition) = pairwise_refine_ub(trees, n);
         eprintln!(
             "[bounds] Pairwise-refine UB: {} (all-tree cherry: {}) in {:.1}ms",
-            pr_ub, best_multi_ub, t_pr.elapsed().as_secs_f64() * 1000.0
+            pr_ub,
+            best_multi_ub,
+            t_pr.elapsed().as_secs_f64() * 1000.0
         );
 
         if pr_ub < best_multi_ub {

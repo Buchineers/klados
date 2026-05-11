@@ -27,6 +27,7 @@
 
 pub mod anchor_extend;
 pub mod composite;
+pub mod exact_pair_dp;
 pub mod leaf_pair_dp;
 pub mod pair_dp;
 pub mod pair_dp_filter;
@@ -34,6 +35,7 @@ pub mod scratch;
 
 pub use anchor_extend::AnchorExtendPricer;
 pub use composite::{CompositePricer, dispatch_by_m};
+pub use exact_pair_dp::ExactPairDpPricer;
 pub use leaf_pair_dp::LeafPairDpPricer;
 pub use pair_dp::PairDpPricer;
 pub use pair_dp_filter::PairDpFilterPricer;

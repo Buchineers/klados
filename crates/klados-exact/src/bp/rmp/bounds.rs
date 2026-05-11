@@ -15,7 +15,10 @@ pub struct Bound {
 }
 
 impl Bound {
-    pub const FREE: Bound = Bound { lo: 0.0, hi: f64::INFINITY };
+    pub const FREE: Bound = Bound {
+        lo: 0.0,
+        hi: f64::INFINITY,
+    };
     pub const ZERO: Bound = Bound { lo: 0.0, hi: 0.0 };
 }
 

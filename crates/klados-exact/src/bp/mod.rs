@@ -43,7 +43,7 @@ impl Default for BpConfig {
     fn default() -> Self {
         Self {
             kernelize: true,
-            cluster_algo: ClusterAlgo::Both,
+            cluster_algo: ClusterAlgo::ClusterReduction,
         }
     }
 }
@@ -135,7 +135,6 @@ pub(crate) fn _solve_recursive_alias(instance: &Instance, cfg: &BpConfig) -> Opt
     solve_recursive(instance, cfg)
 }
 
-
 ///
 /// Order:
 /// 1. **Trivial** (m≤1, n≤1) — short-circuit.
@@ -187,7 +186,10 @@ fn solve_recursive(instance: &Instance, cfg: &BpConfig) -> Option<Vec<Tree>> {
                 instance.num_leaves, comps.len(),
             );
             let expanded = klados_core::kernelize::expand_solution(
-                comps, &kern, &instance.trees[0], instance.num_leaves,
+                comps,
+                &kern,
+                &instance.trees[0],
+                instance.num_leaves,
             );
             return Some(expanded);
         }
@@ -199,6 +201,7 @@ fn solve_recursive(instance: &Instance, cfg: &BpConfig) -> Option<Vec<Tree>> {
         cluster_algo: cfg.cluster_algo.clone(),
     };
     let inner_cfg = cfg.clone();
+    let reduced_num_leaves = reduced.num_leaves;
     solve_with_pipeline(
         reduced,
         &pipeline_cfg,
@@ -211,12 +214,19 @@ fn solve_recursive(instance: &Instance, cfg: &BpConfig) -> Option<Vec<Tree>> {
                     return Some(comps);
                 }
             }
-            solver::solve_inner(sub)
+            if sub.num_leaves < reduced_num_leaves {
+                solve_recursive(sub, &inner_cfg)
+            } else {
+                solver::solve_inner(sub)
+            }
         },
     )
     .map(|comps| {
         klados_core::kernelize::expand_solution(
-            comps, &kern, &instance.trees[0], instance.num_leaves,
+            comps,
+            &kern,
+            &instance.trees[0],
+            instance.num_leaves,
         )
     })
 }

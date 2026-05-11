@@ -3,9 +3,9 @@
 //! `SolverChoice` is the single source of truth — each variant carries its
 //! display name, kind, description, and a constructor.
 
+use clap::ValueEnum;
 use klados_core::Instance;
 use klados_core::Tree;
-use clap::ValueEnum;
 use pace26io::newick::NewickWriter;
 use std::io::{self, Write};
 
@@ -84,9 +84,7 @@ impl SolverChoice {
             ],
             BpMulti => &[],
             Bp => &[],
-            GreedyPartition => &[
-                ("KLADOS_HEURISTIC_TEST_MODE", "extended search budget"),
-            ],
+            GreedyPartition => &[("KLADOS_HEURISTIC_TEST_MODE", "extended search budget")],
             Agglomerative => &[],
         }
     }
@@ -95,13 +93,21 @@ impl SolverChoice {
         match self {
             SolverChoice::ILP => from_exact(klados_exact::maf_ilp::MafIlpSolver::new()),
             SolverChoice::Sat => from_exact(klados_exact::maf_sat::MafSatSolver::new()),
-            SolverChoice::MafSatOlver => from_exact(klados_exact::maf_sat::MafSatOlverSolver::new()),
+            SolverChoice::MafSatOlver => {
+                from_exact(klados_exact::maf_sat::MafSatOlverSolver::new())
+            }
             SolverChoice::ChenRspr => from_exact(klados_exact::chen_rspr::ChenRsprSolver::new()),
             SolverChoice::Whidden => from_exact(klados_exact::whidden::WhiddenSolver::new()),
-            SolverChoice::BpMulti => from_exact(klados_exact::maf_branch_price_multi::MafBranchPriceMultiSolver::new()),
+            SolverChoice::BpMulti => {
+                from_exact(klados_exact::maf_branch_price_multi::MafBranchPriceMultiSolver::new())
+            }
             SolverChoice::Bp => from_exact(klados_exact::bp::BpSolver::new()),
-            SolverChoice::GreedyPartition => from_heuristic(klados_heuristic::partition::PartitionHeuristicSolver::greedy_union_add_one()),
-            SolverChoice::Agglomerative => from_heuristic(klados_heuristic::agglomerative::AgglomerativeSolver::new()),
+            SolverChoice::GreedyPartition => from_heuristic(
+                klados_heuristic::partition::PartitionHeuristicSolver::greedy_union_add_one(),
+            ),
+            SolverChoice::Agglomerative => {
+                from_heuristic(klados_heuristic::agglomerative::AgglomerativeSolver::new())
+            }
         }
     }
 }
@@ -131,8 +137,12 @@ pub fn list_solvers() {
     eprintln!("{:=<72}", "");
     for choice in SolverChoice::value_variants() {
         let name = choice.to_possible_value().unwrap().get_name().to_owned();
-        eprintln!("  {:<6}  {:<30}  {}",
-            choice.kind().to_string(), name, choice.description());
+        eprintln!(
+            "  {:<6}  {:<30}  {}",
+            choice.kind().to_string(),
+            name,
+            choice.description()
+        );
         for (opt, desc) in choice.options() {
             eprintln!("  {:>6}    {:>28}: {}", "", opt, desc);
         }
@@ -171,7 +181,10 @@ fn from_heuristic(s: impl klados_heuristic::HeuristicSolver + 'static) -> Box<dy
 
 // ── Solve + print ──────────────────────────────────────────────────────────
 
-pub fn solve_and_print(instance: &Instance, choice: SolverChoice) -> Result<(), Box<dyn std::error::Error>> {
+pub fn solve_and_print(
+    instance: &Instance,
+    choice: SolverChoice,
+) -> Result<(), Box<dyn std::error::Error>> {
     log::info!(
         "solving: {} trees, {} leaves, solver={}",
         instance.num_trees(),

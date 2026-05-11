@@ -10,11 +10,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use fixedbitset::FixedBitSet;
 use klados_core::kernelize::restrict_instance_simple;
-use klados_core::tree::{NodeId, Tree, NONE};
+use klados_core::tree::{NONE, NodeId, Tree};
 use klados_core::{Instance, SolverStats};
+use klados_exact::ExactSolver;
 use klados_exact::maf_sat::MafSatSolver;
 use klados_exact::whidden::WhiddenSolver;
-use klados_exact::ExactSolver;
 
 use crate::HeuristicSolver;
 
@@ -791,7 +791,10 @@ fn deterministic_plateau_escape_pass(
 
         let mut next_frontier: Vec<PartitionState> = Vec::new();
         let current_frontier = std::mem::take(&mut frontier);
-        for state in current_frontier.into_iter().take(PLATEAU_MAX_STATES_PER_EPISODE) {
+        for state in current_frontier
+            .into_iter()
+            .take(PLATEAU_MAX_STATES_PER_EPISODE)
+        {
             if terminate.load(Ordering::Relaxed) || started.elapsed() >= time_limit {
                 break;
             }
@@ -820,7 +823,11 @@ fn deterministic_plateau_escape_pass(
             roots.sort_unstable_by_key(|&r| {
                 (
                     std::cmp::Reverse(comp_labels[r as usize].len()),
-                    comp_labels[r as usize].iter().copied().min().unwrap_or(u32::MAX),
+                    comp_labels[r as usize]
+                        .iter()
+                        .copied()
+                        .min()
+                        .unwrap_or(u32::MAX),
                     r,
                 )
             });
@@ -830,7 +837,8 @@ fn deterministic_plateau_escape_pass(
                     break;
                 }
 
-                let neighbors = collect_nearby_roots(anchor, &leaf_to_root, comp_labels, tp1, tp2, 1);
+                let neighbors =
+                    collect_nearby_roots(anchor, &leaf_to_root, comp_labels, tp1, tp2, 1);
                 if neighbors.is_empty() {
                     continue;
                 }
@@ -861,7 +869,8 @@ fn deterministic_plateau_escape_pass(
                 }
 
                 let (region_instance, reverse_map) = restrict_instance_simple(instance, &keep);
-                let Some((exact_solution, _solver_name)) = exact_local_solve(&region_instance) else {
+                let Some((exact_solution, _solver_name)) = exact_local_solve(&region_instance)
+                else {
                     continue;
                 };
                 let mapped = region_components_from_exact(&exact_solution, &reverse_map, n);
@@ -901,7 +910,9 @@ fn deterministic_plateau_escape_pass(
                         next_frontier.push(candidate);
                         if *num_components < initial_score {
                             stats.accepted += 1;
-                            stats.best_delta = stats.best_delta.max(initial_score.saturating_sub(*num_components));
+                            stats.best_delta = stats
+                                .best_delta
+                                .max(initial_score.saturating_sub(*num_components));
                         }
                     }
                 }
@@ -973,11 +984,20 @@ fn exact_region_reoptimization_pass(
         for (_, hits, _) in &neighbors {
             conflict_score = conflict_score.saturating_add(*hits as u32);
         }
-        let min_label = comp_labels[r as usize].iter().copied().min().unwrap_or(u32::MAX);
+        let min_label = comp_labels[r as usize]
+            .iter()
+            .copied()
+            .min()
+            .unwrap_or(u32::MAX);
         anchor_rank.push((r, neighbors.len(), conflict_score, min_label));
     }
     anchor_rank.sort_unstable_by_key(|&(r, deg, score, min_label)| {
-        (std::cmp::Reverse(score), std::cmp::Reverse(deg), min_label, r)
+        (
+            std::cmp::Reverse(score),
+            std::cmp::Reverse(deg),
+            min_label,
+            r,
+        )
     });
     roots = anchor_rank.into_iter().map(|(r, _, _, _)| r).collect();
 
@@ -1173,8 +1193,14 @@ impl AgglomerativeSolver {
             let br = uf.find(lbl_b);
             if ar != br
                 && try_merge(
-                    ar, br, &mut uf, &mut comp_labels,
-                    &mut node_owner1, &mut node_owner2, &tp1, &tp2,
+                    ar,
+                    br,
+                    &mut uf,
+                    &mut comp_labels,
+                    &mut node_owner1,
+                    &mut node_owner2,
+                    &tp1,
+                    &tp2,
                 )
             {
                 cherry_merges += 1;
@@ -1183,7 +1209,9 @@ impl AgglomerativeSolver {
         }
         eprintln!(
             "[agglo] Phase 1 (common cherries): {} merges, {} components, {:.1}ms",
-            cherry_merges, num_components, start.elapsed().as_secs_f64() * 1000.0,
+            cherry_merges,
+            num_components,
+            start.elapsed().as_secs_f64() * 1000.0,
         );
 
         // =================================================================
@@ -1238,7 +1266,8 @@ impl AgglomerativeSolver {
                     leaf_to_root[lbl as usize] = uf.find(lbl);
                 }
 
-                let mut meta_by_root: HashMap<u32, ComponentMeta> = HashMap::with_capacity(roots.len());
+                let mut meta_by_root: HashMap<u32, ComponentMeta> =
+                    HashMap::with_capacity(roots.len());
                 for &r in &roots {
                     let labels = &comp_labels[r as usize];
                     if labels.is_empty() {
@@ -1256,13 +1285,21 @@ impl AgglomerativeSolver {
                 }
 
                 let mut pair_seen: HashSet<(u32, u32)> = HashSet::with_capacity(roots.len() * 8);
-                let mut pair_support: Vec<(u32, u32, u16, u16)> = Vec::with_capacity(roots.len() * 8);
+                let mut pair_support: Vec<(u32, u32, u16, u16)> =
+                    Vec::with_capacity(roots.len() * 8);
                 for &r in &roots {
                     let rr = uf.find(r);
                     if rr != r || comp_labels[rr as usize].is_empty() {
                         continue;
                     }
-                    let neighbors = collect_nearby_roots(rr, &leaf_to_root, &comp_labels, &tp1, &tp2, rise_limit);
+                    let neighbors = collect_nearby_roots(
+                        rr,
+                        &leaf_to_root,
+                        &comp_labels,
+                        &tp1,
+                        &tp2,
+                        rise_limit,
+                    );
                     for (other, hits, rise_sum) in neighbors {
                         let ro = uf.find(other);
                         if ro == rr || comp_labels[ro as usize].is_empty() {
@@ -1324,7 +1361,10 @@ impl AgglomerativeSolver {
                     }
                     let ra = uf.find(c.a);
                     let rb = uf.find(c.b);
-                    if ra == rb || comp_labels[ra as usize].is_empty() || comp_labels[rb as usize].is_empty() {
+                    if ra == rb
+                        || comp_labels[ra as usize].is_empty()
+                        || comp_labels[rb as usize].is_empty()
+                    {
                         continue;
                     }
                     attempts += 1;
@@ -1386,7 +1426,8 @@ impl AgglomerativeSolver {
                 region_stats_total.accepted += region_stats.accepted;
                 region_stats_total.rejected += region_stats.rejected;
                 region_stats_total.merges += region_stats.merges;
-                region_stats_total.best_delta = region_stats_total.best_delta.max(region_stats.best_delta);
+                region_stats_total.best_delta =
+                    region_stats_total.best_delta.max(region_stats.best_delta);
                 region_stats_total.whidden_attempts += region_stats.whidden_attempts;
                 region_stats_total.maf_sat_attempts += region_stats.maf_sat_attempts;
 
@@ -1432,7 +1473,8 @@ impl AgglomerativeSolver {
                     plateau_stats_total.expanded += plateau_stats.expanded;
                     plateau_stats_total.deduped += plateau_stats.deduped;
                     plateau_stats_total.accepted += plateau_stats.accepted;
-                    plateau_stats_total.best_delta = plateau_stats_total.best_delta.max(plateau_stats.best_delta);
+                    plateau_stats_total.best_delta =
+                        plateau_stats_total.best_delta.max(plateau_stats.best_delta);
 
                     let plateau_improved = num_components < plateau_before;
                     eprintln!(

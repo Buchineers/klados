@@ -2,6 +2,7 @@
 
 use crate::bp::column::{AfColumn, ColumnSet};
 
+#[derive(Clone)]
 pub struct Incumbent {
     /// Indices into `SearchState::columns` that form the integer solution.
     pub component_columns: Vec<usize>,

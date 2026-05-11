@@ -1,7 +1,7 @@
 //! Kernelization statistics and output.
 
-use std::collections::BTreeMap;
 use fxhash::FxHashMap;
+use std::collections::BTreeMap;
 
 /// Statistics from a kernelization run.
 #[derive(Clone, Debug, Default)]
@@ -58,7 +58,10 @@ pub fn print_stats(stats: &KernelizeStats) {
         total_removed, pct
     );
     // Fixed-name rules in backward-compatible format
-    eprintln!("// --- Due to subtree reduction: {}", stats.subtree_removed());
+    eprintln!(
+        "// --- Due to subtree reduction: {}",
+        stats.subtree_removed()
+    );
     eprintln!("// --- Due to chain reduction: {}", stats.chain_removed());
     eprintln!(
         "// --- Due to 3-2 chain reduction: {}",
@@ -66,8 +69,11 @@ pub fn print_stats(stats: &KernelizeStats) {
     );
     // Any additional rules beyond the core three
     for (name, &count) in &stats.rule_counts {
-        if *name != "cherry" && *name != "chain" && *name != "chain-3-2"
-            && *name != "triple" && count > 0
+        if *name != "cherry"
+            && *name != "chain"
+            && *name != "chain-3-2"
+            && *name != "triple"
+            && count > 0
         {
             eprintln!("// --- Due to {} reduction: {}", name, count);
         }

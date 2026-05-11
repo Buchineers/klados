@@ -1,7 +1,7 @@
 //! Red-Blue 2-approximation algorithm for MAF lower bounds.
 
-use fixedbitset::FixedBitSet;
 use crate::tree::{Label, NONE, NodeId, Tree};
+use fixedbitset::FixedBitSet;
 
 use super::feasibility::{
     find_lowest_roi, is_rub_feasible_impl, is_set_compatible, is_triple_compatible, mark_v_set,
@@ -134,7 +134,9 @@ pub fn red_blue_approx_detailed(t1: &Tree, t2: &Tree) -> RedBlueResult {
 
     // D = |P_before_merge| - 1 - y_decrements
     let p_before_merge = partition.count_components();
-    let dual_lb = p_before_merge.saturating_sub(1).saturating_sub(y_decrements);
+    let dual_lb = p_before_merge
+        .saturating_sub(1)
+        .saturating_sub(y_decrements);
 
     if trace {
         eprintln!("[RB] === Merge-Components: {} pairs ===", pairslist.len());

@@ -419,7 +419,9 @@ pub fn pairwise_refine_ub(trees: &[Tree], num_leaves: usize) -> (usize, Vec<usiz
             // UF: merge leaves that are in the same uniform subtree.
             let mut uf: Vec<usize> = (0..num_leaves).collect();
             fn find(p: &mut [usize], x: usize) -> usize {
-                if p[x] != x { p[x] = find(p, p[x]); }
+                if p[x] != x {
+                    p[x] = find(p, p[x]);
+                }
                 p[x]
             }
 
@@ -430,14 +432,18 @@ pub fn pairwise_refine_ub(trees: &[Tree], num_leaves: usize) -> (usize, Vec<usiz
                 // Uniform subtree: merge a leaf from left with a leaf from right.
                 let l = tree.left[v as usize];
                 let r = tree.right[v as usize];
-                if l == NONE || r == NONE { continue; }
+                if l == NONE || r == NONE {
+                    continue;
+                }
 
                 let la = find_any_leaf_label(tree, l, num_leaves);
                 let ra = find_any_leaf_label(tree, r, num_leaves);
                 if let (Some(a), Some(b)) = (la, ra) {
                     let fa = find(&mut uf, a);
                     let fb = find(&mut uf, b);
-                    if fa != fb { uf[fa] = fb; }
+                    if fa != fb {
+                        uf[fa] = fb;
+                    }
                 }
             }
 
@@ -472,7 +478,9 @@ pub fn pairwise_refine_ub(trees: &[Tree], num_leaves: usize) -> (usize, Vec<usiz
                 }
             }
         }
-        if !changed { break; }
+        if !changed {
+            break;
+        }
     }
 
     // Phase 2: Split components that contain incompatible triples (H4).
@@ -487,7 +495,9 @@ pub fn pairwise_refine_ub(trees: &[Tree], num_leaves: usize) -> (usize, Vec<usiz
         }
 
         'outer: for (_comp, leaves) in &comp_leaves {
-            if leaves.len() < 3 { continue; }
+            if leaves.len() < 3 {
+                continue;
+            }
             // Check all triples within this component.
             for ii in 0..leaves.len() {
                 for jj in (ii + 1)..leaves.len() {
@@ -506,12 +516,16 @@ pub fn pairwise_refine_ub(trees: &[Tree], num_leaves: usize) -> (usize, Vec<usiz
                 }
             }
         }
-        if !changed { break; }
+        if !changed {
+            break;
+        }
     }
 
     // Count components.
     let mut seen = std::collections::HashSet::new();
-    for &c in &partition { seen.insert(c); }
+    for &c in &partition {
+        seen.insert(c);
+    }
     (seen.len(), partition)
 }
 
@@ -549,7 +563,9 @@ fn is_incompatible_triple(trees: &[Tree], a: usize, b: usize, c: usize) -> bool 
 
 /// Find any leaf label (0-indexed) in the subtree rooted at `node`.
 fn find_any_leaf_label(tree: &Tree, node: NodeId, num_leaves: usize) -> Option<usize> {
-    if node == NONE { return None; }
+    if node == NONE {
+        return None;
+    }
     if tree.is_leaf(node) {
         let lbl = tree.label[node as usize];
         if lbl > 0 && (lbl as usize) <= num_leaves {

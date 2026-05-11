@@ -10,8 +10,8 @@
 //! Victim = r (deleted). The standard 3-2 uses cherry + interceptor states.
 //! The rotation state extends to m >= 3.
 
-use crate::{NONE, Tree};
 use super::rule::{ReductionAction, ReductionRule, RuleContext};
+use crate::{NONE, Tree};
 
 #[derive(Debug)]
 pub struct TripleRule;
@@ -84,14 +84,19 @@ fn find_generalized_triple(trees: &[Tree], num_leaves: u32) -> Option<ReductionA
     // Scan each leaf as PIVOT (like the original 3-2 rule)
     for p in 1..=num_leaves {
         // Get p's cherry partner in each tree
-        let partners: Vec<Option<u32>> = trees.iter().map(|t| {
-            let np = t.node_by_label(p);
-            if np == NONE { return None; }
-            match t.sibling(np) {
-                Some(s) if t.is_leaf(s) => Some(t.label[s as usize]),
-                _ => None,
-            }
-        }).collect();
+        let partners: Vec<Option<u32>> = trees
+            .iter()
+            .map(|t| {
+                let np = t.node_by_label(p);
+                if np == NONE {
+                    return None;
+                }
+                match t.sibling(np) {
+                    Some(s) if t.is_leaf(s) => Some(t.label[s as usize]),
+                    _ => None,
+                }
+            })
+            .collect();
 
         // p must be in a cherry in at least one tree
         let mut unique: Vec<u32> = partners.iter().filter_map(|x| *x).collect();
@@ -104,7 +109,9 @@ fn find_generalized_triple(trees: &[Tree], num_leaves: u32) -> Option<ReductionA
         // For each pair of partners: one is keeper q, other is victim r
         for i in 0..unique.len() {
             for j in 0..unique.len() {
-                if i == j { continue; }
+                if i == j {
+                    continue;
+                }
                 let q = unique[i]; // keeper
                 let r = unique[j]; // victim (to be deleted)
 
@@ -116,9 +123,16 @@ fn find_generalized_triple(trees: &[Tree], num_leaves: u32) -> Option<ReductionA
                     let state = classify_tree(&trees[t], p, q, r);
                     match state {
                         TreeState::CherryPQ => {}
-                        TreeState::InterceptPR => { has_interceptor = true; }
-                        TreeState::RotationQR => { has_interceptor = true; }
-                        TreeState::Invalid => { all_valid = false; break; }
+                        TreeState::InterceptPR => {
+                            has_interceptor = true;
+                        }
+                        TreeState::RotationQR => {
+                            has_interceptor = true;
+                        }
+                        TreeState::Invalid => {
+                            all_valid = false;
+                            break;
+                        }
                     }
                 }
 

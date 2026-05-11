@@ -1,7 +1,7 @@
 //! Instance reduction and restriction operations.
 
-use fixedbitset::FixedBitSet;
 use crate::{Instance, Tree};
+use fixedbitset::FixedBitSet;
 
 /// Reduce an instance by collapsing groups of leaves.
 /// Each collapse (representative, removed_labels) prunes the removed labels from all trees.

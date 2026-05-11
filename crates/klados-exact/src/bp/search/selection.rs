@@ -96,7 +96,9 @@ pub struct StrongBranching {
 
 impl StrongBranching {
     pub fn new(candidates: usize) -> Self {
-        Self { candidates: candidates.max(1) }
+        Self {
+            candidates: candidates.max(1),
+        }
     }
 }
 
@@ -146,7 +148,12 @@ impl BranchSelector for StrongBranching {
 /// the parent branchings, solve the LP (no pricing), return objective. Does
 /// **not** restore — caller must call `apply_bounds` with the parent's
 /// branchings before relying on RMP state.
-fn simulate_child(rmp: &mut Rmp, ctx: &SelectionContext, pair: LeafPair, must_link: bool) -> Option<f64> {
+fn simulate_child(
+    rmp: &mut Rmp,
+    ctx: &SelectionContext,
+    pair: LeafPair,
+    must_link: bool,
+) -> Option<f64> {
     let mut child = ctx.branchings.clone();
     if must_link {
         child.push_must_link(pair);

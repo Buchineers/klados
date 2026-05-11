@@ -3,8 +3,8 @@
 //! Proven safe for all t >= 2.
 //! See: "A generalized 3-2 chain reduction rule for rooted MAF on multiple trees"
 
-use crate::{NONE, Tree};
 use super::rule::{ReductionAction, ReductionRule, RuleContext, VictimStrategy};
+use crate::{NONE, Tree};
 
 /// 3-2 chain reduction: find a 3-2 interceptor configuration (p, q, r) and
 /// delete the victim r.
@@ -69,7 +69,11 @@ impl ReductionRule for Chain32Rule {
 }
 
 /// Find ALL 3-2 chain candidates in the instance.
-fn find_all_32_candidates(inst: &crate::Instance, allow_multi: bool, max_partners: usize) -> Vec<u32> {
+fn find_all_32_candidates(
+    inst: &crate::Instance,
+    allow_multi: bool,
+    max_partners: usize,
+) -> Vec<u32> {
     if inst.num_trees() == 2 {
         find_all_32_chain_candidates_2tree(&inst.trees[0], &inst.trees[1], inst.num_leaves)
     } else if allow_multi && inst.num_trees() >= 3 {
@@ -248,7 +252,11 @@ fn check_32_at_pivot(t1: &Tree, t2: &Tree, p: u32, _num_leaves: u32) -> Option<u
 // ═══════════════════════════════════════════════════════════════
 
 /// Find a single 3-2 chain reduction candidate across multiple trees.
-fn find_32_chain_candidate_multi(trees: &[Tree], num_leaves: u32, max_partners: usize) -> Option<u32> {
+fn find_32_chain_candidate_multi(
+    trees: &[Tree],
+    num_leaves: u32,
+    max_partners: usize,
+) -> Option<u32> {
     for p in 1..=num_leaves {
         if let Some(victim) = check_32_multi_at_pivot(trees, p, max_partners) {
             return Some(victim);
@@ -258,7 +266,11 @@ fn find_32_chain_candidate_multi(trees: &[Tree], num_leaves: u32, max_partners: 
 }
 
 /// Find ALL 3-2 chain candidates across multiple trees.
-fn find_all_32_chain_candidates_multi(trees: &[Tree], num_leaves: u32, max_partners: usize) -> Vec<u32> {
+fn find_all_32_chain_candidates_multi(
+    trees: &[Tree],
+    num_leaves: u32,
+    max_partners: usize,
+) -> Vec<u32> {
     let mut candidates = Vec::new();
     for p in 1..=num_leaves {
         if let Some(victim) = check_32_multi_at_pivot(trees, p, max_partners) {

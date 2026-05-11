@@ -1,7 +1,7 @@
 //! Reduction rule trait and supporting types.
 
-use std::time::Duration;
 use crate::Instance;
+use std::time::Duration;
 
 /// What a rule does when it fires.
 #[derive(Clone, Debug, PartialEq, Eq)]
