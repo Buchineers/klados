@@ -6,6 +6,7 @@ description = "Exact FPT solver for klados MAF solver"
 license = "GPL-3.0-or-later"
 
 [dependencies]
+log = "0.4"
 klados-core = { workspace = true }
 fixedbitset = { workspace = true }
 fxhash = { workspace = true }

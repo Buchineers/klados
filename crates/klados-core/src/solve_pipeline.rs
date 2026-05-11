@@ -131,18 +131,20 @@ pub fn solve_with_pipeline(
 
     let solve = &mut |sub: &Instance| -> Option<Vec<Tree>> { solve_inner(sub) };
 
-    // Try cluster algorithms in order
+    // Try cluster algorithms in order. `try_cluster_reduction` returns
+    // `Some(NotApplicable)` when no common cluster exists — we must fall
+    // through to the next algorithm or inner solver, NOT return None.
     match config.cluster_algo {
         ClusterAlgo::None => {}
         ClusterAlgo::ClusterReduction => {
-            if let Some(result) = cluster_reduction::try_cluster_reduction(reduced, solve) {
-                return match result {
-                    ClusterReductionResult::NotApplicable => None,
-                    ClusterReductionResult::Solved(solution) => Some(kernelize::expand_solution(
-                        solution.components, &kern, &instance.trees[0], instance.num_leaves,
-                    )),
-                };
+            if let Some(ClusterReductionResult::Solved(solution)) =
+                cluster_reduction::try_cluster_reduction(reduced, solve)
+            {
+                return Some(kernelize::expand_solution(
+                    solution.components, &kern, &instance.trees[0], instance.num_leaves,
+                ));
             }
+            // NotApplicable or None → fall through to inner solver.
         }
         ClusterAlgo::ClusterDecomposition => {
             if let Some(components) =
@@ -154,15 +156,14 @@ pub fn solve_with_pipeline(
             }
         }
         ClusterAlgo::Both => {
-            // Try cluster reduction first, then rSPR decomposition.
-            if let Some(result) = cluster_reduction::try_cluster_reduction(reduced, solve) {
-                return match result {
-                    ClusterReductionResult::NotApplicable => None,
-                    ClusterReductionResult::Solved(solution) => Some(kernelize::expand_solution(
-                        solution.components, &kern, &instance.trees[0], instance.num_leaves,
-                    )),
-                };
+            if let Some(ClusterReductionResult::Solved(solution)) =
+                cluster_reduction::try_cluster_reduction(reduced, solve)
+            {
+                return Some(kernelize::expand_solution(
+                    solution.components, &kern, &instance.trees[0], instance.num_leaves,
+                ));
             }
+            // NotApplicable → fall through to cluster decomposition.
             if let Some(components) =
                 cluster_decomposition::try_rspr_cluster_decomposition(reduced, solve)
             {
