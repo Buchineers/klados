@@ -16,7 +16,6 @@ pub fn run(
     max_partners: usize,
     verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-
     let config = KernelizeConfig {
         subtree,
         chain,

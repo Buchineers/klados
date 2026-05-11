@@ -1,7 +1,7 @@
 //! Precomputed tree data for efficient LCA queries.
 
-use fixedbitset::FixedBitSet;
 use crate::tree::{NONE, NodeId, Tree};
+use fixedbitset::FixedBitSet;
 
 pub struct TreeData {
     pub tree: Tree,

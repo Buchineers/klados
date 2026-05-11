@@ -104,10 +104,7 @@ impl WhiddenSolver {
     ) -> Option<Vec<Tree>> {
         // Whidden is 2-tree only; fall back to SAT solver for multi-tree instances.
         if instance.num_trees() != 2 {
-            eprintln!(
-                "[whidden] m={}, falling back to sat",
-                instance.num_trees()
-            );
+            eprintln!("[whidden] m={}, falling back to sat", instance.num_trees());
             let mut sat = crate::maf_sat::MafSatSolver::new();
             let result = crate::ExactSolver::solve(&mut sat, instance);
             self.stats = crate::ExactSolver::stats(&sat).clone();

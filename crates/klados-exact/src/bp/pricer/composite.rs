@@ -15,8 +15,7 @@ use klados_core::Tree;
 use log::trace;
 
 use super::{
-    AnchorExtendPricer, LeafPairDpPricer, PairDpPricer, Pricer, PricerScratch,
-    PricingContext, PricingResult,
+    ExactPairDpPricer, LeafPairDpPricer, Pricer, PricerScratch, PricingContext, PricingResult,
 };
 
 const LOG_TARGET: &str = "klados::bp::composite";
@@ -58,10 +57,10 @@ impl Pricer for CompositePricer {
 }
 
 /// Build a default tier list for an instance.
-/// - m=2: `[LeafPairDp(trial_limit=256), PairDp]`. Tier 1 (leaf-pair DP
+/// - m=2: `[LeafPairDp(trial_limit=256), ExactPairDp]`. Tier 1 (leaf-pair DP
 ///   with limited pair evaluation, matching bp-multi's FastPricer) provides
-///   column diversity without flooding the LP. Tier 2 (Steel-Warnow node-DP)
-///   is sound and provides the convergence proof.
+///   column diversity without flooding the LP. Tier 2 is the faithful port of
+///   bp-multi's exact two-tree bottom-up DP and provides the convergence proof.
 /// - m≥3: `[LeafPairDp]`. Leaf-pair DP with multi-tree bitmask intersection
 ///   emits valid columns by construction across all m trees. Heuristic —
 ///   does not prove convergence. Full pair evaluation (no trial limit) since
@@ -74,7 +73,11 @@ pub fn dispatch_by_m(trees: &[Tree]) -> CompositePricer {
                 .with_pair_trial_limit(256)
                 .with_max_per_call(16),
         ));
-        tiers.push(Box::new(PairDpPricer::new(trees)));
+        tiers.push(Box::new(ExactPairDpPricer::new(trees)));
+        // Add unlimited LeafPairDpPricer to match bp-multi's collect_profitable_columns.
+        // PairDpPricer shadows columns when constraints are present. bp-multi
+        // fell back to unlimited Leaf-Pair DP when constraints existed.
+        tiers.push(Box::new(LeafPairDpPricer::new(trees)));
     } else {
         tiers.push(Box::new(LeafPairDpPricer::new(trees)));
     }

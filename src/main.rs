@@ -6,15 +6,19 @@ mod commands;
 mod solver;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use commands::bounds::BoundsAlgo;
 use klados_core::Instance;
 use klados_core::kernelize::VictimStrategy;
-use commands::bounds::BoundsAlgo;
 use solver::SolverChoice;
 use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "klados")]
-#[command(author, version, about = "κλάδος - PACE 2026 Maximum Agreement Forest solver")]
+#[command(
+    author,
+    version,
+    about = "κλάδος - PACE 2026 Maximum Agreement Forest solver"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -84,7 +88,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Solve { solver, verbose: _verbose } => {
+        Commands::Solve {
+            solver,
+            verbose: _verbose,
+        } => {
             if solver.is_none() {
                 solver::list_solvers();
                 return Ok(());
@@ -93,7 +100,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             solver::solve_and_print(&instance, solver.unwrap())?;
         }
 
-        Commands::Bounds { algos, list, scores, verbose } => {
+        Commands::Bounds {
+            algos,
+            list,
+            scores,
+            verbose,
+        } => {
             if algos.is_empty() {
                 eprintln!("bounds: specify at least one --algo. Options:");
                 for v in BoundsAlgo::value_variants() {
@@ -104,12 +116,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             commands::bounds::run(&algos, list.as_deref(), scores.as_deref(), verbose)?;
         }
 
-        Commands::Kernelize { subtree, chain, chain32, chain32_multi, strategy, max_partners, verbose } => {
+        Commands::Kernelize {
+            subtree,
+            chain,
+            chain32,
+            chain32_multi,
+            strategy,
+            max_partners,
+            verbose,
+        } => {
             let instance = Instance::from_stdin()?;
             commands::kernelize::run(
-                &instance, subtree, chain, chain32, chain32_multi,
+                &instance,
+                subtree,
+                chain,
+                chain32,
+                chain32_multi,
                 strategy,
-                if max_partners == 0 { usize::MAX } else { max_partners },
+                if max_partners == 0 {
+                    usize::MAX
+                } else {
+                    max_partners
+                },
                 verbose,
             )?;
         }

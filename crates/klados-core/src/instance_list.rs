@@ -18,7 +18,9 @@ pub struct InstanceEntry {
 ///
 /// Resolves each digest to a path under `base_dir/stride-downloads/XX/XX/XXXX...`
 /// where `XX/XX/` are the first 4 chars of the digest.
-pub fn parse_list_file(list_file: &Path) -> Result<(Vec<InstanceEntry>, PathBuf), Box<dyn std::error::Error>> {
+pub fn parse_list_file(
+    list_file: &Path,
+) -> Result<(Vec<InstanceEntry>, PathBuf), Box<dyn std::error::Error>> {
     let content = std::fs::read_to_string(list_file)?;
     let base_dir = list_file.parent().unwrap_or(Path::new("."));
 
@@ -46,4 +48,3 @@ pub fn parse_list_file(list_file: &Path) -> Result<(Vec<InstanceEntry>, PathBuf)
 
     Ok((entries, base_dir.to_path_buf()))
 }
-

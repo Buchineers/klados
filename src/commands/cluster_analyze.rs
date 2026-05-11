@@ -26,15 +26,26 @@ pub fn run(instance: &Instance) -> Result<(), Box<dyn std::error::Error>> {
     let kern_ms = t_kern.elapsed().as_secs_f64() * 1000.0;
 
     eprintln!();
-    eprintln!("  trees={}  leaves={} → kernelized={}  ({:.0}% removed by kernel, {:.1}ms)",
-        m, n, n_red,
-        if n > 0 { 100.0 * kern_removed as f64 / n as f64 } else { 0.0 },
+    eprintln!(
+        "  trees={}  leaves={} → kernelized={}  ({:.0}% removed by kernel, {:.1}ms)",
+        m,
+        n,
+        n_red,
+        if n > 0 {
+            100.0 * kern_removed as f64 / n as f64
+        } else {
+            0.0
+        },
         kern_ms,
     );
     eprintln!();
 
     // 2-tree only for Whidden diagnostics
-    let raw = if m == 2 { Some(analyze_whidden(reduced)) } else { None };
+    let raw = if m == 2 {
+        Some(analyze_whidden(reduced))
+    } else {
+        None
+    };
 
     // Kelk common-cluster
     let t = Instant::now();
@@ -50,7 +61,12 @@ pub fn run(instance: &Instance) -> Result<(), Box<dyn std::error::Error>> {
         Some(cs) => {
             let sizes: Vec<usize> = cs.iter().map(|c| c.leaves.count_ones(..)).collect();
             let clustered = sizes.iter().sum::<usize>();
-            (cs.len(), sizes.iter().copied().max().unwrap_or(0), clustered, n_red as usize - clustered)
+            (
+                cs.len(),
+                sizes.iter().copied().max().unwrap_or(0),
+                clustered,
+                n_red as usize - clustered,
+            )
         }
         None => (0, 0, 0, n_red as usize),
     };
@@ -60,7 +76,10 @@ pub fn run(instance: &Instance) -> Result<(), Box<dyn std::error::Error>> {
         "  {:<32} {:>8} {:>10} {:>10} {:>10} {:>8}",
         "method", "clusters", "clustered", "remainder", "largest", "ms"
     );
-    eprintln!("  {:-<32} {:-<8} {:-<10} {:-<10} {:-<10} {:-<8}", "", "", "", "", "", "");
+    eprintln!(
+        "  {:-<32} {:-<8} {:-<10} {:-<10} {:-<10} {:-<8}",
+        "", "", "", "", "", ""
+    );
 
     // Kelk row
     eprintln!(
@@ -77,10 +96,22 @@ pub fn run(instance: &Instance) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!(
         "  {:<32} {:>8} {:>10} {:>10} {:>10} {:>7.1}",
         "rSPR cluster points",
-        if rspr_count > 0 { rspr_count.to_string() } else { "—".into() },
+        if rspr_count > 0 {
+            rspr_count.to_string()
+        } else {
+            "—".into()
+        },
         rspr_clustered.max(1),
-        if rspr_count > 0 { rspr_rem.to_string() } else { "—".into() },
-        if rspr_count > 0 { rspr_max.to_string() } else { "—".into() },
+        if rspr_count > 0 {
+            rspr_rem.to_string()
+        } else {
+            "—".into()
+        },
+        if rspr_count > 0 {
+            rspr_max.to_string()
+        } else {
+            "—".into()
+        },
         rspr_ms,
     );
 
@@ -97,16 +128,27 @@ pub fn run(instance: &Instance) -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("    top strict sizes:   {}", fmt_sizes(&w.top_strict_sizes));
         }
         if !w.top_raw_relaxed_sizes.is_empty() {
-            eprintln!("    top relaxed sizes:  {}", fmt_sizes(&w.top_raw_relaxed_sizes));
+            eprintln!(
+                "    top relaxed sizes:  {}",
+                fmt_sizes(&w.top_raw_relaxed_sizes)
+            );
         }
         if !w.top_relaxed_sizes.is_empty() {
-            eprintln!("    top child-filtered: {}", fmt_sizes(&w.top_relaxed_sizes));
+            eprintln!(
+                "    top child-filtered: {}",
+                fmt_sizes(&w.top_relaxed_sizes)
+            );
         }
 
         eprintln!();
-        eprintln!("  {:<28} {:>8} {:>10} {:>10} {:>10}",
-            "selection strategy", "selected", "clustered", "remainder", "largest-subproblem");
-        eprintln!("  {:-<28} {:-<8} {:-<10} {:-<10} {:-<10}", "", "", "", "", "");
+        eprintln!(
+            "  {:<28} {:>8} {:>10} {:>10} {:>10}",
+            "selection strategy", "selected", "clustered", "remainder", "largest-subproblem"
+        );
+        eprintln!(
+            "  {:-<28} {:-<8} {:-<10} {:-<10} {:-<10}",
+            "", "", "", "", ""
+        );
 
         print_sel("balanced", &w.balanced);
         print_sel("strict-balanced", &w.strict_balanced);
@@ -121,9 +163,15 @@ pub fn run(instance: &Instance) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ref w) = raw {
         println!(
             "strict={}\trelaxed_raw={}\tchild_filtered={}\tbal_sel={}\tbal_clustered={}\tbal_rem={}\tpost_sel={}\tpost_clustered={}\tpost_rem={}",
-            w.strict_common, w.relaxed_raw, w.relaxed_child_filtered,
-            w.balanced.selected, w.balanced.clustered_leaves, w.balanced.placeholder_remainder,
-            w.postorder.selected, w.postorder.clustered_leaves, w.postorder.placeholder_remainder,
+            w.strict_common,
+            w.relaxed_raw,
+            w.relaxed_child_filtered,
+            w.balanced.selected,
+            w.balanced.clustered_leaves,
+            w.balanced.placeholder_remainder,
+            w.postorder.selected,
+            w.postorder.clustered_leaves,
+            w.postorder.placeholder_remainder,
         );
     }
 
@@ -150,7 +198,13 @@ fn fmt_sizes(sizes: &[usize]) -> String {
 }
 
 fn format_label(count: usize, total: usize) -> String {
-    if count == 0 { "—".into() } else if total > 0 { format!("{}+{}", count, total - count) } else { "—".into() }
+    if count == 0 {
+        "—".into()
+    } else if total > 0 {
+        format!("{}+{}", count, total - count)
+    } else {
+        "—".into()
+    }
 }
 
 // ── Whidden stats types ────────────────────────────────────────────────────
@@ -195,21 +249,33 @@ fn analyze_whidden(instance: &Instance) -> WhiddenStats {
     let mut strict_pts = Vec::new();
     let mut strict_sizes = Vec::new();
     for node in t1.post_order() {
-        if t1.is_leaf(node) || t1.is_root(node) { continue; }
+        if t1.is_leaf(node) || t1.is_root(node) {
+            continue;
+        }
         let sz = leaf_sets[node as usize].count_ones(..);
-        if sz < 2 || sz > n - 2 { continue; }
+        if sz < 2 || sz > n - 2 {
+            continue;
+        }
         let t2t = tw12[node as usize];
-        if t2t == NONE { continue; }
+        if t2t == NONE {
+            continue;
+        }
         let round_trip = tw21[t2t as usize];
-        if round_trip == NONE { continue; }
+        if round_trip == NONE {
+            continue;
+        }
         if round_trip == node {
             strict_sizes.push(sz);
             strict_pts.push((node, sz));
         }
-        if t1.depth[node as usize] > t1.depth[round_trip as usize] { continue; }
+        if t1.depth[node as usize] > t1.depth[round_trip as usize] {
+            continue;
+        }
         raw_relaxed.push((node, sz));
         if let Some((l, r)) = t1.children(node) {
-            if is_cl[l as usize] && is_cl[r as usize] { continue; }
+            if is_cl[l as usize] && is_cl[r as usize] {
+                continue;
+            }
         }
         is_cl[node as usize] = true;
         pts.push((node, sz));
@@ -250,13 +316,19 @@ fn analyze_whidden(instance: &Instance) -> WhiddenStats {
     }
 }
 
-fn select_disjoint(n: usize, leaf_sets: &[FixedBitSet], candidates: &[(NodeId, usize)]) -> SelectionStats {
+fn select_disjoint(
+    n: usize,
+    leaf_sets: &[FixedBitSet],
+    candidates: &[(NodeId, usize)],
+) -> SelectionStats {
     let cap = leaf_sets.first().map(|l| l.len()).unwrap_or(0);
     let mut taken = FixedBitSet::with_capacity(cap);
     let mut sizes = Vec::new();
     for &(node, size) in candidates {
         let leaves = &leaf_sets[node as usize];
-        if !taken.is_disjoint(leaves) { continue; }
+        if !taken.is_disjoint(leaves) {
+            continue;
+        }
         taken.union_with(leaves);
         sizes.push(size);
     }
@@ -268,7 +340,13 @@ fn select_disjoint(n: usize, leaf_sets: &[FixedBitSet], candidates: &[(NodeId, u
     let largest_subproblem = largest.max(placeholder_remainder);
     let mut sample = sizes;
     sample.truncate(32);
-    SelectionStats { selected, clustered_leaves, placeholder_remainder, largest_subproblem, sizes: sample }
+    SelectionStats {
+        selected,
+        clustered_leaves,
+        placeholder_remainder,
+        largest_subproblem,
+        sizes: sample,
+    }
 }
 
 fn compute_leaf_sets(tree: &Tree, n: usize) -> Vec<FixedBitSet> {
@@ -301,8 +379,11 @@ fn compute_twins(src: &Tree, dst: &Tree) -> Vec<NodeId> {
             let tr = twin[r as usize];
             if tl != NONE && tr != NONE {
                 twin[node as usize] = dst.nearest_common_ancestor(tl, tr);
-            } else if tl != NONE { twin[node as usize] = tl; }
-            else if tr != NONE { twin[node as usize] = tr; }
+            } else if tl != NONE {
+                twin[node as usize] = tl;
+            } else if tr != NONE {
+                twin[node as usize] = tr;
+            }
         }
     }
     twin

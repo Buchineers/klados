@@ -13,9 +13,9 @@
 
 use fixedbitset::FixedBitSet;
 
-use crate::af_validator::{validate_agreement_forest, AfValidation};
-use crate::tree::{Label, NodeId, Tree, NONE};
 use crate::Instance;
+use crate::af_validator::{AfValidation, validate_agreement_forest};
+use crate::tree::{Label, NONE, NodeId, Tree};
 
 pub const BRUTE_MAF_MAX_N: u32 = 10;
 
@@ -76,11 +76,7 @@ pub fn brute_force_maf(instance: &Instance) -> Option<BruteMafResult> {
         ) {
             best = Some(BruteMafResult {
                 num_components: k,
-                partition: part
-                    .iter()
-                    .filter(|p| !p.is_empty())
-                    .cloned()
-                    .collect(),
+                partition: part.iter().filter(|p| !p.is_empty()).cloned().collect(),
             });
         }
     });

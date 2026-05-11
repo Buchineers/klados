@@ -131,7 +131,11 @@ struct DpClosed {
 
 impl Default for DpClosed {
     fn default() -> Self {
-        Self { score: NEG_INF, v_l: 0, v_r: 0 }
+        Self {
+            score: NEG_INF,
+            v_l: 0,
+            v_r: 0,
+        }
     }
 }
 
@@ -143,7 +147,10 @@ struct DpOpen {
 
 impl Default for DpOpen {
     fn default() -> Self {
-        Self { score: NEG_INF, choice: 0 }
+        Self {
+            score: NEG_INF,
+            choice: 0,
+        }
     }
 }
 
@@ -166,7 +173,7 @@ impl Dp2TreeCache {
         let mut t0_post_order = Vec::new();
         let mut t1_post_order = Vec::new();
         let mut max_score_under = Vec::new();
-        
+
         if trees.len() == 2 {
             dp_closed = vec![vec![DpClosed::default(); trees[1].num_nodes()]; trees[0].num_nodes()];
             dp_open = vec![vec![DpOpen::default(); trees[1].num_nodes()]; trees[0].num_nodes()];
@@ -201,17 +208,24 @@ struct ExactPricer2Tree<'a> {
 }
 
 impl<'a> ExactPricer2Tree<'a> {
-    fn new(trees: &'a [Tree], num_leaves: usize, alpha: &'a [f64], beta: &'a [Vec<f64>], blocked_leaves: &[bool], cache: &'a mut Dp2TreeCache) -> Self {
+    fn new(
+        trees: &'a [Tree],
+        num_leaves: usize,
+        alpha: &'a [f64],
+        beta: &'a [Vec<f64>],
+        blocked_leaves: &[bool],
+        cache: &'a mut Dp2TreeCache,
+    ) -> Self {
         assert_eq!(trees.len(), 2);
         let mut active_labels = vec![false; num_leaves + 1];
-        
+
         cache.t0_active.fill(false);
         cache.t1_active.fill(false);
 
         for i in 1..=num_leaves {
             if !blocked_leaves[i] && alpha[i] > 1.0e-12 {
                 active_labels[i] = true;
-                
+
                 let mut curr = trees[0].label_to_node[i] as u32;
                 while curr != klados_core::NONE && !cache.t0_active[curr as usize] {
                     cache.t0_active[curr as usize] = true;
@@ -257,9 +271,9 @@ impl<'a> ExactPricer2Tree<'a> {
     fn solve(&mut self) -> Vec<(f64, Vec<u32>)> {
         let t0 = &self.trees[0];
         let t1 = &self.trees[1];
-        
+
         let t1_nodes = t1.num_nodes();
-        
+
         let mut best_l0 = vec![(NEG_INF, 0u32); t1_nodes];
         let mut best_r0 = vec![(NEG_INF, 0u32); t1_nodes];
 
@@ -289,7 +303,7 @@ impl<'a> ExactPricer2Tree<'a> {
             let (l0, r0) = t0.children_pair(u);
             let l0_idx = l0 as usize;
             let r0_idx = r0 as usize;
-            
+
             let l0_active = self.t0_active[l0_idx];
             let r0_active = self.t0_active[r0_idx];
 
@@ -301,18 +315,22 @@ impl<'a> ExactPricer2Tree<'a> {
             // Compute best_l0_in_t1
             for &v in self.t1_post_order {
                 let v_idx = v as usize;
-                let mut max_s = if l0_active { self.dp_open[l0_idx][v_idx].score } else { NEG_INF };
+                let mut max_s = if l0_active {
+                    self.dp_open[l0_idx][v_idx].score
+                } else {
+                    NEG_INF
+                };
                 let mut best_v = v;
-                
+
                 if !t1.is_leaf(v) {
                     let (l1, r1) = t1.children_pair(v);
-                    
+
                     let s_l = best_l0[l1 as usize].0 - self.beta[1][l1 as usize];
                     if s_l > max_s {
                         max_s = s_l;
                         best_v = best_l0[l1 as usize].1;
                     }
-                    
+
                     let s_r = best_l0[r1 as usize].0 - self.beta[1][r1 as usize];
                     if s_r > max_s {
                         max_s = s_r;
@@ -325,18 +343,22 @@ impl<'a> ExactPricer2Tree<'a> {
             // Compute best_r0_in_t1
             for &v in self.t1_post_order {
                 let v_idx = v as usize;
-                let mut max_s = if r0_active { self.dp_open[r0_idx][v_idx].score } else { NEG_INF };
+                let mut max_s = if r0_active {
+                    self.dp_open[r0_idx][v_idx].score
+                } else {
+                    NEG_INF
+                };
                 let mut best_v = v;
-                
+
                 if !t1.is_leaf(v) {
                     let (l1, r1) = t1.children_pair(v);
-                    
+
                     let s_l = best_r0[l1 as usize].0 - self.beta[1][l1 as usize];
                     if s_l > max_s {
                         max_s = s_l;
                         best_v = best_r0[l1 as usize].1;
                     }
-                    
+
                     let s_r = best_r0[r1 as usize].0 - self.beta[1][r1 as usize];
                     if s_r > max_s {
                         max_s = s_r;
@@ -348,7 +370,9 @@ impl<'a> ExactPricer2Tree<'a> {
 
             // Combine to form dp_closed[u]
             for &v in self.t1_post_order {
-                if t1.is_leaf(v) { continue; }
+                if t1.is_leaf(v) {
+                    continue;
+                }
                 let v_idx = v as usize;
                 let (l1, r1) = t1.children_pair(v);
 
@@ -360,7 +384,11 @@ impl<'a> ExactPricer2Tree<'a> {
                 let s_l0_l1 = best_l0[l1 as usize].0 - self.beta[1][l1 as usize];
                 let s_r0_r1 = best_r0[r1 as usize].0 - self.beta[1][r1 as usize];
                 if s_l0_l1 > NEG_INF / 2.0 && s_r0_r1 > NEG_INF / 2.0 {
-                    let s = s_l0_l1 + s_r0_r1 - self.beta[0][u_idx] - self.beta[1][v_idx] - self.beta[0][l0_idx] - self.beta[0][r0_idx];
+                    let s = s_l0_l1 + s_r0_r1
+                        - self.beta[0][u_idx]
+                        - self.beta[1][v_idx]
+                        - self.beta[0][l0_idx]
+                        - self.beta[0][r0_idx];
                     if s > best_c_score {
                         best_c_score = s;
                         v_l = best_l0[l1 as usize].1;
@@ -372,7 +400,11 @@ impl<'a> ExactPricer2Tree<'a> {
                 let s_l0_r1 = best_l0[r1 as usize].0 - self.beta[1][r1 as usize];
                 let s_r0_l1 = best_r0[l1 as usize].0 - self.beta[1][l1 as usize];
                 if s_l0_r1 > NEG_INF / 2.0 && s_r0_l1 > NEG_INF / 2.0 {
-                    let s = s_l0_r1 + s_r0_l1 - self.beta[0][u_idx] - self.beta[1][v_idx] - self.beta[0][l0_idx] - self.beta[0][r0_idx];
+                    let s = s_l0_r1 + s_r0_l1
+                        - self.beta[0][u_idx]
+                        - self.beta[1][v_idx]
+                        - self.beta[0][l0_idx]
+                        - self.beta[0][r0_idx];
                     if s > best_c_score {
                         best_c_score = s;
                         v_l = best_l0[r1 as usize].1;
@@ -396,16 +428,26 @@ impl<'a> ExactPricer2Tree<'a> {
                 let mut choice = 0;
 
                 if self.dp_closed[u_idx][v_idx].score > NEG_INF / 2.0 {
-                    best_o_score = self.dp_closed[u_idx][v_idx].score + self.beta[0][u_idx] + self.beta[1][v_idx];
+                    best_o_score = self.dp_closed[u_idx][v_idx].score
+                        + self.beta[0][u_idx]
+                        + self.beta[1][v_idx];
                 }
 
-                let s_l0 = if l0_active { self.dp_open[l0_idx][v_idx].score - self.beta[0][l0_idx] } else { NEG_INF };
+                let s_l0 = if l0_active {
+                    self.dp_open[l0_idx][v_idx].score - self.beta[0][l0_idx]
+                } else {
+                    NEG_INF
+                };
                 if s_l0 > best_o_score {
                     best_o_score = s_l0;
                     choice = 1;
                 }
 
-                let s_r0 = if r0_active { self.dp_open[r0_idx][v_idx].score - self.beta[0][r0_idx] } else { NEG_INF };
+                let s_r0 = if r0_active {
+                    self.dp_open[r0_idx][v_idx].score - self.beta[0][r0_idx]
+                } else {
+                    NEG_INF
+                };
                 if s_r0 > best_o_score {
                     best_o_score = s_r0;
                     choice = 2;
@@ -421,9 +463,13 @@ impl<'a> ExactPricer2Tree<'a> {
         // Collect results
         let mut results = Vec::new();
         for u in 0..t0.num_nodes() {
-            if t0.is_leaf(u as u32) { continue; }
+            if t0.is_leaf(u as u32) {
+                continue;
+            }
             for v in 0..t1.num_nodes() {
-                if t1.is_leaf(v as u32) { continue; }
+                if t1.is_leaf(v as u32) {
+                    continue;
+                }
                 let score = self.dp_closed[u][v].score;
                 if score > 1.0 + 1.0e-8 {
                     let mut labels = Vec::new();
@@ -435,7 +481,7 @@ impl<'a> ExactPricer2Tree<'a> {
                 }
             }
         }
-        
+
         results.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
         results
     }
@@ -1398,8 +1444,13 @@ fn solve_bp_node(
         };
         state.t_lp_solve += t_solve.elapsed().as_secs_f64();
         if num_leaves > 500 && state.cg_iterations_total % 50 == 0 {
-            eprintln!("[bp-multi] CG iter {} cols={} obj={:.4} (lp_solve={:.1}ms)", 
-                state.cg_iterations_total, state.columns.len(), lp.objective, state.t_lp_solve * 1000.0);
+            eprintln!(
+                "[bp-multi] CG iter {} cols={} obj={:.4} (lp_solve={:.1}ms)",
+                state.cg_iterations_total,
+                state.columns.len(),
+                lp.objective,
+                state.t_lp_solve * 1000.0
+            );
         }
 
         // Separate violated node ≤1 cuts FIRST so the dual values we feed to the
@@ -1861,7 +1912,8 @@ impl<'a> PairDpPricer<'a> {
             }
             for node in tree.post_order() {
                 if tree.is_leaf(node) {
-                    s_alpha[node as usize] = self.alpha[tree.label[node as usize] as usize].max(0.0);
+                    s_alpha[node as usize] =
+                        self.alpha[tree.label[node as usize] as usize].max(0.0);
                 } else {
                     let (l, r) = tree.children_pair(node);
                     s_alpha[node as usize] = s_alpha[l as usize] + s_alpha[r as usize];
@@ -1925,7 +1977,7 @@ impl<'a> PairDpPricer<'a> {
             }
         }
         let target = limit.saturating_add(stash_limit);
-        
+
         proxy_order.sort_unstable_by(|lhs, rhs| {
             rhs.0
                 .total_cmp(&lhs.0)
@@ -1999,21 +2051,30 @@ impl<'a> PairDpPricer<'a> {
                 proxy_order.push((self.quick_pair_proxy(a, b), a, b));
             }
         }
-        
+
         let target = limit.saturating_add(stash_limit);
         let trial_limit = pair_trial_limit.min(proxy_order.len());
-        
+
         if trial_limit < proxy_order.len() {
             proxy_order.select_nth_unstable_by(trial_limit, |lhs, rhs| {
-                rhs.0.total_cmp(&lhs.0).then_with(|| lhs.1.cmp(&rhs.1)).then_with(|| lhs.2.cmp(&rhs.2))
+                rhs.0
+                    .total_cmp(&lhs.0)
+                    .then_with(|| lhs.1.cmp(&rhs.1))
+                    .then_with(|| lhs.2.cmp(&rhs.2))
             });
             let (head, _) = proxy_order.split_at_mut(trial_limit);
             head.sort_unstable_by(|lhs, rhs| {
-                rhs.0.total_cmp(&lhs.0).then_with(|| lhs.1.cmp(&rhs.1)).then_with(|| lhs.2.cmp(&rhs.2))
+                rhs.0
+                    .total_cmp(&lhs.0)
+                    .then_with(|| lhs.1.cmp(&rhs.1))
+                    .then_with(|| lhs.2.cmp(&rhs.2))
             });
         } else {
             proxy_order.sort_unstable_by(|lhs, rhs| {
-                rhs.0.total_cmp(&lhs.0).then_with(|| lhs.1.cmp(&rhs.1)).then_with(|| lhs.2.cmp(&rhs.2))
+                rhs.0
+                    .total_cmp(&lhs.0)
+                    .then_with(|| lhs.1.cmp(&rhs.1))
+                    .then_with(|| lhs.2.cmp(&rhs.2))
             });
         }
 
@@ -2171,7 +2232,7 @@ impl<'a> PairDpPricer<'a> {
         let lb_w = lb >> BLOCK_SHIFT;
         let lb_m = 1usize << (lb & BLOCK_MASK);
         let d0 = desc[0][side_nodes[0] as usize].as_slice();
-        
+
         for wi in 0..d0.len() {
             let mut w = d0[wi] & am_slice[wi];
             for ti in 1..num_trees {
@@ -2323,7 +2384,7 @@ fn price_best_new_pairdp_columns<'a>(
     };
     *t_new += t0.elapsed().as_secs_f64();
     let exact_batch_size = adaptive_exact_batch_size(pricer.active_labels.len(), allow_wide);
-    
+
     let t1 = Instant::now();
     let fast = pricer.collect_fast_columns(
         FASTPRICER_BATCH_SIZE.min(exact_batch_size),
@@ -2336,7 +2397,11 @@ fn price_best_new_pairdp_columns<'a>(
     if !fast.is_empty() {
         let mut reserve = fast;
         let immediate = reserve
-            .drain(..reserve.len().min(FASTPRICER_BATCH_SIZE.min(exact_batch_size)))
+            .drain(
+                ..reserve
+                    .len()
+                    .min(FASTPRICER_BATCH_SIZE.min(exact_batch_size)),
+            )
             .collect();
         return PricingColumns { immediate, reserve };
     }
@@ -2360,19 +2425,28 @@ fn price_best_new_pairdp_columns<'a>(
         if !wide.is_empty() {
             let mut reserve = wide;
             let immediate = reserve
-                .drain(..reserve.len().min(WIDEPRICER_BATCH_SIZE.min(exact_batch_size)))
+                .drain(
+                    ..reserve
+                        .len()
+                        .min(WIDEPRICER_BATCH_SIZE.min(exact_batch_size)),
+                )
                 .collect();
             return PricingColumns { immediate, reserve };
         }
     }
 
-    let has_constraints = !forbidden.fixed_zero_labels.is_empty() || !must_link_pairs.is_empty() || !cannot_link_pairs.is_empty();
-    
+    let has_constraints = !forbidden.fixed_zero_labels.is_empty()
+        || !must_link_pairs.is_empty()
+        || !cannot_link_pairs.is_empty();
+
     let t2 = Instant::now();
     let exact = if trees.len() == 2 && !has_constraints {
-        let mut dp2 = ExactPricer2Tree::new(trees, num_leaves, alpha, beta, blocked_leaves, dp2_cache);
+        let mut dp2 =
+            ExactPricer2Tree::new(trees, num_leaves, alpha, beta, blocked_leaves, dp2_cache);
         let mut all_results = dp2.solve();
-        all_results.retain(|(_, labels)| pricing_candidate_allowed(labels, seen, forbidden, must_link_pairs, cannot_link_pairs));
+        all_results.retain(|(_, labels)| {
+            pricing_candidate_allowed(labels, seen, forbidden, must_link_pairs, cannot_link_pairs)
+        });
         all_results.truncate(exact_batch_size + COLUMN_RESERVE_REFILL);
         all_results
     } else {
@@ -2381,7 +2455,7 @@ fn price_best_new_pairdp_columns<'a>(
         })
     };
     *t_solve += t2.elapsed().as_secs_f64();
-    
+
     let t_col = Instant::now();
     let mut reserve = exact;
     let immediate = reserve

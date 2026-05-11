@@ -405,7 +405,11 @@ impl Tree {
     /// Otherwise prunes `reference` to only the leaves in `leafset`.
     ///
     /// Ported from `shi_mestel::extraction::build_component_tree`.
-    pub fn component_from_leafset(leafset: &FixedBitSet, reference: &Tree, num_leaves: u32) -> Self {
+    pub fn component_from_leafset(
+        leafset: &FixedBitSet,
+        reference: &Tree,
+        num_leaves: u32,
+    ) -> Self {
         if leafset.count_ones(..) == 1 {
             let lbl = leafset.ones().next().unwrap() as Label;
             Tree::singleton(lbl, num_leaves)

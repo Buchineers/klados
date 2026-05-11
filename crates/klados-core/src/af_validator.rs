@@ -16,8 +16,8 @@
 
 use fixedbitset::FixedBitSet;
 
-use crate::tree::{Label, NodeId, Tree, NONE};
 use crate::Instance;
+use crate::tree::{Label, NONE, NodeId, Tree};
 
 /// Result of validating a candidate agreement forest.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,7 +43,10 @@ pub enum AfValidation {
         component_b: usize,
     },
     /// A component contains a label that is not in the instance.
-    LabelOutOfRange { component_index: usize, label: Label },
+    LabelOutOfRange {
+        component_index: usize,
+        label: Label,
+    },
 }
 
 impl AfValidation {

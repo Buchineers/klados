@@ -1,7 +1,7 @@
 //! Cherry (subtree) reduction rule.
 
-use crate::{NONE, Tree};
 use super::rule::{ReductionAction, ReductionRule, RuleContext};
+use crate::{NONE, Tree};
 
 /// Subtree reduction: find a common cherry (two sibling leaves with the same
 /// parent in all trees) and collapse them into one.
@@ -16,10 +16,8 @@ impl ReductionRule for CherryRule {
     }
 
     fn find(&self, ctx: &RuleContext) -> Option<ReductionAction> {
-        let (mut keep, mut remove) = find_common_cherry(
-            &ctx.instance.trees,
-            ctx.instance.num_leaves,
-        )?;
+        let (mut keep, mut remove) =
+            find_common_cherry(&ctx.instance.trees, ctx.instance.num_leaves)?;
 
         // If the remove label is protected but keep is not, swap them so the
         // protected label survives as the representative.

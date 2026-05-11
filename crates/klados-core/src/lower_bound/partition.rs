@@ -1,7 +1,7 @@
 //! Partition of labels into components.
 
-use fixedbitset::FixedBitSet;
 use crate::tree::Label;
+use fixedbitset::FixedBitSet;
 
 pub struct Partition {
     pub comp: Vec<u32>,

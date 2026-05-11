@@ -141,7 +141,10 @@ pub fn solve_with_pipeline(
                 cluster_reduction::try_cluster_reduction(reduced, solve)
             {
                 return Some(kernelize::expand_solution(
-                    solution.components, &kern, &instance.trees[0], instance.num_leaves,
+                    solution.components,
+                    &kern,
+                    &instance.trees[0],
+                    instance.num_leaves,
                 ));
             }
             // NotApplicable or None → fall through to inner solver.
@@ -151,7 +154,10 @@ pub fn solve_with_pipeline(
                 cluster_decomposition::try_rspr_cluster_decomposition(reduced, solve)
             {
                 return Some(kernelize::expand_solution(
-                    components, &kern, &instance.trees[0], instance.num_leaves,
+                    components,
+                    &kern,
+                    &instance.trees[0],
+                    instance.num_leaves,
                 ));
             }
         }
@@ -160,7 +166,10 @@ pub fn solve_with_pipeline(
                 cluster_reduction::try_cluster_reduction(reduced, solve)
             {
                 return Some(kernelize::expand_solution(
-                    solution.components, &kern, &instance.trees[0], instance.num_leaves,
+                    solution.components,
+                    &kern,
+                    &instance.trees[0],
+                    instance.num_leaves,
                 ));
             }
             // NotApplicable → fall through to cluster decomposition.
@@ -168,7 +177,10 @@ pub fn solve_with_pipeline(
                 cluster_decomposition::try_rspr_cluster_decomposition(reduced, solve)
             {
                 return Some(kernelize::expand_solution(
-                    components, &kern, &instance.trees[0], instance.num_leaves,
+                    components,
+                    &kern,
+                    &instance.trees[0],
+                    instance.num_leaves,
                 ));
             }
         }

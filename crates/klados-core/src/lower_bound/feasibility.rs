@@ -1,7 +1,7 @@
 //! Feasibility checking and root-of-infeasibility detection.
 
-use fixedbitset::FixedBitSet;
 use crate::tree::{Label, NodeId};
+use fixedbitset::FixedBitSet;
 
 use super::partition::Partition;
 use super::tree_data::TreeData;

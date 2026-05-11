@@ -1,9 +1,9 @@
 //! Solution expansion: map kernelized solutions back to original label space.
 
+use super::KernelizeResult;
+use crate::Tree;
 use fixedbitset::FixedBitSet;
 use fxhash::FxHashMap;
-use crate::Tree;
-use super::KernelizeResult;
 
 /// Expand a solution on a kernelized instance back to the original label space.
 ///

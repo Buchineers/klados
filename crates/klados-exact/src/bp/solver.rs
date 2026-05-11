@@ -8,18 +8,19 @@
 use std::time::Instant;
 
 use fixedbitset::FixedBitSet;
+use klados_core::af_validator::validate_agreement_forest;
 use klados_core::{Instance, Tree};
 use log::{debug, info, trace};
 
 use crate::bp::column::{AfColumn, ColumnBuilder};
 use crate::bp::pricer::{Pricer, PricerScratch, PricingContext, PricingResult, dispatch_by_m};
 use crate::bp::rmp::Rmp;
+use crate::bp::search::{
+    BranchSelector, Branchings, Incumbent, SearchState, SelectionContext, Telemetry,
+};
 use crate::chen_rspr::chen_pair_agreement;
 use crate::whidden_cluster::try_whidden_relaxed_incumbent_2tree;
-use crate::bp::search::{
-    Branchings, BranchSelector, Incumbent, SearchState, SelectionContext, Telemetry,
-};
-use crate::bp::search::selection::StrongBranching;
+use crate::{ExactSolver, maf_branch_price_multi::MafBranchPriceMultiSolver};
 
 const LOG_TARGET: &str = "klados::bp";
 
@@ -88,6 +89,31 @@ enum NodeOutcome {
     },
 }
 
+/// Decide whether an LP objective may prune a B&B node.
+///
+/// A `Converged` pricer result gives a valid lower bound for the
+/// branch-constrained master, so `ceil(lp) >= incumbent` is safe.
+///
+/// An `Exhausted` result is only a heuristic "no column found" result.  The
+/// restricted master objective can be *higher* than the true LP optimum (and
+/// therefore higher than the true integer optimum) because improving columns
+/// may still be missing.  Consequently, pruning on that bound is not sound at
+/// all.  Keep the historical fast-but-unsafe behaviour behind an explicit
+/// opt-in for experiments only.
+fn can_prune_by_bound(bound_sound: bool, lb: usize, best_ub: usize) -> bool {
+    if std::env::var("KLADOS_BP_DISABLE_BOUND_PRUNE").is_ok() {
+        return false;
+    }
+    if bound_sound {
+        lb >= best_ub
+    } else {
+        std::env::var("KLADOS_BP_PRUNE_UNSOUND")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+            && lb >= best_ub
+    }
+}
+
 /// Solve a kernelized, undecomposable subinstance.
 ///
 /// Caller must guarantee `m ≥ 2` and `n ≥ 2` (the pipeline's
@@ -149,22 +175,22 @@ pub fn solve_inner(reduced: &Instance) -> Option<Vec<Tree>> {
     // bp-multi's behavior; this was the missing primal heuristic that
     // explains the recurring "LP=optimum but support fractional" gap.
     if trees.len() >= 2 && reduced.num_leaves >= 20 {
-        if let Some(incumbent_forest) =
-            try_whidden_relaxed_incumbent_2tree(reduced, &mut |sub| {
-                crate::bp::_solve_recursive_alias(sub, &crate::bp::BpConfig::default())
-            })
-        {
-            install_incumbent(&mut state, &mut rmp, trees, &mut seed_builder, incumbent_forest);
+        if let Some(incumbent_forest) = try_whidden_relaxed_incumbent_2tree(reduced, &mut |sub| {
+            crate::bp::_solve_recursive_alias(sub, &crate::bp::BpConfig::default())
+        }) {
+            install_incumbent(
+                &mut state,
+                &mut rmp,
+                trees,
+                &mut seed_builder,
+                incumbent_forest,
+            );
         }
     }
 
     let mut scratch = PricerScratch::new(trees);
     let mut pricer = dispatch_by_m(trees);
-    // Strong branching by default: simulates the top-K candidate pairs and
-    // chooses the one that drives both children's LP up the most. This
-    // explores tighter B&B paths than most-fractional and routinely closes
-    // +1 cases that the LP-bound prune would otherwise lose.
-    let mut selector = StrongBranching::default();
+    let mut selector = crate::bp::search::selection::MostFractionalPair;
     let mut tel = Telemetry::default();
 
     let mut stack: Vec<Branchings> = vec![Branchings::default()];
@@ -173,7 +199,15 @@ pub fn solve_inner(reduced: &Instance) -> Option<Vec<Tree>> {
             continue;
         }
         let outcome = solve_node(
-            &mut state, &b, trees, &mut rmp, &mut pricer, &mut scratch, &mut selector, &mut tel,
+            &mut state,
+            &b,
+            reduced,
+            trees,
+            &mut rmp,
+            &mut pricer,
+            &mut scratch,
+            &mut selector,
+            &mut tel,
         );
         match outcome {
             NodeOutcome::Pruned => {}
@@ -188,16 +222,22 @@ pub fn solve_inner(reduced: &Instance) -> Option<Vec<Tree>> {
                     );
                 }
             }
-            NodeOutcome::Branch { lp_obj, pair, bound_sound } => {
+            NodeOutcome::Branch {
+                lp_obj,
+                pair,
+                bound_sound,
+            } => {
                 if !bound_sound {
                     tel.had_unsound_prune = true;
                 }
                 let lb = (lp_obj - 1e-6).ceil() as usize;
-                let allow_prune = bound_sound
-                    || std::env::var("KLADOS_BP_PRUNE_UNSOUND")
-                        .map(|v| v != "0")
-                        .unwrap_or(true);
-                if allow_prune && lb >= state.best_ub() {
+
+                // If we haven't formally converged (bound_sound=false), the LP objective
+                // is not a valid lower bound: the restricted master may still
+                // be missing improving columns. Only prune by bound after a
+                // sound convergence proof (unless explicitly opted into the
+                // historical unsafe mode for experiments).
+                if can_prune_by_bound(bound_sound, lb, state.best_ub()) {
                     tel.bound_prunes += 1;
                     continue;
                 }
@@ -223,6 +263,7 @@ pub fn solve_inner(reduced: &Instance) -> Option<Vec<Tree>> {
 fn solve_node<P: Pricer, S: BranchSelector>(
     state: &mut SearchState,
     branchings: &Branchings,
+    reduced: &Instance,
     trees: &[Tree],
     rmp: &mut Rmp,
     pricer: &mut P,
@@ -308,11 +349,8 @@ fn solve_node<P: Pricer, S: BranchSelector>(
     if !bound_sound {
         tel.had_unsound_prune = true;
     }
-    let allow_prune = bound_sound
-        || std::env::var("KLADOS_BP_PRUNE_UNSOUND")
-            .map(|v| v != "0")
-            .unwrap_or(true);
-    if allow_prune && lb >= state.best_ub() {
+
+    if can_prune_by_bound(bound_sound, lb, state.best_ub()) {
         debug!(
             target: LOG_TARGET,
             "node pruned by bound (sound={}): lp={:.4} ub={}",
@@ -323,6 +361,27 @@ fn solve_node<P: Pricer, S: BranchSelector>(
     }
 
     if let Some(inc) = try_integral(state, &lp.column_values) {
+        if !bound_sound {
+            debug!(
+                target: LOG_TARGET,
+                "integer restricted-master solution without pricing proof: k={} depth={} ub={}",
+                inc.k,
+                branchings.depth(),
+                state.best_ub(),
+            );
+        }
+        return NodeOutcome::Integral(inc);
+    }
+    if let Some(inc) = try_support_partition(state, &lp.column_values, reduced) {
+        if !bound_sound {
+            debug!(
+                target: LOG_TARGET,
+                "support-partition incumbent without pricing proof: k={} depth={} ub={}",
+                inc.k,
+                branchings.depth(),
+                state.best_ub(),
+            );
+        }
         return NodeOutcome::Integral(inc);
     }
 
@@ -342,7 +401,8 @@ fn solve_node<P: Pricer, S: BranchSelector>(
                     "primal heuristic improved incumbent: ub={} (cg_iter={})",
                     state.best_ub(), tel.cg_iters,
                 );
-                if lb >= state.best_ub() {
+
+                if can_prune_by_bound(bound_sound, lb, state.best_ub()) {
                     tel.bound_prunes += 1;
                     return NodeOutcome::Pruned;
                 }
@@ -358,13 +418,14 @@ fn solve_node<P: Pricer, S: BranchSelector>(
             mip_attempts += 1;
             if let Ok(Some(mip_sol)) = rmp.solve_mip() {
                 trace!(target: LOG_TARGET, "MIP solve {}: obj={:.4}", mip_attempts, mip_sol.objective);
-                let new_cuts = rmp.separate_and_add_cuts(state.columns(), &mip_sol.column_values, 0.5);
+                let new_cuts =
+                    rmp.separate_and_add_cuts(state.columns(), &mip_sol.column_values, 0.5);
                 if new_cuts > 0 {
                     tel.cuts_added += new_cuts;
                     trace!(target: LOG_TARGET, "MIP solution violated {} cuts, looping", new_cuts);
                     continue; // Re-solve MIP with new cuts
                 }
-                
+
                 if let Some(inc) = try_integral(state, &mip_sol.column_values) {
                     trace!(target: LOG_TARGET, "try_integral found valid incumbent k={}", inc.k);
                     if inc.k < state.best_ub() {
@@ -376,7 +437,8 @@ fn solve_node<P: Pricer, S: BranchSelector>(
                                 "MIP heuristic improved incumbent: ub={} (cg_iter={}, depth={})",
                                 state.best_ub(), tel.cg_iters, branchings.depth(),
                             );
-                            if lb >= state.best_ub() {
+
+                            if can_prune_by_bound(bound_sound, lb, state.best_ub()) {
                                 tel.bound_prunes += 1;
                                 return NodeOutcome::Pruned;
                             }
@@ -391,7 +453,6 @@ fn solve_node<P: Pricer, S: BranchSelector>(
             break;
         }
     }
-
     let t0 = Instant::now();
     let pair = selector.select(
         &SelectionContext {
@@ -410,7 +471,10 @@ fn solve_node<P: Pricer, S: BranchSelector>(
             pair,
             bound_sound,
         },
-        None => NodeOutcome::Pruned,
+        None => {
+            debug!(target: LOG_TARGET, "selector returned None, but not integral. Pruning fractional solution!");
+            NodeOutcome::Pruned
+        }
     }
 }
 
@@ -437,9 +501,13 @@ fn try_round_primal(state: &SearchState, values: &[f64]) -> Option<Incumbent> {
     indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     let mut covered_leaves = vec![false; n + 1];
-    let num_trees = state.columns().first().map(|c| c.coverage().iter_per_tree().count()).unwrap_or(0);
+    let num_trees = state
+        .columns()
+        .first()
+        .map(|c| c.coverage().iter_per_tree().count())
+        .unwrap_or(0);
     let mut covered_nodes = vec![std::collections::HashSet::new(); num_trees];
-    
+
     let mut chosen = Vec::new();
     for &(ci, _) in &indexed {
         let col = &state.columns()[ci];
@@ -447,7 +515,7 @@ fn try_round_primal(state: &SearchState, values: &[f64]) -> Option<Incumbent> {
         if labels.iter().any(|&l| covered_leaves[l as usize]) {
             continue;
         }
-        
+
         let mut node_overlap = false;
         for (ti, nodes) in col.coverage().iter_per_tree().enumerate() {
             if nodes.iter().any(|n| covered_nodes[ti].contains(n)) {
@@ -505,12 +573,16 @@ fn try_integral(state: &SearchState, values: &[f64]) -> Option<Incumbent> {
     let n = state.num_leaves();
     let mut cover = vec![0u32; n + 1];
     let mut chosen = Vec::new();
-    
-    let num_trees = state.columns().first().map(|c| c.coverage().iter_per_tree().count()).unwrap_or(0);
+
+    let num_trees = state
+        .columns()
+        .first()
+        .map(|c| c.coverage().iter_per_tree().count())
+        .unwrap_or(0);
     let mut covered_nodes = vec![std::collections::HashSet::new(); num_trees];
 
     for (ci, &v) in values.iter().enumerate() {
-        if v <= 1.0e-9 {
+        if v <= 1.0e-6 {
             continue;
         }
         if (v - 1.0).abs() > 1.0e-6 {
@@ -518,7 +590,7 @@ fn try_integral(state: &SearchState, values: &[f64]) -> Option<Incumbent> {
             return None;
         }
         let col = &state.columns()[ci];
-        
+
         for (ti, nodes) in col.coverage().iter_per_tree().enumerate() {
             for &n in nodes {
                 if !covered_nodes[ti].insert(n) {
@@ -546,6 +618,52 @@ fn try_integral(state: &SearchState, values: &[f64]) -> Option<Incumbent> {
         component_columns: chosen,
         k,
     })
+}
+
+/// Old bp-multi accepted an LP support as an incumbent whenever the positive
+/// columns formed a leaf partition, even if the LP values themselves were
+/// fractional.  That is a rounding heuristic, not an LP-integrality proof, but
+/// it is extremely useful on degenerate roots where the simplex returns a
+/// 0.5/0.5 basis over disjoint components.  Keep it safe by validating the
+/// reconstructed forest before installing the incumbent.
+fn try_support_partition(
+    state: &SearchState,
+    values: &[f64],
+    reduced: &Instance,
+) -> Option<Incumbent> {
+    let n = state.num_leaves();
+    let mut cover = vec![0u32; n + 1];
+    let mut chosen = Vec::new();
+
+    for (ci, &v) in values.iter().enumerate() {
+        if v <= 1.0e-9 {
+            continue;
+        }
+        let col = &state.columns()[ci];
+        for &l in col.labels() {
+            let idx = l as usize;
+            cover[idx] += 1;
+            if cover[idx] > 1 {
+                return None;
+            }
+        }
+        chosen.push(ci);
+    }
+
+    if chosen.is_empty() || (1..=n).any(|l| cover[l] != 1) {
+        return None;
+    }
+
+    let inc = Incumbent {
+        k: chosen.len(),
+        component_columns: chosen,
+    };
+    let components = reconstruct_components(&inc, state.columns(), reduced);
+    if validate_agreement_forest(reduced, &components).is_ok() {
+        Some(inc)
+    } else {
+        None
+    }
 }
 
 /// Convert an incumbent into AF components in the reduced label space.

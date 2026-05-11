@@ -294,14 +294,14 @@ impl Rmp {
         } else {
             0.0
         };
-        
+
         let (solution_cols, has_solution) = if status == HighsModelStatus::Optimal {
             let solution = solved.get_solution();
             (solution.columns().to_vec(), true)
         } else {
             (Vec::new(), false)
         };
-        
+
         let mut model = Model::from(solved);
         model.set_option("presolve", "off");
         model.set_option("solver", "simplex");
@@ -321,9 +321,11 @@ impl Rmp {
         if !has_solution {
             return Ok(None);
         }
-        
-        let column_values: Vec<f64> = (0..self.col_handle.len()).map(|ci| solution_cols[ci]).collect();
-        
+
+        let column_values: Vec<f64> = (0..self.col_handle.len())
+            .map(|ci| solution_cols[ci])
+            .collect();
+
         Ok(Some(RmpSolution {
             objective,
             column_values,

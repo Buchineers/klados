@@ -32,11 +32,7 @@ impl ColumnCoverage {
         }
     }
 
-    pub(super) fn from_marker_paths(
-        labels: &[u32],
-        trees: &[Tree],
-        scratch: &mut Scratch,
-    ) -> Self {
+    pub(super) fn from_marker_paths(labels: &[u32], trees: &[Tree], scratch: &mut Scratch) -> Self {
         let nodes_per_tree = trees
             .iter()
             .enumerate()

@@ -10,10 +10,10 @@
 //! instance has optimum `OPT(TP2) + OPT(TP4) - 1`; otherwise it is
 //! `OPT(TP2) + OPT(TP4)`.
 
-use fixedbitset::FixedBitSet;
-use fxhash::FxHashMap;
 use crate::Instance;
 use crate::tree::{Label, NONE, NodeId, Tree};
+use fixedbitset::FixedBitSet;
+use fxhash::FxHashMap;
 
 #[derive(Clone, Debug)]
 pub struct CommonCluster {
@@ -356,7 +356,8 @@ fn marker_attachment_valid(
     old_component_nodes: &[FixedBitSet],
     used_nodes: &[FixedBitSet],
 ) -> bool {
-    let Some(reference_signature) = induced_tree_signature(&instance.trees[0], augmented_leafset) else {
+    let Some(reference_signature) = induced_tree_signature(&instance.trees[0], augmented_leafset)
+    else {
         return false;
     };
 
@@ -510,9 +511,7 @@ fn build_cluster_subproblems(instance: &Instance, cluster: &CommonCluster) -> Cl
         .trees
         .iter()
         .zip(&cluster.nodes)
-        .map(|(tree, &node)| {
-            replace_cluster_with_marker(tree, node, marker_up, total_label_space)
-        })
+        .map(|(tree, &node)| replace_cluster_with_marker(tree, node, marker_up, total_label_space))
         .collect();
     let tp4_trees: Vec<Tree> = instance
         .trees

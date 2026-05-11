@@ -7,8 +7,8 @@
 
 use fixedbitset::FixedBitSet;
 
-use crate::tree::{Label, NodeId, NONE, Tree};
 use crate::Instance;
+use crate::tree::{Label, NONE, NodeId, Tree};
 
 /// A selected cluster: a disjoint leaf set that can be solved independently.
 #[derive(Clone, Debug)]
@@ -186,7 +186,9 @@ fn compute_twins(src: &Tree, dst: &Tree) -> Vec<NodeId> {
                 }
             }
         } else {
-            let (left, right) = src.children(node).expect("internal node must have children");
+            let (left, right) = src
+                .children(node)
+                .expect("internal node must have children");
             let twin_left = twin[left as usize];
             let twin_right = twin[right as usize];
 
@@ -217,7 +219,9 @@ fn compute_leaf_sets(tree: &Tree, n: usize) -> Vec<FixedBitSet> {
                 leaf_sets[node as usize].insert(lbl as usize);
             }
         } else {
-            let (left, right) = tree.children(node).expect("internal node must have children");
+            let (left, right) = tree
+                .children(node)
+                .expect("internal node must have children");
             let mut set = leaf_sets[left as usize].clone();
             set.union_with(&leaf_sets[right as usize]);
             leaf_sets[node as usize] = set;
