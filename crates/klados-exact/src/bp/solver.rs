@@ -214,11 +214,7 @@ pub fn solve_inner(reduced: &Instance) -> Option<Vec<Tree>> {
                 lp_obj,
                 pair,
             } => {
-                let lb = (lp_obj - 1e-6).ceil() as usize;
-                if can_prune_by_bound(lb, state.best_ub()) {
-                    tel.bound_prunes += 1;
-                    continue;
-                }
+                let _ = lp_obj;
                 let (left, right) = b.split_on(pair);
                 stack.push(right);
                 stack.push(left);
@@ -298,27 +294,36 @@ fn solve_node<P: Pricer, S: BranchSelector>(
             scratch,
         );
         tel.timings.pricing += t0.elapsed();
+        let pt = t0.elapsed();
 
         match result {
             PricingResult::Found(cols) => {
+                let ncols = cols.len();
+                let nseen = cols.iter().filter(|c| state.seen().contains(c.labels())).count();
                 let mut added = 0;
                 for c in cols {
                     if let Some(_id) = state.add_column(c) {
-                        // RMP needs to mirror state.columns; fetch the just-added one.
                         rmp.add_column(state.columns().last().unwrap());
                         added += 1;
                     }
                 }
                 tel.columns_added += added;
-                trace!(
-                    target: LOG_TARGET,
-                    "cg iter {}: +{} cols (total {}) lp_obj={:.4}",
-                    tel.cg_iters, added, state.columns().len(), lp.objective,
+                eprintln!(
+                    "[bp-cg] iter={} lp={:.4} lp_ms={:.1} pricer_ms={:.1} cols_found={} added={} seen={} total_cols={}",
+                    tel.cg_iters, lp.objective, tel.timings.lp_solve.as_secs_f64()*1000.0,
+                    pt.as_secs_f64()*1000.0, ncols, added, nseen, state.columns().len(),
                 );
                 continue;
             }
-            PricingResult::Exhausted => break lp,
-            PricingResult::Converged => { tel.had_converged = true; break lp; }
+            PricingResult::Exhausted => {
+                eprintln!("[bp-cg] iter={} lp={:.4} EXHAUSTED pricer_ms={:.1}", tel.cg_iters, lp.objective, pt.as_secs_f64()*1000.0);
+                break lp;
+            }
+            PricingResult::Converged => {
+                eprintln!("[bp-cg] iter={} lp={:.4} CONVERGED pricer_ms={:.1}", tel.cg_iters, lp.objective, pt.as_secs_f64()*1000.0);
+                tel.had_converged = true;
+                break lp;
+            }
         }
     };
 

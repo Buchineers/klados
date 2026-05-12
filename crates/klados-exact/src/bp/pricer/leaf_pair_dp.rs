@@ -698,8 +698,9 @@ impl Pricer for LeafPairDpPricer {
 
         let mut found: Vec<(f64, AfColumn)> = Vec::new();
         let target = self.max_per_call;
+        let trial_limit = (self.pair_trial_limit as usize).min(order.len());
 
-        for &(_, a, b) in &order {
+        for &(_, a, b) in order.iter().take(trial_limit) {
             if found.len() >= target {
                 break;
             }
@@ -750,8 +751,10 @@ impl Pricer for LeafPairDpPricer {
             }
             return PricingResult::Exhausted;
         }
+        // Sort by RC descending, cap at 128 to prevent RMP flooding
+        // while still returning far more columns than the old limit of 32.
         found.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        found.truncate(target);
-        PricingResult::Found(found.into_iter().map(|(_, c)| c).collect())
+        let cap = 128usize.min(found.len());
+        PricingResult::Found(found.into_iter().take(cap).map(|(_, c)| c).collect())
     }
 }

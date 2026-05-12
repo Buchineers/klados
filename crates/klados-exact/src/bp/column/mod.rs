@@ -84,10 +84,20 @@ impl ColumnBuilder {
     pub fn try_build(&mut self, mut labels: Vec<u32>, trees: &[Tree]) -> Option<AfColumn> {
         labels.sort_unstable();
         labels.dedup();
-        if !is_valid_af_component(&labels, trees) {
-            return None;
+        self.try_build_with_violation(labels, trees).ok()
+    }
+
+    pub fn try_build_with_violation(
+        &mut self,
+        mut labels: Vec<u32>,
+        trees: &[Tree],
+    ) -> Result<AfColumn, ViolatingTriplet> {
+        labels.sort_unstable();
+        labels.dedup();
+        match validate_component_with_triplet(&labels, trees) {
+            ComponentValidation::Valid => Ok(self.build_unchecked(labels, trees)),
+            ComponentValidation::Invalid(v) => Err(v),
         }
-        Some(self.build_unchecked(labels, trees))
     }
 
     /// Construct without validation. Available to bp internals only via
@@ -111,8 +121,37 @@ impl ColumnBuilder {
 /// every leaf triplet must have the same outgroup in every tree (rooted
 /// triplets uniquely determine a rooted binary tree's topology).
 pub fn is_valid_af_component(labels: &[u32], trees: &[Tree]) -> bool {
+    matches!(
+        validate_component_with_triplet(labels, trees),
+        ComponentValidation::Valid
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ViolatingTriplet {
+    pub a: u32,
+    pub b: u32,
+    pub c: u32,
+    pub ref_tree: usize,
+    pub other_tree: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComponentValidation {
+    Valid,
+    Invalid(ViolatingTriplet),
+}
+
+/// Validate a component and return the first discordant triplet if it fails.
+///
+/// This intentionally starts with the simple rooted-triplet characterization
+/// used by [`is_valid_af_component`]. It is asymptotically heavier than the
+/// future induced-topology walk, but it is exact, deterministic, and gives the
+/// DSSR pricer the concrete triplet needed to cut off an invalid relaxed DP
+/// state.
+pub fn validate_component_with_triplet(labels: &[u32], trees: &[Tree]) -> ComponentValidation {
     if labels.len() <= 2 || trees.len() <= 1 {
-        return true;
+        return ComponentValidation::Valid;
     }
     let n = labels.len();
     for i in 0..n {
@@ -120,15 +159,22 @@ pub fn is_valid_af_component(labels: &[u32], trees: &[Tree]) -> bool {
             for k in (j + 1)..n {
                 let (a, b, c) = (labels[i], labels[j], labels[k]);
                 let og0 = triplet_outgroup(&trees[0], a, b, c);
-                for tree in &trees[1..] {
-                    if triplet_outgroup(tree, a, b, c) != og0 {
-                        return false;
+                for (ti, tree) in trees.iter().enumerate().skip(1) {
+                    let og = triplet_outgroup(tree, a, b, c);
+                    if og != og0 {
+                        return ComponentValidation::Invalid(ViolatingTriplet {
+                            a,
+                            b,
+                            c,
+                            ref_tree: 0,
+                            other_tree: ti,
+                        });
                     }
                 }
             }
         }
     }
-    true
+    ComponentValidation::Valid
 }
 
 fn triplet_outgroup(tree: &Tree, a: u32, b: u32, c: u32) -> u32 {

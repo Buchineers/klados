@@ -31,6 +31,7 @@ pub struct PricerScratch {
     /// to match the legacy `Dp2TreeCache` pattern (allocated once,
     /// filled per call with current duals).
     pub exact_dp_cache: Option<super::exact_pair_dp::ExactPairDpCache>,
+    pub column_reserve: Vec<AfColumn>,
 }
 
 impl PricerScratch {
@@ -40,6 +41,7 @@ impl PricerScratch {
             candidate_pool: Vec::new(),
             pair_dp_table: None,
             exact_dp_cache: None,
+            column_reserve: Vec::new(),
         }
     }
 }
