@@ -16,7 +16,7 @@ pub mod set;
 pub use coverage::{ColumnCoverage, Scratch};
 pub use set::ColumnSet;
 
-use klados_core::Tree;
+use klados_core::{NONE, Tree};
 
 /// A leafset that is guaranteed to be a valid AF component for the trees
 /// passed to its constructor.
@@ -144,15 +144,42 @@ pub enum ComponentValidation {
 
 /// Validate a component and return the first discordant triplet if it fails.
 ///
-/// This intentionally starts with the simple rooted-triplet characterization
-/// used by [`is_valid_af_component`]. It is asymptotically heavier than the
-/// future induced-topology walk, but it is exact, deterministic, and gives the
-/// DSSR pricer the concrete triplet needed to cut off an invalid relaxed DP
-/// state.
+/// Fast path: build the canonical topology of the restricted tree `T|labels`
+/// in each input tree and compare those strings. This avoids the old
+/// `O(m·|L|³)` all-triplets scan for valid components. If a mismatch is
+/// detected, we then do a focused triplet scan between `T₀` and the first
+/// disagreeing tree to produce the concrete triplet DSSR needs.
 pub fn validate_component_with_triplet(labels: &[u32], trees: &[Tree]) -> ComponentValidation {
     if labels.len() <= 2 || trees.len() <= 1 {
         return ComponentValidation::Valid;
     }
+    // For the overwhelmingly common tiny components (pairs/triples/quartets),
+    // the direct triplet test is faster than constructing induced signatures.
+    // Use the signature path only when it can amortize its setup cost.
+    if labels.len() <= 8 {
+        return validate_component_by_triplets(labels, trees);
+    }
+    let sig0 = induced_signature(labels, &trees[0]);
+    for (ti, tree) in trees.iter().enumerate().skip(1) {
+        let sig = induced_signature(labels, tree);
+        if sig != sig0 {
+            return ComponentValidation::Invalid(
+                find_violating_triplet_between(labels, &trees[0], tree, ti).unwrap_or(
+                    ViolatingTriplet {
+                        a: labels[0],
+                        b: labels[1],
+                        c: labels[2],
+                        ref_tree: 0,
+                        other_tree: ti,
+                    },
+                ),
+            );
+        }
+    }
+    ComponentValidation::Valid
+}
+
+fn validate_component_by_triplets(labels: &[u32], trees: &[Tree]) -> ComponentValidation {
     let n = labels.len();
     for i in 0..n {
         for j in (i + 1)..n {
@@ -160,8 +187,7 @@ pub fn validate_component_with_triplet(labels: &[u32], trees: &[Tree]) -> Compon
                 let (a, b, c) = (labels[i], labels[j], labels[k]);
                 let og0 = triplet_outgroup(&trees[0], a, b, c);
                 for (ti, tree) in trees.iter().enumerate().skip(1) {
-                    let og = triplet_outgroup(tree, a, b, c);
-                    if og != og0 {
+                    if triplet_outgroup(tree, a, b, c) != og0 {
                         return ComponentValidation::Invalid(ViolatingTriplet {
                             a,
                             b,
@@ -175,6 +201,103 @@ pub fn validate_component_with_triplet(labels: &[u32], trees: &[Tree]) -> Compon
         }
     }
     ComponentValidation::Valid
+}
+
+fn induced_signature(labels: &[u32], tree: &Tree) -> String {
+    debug_assert!(!labels.is_empty());
+
+    if labels.len() == 1 {
+        return labels[0].to_string();
+    }
+
+    let mut lca = tree.node_by_label(labels[0]);
+    for &lbl in &labels[1..] {
+        lca = tree.nearest_common_ancestor(lca, tree.node_by_label(lbl));
+    }
+
+    induced_signature_rec(tree, lca, labels)
+}
+
+fn induced_signature_rec(tree: &Tree, lca: u32, labels: &[u32]) -> String {
+    if labels.len() == 1 {
+        return labels[0].to_string();
+    }
+
+    if tree.is_leaf(lca) {
+        return tree.label[lca as usize].to_string();
+    }
+
+    let (left_child, right_child) = tree.children_pair(lca);
+    let mut left_labels = Vec::new();
+    let mut right_labels = Vec::new();
+
+    for &lbl in labels {
+        let side = child_below(tree, lca, lbl);
+        if side == left_child {
+            left_labels.push(lbl);
+        } else if side == right_child {
+            right_labels.push(lbl);
+        }
+    }
+
+    match (!left_labels.is_empty(), !right_labels.is_empty()) {
+        (true, true) => {
+            let ls = induced_signature(&left_labels, tree);
+            let rs = induced_signature(&right_labels, tree);
+            let (a, b) = if ls <= rs { (ls, rs) } else { (rs, ls) };
+            let mut out = String::with_capacity(a.len() + b.len() + 3);
+            out.push('(');
+            out.push_str(&a);
+            out.push(',');
+            out.push_str(&b);
+            out.push(')');
+            out
+        }
+        (true, false) => induced_signature(&left_labels, tree),
+        (false, true) => induced_signature(&right_labels, tree),
+        (false, false) => String::new(),
+    }
+}
+
+fn child_below(tree: &Tree, ancestor: u32, label: u32) -> u32 {
+    let mut cur = tree.node_by_label(label);
+    while cur != NONE {
+        let parent = tree.parent[cur as usize];
+        if parent == ancestor {
+            return cur;
+        }
+        if cur == ancestor {
+            return cur;
+        }
+        cur = parent;
+    }
+    NONE
+}
+
+fn find_violating_triplet_between(
+    labels: &[u32],
+    ref_tree: &Tree,
+    other_tree: &Tree,
+    other_tree_idx: usize,
+) -> Option<ViolatingTriplet> {
+    let n = labels.len();
+    for i in 0..n {
+        for j in (i + 1)..n {
+            for k in (j + 1)..n {
+                let (a, b, c) = (labels[i], labels[j], labels[k]);
+                if triplet_outgroup(ref_tree, a, b, c) != triplet_outgroup(other_tree, a, b, c) {
+                    return Some(ViolatingTriplet {
+                        a,
+                        b,
+                        c,
+                        ref_tree: 0,
+                        other_tree: other_tree_idx,
+                    });
+                }
+            }
+        }
+    }
+    None
 }
 
 fn triplet_outgroup(tree: &Tree, a: u32, b: u32, c: u32) -> u32 {

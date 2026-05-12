@@ -39,14 +39,34 @@ impl Pricer for CompositePricer {
     }
 
     fn price(&mut self, ctx: &PricingContext, scratch: &mut PricerScratch) -> PricingResult {
+        scratch.reset_pricing_stats();
+        let reserve = scratch.drain_reserve(ctx, 64);
+        if !reserve.is_empty() {
+            trace!(
+                target: LOG_TARGET,
+                "reserve: Found {} (before={} kept={} discarded={})",
+                reserve.len(),
+                scratch.pricing_stats.reserve_before,
+                scratch.pricing_stats.reserve_kept,
+                scratch.pricing_stats.reserve_discarded,
+            );
+            return PricingResult::Found(reserve);
+        }
+
         for tier in self.tiers.iter_mut() {
             match tier.price(ctx, scratch) {
                 PricingResult::Found(cols) => {
-                    trace!(target: LOG_TARGET, "{}: Found {}", tier.name(), cols.len());
+                    trace!(
+                        target: LOG_TARGET,
+                        "{}: Found {} stats={:?}",
+                        tier.name(),
+                        cols.len(),
+                        scratch.pricing_stats,
+                    );
                     return PricingResult::Found(cols);
                 }
                 PricingResult::Converged => {
-                    trace!(target: LOG_TARGET, "{}: Converged", tier.name());
+                    trace!(target: LOG_TARGET, "{}: Converged stats={:?}", tier.name(), scratch.pricing_stats);
                     return PricingResult::Converged;
                 }
                 PricingResult::Exhausted => {

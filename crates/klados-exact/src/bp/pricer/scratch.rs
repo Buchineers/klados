@@ -17,6 +17,28 @@
 
 use crate::bp::column::{AfColumn, ColumnBuilder};
 
+use super::PricingContext;
+
+const PRICING_EPS: f64 = 1.0e-8;
+
+#[derive(Clone, Debug, Default)]
+pub struct PricingStats {
+    pub reserve_before: usize,
+    pub reserve_drained: usize,
+    pub reserve_discarded: usize,
+    pub reserve_kept: usize,
+    pub reserve_stashed: usize,
+    pub dssr_passes: usize,
+    pub dssr_candidates: usize,
+    pub dssr_seen: usize,
+    pub dssr_branch_blocked: usize,
+    pub dssr_invalid: usize,
+    pub dssr_nonprofitable: usize,
+    pub dssr_found: usize,
+    pub small_cache_cols: usize,
+    pub small_profitable: usize,
+}
+
 pub struct PricerScratch {
     pub builder: ColumnBuilder,
     /// Promising columns or anchors found by an earlier tier; later tiers
@@ -32,6 +54,7 @@ pub struct PricerScratch {
     /// filled per call with current duals).
     pub exact_dp_cache: Option<super::exact_pair_dp::ExactPairDpCache>,
     pub column_reserve: Vec<AfColumn>,
+    pub pricing_stats: PricingStats,
 }
 
 impl PricerScratch {
@@ -42,6 +65,105 @@ impl PricerScratch {
             pair_dp_table: None,
             exact_dp_cache: None,
             column_reserve: Vec::new(),
+            pricing_stats: PricingStats::default(),
+        }
+    }
+
+    pub fn reset_pricing_stats(&mut self) {
+        self.pricing_stats = PricingStats::default();
+    }
+
+    pub fn drain_reserve(&mut self, ctx: &PricingContext, limit: usize) -> Vec<AfColumn> {
+        self.pricing_stats.reserve_before = self.column_reserve.len();
+        if self.column_reserve.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+
+        let mut scored: Vec<(f64, usize)> = Vec::new();
+        let mut keep = vec![true; self.column_reserve.len()];
+        for (i, col) in self.column_reserve.iter().enumerate() {
+            if ctx.seen.contains(col.labels()) || ctx.branchings.forbids(col) {
+                keep[i] = false;
+                self.pricing_stats.reserve_discarded += 1;
+                continue;
+            }
+            let score = col.pricing_score(ctx.alpha, ctx.beta);
+            if score > 1.0 + PRICING_EPS {
+                scored.push((score, i));
+            } else {
+                keep[i] = false;
+                self.pricing_stats.reserve_discarded += 1;
+            }
+        }
+
+        if scored.is_empty() {
+            self.compact_reserve(&keep);
+            self.pricing_stats.reserve_kept = self.column_reserve.len();
+            return Vec::new();
+        }
+
+        scored.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        scored.truncate(limit);
+        for &(_, i) in &scored {
+            keep[i] = false;
+        }
+
+        let mut selected = vec![false; self.column_reserve.len()];
+        for &(_, i) in &scored {
+            selected[i] = true;
+        }
+
+        let mut out = Vec::with_capacity(scored.len());
+        let mut old = std::mem::take(&mut self.column_reserve);
+        for (i, col) in old.drain(..).enumerate() {
+            if selected[i] {
+                out.push(col);
+            } else if keep[i] {
+                self.column_reserve.push(col);
+            }
+        }
+        self.pricing_stats.reserve_drained = out.len();
+        self.pricing_stats.reserve_kept = self.column_reserve.len();
+        out
+    }
+
+    pub fn emit_with_reserve(
+        &mut self,
+        mut cols: Vec<AfColumn>,
+        ctx: &PricingContext,
+        limit: usize,
+    ) -> Vec<AfColumn> {
+        cols.sort_unstable_by(|a, b| {
+            let sa = a.pricing_score(ctx.alpha, ctx.beta);
+            let sb = b.pricing_score(ctx.alpha, ctx.beta);
+            sb.total_cmp(&sa)
+                .then_with(|| b.size().cmp(&a.size()))
+                .then_with(|| a.labels().cmp(b.labels()))
+        });
+        cols.dedup_by(|a, b| a.labels() == b.labels());
+
+        let split = cols.len().min(limit);
+        let reserve = cols.split_off(split);
+        for col in reserve {
+            if !ctx.seen.contains(col.labels())
+                && !self
+                    .column_reserve
+                    .iter()
+                    .any(|existing| existing.labels() == col.labels())
+            {
+                self.column_reserve.push(col);
+                self.pricing_stats.reserve_stashed += 1;
+            }
+        }
+        cols
+    }
+
+    fn compact_reserve(&mut self, keep: &[bool]) {
+        let mut old = std::mem::take(&mut self.column_reserve);
+        for (i, col) in old.drain(..).enumerate() {
+            if keep[i] {
+                self.column_reserve.push(col);
+            }
         }
     }
 }

@@ -9,7 +9,7 @@
 
 use klados_core::Tree;
 
-use crate::bp::column::{AfColumn, ViolatingTriplet};
+use crate::bp::column::ViolatingTriplet;
 use crate::bp::search::LeafPair;
 
 use super::{Pricer, PricerScratch, PricingContext, PricingResult};
@@ -39,15 +39,12 @@ impl Pricer for MultiTreePairDpPricer {
             return PricingResult::Exhausted;
         }
 
-        if let Some(cols) = drain_reserve(ctx, scratch, self.batch_size) {
-            return PricingResult::Found(cols);
-        }
-
         let mut forbidden: Vec<(u32, u32)> = Vec::new();
-        let mut found: Vec<AfColumn> = Vec::new();
+        let mut found = Vec::new();
         let mut used_decremental_cuts = false;
 
         loop {
+            scratch.pricing_stats.dssr_passes += 1;
             let n0 = ctx.trees[0].num_nodes();
             let n1 = ctx.trees[1].num_nodes();
             let mut cache = scratch
@@ -61,6 +58,7 @@ impl Pricer for MultiTreePairDpPricer {
             let output =
                 super::exact_pair_dp::collect_positive_candidates(ctx, &mut cache, &forbidden);
             scratch.exact_dp_cache = Some(cache);
+            scratch.pricing_stats.dssr_candidates += output.candidates.len();
 
             if output.candidates.is_empty() {
                 if found.is_empty() {
@@ -76,17 +74,20 @@ impl Pricer for MultiTreePairDpPricer {
                         PricingResult::Exhausted
                     };
                 }
-                return emit_with_reserve(found, ctx, scratch, self.batch_size);
+                let cols = scratch.emit_with_reserve(found, ctx, self.batch_size);
+                return PricingResult::Found(cols);
             }
 
             let mut added_forbidden = false;
 
             for cand in output.candidates {
                 if ctx.seen.contains(&cand.labels) {
+                    scratch.pricing_stats.dssr_seen += 1;
                     continue;
                 }
 
                 if let Some(anchor) = branching_forbidden_anchor(&cand.labels, ctx) {
+                    scratch.pricing_stats.dssr_branch_blocked += 1;
                     added_forbidden |= push_forbidden(&mut forbidden, anchor);
                     added_forbidden |=
                         push_forbidden(&mut forbidden, (cand.anchor0, cand.anchor1));
@@ -100,6 +101,7 @@ impl Pricer for MultiTreePairDpPricer {
                 {
                     Ok(c) => c,
                     Err(v) => {
+                        scratch.pricing_stats.dssr_invalid += 1;
                         let triplet_anchor = triplet_anchor_01(v, ctx.trees);
                         added_forbidden |= push_forbidden(&mut forbidden, triplet_anchor);
                         // Always cut the emitted closed anchor too. The
@@ -114,6 +116,7 @@ impl Pricer for MultiTreePairDpPricer {
                 };
 
                 if ctx.branchings.forbids(&column) {
+                    scratch.pricing_stats.dssr_branch_blocked += 1;
                     added_forbidden |= push_forbidden(&mut forbidden, (cand.anchor0, cand.anchor1));
                     used_decremental_cuts = true;
                     continue;
@@ -121,8 +124,10 @@ impl Pricer for MultiTreePairDpPricer {
 
                 let full_score = column.pricing_score(ctx.alpha, ctx.beta);
                 if full_score > 1.0 + PRICING_EPS {
+                    scratch.pricing_stats.dssr_found += 1;
                     found.push(column);
                 } else {
+                    scratch.pricing_stats.dssr_nonprofitable += 1;
                     // Relaxed-positive but full-nonprofitable columns can
                     // hide the full-profitable second-best at the same DP
                     // state. Cut this relaxed optimum and continue.
@@ -132,7 +137,8 @@ impl Pricer for MultiTreePairDpPricer {
             }
 
             if !found.is_empty() {
-                return emit_with_reserve(found, ctx, scratch, self.batch_size);
+                let cols = scratch.emit_with_reserve(found, ctx, self.batch_size);
+                return PricingResult::Found(cols);
             }
 
             if !added_forbidden {
@@ -140,99 +146,6 @@ impl Pricer for MultiTreePairDpPricer {
             }
         }
     }
-}
-
-fn drain_reserve(
-    ctx: &PricingContext,
-    scratch: &mut PricerScratch,
-    limit: usize,
-) -> Option<Vec<AfColumn>> {
-    if scratch.column_reserve.is_empty() || limit == 0 {
-        return None;
-    }
-
-    let mut scored: Vec<(f64, usize)> = Vec::new();
-    let mut keep = vec![true; scratch.column_reserve.len()];
-    for (i, col) in scratch.column_reserve.iter().enumerate() {
-        if ctx.seen.contains(col.labels()) || ctx.branchings.forbids(col) {
-            keep[i] = false;
-            continue;
-        }
-        let score = col.pricing_score(ctx.alpha, ctx.beta);
-        if score > 1.0 + PRICING_EPS {
-            scored.push((score, i));
-        } else {
-            // Stale under the current duals. If the dual landscape shifts
-            // back later, exact DSSR can rediscover it.
-            keep[i] = false;
-        }
-    }
-
-    if scored.is_empty() {
-        compact_reserve(&mut scratch.column_reserve, &keep);
-        return None;
-    }
-
-    scored.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-    scored.truncate(limit);
-    for &(_, i) in &scored {
-        keep[i] = false;
-    }
-
-    let mut selected = vec![false; scratch.column_reserve.len()];
-    for &(_, i) in &scored {
-        selected[i] = true;
-    }
-
-    let mut out = Vec::with_capacity(scored.len());
-    let mut old = std::mem::take(&mut scratch.column_reserve);
-    for (i, col) in old.drain(..).enumerate() {
-        if selected[i] {
-            out.push(col);
-        } else if keep[i] {
-            scratch.column_reserve.push(col);
-        }
-    }
-    Some(out)
-}
-
-fn compact_reserve(reserve: &mut Vec<AfColumn>, keep: &[bool]) {
-    let mut old = std::mem::take(reserve);
-    for (i, col) in old.drain(..).enumerate() {
-        if keep[i] {
-            reserve.push(col);
-        }
-    }
-}
-
-fn emit_with_reserve(
-    mut cols: Vec<AfColumn>,
-    ctx: &PricingContext,
-    scratch: &mut PricerScratch,
-    limit: usize,
-) -> PricingResult {
-    cols.sort_unstable_by(|a, b| {
-        let sa = a.pricing_score(ctx.alpha, ctx.beta);
-        let sb = b.pricing_score(ctx.alpha, ctx.beta);
-        sb.total_cmp(&sa)
-            .then_with(|| b.size().cmp(&a.size()))
-            .then_with(|| a.labels().cmp(b.labels()))
-    });
-    cols.dedup_by(|a, b| a.labels() == b.labels());
-
-    let split = cols.len().min(limit);
-    let reserve = cols.split_off(split);
-    for col in reserve {
-        if !ctx.seen.contains(col.labels())
-            && !scratch
-                .column_reserve
-                .iter()
-                .any(|existing| existing.labels() == col.labels())
-        {
-            scratch.column_reserve.push(col);
-        }
-    }
-    PricingResult::Found(cols)
 }
 
 fn push_forbidden(forbidden: &mut Vec<(u32, u32)>, anchor: (u32, u32)) -> bool {
