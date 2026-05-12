@@ -98,27 +98,24 @@ impl Pricer for SmallComponentPricer {
         "small-component"
     }
 
-    fn price(&mut self, ctx: &PricingContext, _scratch: &mut PricerScratch) -> PricingResult {
+    fn price(&mut self, ctx: &PricingContext, scratch: &mut PricerScratch) -> PricingResult {
         self.ensure_cache(ctx);
-        let mut scored = Vec::new();
+        scratch.pricing_stats.small_cache_cols = self.cache.as_ref().unwrap().len();
+        let mut cols = Vec::new();
         for col in self.cache.as_ref().unwrap() {
             if ctx.seen.contains(col.labels()) || ctx.branchings.forbids(col) {
                 continue;
             }
             let score = col.pricing_score(ctx.alpha, ctx.beta);
             if score > 1.0 + PRICING_EPS {
-                scored.push((score, col.clone()));
+                scratch.pricing_stats.small_profitable += 1;
+                cols.push(col.clone());
             }
         }
-        if scored.is_empty() {
+        if cols.is_empty() {
             return PricingResult::Exhausted;
         }
-        scored.sort_unstable_by(|a, b| {
-            b.0.total_cmp(&a.0)
-                .then_with(|| b.1.size().cmp(&a.1.size()))
-                .then_with(|| a.1.labels().cmp(b.1.labels()))
-        });
-        scored.truncate(MAX_PER_CALL);
-        PricingResult::Found(scored.into_iter().map(|(_, c)| c).collect())
+        let out = scratch.emit_with_reserve(cols, ctx, MAX_PER_CALL);
+        PricingResult::Found(out)
     }
 }
