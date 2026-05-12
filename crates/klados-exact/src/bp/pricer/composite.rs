@@ -9,14 +9,16 @@
 //!    leaf-pair DP returns `Exhausted`.  Proves no positive-RC column
 //!    exists in O(n²) time, terminating column generation.
 //!
-//! For m≥3: single tier `LeafPairDpPricer` with multi-tree bitmask
-//! intersection.  Heuristic — no convergence proof.
+//! For m≥3: DSSR exact relaxed 2-tree DP with full multi-tree validation.
+//! Leaf-pair DP is kept as a heuristic column generator only; it must not
+//! certify convergence at branched multi-tree nodes.
 
 use klados_core::Tree;
 use log::trace;
 
 use super::{
-    ExactPairDpPricer, LeafPairDpPricer, Pricer, PricerScratch, PricingContext, PricingResult,
+    ExactPairDpPricer, LeafPairDpPricer, MultiTreePairDpPricer, Pricer, PricerScratch,
+    PricingContext, PricingResult, SmallComponentPricer,
 };
 
 const LOG_TARGET: &str = "klados::bp::composite";
@@ -70,7 +72,14 @@ pub fn dispatch_by_m(trees: &[Tree]) -> CompositePricer {
             tiers.push(Box::new(ExactPairDpPricer::new(trees)));
         }
     } else {
-        tiers.push(Box::new(LeafPairDpPricer::new(trees)));
+        // m≥3: DSSR is the primary pricer. It uses the exact (T0,T1) DP as
+        // a relaxation, then decrementally cuts invalid / illegal anchors.
+        tiers.push(Box::new(MultiTreePairDpPricer::new(trees)));
+        tiers.push(Box::new(SmallComponentPricer::new(trees)));
+        // Keep the multi-tree leaf-pair DP as a column-generation safety net,
+        // but never as a convergence oracle: its one-best-per-state behavior
+        // is exactly what DSSR is meant to repair.
+        tiers.push(Box::new(LeafPairDpPricer::new(trees).with_max_per_call(64)));
     }
     CompositePricer::new(tiers)
 }

@@ -26,17 +26,24 @@
 //!   space, given current branchings. Strongest guarantee.
 
 pub mod anchor_extend;
+pub mod column_aggregation;
 pub mod composite;
 pub mod exact_pair_dp;
+pub mod ilp;
 pub mod leaf_pair_dp;
+pub mod multi_pair_dp;
 pub mod pair_dp;
 pub mod pair_dp_filter;
 pub mod scratch;
+pub mod small_component;
 
 // --- Used in the default dispatch_by_m() ---
+pub use column_aggregation::ColumnAggregationPricer;
 pub use composite::{CompositePricer, dispatch_by_m};
 pub use exact_pair_dp::ExactPairDpPricer;
 pub use leaf_pair_dp::LeafPairDpPricer;
+pub use multi_pair_dp::MultiTreePairDpPricer;
+pub use small_component::SmallComponentPricer;
 
 // --- Tier infrastructure ---
 pub use scratch::{PairDpTable, PricerScratch};

@@ -14,6 +14,20 @@ use super::{Pricer, PricerScratch, PricingContext, PricingResult};
 const PRICING_EPS: f64 = 1.0e-8;
 const NEG_INF: f64 = f64::NEG_INFINITY;
 
+#[derive(Clone, Debug)]
+pub(crate) struct PairDpCandidate {
+    pub score: f64,
+    pub labels: Vec<u32>,
+    pub anchor0: u32,
+    pub anchor1: u32,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PairDpOutput {
+    pub candidates: Vec<PairDpCandidate>,
+    pub max_allowed_closed: f64,
+}
+
 #[derive(Clone, Copy)]
 struct DpClosed {
     score: f64,
@@ -73,7 +87,7 @@ impl ExactPairDpCache {
         }
     }
 
-    fn fits(&self, n0: usize, n1: usize, num_leaves: usize) -> bool {
+    pub(crate) fn fits(&self, n0: usize, n1: usize, num_leaves: usize) -> bool {
         self.t0_active.len() == n0
             && self.t1_active.len() == n1
             && self.active_labels.len() == num_leaves + 1
@@ -151,15 +165,32 @@ fn price_exact_pair_dp(
     }
 }
 
-fn collect_positive_columns(
+pub(crate) fn collect_positive_columns(
     ctx: &PricingContext,
     cache: &mut ExactPairDpCache,
 ) -> Vec<(f64, Vec<u32>)> {
+    collect_positive_candidates(ctx, cache, &[])
+        .candidates
+        .into_iter()
+        .map(|c| (c.score, c.labels))
+        .collect()
+}
+
+pub(crate) fn collect_positive_candidates(
+    ctx: &PricingContext,
+    cache: &mut ExactPairDpCache,
+    forbidden_anchors: &[(u32, u32)],
+) -> PairDpOutput {
     let t0 = &ctx.trees[0];
     let t1 = &ctx.trees[1];
     let n0 = t0.num_nodes();
     let n1 = t1.num_nodes();
     let idx = |u: usize, v: usize| -> usize { u * n1 + v };
+    let is_forbidden = |u: u32, v: u32| -> bool {
+        forbidden_anchors
+            .iter()
+            .any(|&(fu, fv)| fu == u && fv == v)
+    };
 
     let active_labels = &mut cache.active_labels;
     let t0_active = &mut cache.t0_active;
@@ -197,7 +228,10 @@ fn collect_positive_columns(
     let t0_post: Vec<u32> = t0.post_order().filter(|&u| t0_active[u as usize]).collect();
     let t1_post: Vec<u32> = t1.post_order().filter(|&v| t1_active[v as usize]).collect();
     if t0_post.is_empty() || t1_post.is_empty() {
-        return Vec::new();
+        return PairDpOutput {
+            candidates: Vec::new(),
+            max_allowed_closed: NEG_INF,
+        };
     }
 
     // Reset DP tables only for entries we will read (children of visited nodes).
@@ -291,6 +325,9 @@ fn collect_positive_columns(
             if t1.is_leaf(v) {
                 continue;
             }
+            if is_forbidden(u, v) {
+                continue;
+            }
             let v_idx = v as usize;
             let (l1, r1) = t1.children_pair(v);
 
@@ -375,6 +412,7 @@ fn collect_positive_columns(
     }
 
     let mut results = Vec::new();
+    let mut max_allowed_closed = NEG_INF;
     for u in 0..n0 {
         if t0.is_leaf(u as u32) {
             continue;
@@ -383,7 +421,13 @@ fn collect_positive_columns(
             if t1.is_leaf(v as u32) {
                 continue;
             }
+            if is_forbidden(u as u32, v as u32) {
+                continue;
+            }
             let score = dp_closed[idx(u, v)].score;
+            if score > max_allowed_closed {
+                max_allowed_closed = score;
+            }
             if score > 1.0 + PRICING_EPS {
                 let mut labels = Vec::new();
                 extract_closed(
@@ -398,18 +442,27 @@ fn collect_positive_columns(
                 labels.sort_unstable();
                 labels.dedup();
                 if labels.len() >= 2 {
-                    results.push((score, labels));
+                    results.push(PairDpCandidate {
+                        score,
+                        labels,
+                        anchor0: u as u32,
+                        anchor1: v as u32,
+                    });
                 }
             }
         }
     }
 
     results.sort_unstable_by(|a, b| {
-        b.0.total_cmp(&a.0)
-            .then_with(|| b.1.len().cmp(&a.1.len()))
-            .then_with(|| a.1.cmp(&b.1))
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| b.labels.len().cmp(&a.labels.len()))
+            .then_with(|| a.labels.cmp(&b.labels))
     });
-    results
+    PairDpOutput {
+        candidates: results,
+        max_allowed_closed,
+    }
 }
 
 fn extract_closed(
