@@ -89,6 +89,11 @@ impl Branchings {
     /// True if `column` is forbidden by these branchings — i.e., its label
     /// set violates at least one must-link or cannot-link constraint.
     pub fn forbids(&self, column: &AfColumn) -> bool {
+        // Hot path on the root node and shallow branches: with no constraints
+        // every column is feasible, so skip the binary searches entirely.
+        if self.must_link.is_empty() && self.cannot_link.is_empty() {
+            return false;
+        }
         for ml in &self.must_link {
             let has_a = column.labels().binary_search(&ml.a).is_ok();
             let has_b = column.labels().binary_search(&ml.b).is_ok();
