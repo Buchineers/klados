@@ -5,10 +5,14 @@
 //! never reference column ids. See [`crate::bp::search::branchings`] for
 //! the rationale.
 
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 use fixedbitset::FixedBitSet;
 use klados_core::af_validator::validate_agreement_forest;
+use klados_core::lower_bound::{
+    greedy_multi_tree_partition, greedy_multi_tree_ub_seeded, pairwise_refine_ub,
+};
 use klados_core::{Instance, Tree};
 use log::{debug, info, trace};
 
@@ -22,6 +26,72 @@ use crate::chen_rspr::chen_pair_agreement;
 use crate::whidden_cluster::try_whidden_relaxed_incumbent_2tree;
 
 const LOG_TARGET: &str = "klados::bp";
+
+struct LocalBounds {
+    best_partition: Option<Vec<usize>>,
+}
+
+fn sampled_reference_indices(m: usize, limit: usize) -> Vec<usize> {
+    if limit >= m {
+        return (0..m).collect();
+    }
+    let mut out = Vec::with_capacity(limit);
+    for slot in 0..limit {
+        let idx = slot * (m - 1) / (limit - 1).max(1);
+        if out.last().copied() != Some(idx) {
+            out.push(idx);
+        }
+    }
+    out
+}
+
+fn compute_local_bounds(trees: &[Tree], num_leaves: u32) -> LocalBounds {
+    if trees.len() <= 2 {
+        return LocalBounds {
+            best_partition: None,
+        };
+    }
+
+    let m = trees.len();
+    let n = num_leaves as usize;
+    let (ref_limit, seed_limit, run_pairwise) = if m >= 20 || n >= 200 {
+        (4usize, 2u64, false)
+    } else if m >= 12 || n >= 140 {
+        (6usize, 3u64, true)
+    } else {
+        (m, 5u64, true)
+    };
+
+    let ref_indices = sampled_reference_indices(m, ref_limit.min(m));
+    let mut best_multi_ub = n;
+    let mut best_ref = 0usize;
+    let mut best_seed = 0u64;
+    for ref_idx in ref_indices {
+        for seed in 0..seed_limit {
+            let ub = greedy_multi_tree_ub_seeded(trees, ref_idx, seed);
+            if ub < best_multi_ub {
+                best_multi_ub = ub;
+                best_ref = ref_idx;
+                best_seed = seed;
+            }
+        }
+    }
+
+    let best_partition = if run_pairwise {
+        let (pr_ub, pr_partition) = pairwise_refine_ub(trees, n);
+        if pr_ub < best_multi_ub {
+            Some(pr_partition)
+        } else {
+            let (_, partition) = greedy_multi_tree_partition(trees, best_ref, best_seed);
+            Some(partition)
+        }
+    } else {
+        let (_, partition) = greedy_multi_tree_partition(trees, best_ref, best_seed);
+        Some(partition)
+    };
+
+    LocalBounds { best_partition }
+}
 
 /// Install a feasible AF (returned by a primal heuristic such as Whidden
 /// relaxed) as the search incumbent. Adds each component as an `AfColumn`
@@ -76,6 +146,61 @@ fn install_incumbent(
     );
 }
 
+fn install_partition_incumbent(
+    state: &mut SearchState,
+    rmp: &mut Rmp,
+    trees: &[Tree],
+    builder: &mut ColumnBuilder,
+    partition: &[usize],
+) {
+    let mut comp_labels: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
+    for (leaf_idx, &comp_id) in partition.iter().enumerate() {
+        comp_labels
+            .entry(comp_id)
+            .or_default()
+            .push((leaf_idx + 1) as u32);
+    }
+
+    let candidate_k = comp_labels.len();
+    if candidate_k == 0 || candidate_k >= state.best_ub() {
+        return;
+    }
+
+    let mut component_columns = Vec::with_capacity(candidate_k);
+    for labels in comp_labels.values() {
+        if let Some(existing) = state
+            .columns()
+            .iter()
+            .position(|col| col.labels() == labels.as_slice())
+        {
+            component_columns.push(existing);
+            continue;
+        }
+
+        let Some(column) = builder.try_build(labels.clone(), trees) else {
+            return;
+        };
+        if let Some(id) = state.add_column(column) {
+            rmp.add_column(state.columns().last().unwrap());
+            component_columns.push(id);
+        } else {
+            return;
+        }
+    }
+
+    if component_columns.len() == candidate_k {
+        state.update_incumbent(Incumbent {
+            component_columns,
+            k: candidate_k,
+        });
+        log::info!(
+            target: LOG_TARGET,
+            "local multi-tree UB: installed incumbent k={}",
+            candidate_k,
+        );
+    }
+}
+
 enum NodeOutcome {
     Pruned,
     Integral(Incumbent),
@@ -120,6 +245,13 @@ pub fn solve_inner(reduced: &Instance) -> Option<Vec<Tree>> {
     let mut state = SearchState::seed_singletons(n, initial.clone());
     let mut rmp = Rmp::new(&initial, trees, n);
 
+    if trees.len() > 2 {
+        let bounds = compute_local_bounds(trees, reduced.num_leaves);
+        if let Some(partition) = bounds.best_partition.as_deref() {
+            install_partition_incumbent(&mut state, &mut rmp, trees, &mut seed_builder, partition);
+        }
+    }
+
     // For m=2, seed multi-leaf columns from Chen's 2-approximation. These are
     // valid AF components (any pair-derived AF component is consistent in 2
     // trees by definition), so they go straight into the pool. Gives the LP
@@ -162,7 +294,7 @@ pub fn solve_inner(reduced: &Instance) -> Option<Vec<Tree>> {
     // integer solution and we lose by branching needlessly. Matches
     // bp-multi's behavior; this was the missing primal heuristic that
     // explains the recurring "LP=optimum but support fractional" gap.
-    if trees.len() >= 2 && reduced.num_leaves >= 20 {
+    if trees.len() == 2 && reduced.num_leaves >= 20 {
         if let Some(incumbent_forest) = try_whidden_relaxed_incumbent_2tree(reduced, &mut |sub| {
             crate::bp::solve_subinstance(sub, &crate::bp::BpConfig::default())
         }) {
@@ -229,6 +361,15 @@ pub fn solve_inner(reduced: &Instance) -> Option<Vec<Tree>> {
         "bp done: n={} m={} k={} nodes={} cg_iters={} cols={} cuts={}",
         reduced.num_leaves, trees.len(), components.len(),
         tel.nodes_explored, tel.cg_iters, tel.columns_added, tel.cuts_added,
+    );
+    info!(
+        target: LOG_TARGET,
+        "bp timings ms: pricing={:.1} lp_solve={:.1} apply_bounds={:.1} cuts={:.1} branching={:.1}",
+        tel.timings.pricing.as_secs_f64() * 1000.0,
+        tel.timings.lp_solve.as_secs_f64() * 1000.0,
+        tel.timings.bounds_apply.as_secs_f64() * 1000.0,
+        tel.timings.cut_separation.as_secs_f64() * 1000.0,
+        tel.timings.branching.as_secs_f64() * 1000.0,
     );
     Some(components)
 }
@@ -308,19 +449,38 @@ fn solve_node<P: Pricer, S: BranchSelector>(
                     }
                 }
                 tel.columns_added += added;
-                eprintln!(
-                    "[bp-cg] iter={} lp={:.4} lp_ms={:.1} pricer_ms={:.1} cols_found={} added={} seen={} total_cols={}",
-                    tel.cg_iters, lp.objective, tel.timings.lp_solve.as_secs_f64()*1000.0,
-                    pt.as_secs_f64()*1000.0, ncols, added, nseen, state.columns().len(),
+                trace!(
+                    target: LOG_TARGET,
+                    "cg iter={} lp={:.4} lp_ms={:.1} pricer_ms={:.1} cols_found={} added={} seen={} total_cols={}",
+                    tel.cg_iters,
+                    lp.objective,
+                    tel.timings.lp_solve.as_secs_f64() * 1000.0,
+                    pt.as_secs_f64() * 1000.0,
+                    ncols,
+                    added,
+                    nseen,
+                    state.columns().len(),
                 );
                 continue;
             }
             PricingResult::Exhausted => {
-                eprintln!("[bp-cg] iter={} lp={:.4} EXHAUSTED pricer_ms={:.1}", tel.cg_iters, lp.objective, pt.as_secs_f64()*1000.0);
+                trace!(
+                    target: LOG_TARGET,
+                    "cg iter={} lp={:.4} EXHAUSTED pricer_ms={:.1}",
+                    tel.cg_iters,
+                    lp.objective,
+                    pt.as_secs_f64() * 1000.0
+                );
                 break lp;
             }
             PricingResult::Converged => {
-                eprintln!("[bp-cg] iter={} lp={:.4} CONVERGED pricer_ms={:.1}", tel.cg_iters, lp.objective, pt.as_secs_f64()*1000.0);
+                trace!(
+                    target: LOG_TARGET,
+                    "cg iter={} lp={:.4} CONVERGED pricer_ms={:.1}",
+                    tel.cg_iters,
+                    lp.objective,
+                    pt.as_secs_f64() * 1000.0
+                );
                 tel.had_converged = true;
                 break lp;
             }

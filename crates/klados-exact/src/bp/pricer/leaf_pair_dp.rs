@@ -106,6 +106,11 @@ pub struct LeafPairDpPricer {
     /// call (unlimited = u32::MAX). Limits the DP work and matches bp-multi's
     /// FASTPRICER_PAIR_TRIALS / WIDEPRICER_PAIR_TRIALS behaviour.
     pair_trial_limit: u32,
+    /// If the limited proxy scan finds no columns, continue with the full
+    /// leaf-pair scan using the same refreshed tables and memoization.  This
+    /// matches bp-multi's fast-then-exact pipeline without paying for two
+    /// separate pricer objects and two O(p²·m) dual refreshes.
+    fallback_full_when_empty: bool,
     /// Skip the pricer entirely when active_labels < this threshold (0 = always
     /// active).  Matches bp-multi's WIDEPRICER_MIN_ACTIVE_LABELS gate.
     min_active_labels: usize,
@@ -130,6 +135,11 @@ impl LeafPairDpPricer {
 
     pub fn with_pair_trial_limit(mut self, limit: u32) -> Self {
         self.pair_trial_limit = limit;
+        self
+    }
+
+    pub fn with_fallback_full_when_empty(mut self, enabled: bool) -> Self {
+        self.fallback_full_when_empty = enabled;
         self
     }
 
@@ -240,6 +250,7 @@ impl LeafPairDpPricer {
             num_trees,
             max_per_call: 64,
             pair_trial_limit: u32::MAX,
+            fallback_full_when_empty: false,
             min_active_labels: 0,
             cannot_pair: Vec::new(),
             must_pair: Vec::new(),
@@ -498,8 +509,6 @@ impl LeafPairDpPricer {
             let _ = anc;
         }
 
-        let am = self.active_mask.clone();
-        let am_blocks: Vec<usize> = am.as_slice().to_vec();
         const BLOCK_BITS: usize = std::mem::size_of::<usize>() * 8;
         const BLOCK_SHIFT: usize = BLOCK_BITS.trailing_zeros() as usize;
         const BLOCK_MASK: usize = BLOCK_BITS - 1;
@@ -518,7 +527,8 @@ impl LeafPairDpPricer {
             .len();
         for wi in 0..n_blocks {
             let mut w =
-                self.descendant_leaves[0][side_nodes[0] as usize].as_slice()[wi] & am_blocks[wi];
+                self.descendant_leaves[0][side_nodes[0] as usize].as_slice()[wi]
+                    & self.active_mask.as_slice()[wi];
             for ti in 1..self.num_trees {
                 w &= self.descendant_leaves[ti][side_nodes[ti] as usize].as_slice()[wi];
             }
@@ -629,6 +639,62 @@ impl LeafPairDpPricer {
             - self.pair_singleton_penalty[a * p + b]
             - self.pair_singleton_penalty[b * p + a]
     }
+
+    fn collect_from_order(
+        &mut self,
+        order: &[(f64, usize, usize)],
+        trial_limit: usize,
+        target: usize,
+        ctx: &PricingContext,
+        scratch: &mut PricerScratch,
+    ) -> Vec<(f64, AfColumn)> {
+        let p = self.active_labels.len();
+        let mut found: Vec<(f64, AfColumn)> = Vec::new();
+
+        for &(_, a, b) in order.iter().take(trial_limit) {
+            if found.len() >= target {
+                break;
+            }
+            // `pair_ub` may have tightened since we built the order (the
+            // bound is recomputed each call).  Double-check here.
+            if self.pair_ub[a * p + b] <= 1.0 + PRICING_EPS {
+                continue;
+            }
+
+            // Branch-aware: skip anchor pairs that separate must-linked
+            // leaves or that are themselves cannot-linked.
+            let la = self.active_labels[a];
+            let lb = self.active_labels[b];
+            if self.must_pair[la as usize] != 0 && self.must_pair[la as usize] != lb {
+                continue;
+            }
+            if self.must_pair[lb as usize] != 0 && self.must_pair[lb as usize] != la {
+                continue;
+            }
+            if self.cannot_pair[la as usize] == lb {
+                continue;
+            }
+
+            let score = self.solve_pair(a, b, ctx.alpha, ctx.beta);
+            if score <= 1.0 + PRICING_EPS {
+                continue;
+            }
+            let labels = self.pair_labels(a, b, ctx.alpha, ctx.beta);
+            if labels.len() < 2 {
+                continue;
+            }
+            if ctx.seen.contains(&labels) {
+                continue;
+            }
+            let column = scratch.builder.build_unchecked(labels, ctx.trees);
+            if ctx.branchings.forbids(&column) {
+                continue;
+            }
+            found.push((score, column));
+        }
+
+        found
+    }
 }
 
 impl Pricer for LeafPairDpPricer {
@@ -694,52 +760,30 @@ impl Pricer for LeafPairDpPricer {
             }
             return PricingResult::Exhausted;
         }
-        order.sort_unstable_by(|l, r| r.0.partial_cmp(&l.0).unwrap_or(std::cmp::Ordering::Equal));
-
-        let mut found: Vec<(f64, AfColumn)> = Vec::new();
         let target = self.max_per_call;
         let trial_limit = (self.pair_trial_limit as usize).min(order.len());
 
-        for &(_, a, b) in order.iter().take(trial_limit) {
-            if found.len() >= target {
-                break;
-            }
-            // `pair_ub` may have tightened since we built the order (the
-            // bound is recomputed each call).  Double-check here.
-            if self.pair_ub[a * p + b] <= 1.0 + PRICING_EPS {
-                continue;
-            }
+        if trial_limit < order.len() {
+            order.select_nth_unstable_by(trial_limit, |l, r| {
+                r.0.partial_cmp(&l.0).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let (head, _) = order.split_at_mut(trial_limit);
+            head.sort_unstable_by(|l, r| {
+                r.0.partial_cmp(&l.0).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        } else {
+            order.sort_unstable_by(|l, r| {
+                r.0.partial_cmp(&l.0).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
 
-            // Branch-aware: skip anchor pairs that separate must-linked
-            // leaves or that are themselves cannot-linked.
-            let la = self.active_labels[a];
-            let lb = self.active_labels[b];
-            if self.must_pair[la as usize] != 0 && self.must_pair[la as usize] != lb {
-                continue;
-            }
-            if self.must_pair[lb as usize] != 0 && self.must_pair[lb as usize] != la {
-                continue;
-            }
-            if self.cannot_pair[la as usize] == lb {
-                continue;
-            }
+        let mut found = self.collect_from_order(&order, trial_limit, target, ctx, scratch);
 
-            let score = self.solve_pair(a, b, ctx.alpha, ctx.beta);
-            if score <= 1.0 + PRICING_EPS {
-                continue;
-            }
-            let labels = self.pair_labels(a, b, ctx.alpha, ctx.beta);
-            if labels.len() < 2 {
-                continue;
-            }
-            if ctx.seen.contains(&labels) {
-                continue;
-            }
-            let column = scratch.builder.build_unchecked(labels, ctx.trees);
-            if ctx.branchings.forbids(&column) {
-                continue;
-            }
-            found.push((score, column));
+        if found.is_empty() && self.fallback_full_when_empty && trial_limit < order.len() {
+            order.sort_unstable_by(|l, r| {
+                r.0.partial_cmp(&l.0).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            found = self.collect_from_order(&order, order.len(), target, ctx, scratch);
         }
 
         if found.is_empty() {
