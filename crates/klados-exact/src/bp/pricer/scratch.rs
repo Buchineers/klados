@@ -35,6 +35,7 @@ pub struct PricingStats {
     pub dssr_invalid: usize,
     pub dssr_nonprofitable: usize,
     pub dssr_found: usize,
+    pub dssr_alt_refs_tried: usize,
     pub small_cache_cols: usize,
     pub small_profitable: usize,
 }

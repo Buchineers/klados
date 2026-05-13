@@ -181,16 +181,22 @@ pub(crate) fn collect_positive_candidates(
     cache: &mut ExactPairDpCache,
     forbidden_anchors: &[(u32, u32)],
 ) -> PairDpOutput {
+    collect_positive_candidates_ref(ctx, cache, 1, forbidden_anchors)
+}
+
+pub(crate) fn collect_positive_candidates_ref(
+    ctx: &PricingContext,
+    cache: &mut ExactPairDpCache,
+    ref_tree_idx: usize,
+    forbidden_anchors: &[(u32, u32)],
+) -> PairDpOutput {
     let t0 = &ctx.trees[0];
-    let t1 = &ctx.trees[1];
+    let t1 = &ctx.trees[ref_tree_idx];
     let n0 = t0.num_nodes();
     let n1 = t1.num_nodes();
     let idx = |u: usize, v: usize| -> usize { u * n1 + v };
-    let is_forbidden = |u: u32, v: u32| -> bool {
-        forbidden_anchors
-            .iter()
-            .any(|&(fu, fv)| fu == u && fv == v)
-    };
+    let is_forbidden =
+        |u: u32, v: u32| -> bool { forbidden_anchors.iter().any(|&(fu, fv)| fu == u && fv == v) };
 
     let active_labels = &mut cache.active_labels;
     let t0_active = &mut cache.t0_active;
@@ -283,12 +289,12 @@ pub(crate) fn collect_positive_candidates(
             let mut best_v = v;
             if !t1.is_leaf(v) {
                 let (l1, r1) = t1.children_pair(v);
-                let s_l = best_l0[l1 as usize].0 - ctx.beta[1][l1 as usize];
+                let s_l = best_l0[l1 as usize].0 - ctx.beta[ref_tree_idx][l1 as usize];
                 if s_l > max_s {
                     max_s = s_l;
                     best_v = best_l0[l1 as usize].1;
                 }
-                let s_r = best_l0[r1 as usize].0 - ctx.beta[1][r1 as usize];
+                let s_r = best_l0[r1 as usize].0 - ctx.beta[ref_tree_idx][r1 as usize];
                 if s_r > max_s {
                     max_s = s_r;
                     best_v = best_l0[r1 as usize].1;
@@ -307,12 +313,12 @@ pub(crate) fn collect_positive_candidates(
             let mut best_v = v;
             if !t1.is_leaf(v) {
                 let (l1, r1) = t1.children_pair(v);
-                let s_l = best_r0[l1 as usize].0 - ctx.beta[1][l1 as usize];
+                let s_l = best_r0[l1 as usize].0 - ctx.beta[ref_tree_idx][l1 as usize];
                 if s_l > max_s {
                     max_s = s_l;
                     best_v = best_r0[l1 as usize].1;
                 }
-                let s_r = best_r0[r1 as usize].0 - ctx.beta[1][r1 as usize];
+                let s_r = best_r0[r1 as usize].0 - ctx.beta[ref_tree_idx][r1 as usize];
                 if s_r > max_s {
                     max_s = s_r;
                     best_v = best_r0[r1 as usize].1;
@@ -335,12 +341,12 @@ pub(crate) fn collect_positive_candidates(
             let mut v_l = 0;
             let mut v_r = 0;
 
-            let s_l0_l1 = best_l0[l1 as usize].0 - ctx.beta[1][l1 as usize];
-            let s_r0_r1 = best_r0[r1 as usize].0 - ctx.beta[1][r1 as usize];
+            let s_l0_l1 = best_l0[l1 as usize].0 - ctx.beta[ref_tree_idx][l1 as usize];
+            let s_r0_r1 = best_r0[r1 as usize].0 - ctx.beta[ref_tree_idx][r1 as usize];
             if s_l0_l1 > NEG_INF / 2.0 && s_r0_r1 > NEG_INF / 2.0 {
                 let s = s_l0_l1 + s_r0_r1
                     - ctx.beta[0][u_idx]
-                    - ctx.beta[1][v_idx]
+                    - ctx.beta[ref_tree_idx][v_idx]
                     - ctx.beta[0][l0_idx]
                     - ctx.beta[0][r0_idx];
                 if s > best_c_score {
@@ -350,12 +356,12 @@ pub(crate) fn collect_positive_candidates(
                 }
             }
 
-            let s_l0_r1 = best_l0[r1 as usize].0 - ctx.beta[1][r1 as usize];
-            let s_r0_l1 = best_r0[l1 as usize].0 - ctx.beta[1][l1 as usize];
+            let s_l0_r1 = best_l0[r1 as usize].0 - ctx.beta[ref_tree_idx][r1 as usize];
+            let s_r0_l1 = best_r0[l1 as usize].0 - ctx.beta[ref_tree_idx][l1 as usize];
             if s_l0_r1 > NEG_INF / 2.0 && s_r0_l1 > NEG_INF / 2.0 {
                 let s = s_l0_r1 + s_r0_l1
                     - ctx.beta[0][u_idx]
-                    - ctx.beta[1][v_idx]
+                    - ctx.beta[ref_tree_idx][v_idx]
                     - ctx.beta[0][l0_idx]
                     - ctx.beta[0][r0_idx];
                 if s > best_c_score {
@@ -381,7 +387,7 @@ pub(crate) fn collect_positive_candidates(
 
             let closed = dp_closed[idx(u_idx, v_idx)].score;
             if closed > NEG_INF / 2.0 {
-                best_o_score = closed + ctx.beta[0][u_idx] + ctx.beta[1][v_idx];
+                best_o_score = closed + ctx.beta[0][u_idx] + ctx.beta[ref_tree_idx][v_idx];
             }
 
             let s_l0 = if l0_active {
@@ -430,15 +436,7 @@ pub(crate) fn collect_positive_candidates(
             }
             if score > 1.0 + PRICING_EPS {
                 let mut labels = Vec::new();
-                extract_closed(
-                    u as u32,
-                    v as u32,
-                    t0,
-                    dp_closed,
-                    dp_open,
-                    n1,
-                    &mut labels,
-                );
+                extract_closed(u as u32, v as u32, t0, dp_closed, dp_open, n1, &mut labels);
                 labels.sort_unstable();
                 labels.dedup();
                 if labels.len() >= 2 {
