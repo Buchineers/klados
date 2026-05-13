@@ -313,9 +313,30 @@ pub fn solve_inner(reduced: &Instance) -> Option<Vec<Tree>> {
     let mut selector = crate::bp::search::selection::MostFractionalPair;
     let mut tel = Telemetry::default();
 
-    let mut stack: Vec<Branchings> = vec![Branchings::default()];
-    while let Some(b) = stack.pop() {
-        if b.is_inconsistent() {
+    // Stack entries carry the parent's converged LP objective. Branching
+    // adds constraints, and adding constraints to a min-LP can only raise
+    // its optimum, so child_LP ≥ parent_LP. If `ceil(parent_LP) ≥ best_ub`
+    // already, the child is provably pruned and we can skip its CG entirely
+    // — saving every prune-by-bound that would otherwise have re-solved
+    // the LP to discover the same conclusion. Free, exact, no parameters.
+    let mut stack: Vec<(Branchings, f64)> = vec![(Branchings::default(), f64::NEG_INFINITY)];
+    while let Some((b, parent_lp_bound)) = stack.pop() {
+        // Backtrack: drop any per-subtree RCVF fixings made by previously-
+        // explored sibling subtrees. Trail entries with depth ≥ b.depth()
+        // were placed by deeper nodes that have since been fully explored;
+        // their fixings are no longer valid in the subtree we're entering.
+        // Root fixings (depth=0) live outside the trail and persist.
+        rmp.unfix_above_depth(b.depth());
+
+        // Inherited-bound prune: child_LP ≥ parent_LP, so if the parent's
+        // LP already met the prune threshold the child does too.
+        let inherited_lb = if parent_lp_bound.is_finite() {
+            (parent_lp_bound - 1e-6).ceil() as usize
+        } else {
+            0
+        };
+        if can_prune_by_bound(inherited_lb, state.best_ub()) {
+            tel.bound_prunes += 1;
             continue;
         }
         let outcome = solve_node(
@@ -340,16 +361,19 @@ pub fn solve_inner(reduced: &Instance) -> Option<Vec<Tree>> {
                         "incumbent: k={} (depth={}, nodes={})",
                         state.best_ub(), b.depth(), tel.nodes_explored,
                     );
+                    // RCVF replay happens at the top of the next solve_node.
                 }
             }
             NodeOutcome::Branch {
                 lp_obj,
                 pair,
             } => {
-                let _ = lp_obj;
                 let (left, right) = b.split_on(pair);
-                stack.push(right);
-                stack.push(left);
+                // Both children inherit the parent's LP bound; their own LP
+                // is at least this value. The top-of-loop check uses it to
+                // skip CG when the inherited bound already prunes.
+                stack.push((right, lp_obj));
+                stack.push((left, lp_obj));
             }
         }
     }
@@ -386,6 +410,20 @@ fn solve_node<P: Pricer, S: BranchSelector>(
     tel: &mut Telemetry,
 ) -> NodeOutcome {
     tel.nodes_explored += 1;
+
+    // Replay root-RCVF if the incumbent tightened since the last fixing.
+    // No-op when untightened (or before root has been solved), so this is
+    // free on the hot path; when an in-node primal heuristic (rounding /
+    // MIP-on-pool) cut best_ub, the next node entry picks up the new
+    // fixings before we touch the LP.
+    let newly = rmp.reapply_root_rcvf(state.columns(), state.best_ub());
+    if newly > 0 {
+        debug!(
+            target: LOG_TARGET,
+            "rcvf replay (incumbent={}, depth={}): fixed {} more columns",
+            state.best_ub(), branchings.depth(), newly,
+        );
+    }
 
     let t0 = Instant::now();
     rmp.apply_bounds(state.columns(), branchings);
@@ -499,6 +537,67 @@ fn solve_node<P: Pricer, S: BranchSelector>(
         return NodeOutcome::Pruned;
     }
 
+    // Reduced-cost variable fixing. Standard B&P result: for every column c,
+    // `LP_with_x_c≥1 ≥ lp_obj + rc(c)`, so any improving integer solution
+    // (objective ≤ best_ub − 1) cannot use c if `lp_obj + rc(c) > best_ub − 1`.
+    //
+    // Only safe at the **root** because RCVF fixings live on the shared Rmp
+    // and would otherwise poison sibling subtrees. Root duals come from the
+    // unrestricted master LP, so the fixings hold globally — every feasible
+    // solution of any descendant subtree is feasible for the unrestricted
+    // problem too, so columns barred from the unrestricted improving region
+    // are barred everywhere. Non-root RCVF would tighten further within its
+    // subtree but requires per-subtree undo machinery; deferred.
+    if branchings.depth() == 0 {
+        let rcvf_newly_fixed = rmp.apply_rcvf(
+            lp.objective,
+            state.columns(),
+            &lp.leaf_duals,
+            &lp.node_duals,
+            state.best_ub(),
+        );
+        if rcvf_newly_fixed > 0 {
+            debug!(
+                target: LOG_TARGET,
+                "rcvf root: fixed {} / {} columns (lp={:.4} ub={})",
+                rcvf_newly_fixed,
+                state.columns().len(),
+                lp.objective,
+                state.best_ub(),
+            );
+        }
+        // Cache the root LP solution: every future incumbent improvement
+        // makes the RCVF condition strictly tighter under these same duals,
+        // so we replay them rather than re-solving root.
+        rmp.save_root_lp(
+            lp.objective,
+            lp.leaf_duals.clone(),
+            lp.node_duals.clone(),
+            state.best_ub(),
+        );
+    } else {
+        // Subtree-local RCVF: the LP at a branched node is tighter than
+        // root because the branching constraints have raised its optimum,
+        // so the same rc-bound condition fixes columns that root duals
+        // can't reach. Fixings here are valid only inside this subtree —
+        // recorded on the rcvf_trail and undone on backtrack.
+        let rcvf_newly_fixed = rmp.apply_subtree_rcvf(
+            lp.objective,
+            state.columns(),
+            &lp.leaf_duals,
+            &lp.node_duals,
+            state.best_ub(),
+            branchings.depth(),
+        );
+        if rcvf_newly_fixed > 0 {
+            trace!(
+                target: LOG_TARGET,
+                "rcvf subtree (depth={}): fixed {} more (lp={:.4} ub={})",
+                branchings.depth(), rcvf_newly_fixed, lp.objective, state.best_ub(),
+            );
+        }
+    }
+
     if let Some(inc) = try_integral(state, &lp.column_values) {
         return NodeOutcome::Integral(inc);
     }
@@ -531,10 +630,17 @@ fn solve_node<P: Pricer, S: BranchSelector>(
         }
     }
 
+    // MIP-on-pool primal heuristic. Enabled by default; disable with
+    // KLADOS_BP_MIP_HEURISTIC=0. Fires when the LP objective is at an
+    // integer boundary but the support is fractional — exactly the case
+    // where pure branching nudges the LP by ε per node and a MIP solve
+    // over the existing pool finds the missing integer combination
+    // directly. Time-capped (100ms by default) so the failure mode is
+    // bounded.
     let lp_frac = lp.objective.ceil() - lp.objective;
-    if std::env::var("KLADOS_BP_MIP_HEURISTIC").map_or(false, |v| v != "0")
+    if std::env::var("KLADOS_BP_MIP_HEURISTIC").map_or(true, |v| v != "0")
         && lb < state.best_ub()
-        && (lp_frac < 1e-4 || branchings.depth() == 0)
+        && lp_frac < 1e-4
     {
         trace!(target: LOG_TARGET, "Running MIP heuristic on pool of {} columns (lp_obj={:.4})", state.columns().len(), lp.objective);
         let mut mip_attempts = 0;

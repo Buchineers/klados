@@ -60,6 +60,34 @@ pub struct Rmp {
     col_handle: Vec<i32>,
     cur_lo: Vec<f64>,
     cur_hi: Vec<f64>,
+    /// Reduced-cost variable fixing flag, indexed by global column id.
+    /// Once a column is RCVF-fixed it remains x=0 for the entire subtree
+    /// — the fixing is monotone-valid because best_ub only decreases as
+    /// the search progresses, and tighter best_ub fixes strictly more
+    /// columns. Once true, `apply_bounds` ignores the branching-derived
+    /// bound and keeps the column pinned at zero.
+    rcvf_zero: Vec<bool>,
+    /// Cached root-node LP solution. Stored once the root CG converges so
+    /// that whenever the incumbent tightens we can re-derive RCVF fixings
+    /// from the *unrestricted* duals (the only ones whose fixings hold
+    /// globally) without re-solving the root.
+    root_lp: Option<RootLp>,
+    /// Per-subtree RCVF trail. Each entry `(depth, ci)` records a column
+    /// that was fixed by `apply_subtree_rcvf` while exploring a node at
+    /// the given branching depth. On backtrack above that depth the entry
+    /// is popped and the column is unfixed. Root fixings (depth=0) are
+    /// **never** placed on the trail — they hold globally.
+    rcvf_trail: Vec<(usize, usize)>,
+}
+
+struct RootLp {
+    objective: f64,
+    leaf_duals: Vec<f64>,
+    node_duals: Vec<Vec<f64>>,
+    /// Smallest `best_ub` we've already RCVF'd against using this root LP.
+    /// Replaying with the same or looser bound is a no-op; replaying with
+    /// a tighter bound can only fix more columns.
+    last_applied_best_ub: usize,
 }
 
 impl Rmp {
@@ -100,6 +128,9 @@ impl Rmp {
             col_handle: Vec::new(),
             cur_lo: Vec::new(),
             cur_hi: Vec::new(),
+            rcvf_zero: Vec::new(),
+            root_lp: None,
+            rcvf_trail: Vec::new(),
         };
         for c in initial {
             rmp.add_column(c);
@@ -144,6 +175,162 @@ impl Rmp {
         self.col_handle.push(global_ci as i32);
         self.cur_lo.push(0.0);
         self.cur_hi.push(f64::INFINITY);
+        self.rcvf_zero.push(false);
+    }
+
+    /// Reduced-Cost Variable Fixing.
+    ///
+    /// Standard branch-and-price result: after CG converges, for every column
+    /// `c` the reduced cost `rc(c) = 1 − pricing_score(c)` satisfies the bound
+    /// `LP_with_x_c≥1 ≥ lp_obj + rc(c)`. Therefore any integer solution using
+    /// `c` has objective ≥ ⌈lp_obj + rc(c)⌉. An improving integer solution has
+    /// objective ≤ `best_ub − 1`, so if `lp_obj + rc(c) > best_ub − 1` then
+    /// `c` cannot appear in any improving solution and `x_c = 0` is forced
+    /// throughout the remaining subtree.
+    ///
+    /// Returns the number of columns newly fixed by this call. The fixing
+    /// is monotone: future calls (with tighter `best_ub` or different LP)
+    /// can only fix more, never unfix.
+    pub fn apply_rcvf(
+        &mut self,
+        lp_obj: f64,
+        columns: &[AfColumn],
+        alpha: &[f64],
+        beta: &[Vec<f64>],
+        best_ub: usize,
+    ) -> usize {
+        // depth=0 → root: fixings are global, never trail-tracked.
+        self.apply_rcvf_inner(lp_obj, columns, alpha, beta, best_ub, 0)
+    }
+
+    /// Subtree-local RCVF. Fixings made here are sound only inside the
+    /// subtree rooted at the current node; they are pushed onto
+    /// `rcvf_trail` so [`unfix_above_depth`] can flip them back when the
+    /// search backtracks above `depth`.
+    ///
+    /// `depth` must be ≥ 1 — the root path uses [`apply_rcvf`] /
+    /// [`reapply_root_rcvf`] for permanent fixings instead.
+    pub fn apply_subtree_rcvf(
+        &mut self,
+        lp_obj: f64,
+        columns: &[AfColumn],
+        alpha: &[f64],
+        beta: &[Vec<f64>],
+        best_ub: usize,
+        depth: usize,
+    ) -> usize {
+        debug_assert!(depth >= 1, "subtree RCVF must run at depth >= 1");
+        self.apply_rcvf_inner(lp_obj, columns, alpha, beta, best_ub, depth)
+    }
+
+    /// Pop and unfix every trail entry whose recorded depth is ≥
+    /// `min_depth`. Called when the DFS pops a node at depth `min_depth`:
+    /// any per-subtree fixings made by previously-explored sibling
+    /// subtrees no longer apply, so we restore those columns to FREE.
+    pub fn unfix_above_depth(&mut self, min_depth: usize) {
+        let ptr = self.model.as_mut().expect("model present").as_mut_ptr();
+        while let Some(&(d, _)) = self.rcvf_trail.last() {
+            if d < min_depth {
+                break;
+            }
+            let (_, ci) = self.rcvf_trail.pop().unwrap();
+            // Mark as not-fixed; the next apply_bounds will re-derive the
+            // bound from the active branchings and call HiGHS only if
+            // changed. But the column is currently pinned at [0,0]; we
+            // need to restore it to FREE here so the LP sees it again.
+            self.rcvf_zero[ci] = false;
+            unsafe {
+                highs_sys::Highs_changeColBounds(
+                    ptr,
+                    self.col_handle[ci],
+                    0.0,
+                    f64::INFINITY,
+                );
+            }
+            self.cur_lo[ci] = 0.0;
+            self.cur_hi[ci] = f64::INFINITY;
+        }
+    }
+
+    /// Cache the converged root LP solution so [`reapply_root_rcvf`] can
+    /// re-derive fixings under tighter incumbents without re-solving.
+    pub fn save_root_lp(
+        &mut self,
+        lp_obj: f64,
+        leaf_duals: Vec<f64>,
+        node_duals: Vec<Vec<f64>>,
+        applied_at_best_ub: usize,
+    ) {
+        self.root_lp = Some(RootLp {
+            objective: lp_obj,
+            leaf_duals,
+            node_duals,
+            last_applied_best_ub: applied_at_best_ub,
+        });
+    }
+
+    /// Re-derive RCVF fixings using the cached root LP solution and the
+    /// current incumbent. The whole point: as best_ub tightens during
+    /// search, more columns become fixable *under the original root duals*,
+    /// and those fixings still hold globally. No-op if `best_ub` hasn't
+    /// tightened since the last call (or no root LP is cached). Returns
+    /// the number of columns newly fixed.
+    pub fn reapply_root_rcvf(&mut self, columns: &[AfColumn], best_ub: usize) -> usize {
+        let Some(mut root) = self.root_lp.take() else {
+            return 0;
+        };
+        if best_ub >= root.last_applied_best_ub {
+            self.root_lp = Some(root);
+            return 0;
+        }
+        let newly = self.apply_rcvf_inner(
+            root.objective,
+            columns,
+            &root.leaf_duals,
+            &root.node_duals,
+            best_ub,
+            0,
+        );
+        root.last_applied_best_ub = best_ub;
+        self.root_lp = Some(root);
+        newly
+    }
+
+    fn apply_rcvf_inner(
+        &mut self,
+        lp_obj: f64,
+        columns: &[AfColumn],
+        alpha: &[f64],
+        beta: &[Vec<f64>],
+        best_ub: usize,
+        depth: usize,
+    ) -> usize {
+        debug_assert_eq!(columns.len(), self.col_handle.len());
+        // We can fix x_c = 0 when ⌈lp_obj + rc(c)⌉ ≥ best_ub. Equivalently,
+        // since best_ub is integer, when lp_obj + rc(c) > best_ub − 1.
+        // A small numerical slack guards against LP solver tolerance.
+        let threshold = (best_ub as f64) - 1.0 + 1.0e-6;
+        let ptr = self.model.as_mut().expect("model present").as_mut_ptr();
+        let mut newly_fixed = 0;
+        for (ci, column) in columns.iter().enumerate() {
+            if self.rcvf_zero[ci] {
+                continue;
+            }
+            let rc = 1.0 - column.pricing_score(alpha, beta);
+            if lp_obj + rc > threshold {
+                unsafe {
+                    highs_sys::Highs_changeColBounds(ptr, self.col_handle[ci], 0.0, 0.0);
+                }
+                self.cur_lo[ci] = 0.0;
+                self.cur_hi[ci] = 0.0;
+                self.rcvf_zero[ci] = true;
+                if depth > 0 {
+                    self.rcvf_trail.push((depth, ci));
+                }
+                newly_fixed += 1;
+            }
+        }
+        newly_fixed
     }
 
     /// Materialise the row for `(t, v)` lazily, populating its coefficients
@@ -210,12 +397,17 @@ impl Rmp {
         added
     }
 
-    /// Apply per-column bounds derived from `branchings`.
+    /// Apply per-column bounds derived from `branchings`. RCVF-fixed columns
+    /// stay pinned at zero regardless of the branching state.
     pub fn apply_bounds(&mut self, columns: &[AfColumn], branchings: &Branchings) {
         debug_assert_eq!(columns.len(), self.col_handle.len());
         let ptr = self.model.as_mut().expect("model present").as_mut_ptr();
         for (ci, column) in columns.iter().enumerate() {
-            let Bound { lo, hi } = bound_for(column, branchings);
+            let Bound { lo, hi } = if self.rcvf_zero[ci] {
+                Bound::ZERO
+            } else {
+                bound_for(column, branchings)
+            };
             if Self::bounds_changed(self.cur_lo[ci], self.cur_hi[ci], lo, hi) {
                 unsafe {
                     highs_sys::Highs_changeColBounds(ptr, self.col_handle[ci], lo, hi);
@@ -286,6 +478,14 @@ impl Rmp {
         let mut model = self.model.take().expect("model present");
         model.set_option("presolve", "on");
         model.set_option("solver", "choose");
+        // Cap MIP solve at 100ms — this is a heuristic, not a proof. If we
+        // can't find an integer incumbent in 100ms the LP-only path is
+        // strictly cheaper than continuing to grind.
+        let mip_time_limit: f64 = std::env::var("KLADOS_BP_MIP_TIME_LIMIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.1);
+        model.set_option("time_limit", mip_time_limit);
 
         let solved = model.solve();
         let status = solved.status();
@@ -305,6 +505,8 @@ impl Rmp {
         let mut model = Model::from(solved);
         model.set_option("presolve", "off");
         model.set_option("solver", "simplex");
+        // Reset the time limit so subsequent LP solves aren't capped at 0.1s.
+        model.set_option("time_limit", f64::INFINITY);
         self.model = Some(model);
 
         let ptr = self.model.as_mut().unwrap().as_mut_ptr();
