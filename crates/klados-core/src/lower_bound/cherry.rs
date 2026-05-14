@@ -205,6 +205,20 @@ pub fn greedy_multi_tree_ub(trees: &[Tree], ref_idx: usize) -> usize {
 }
 
 pub fn greedy_multi_tree_ub_seeded(trees: &[Tree], ref_idx: usize, seed: u64) -> usize {
+    greedy_multi_tree_ub_with(trees, ref_idx, seed, /* randomize_cut */ false)
+}
+
+/// Same as [`greedy_multi_tree_ub_seeded`] but with optional randomized
+/// cut tie-breaking. With `randomize_cut=true`, when two leaves of a
+/// non-common cherry have equal "depth deeper" scores we use the seed to
+/// pick instead of the deterministic `a`. Lets a large seed sweep cover
+/// substantially more partition outcomes than seed-cherry-index alone.
+pub fn greedy_multi_tree_ub_with(
+    trees: &[Tree],
+    ref_idx: usize,
+    seed: u64,
+    randomize_cut: bool,
+) -> usize {
     let mut mtrees: Vec<MutableTree> = trees.iter().map(MutableTree::from_tree).collect();
     let mut cuts = 0;
     let mut step = 0u64;
@@ -233,7 +247,11 @@ pub fn greedy_multi_tree_ub_seeded(trees: &[Tree], ref_idx: usize, seed: u64) ->
                 t.contract_cherry(a, b);
             }
         } else {
-            let cut = pick_multi_tree_cut(&mtrees, ref_idx, a, b);
+            let cut = if randomize_cut {
+                pick_multi_tree_cut_seeded(&mtrees, ref_idx, a, b, seed, step)
+            } else {
+                pick_multi_tree_cut(&mtrees, ref_idx, a, b)
+            };
             for t in &mut mtrees {
                 t.cut_leaf(cut);
             }
@@ -256,6 +274,43 @@ pub fn greedy_multi_tree_partition(
     trees: &[Tree],
     ref_idx: usize,
     seed: u64,
+) -> (usize, Vec<usize>) {
+    greedy_multi_tree_partition_with(trees, ref_idx, seed, false)
+}
+
+/// Multi-restart randomized cherry partition: tries `num_seeds` seeds
+/// per reference index using the cut-randomized variant and returns the
+/// partition of the lowest-UB run. Caller controls reference sampling.
+pub fn best_randomized_partition(
+    trees: &[Tree],
+    ref_indices: &[usize],
+    num_seeds: usize,
+) -> (usize, Vec<usize>) {
+    let n = trees[0].num_leaves as usize;
+    let mut best_ub = n + 1;
+    let mut best_ref = ref_indices.first().copied().unwrap_or(0);
+    let mut best_seed: u64 = 0;
+    for &ref_idx in ref_indices {
+        for s in 0..num_seeds.max(1) {
+            let seed = s as u64;
+            let ub = greedy_multi_tree_ub_with(trees, ref_idx, seed, seed != 0);
+            if ub < best_ub {
+                best_ub = ub;
+                best_ref = ref_idx;
+                best_seed = seed;
+            }
+        }
+    }
+    let (_, partition) =
+        greedy_multi_tree_partition_with(trees, best_ref, best_seed, best_seed != 0);
+    (best_ub, partition)
+}
+
+pub fn greedy_multi_tree_partition_with(
+    trees: &[Tree],
+    ref_idx: usize,
+    seed: u64,
+    randomize_cut: bool,
 ) -> (usize, Vec<usize>) {
     let n = trees[ref_idx].num_leaves as usize;
     let mut mtrees: Vec<MutableTree> = trees.iter().map(MutableTree::from_tree).collect();
@@ -297,7 +352,11 @@ pub fn greedy_multi_tree_partition(
                 uf[rb] = ra;
             }
         } else {
-            let cut = pick_multi_tree_cut(&mtrees, ref_idx, a, b);
+            let cut = if randomize_cut {
+                pick_multi_tree_cut_seeded(&mtrees, ref_idx, a, b, seed, step)
+            } else {
+                pick_multi_tree_cut(&mtrees, ref_idx, a, b)
+            };
             for t in &mut mtrees {
                 t.cut_leaf(cut);
             }
@@ -350,6 +409,51 @@ fn pick_multi_tree_cut(mtrees: &[MutableTree], ref_idx: usize, a: Label, b: Labe
         a
     } else {
         b
+    }
+}
+
+/// Like [`pick_multi_tree_cut`] but, when the depth-deeper signal is
+/// inconclusive (tie or near-tie), uses the seed/step hash to pick. The
+/// deterministic version always picks `a` on a tie, which collapses
+/// many seeds onto the same partition; this lets seed sweeps explore
+/// substantially more outcomes.
+fn pick_multi_tree_cut_seeded(
+    mtrees: &[MutableTree],
+    ref_idx: usize,
+    a: Label,
+    b: Label,
+    seed: u64,
+    step: u64,
+) -> Label {
+    let mut a_deeper = 0i32;
+    let mut total_diff: i32 = 0;
+    for (i, t) in mtrees.iter().enumerate() {
+        if i == ref_idx {
+            continue;
+        }
+        let na = t.label_to_node[a as usize];
+        let nb = t.label_to_node[b as usize];
+        if na == NONE || nb == NONE {
+            continue;
+        }
+        let da = depth_in_mtree(t, na) as i32;
+        let db = depth_in_mtree(t, nb) as i32;
+        total_diff += da - db;
+        if da > db {
+            a_deeper += 1;
+        } else if db > da {
+            a_deeper -= 1;
+        }
+    }
+    if a_deeper.abs() >= 2 {
+        // Strong signal — trust it.
+        if a_deeper > 0 { a } else { b }
+    } else {
+        // Inconclusive: randomize via seed.
+        let h = seed
+            .wrapping_mul(0xbf58476d1ce4e5b9)
+            .wrapping_add(step.wrapping_mul(0x94d049bb133111eb));
+        if (h >> 32) & 1 == 0 { a } else { b }
     }
 }
 
