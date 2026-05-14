@@ -11,7 +11,8 @@ use std::time::Instant;
 use fixedbitset::FixedBitSet;
 use klados_core::af_validator::validate_agreement_forest;
 use klados_core::lower_bound::{
-    greedy_multi_tree_partition, greedy_multi_tree_ub_seeded, pairwise_refine_ub,
+    best_randomized_partition, greedy_multi_tree_partition, greedy_multi_tree_ub_seeded,
+    pairwise_refine_ub,
 };
 use klados_core::{Instance, Tree};
 use log::{debug, info, trace};
@@ -54,40 +55,37 @@ fn compute_local_bounds(trees: &[Tree], num_leaves: u32) -> LocalBounds {
 
     let m = trees.len();
     let n = num_leaves as usize;
-    let (ref_limit, seed_limit, run_pairwise) = if m >= 20 || n >= 200 {
-        (4usize, 2u64, false)
+    // Each greedy run is O(n²·m); pairwise refinement is O(m²·22·n²).
+    // We budget total trials: aim for ~200 cherry-greedy runs and only
+    // run pairwise refinement when m and n are both moderate (it's the
+    // expensive component). The old config (2–5 seeds × 4–m refs ≤ 40
+    // trials, deterministic tie-break) systematically missed tighter
+    // UBs on hard v2 instances; cut-randomized tie-breaking plus more
+    // trials buys real diversity. Total wall ~20-100ms.
+    let trial_budget = 200usize;
+    let (ref_limit, run_pairwise) = if m >= 20 || n >= 200 {
+        (6usize, false)
     } else if m >= 12 || n >= 140 {
-        (6usize, 3u64, true)
+        (m.min(8), false)
     } else {
-        (m, 5u64, true)
+        (m, true)
     };
+    let ref_count = ref_limit.min(m).max(1);
+    let seed_count = (trial_budget / ref_count).max(20);
 
-    let ref_indices = sampled_reference_indices(m, ref_limit.min(m));
-    let mut best_multi_ub = n;
-    let mut best_ref = 0usize;
-    let mut best_seed = 0u64;
-    for ref_idx in ref_indices {
-        for seed in 0..seed_limit {
-            let ub = greedy_multi_tree_ub_seeded(trees, ref_idx, seed);
-            if ub < best_multi_ub {
-                best_multi_ub = ub;
-                best_ref = ref_idx;
-                best_seed = seed;
-            }
-        }
-    }
+    let ref_indices = sampled_reference_indices(m, ref_count);
+    let (best_multi_ub, best_partition_multi) =
+        best_randomized_partition(trees, &ref_indices, seed_count);
 
     let best_partition = if run_pairwise {
         let (pr_ub, pr_partition) = pairwise_refine_ub(trees, n);
         if pr_ub < best_multi_ub {
             Some(pr_partition)
         } else {
-            let (_, partition) = greedy_multi_tree_partition(trees, best_ref, best_seed);
-            Some(partition)
+            Some(best_partition_multi)
         }
     } else {
-        let (_, partition) = greedy_multi_tree_partition(trees, best_ref, best_seed);
-        Some(partition)
+        Some(best_partition_multi)
     };
 
     LocalBounds { best_partition }
@@ -310,22 +308,52 @@ pub fn solve_inner(reduced: &Instance) -> Option<Vec<Tree>> {
 
     let mut scratch = PricerScratch::new(trees);
     let mut pricer = dispatch_by_m(trees);
+    // We tried strong branching (at every node, at depth ≤ 5, and root-
+    // only) — all three regressed both easy and hard slices. Each LP
+    // probe at root is slow (largest column set, no RCVF fixings yet:
+    // ~50–200 ms per probe), and the branching choice didn't translate
+    // into proportionally fewer nodes because the LP is intrinsically
+    // loose on hard m≥3 instances (ΔLP/branch ≈ 0.2-0.3 regardless of
+    // which pair we pick). Confirms the diagnosis memory: branching
+    // scheme is not the bottleneck — the LP gap is.
     let mut selector = crate::bp::search::selection::MostFractionalPair;
     let mut tel = Telemetry::default();
 
-    // Stack entries carry the parent's converged LP objective. Branching
-    // adds constraints, and adding constraints to a min-LP can only raise
-    // its optimum, so child_LP ≥ parent_LP. If `ceil(parent_LP) ≥ best_ub`
-    // already, the child is provably pruned and we can skip its CG entirely
-    // — saving every prune-by-bound that would otherwise have re-solved
-    // the LP to discover the same conclusion. Free, exact, no parameters.
+    // DFS stack carrying parent LP bounds. We tried best-first (min-heap
+    // by parent_lp) and it regressed badly (~2× on both easy and hard
+    // slices) because the LP gap per branch is small (ΔLP ≈ 0.2/level on
+    // hard m≥3 instances) — best-first ends up exploring all shallow
+    // subtrees within a narrow LP band before driving to any leaf, never
+    // finding an integer incumbent fast. DFS naturally drives a single
+    // branch to a leaf, finds an incumbent, then prunes via inherited
+    // bound. The combination DFS + inherited-bound prune + per-subtree
+    // RCVF dominates best-first when ΔLP per branch is small relative to
+    // the gap.
     let mut stack: Vec<(Branchings, f64)> = vec![(Branchings::default(), f64::NEG_INFINITY)];
+    let mut last_progress_log = std::time::Instant::now();
     while let Some((b, parent_lp_bound)) = stack.pop() {
+        // Periodic progress log so we can see telemetry on timeouts, not
+        // just on successful completion. Every 5 seconds is rare enough
+        // to be free.
+        if last_progress_log.elapsed().as_secs_f64() >= 5.0 {
+            info!(
+                target: LOG_TARGET,
+                "progress: n={} m={} nodes={} cg={} cols={} prunes={} ub={} stack={}",
+                reduced.num_leaves,
+                trees.len(),
+                tel.nodes_explored,
+                tel.cg_iters,
+                tel.columns_added,
+                tel.bound_prunes,
+                state.best_ub(),
+                stack.len() + 1,
+            );
+            last_progress_log = std::time::Instant::now();
+        }
         // Backtrack: drop any per-subtree RCVF fixings made by previously-
         // explored sibling subtrees. Trail entries with depth ≥ b.depth()
         // were placed by deeper nodes that have since been fully explored;
         // their fixings are no longer valid in the subtree we're entering.
-        // Root fixings (depth=0) live outside the trail and persist.
         rmp.unfix_above_depth(b.depth());
 
         // Inherited-bound prune: child_LP ≥ parent_LP, so if the parent's
@@ -358,8 +386,12 @@ pub fn solve_inner(reduced: &Instance) -> Option<Vec<Tree>> {
                     tel.incumbent_updates += 1;
                     info!(
                         target: LOG_TARGET,
-                        "incumbent: k={} (depth={}, nodes={})",
-                        state.best_ub(), b.depth(), tel.nodes_explored,
+                        "incumbent: k={} (n={} m={} depth={} nodes={})",
+                        state.best_ub(),
+                        reduced.num_leaves,
+                        trees.len(),
+                        b.depth(),
+                        tel.nodes_explored,
                     );
                     // RCVF replay happens at the top of the next solve_node.
                 }
@@ -369,9 +401,6 @@ pub fn solve_inner(reduced: &Instance) -> Option<Vec<Tree>> {
                 pair,
             } => {
                 let (left, right) = b.split_on(pair);
-                // Both children inherit the parent's LP bound; their own LP
-                // is at least this value. The top-of-loop check uses it to
-                // skip CG when the inherited bound already prunes.
                 stack.push((right, lp_obj));
                 stack.push((left, lp_obj));
             }
@@ -580,7 +609,9 @@ fn solve_node<P: Pricer, S: BranchSelector>(
         // root because the branching constraints have raised its optimum,
         // so the same rc-bound condition fixes columns that root duals
         // can't reach. Fixings here are valid only inside this subtree —
-        // recorded on the rcvf_trail and undone on backtrack.
+        // recorded on the rcvf_trail and undone on backtrack. Correct
+        // only under DFS, which is the search order we use (best-first
+        // tried and reverted — see the search loop's comment).
         let rcvf_newly_fixed = rmp.apply_subtree_rcvf(
             lp.objective,
             state.columns(),

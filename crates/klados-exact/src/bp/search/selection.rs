@@ -116,13 +116,25 @@ impl BranchSelector for MostFractionalPair {
 pub struct StrongBranching {
     /// Number of candidate pairs to simulate. K=3..5 typical.
     pub candidates: usize,
+    /// If `Some(d)`, only run strong branching at branching depths `< d`;
+    /// fall back to most-fractional at deeper nodes. The choice at shallow
+    /// nodes shapes the entire subtree below, so the 2K-LP probe cost
+    /// amortizes; deep nodes inherit a tight LP from ancestors and
+    /// branching choice matters less.
+    pub max_depth: Option<usize>,
 }
 
 impl StrongBranching {
     pub fn new(candidates: usize) -> Self {
         Self {
             candidates: candidates.max(1),
+            max_depth: None,
         }
+    }
+
+    pub fn with_max_depth(mut self, max_depth: usize) -> Self {
+        self.max_depth = Some(max_depth);
+        self
     }
 }
 
@@ -142,6 +154,14 @@ impl BranchSelector for StrongBranching {
         }
         if candidates.len() == 1 {
             return Some(candidates[0].0);
+        }
+
+        // Past the depth cap, fall back to most-fractional (the first
+        // entry, which is already sorted by closeness to 0.5).
+        if let Some(d) = self.max_depth {
+            if ctx.branchings.depth() >= d {
+                return Some(candidates[0].0);
+            }
         }
 
         let pool = std::cmp::min(self.candidates, candidates.len());
