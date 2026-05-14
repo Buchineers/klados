@@ -336,9 +336,18 @@ pub fn solve_inner(reduced: &Instance) -> Option<Vec<Tree>> {
         // just on successful completion. Every 5 seconds is rare enough
         // to be free.
         if last_progress_log.elapsed().as_secs_f64() >= 5.0 {
+            let tier_summary = pricer
+                .tier_timings()
+                .into_iter()
+                .filter(|(_, d, _)| !d.is_zero())
+                .map(|(name, dur, calls)| {
+                    format!("{}={:.0}ms/{}", name, dur.as_secs_f64() * 1000.0, calls)
+                })
+                .collect::<Vec<_>>()
+                .join(",");
             info!(
                 target: LOG_TARGET,
-                "progress: n={} m={} nodes={} cg={} cols={} prunes={} ub={} stack={}",
+                "progress: n={} m={} nodes={} cg={} cols={} prunes={} ub={} stack={} tiers=[{}]",
                 reduced.num_leaves,
                 trees.len(),
                 tel.nodes_explored,
@@ -347,6 +356,7 @@ pub fn solve_inner(reduced: &Instance) -> Option<Vec<Tree>> {
                 tel.bound_prunes,
                 state.best_ub(),
                 stack.len() + 1,
+                tier_summary,
             );
             last_progress_log = std::time::Instant::now();
         }
@@ -424,6 +434,19 @@ pub fn solve_inner(reduced: &Instance) -> Option<Vec<Tree>> {
         tel.timings.cut_separation.as_secs_f64() * 1000.0,
         tel.timings.branching.as_secs_f64() * 1000.0,
     );
+    // Per-tier pricer breakdown so we can see which tier dominates on
+    // hard instances. The tier names match the strings logged at
+    // composite-pricer trace level (`reserve`, `leaf-pair-dp`,
+    // `dssr-multi-pair-dp`, `small-component`, `exact-pair-dp`).
+    let tier_breakdown = pricer
+        .tier_timings()
+        .into_iter()
+        .map(|(name, dur, calls)| {
+            format!("{}={:.1}ms/{}", name, dur.as_secs_f64() * 1000.0, calls)
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    info!(target: LOG_TARGET, "bp pricer tiers: {}", tier_breakdown);
     Some(components)
 }
 

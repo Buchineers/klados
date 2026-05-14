@@ -55,6 +55,12 @@ const PRICING_EPS: f64 = 1.0e-8;
 const NEG_INF: f64 = f64::NEG_INFINITY;
 /// Sentinel in `memo_side_split` meaning "leaf-only side, no extension chosen".
 const SPLIT_LEAF_ONLY: u32 = u32::MAX - 1;
+/// `solve_side` hoists per-tree bitset slice pointers into a stack array of
+/// this fixed size to avoid a heap allocation per call. Instances with more
+/// trees than this fall back to a `Vec`; on the v2 benchmark the maximum
+/// observed m is 36, so we set this generously above the long-tail observed
+/// distribution.
+const MAX_TREES_INLINE_HOIST: usize = 40;
 
 pub struct LeafPairDpPricer {
     // ── Instance-fixed precompute (independent of duals) ──
@@ -123,6 +129,9 @@ pub struct LeafPairDpPricer {
     /// or 0 if none.  Checked during `solve_pair` to reject anchor pairs that
     /// separate must-linked leaves.
     must_pair: Vec<u32>,
+    /// Reusable scratch for `solve_side`'s phase-1 candidate collection.
+    /// Avoids a Vec allocation per call (~2500 per CG iter on Class B).
+    solve_side_candidates: Vec<(u32, u32)>,
 }
 
 impl LeafPairDpPricer {
@@ -254,6 +263,7 @@ impl LeafPairDpPricer {
             min_active_labels: 0,
             cannot_pair: Vec::new(),
             must_pair: Vec::new(),
+            solve_side_candidates: Vec::new(),
         }
     }
 
@@ -522,62 +532,122 @@ impl LeafPairDpPricer {
 
         // Bitmask intersection of "descendants of side_child in every tree",
         // restricted to the active mask, excluding a and b themselves.
-        let n_blocks = self.descendant_leaves[0][side_nodes[0] as usize]
-            .as_slice()
-            .len();
-        for wi in 0..n_blocks {
-            let mut w =
-                self.descendant_leaves[0][side_nodes[0] as usize].as_slice()[wi]
-                    & self.active_mask.as_slice()[wi];
-            for ti in 1..self.num_trees {
-                w &= self.descendant_leaves[ti][side_nodes[ti] as usize].as_slice()[wi];
-            }
-            if wi == la_w {
-                w &= !la_m;
-            }
-            if wi == lb_w {
-                w &= !lb_m;
-            }
-            while w != 0 {
-                let bit = w.trailing_zeros() as usize;
-                w &= w - 1;
-                let c_label = (wi << BLOCK_SHIFT) + bit;
-                let c = self.label_to_active_idx[c_label] as usize;
-
-                // Branch-aware: skip extension candidate that would violate
-                // cannot-link with the anchor leaf of this side.
-                let cannot_a = self.cannot_pair[label_a as usize] as u32;
-                if cannot_a != 0 && cannot_a == c_label as u32 {
-                    continue;
+        //
+        // We split this into two phases to enable hoisting the per-tree
+        // bitset slice pointers out of the per-block inner loop.
+        //
+        // Phase 1 (immutable self borrow): walk the m-way bitmask
+        // intersection, collect the candidate set `(c_label, c)` that
+        // survives the cannot-link filter and the static UB-vs-best-score
+        // filter against the *initial* `best_score`.
+        // Phase 2 (mutable self borrow): for each surviving candidate,
+        // re-check the UB filter against the *current* `best_score`
+        // (which may have grown via recursive solve_pair calls), then
+        // recurse / read memo. This re-introduces the dynamic pruning the
+        // single-phase code did inline; the cost is iterating the
+        // candidate list twice in the worst case.
+        //
+        // Hoist motivation: `descendant_leaves[ti][side_nodes[ti] as
+        // usize].as_slice()` walks 3 levels of Vec/FixedBitSet indirection
+        // and `side_nodes[ti]` is constant for fixed (a,b). On Class B
+        // (m=8–36) this function is invoked ~2500× per CG iter, so the
+        // hoisted slice pointers save tens of thousands of pointer chases
+        // per iter without changing the algorithm.
+        let cannot_a = self.cannot_pair[label_a as usize] as u32; // constant across wi
+        // Reuse the scratch candidates buffer; swap it out so recursive
+        // solve_pair → solve_side calls get their own empty buffer.
+        let mut candidates: Vec<(u32, u32)> = std::mem::take(&mut self.solve_side_candidates);
+        candidates.clear();
+        {
+            // Inline-storage slice array for the common case (m ≤
+            // MAX_TREES_INLINE_HOIST); falls back to a heap Vec for
+            // larger m. Stack storage avoids an allocation in the inner
+            // call path.
+            let mut tree_slices_inline: [&[usize]; MAX_TREES_INLINE_HOIST] =
+                [&[][..]; MAX_TREES_INLINE_HOIST];
+            let mut tree_slices_overflow: Vec<&[usize]> = Vec::new();
+            let slices: &[&[usize]] = if self.num_trees <= MAX_TREES_INLINE_HOIST {
+                for ti in 0..self.num_trees {
+                    tree_slices_inline[ti] =
+                        self.descendant_leaves[ti][side_nodes[ti] as usize].as_slice();
                 }
-
-                let idx_c = a * p + c;
-                let pen = self.pair_penalty[idx_c] - b_penalty_sum;
-                let ub = self.pair_ub[idx_c];
-                if ub - pen <= best_score + 1.0e-12 {
-                    continue;
+                &tree_slices_inline[..self.num_trees]
+            } else {
+                tree_slices_overflow.reserve(self.num_trees);
+                for ti in 0..self.num_trees {
+                    tree_slices_overflow
+                        .push(self.descendant_leaves[ti][side_nodes[ti] as usize].as_slice());
                 }
-
-                let cached = self.memo_pair[idx_c];
-                let child = if !cached.is_nan() {
-                    if cached.is_infinite() && cached.is_sign_positive() {
-                        NEG_INF
-                    } else {
-                        cached
+                &tree_slices_overflow
+            };
+            let active_mask_slice = self.active_mask.as_slice();
+            let n_blocks = slices[0].len();
+            for wi in 0..n_blocks {
+                let mut w = slices[0][wi] & active_mask_slice[wi];
+                for ti in 1..slices.len() {
+                    w &= slices[ti][wi];
+                }
+                if wi == la_w {
+                    w &= !la_m;
+                }
+                if wi == lb_w {
+                    w &= !lb_m;
+                }
+                while w != 0 {
+                    let bit = w.trailing_zeros() as usize;
+                    w &= w - 1;
+                    let c_label = (wi << BLOCK_SHIFT) + bit;
+                    if cannot_a != 0 && cannot_a == c_label as u32 {
+                        continue;
                     }
-                } else {
-                    self.solve_pair(a, c, alpha, beta)
-                };
-                if child <= NEG_INF / 2.0 {
-                    continue;
-                }
-                let cand = child - pen;
-                if cand > best_score + 1.0e-12 {
-                    best_score = cand;
-                    best_choice = c as u32;
+                    let c = self.label_to_active_idx[c_label] as usize;
+                    let idx_c = a * p + c;
+                    let pen = self.pair_penalty[idx_c] - b_penalty_sum;
+                    let ub = self.pair_ub[idx_c];
+                    // Static filter against initial best_score; dynamic
+                    // re-filter in phase 2.
+                    if ub - pen <= best_score + 1.0e-12 {
+                        continue;
+                    }
+                    candidates.push((c_label as u32, c as u32));
                 }
             }
         }
+
+        for &(_c_label, c) in &candidates {
+            let c = c as usize;
+            let idx_c = a * p + c;
+            let pen = self.pair_penalty[idx_c] - b_penalty_sum;
+            let ub = self.pair_ub[idx_c];
+            // Dynamic re-filter: best_score may have grown via earlier
+            // recursive solve_pair calls in this same phase 2 loop.
+            if ub - pen <= best_score + 1.0e-12 {
+                continue;
+            }
+            let cached = self.memo_pair[idx_c];
+            let child = if !cached.is_nan() {
+                if cached.is_infinite() && cached.is_sign_positive() {
+                    NEG_INF
+                } else {
+                    cached
+                }
+            } else {
+                self.solve_pair(a, c, alpha, beta)
+            };
+            if child <= NEG_INF / 2.0 {
+                continue;
+            }
+            let cand = child - pen;
+            if cand > best_score + 1.0e-12 {
+                best_score = cand;
+                best_choice = c as u32;
+            }
+        }
+
+        // Return the candidates buffer to scratch so future calls reuse
+        // its capacity instead of reallocating.
+        candidates.clear();
+        self.solve_side_candidates = candidates;
 
         self.memo_side_score[idx] = best_score;
         self.memo_side_split[idx] = best_choice;

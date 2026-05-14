@@ -49,19 +49,46 @@ impl Pricer for HeuristicOnlyPricer {
 pub struct CompositePricer {
     tiers: Vec<Box<dyn Pricer>>,
     portfolio_batch: Option<usize>,
+    /// Aggregate per-tier wall-time across the full search, indexed by
+    /// tier position (mirrors `tiers`). Exposed via [`tier_timings`] so
+    /// the solver can report which tier dominates at `bp done`.
+    tier_total: Vec<std::time::Duration>,
+    /// Per-tier invocation count.
+    tier_calls: Vec<u64>,
+    /// Wall-time spent in `drain_reserve` short-circuits at the top of
+    /// every CG iter — counted separately because it bypasses the tier
+    /// dispatch loop.
+    reserve_total: std::time::Duration,
 }
 
 impl CompositePricer {
     pub fn new(tiers: Vec<Box<dyn Pricer>>) -> Self {
+        let n = tiers.len();
         Self {
             tiers,
             portfolio_batch: None,
+            tier_total: vec![std::time::Duration::ZERO; n],
+            tier_calls: vec![0; n],
+            reserve_total: std::time::Duration::ZERO,
         }
     }
 
     pub fn with_portfolio_batch(mut self, batch: usize) -> Self {
         self.portfolio_batch = Some(batch);
         self
+    }
+
+    /// `(tier_name, total_wall, invocation_count)` per tier plus the
+    /// reserve-drain total at index 0 of the returned vector under the
+    /// synthetic name `"reserve"`. The solver's `bp done` summary logs
+    /// this so we can see at a glance which tier dominates per instance.
+    pub fn tier_timings(&self) -> Vec<(&'static str, std::time::Duration, u64)> {
+        let mut out: Vec<(&'static str, std::time::Duration, u64)> = Vec::new();
+        out.push(("reserve", self.reserve_total, 0));
+        for (i, tier) in self.tiers.iter().enumerate() {
+            out.push((tier.name(), self.tier_total[i], self.tier_calls[i]));
+        }
+        out
     }
 }
 
@@ -78,7 +105,9 @@ impl Pricer for CompositePricer {
             return self.price_portfolio(ctx, scratch, batch);
         }
 
+        let t_reserve = std::time::Instant::now();
         let reserve = scratch.drain_reserve(ctx, batch);
+        self.reserve_total += t_reserve.elapsed();
         if !reserve.is_empty() {
             trace!(
                 target: LOG_TARGET,
@@ -91,16 +120,20 @@ impl Pricer for CompositePricer {
             return PricingResult::Found(reserve);
         }
 
-        for tier in self.tiers.iter_mut() {
+        for (i, tier) in self.tiers.iter_mut().enumerate() {
             let t0 = std::time::Instant::now();
-            match tier.price(ctx, scratch) {
+            let result = tier.price(ctx, scratch);
+            let elapsed = t0.elapsed();
+            self.tier_total[i] += elapsed;
+            self.tier_calls[i] += 1;
+            match result {
                 PricingResult::Found(cols) => {
                     trace!(
                         target: LOG_TARGET,
                         "{}: Found {} in {:.3}ms stats={:?}",
                         tier.name(),
                         cols.len(),
-                        t0.elapsed().as_secs_f64() * 1000.0,
+                        elapsed.as_secs_f64() * 1000.0,
                         scratch.pricing_stats,
                     );
                     return PricingResult::Found(cols);
@@ -110,7 +143,7 @@ impl Pricer for CompositePricer {
                         target: LOG_TARGET,
                         "{}: Converged in {:.3}ms stats={:?}",
                         tier.name(),
-                        t0.elapsed().as_secs_f64() * 1000.0,
+                        elapsed.as_secs_f64() * 1000.0,
                         scratch.pricing_stats
                     );
                     return PricingResult::Converged;
@@ -120,7 +153,7 @@ impl Pricer for CompositePricer {
                         target: LOG_TARGET,
                         "{}: Exhausted in {:.3}ms (cascading)",
                         tier.name(),
-                        t0.elapsed().as_secs_f64() * 1000.0,
+                        elapsed.as_secs_f64() * 1000.0,
                     );
                     continue;
                 }
