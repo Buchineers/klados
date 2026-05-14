@@ -103,11 +103,31 @@ impl Pricer for SmallComponentPricer {
         let cache = self.cache.as_ref().unwrap();
         scratch.pricing_stats.small_cache_cols = cache.len();
 
+        // Cheap upper bound on `pricing_score`: a column with k labels
+        // can score at most `k · max(α)` (ignoring β penalty, which only
+        // subtracts). If that ceiling is already ≤ 1+ε we can skip the
+        // full pricing_score scan entirely. Computing max(α) once is
+        // O(num_leaves); the per-column ceiling is O(1). On Class B
+        // (small_component called ~1000+ times per node) this short-
+        // circuits the dominant cost for the vast majority of cache
+        // entries that aren't candidates.
+        let alpha_max = ctx
+            .alpha
+            .iter()
+            .copied()
+            .fold(0.0_f64, f64::max);
+
         // Pass 1: index-only scan. Compute pricing_score for every
         // surviving cache entry and collect `(score, idx)` pairs.
         // Avoids cloning the AfColumn until we know it's in the top-K.
         let mut scored: Vec<(f64, usize)> = Vec::new();
         for (i, col) in cache.iter().enumerate() {
+            // Cheap reject — labels sum can't pay for the +1 cost,
+            // skip without touching coverage / β.
+            let ceiling = (col.labels().len() as f64) * alpha_max;
+            if ceiling <= 1.0 + PRICING_EPS {
+                continue;
+            }
             if ctx.seen.contains(col.labels()) || ctx.branchings.forbids(col) {
                 continue;
             }
