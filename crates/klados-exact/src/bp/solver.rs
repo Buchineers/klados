@@ -202,10 +202,12 @@ fn install_partition_incumbent(
 enum NodeOutcome {
     Pruned,
     Integral(Incumbent),
-    /// LP is fractional; branch on `pair`.
+    /// LP is fractional; selector produced one or more child branchings.
+    /// 2-element Vec is classic must/cannot pair split; longer Vec is
+    /// k-way (e.g. 4-way cluster branching on a fractional triple).
     Branch {
         lp_obj: f64,
-        pair: crate::bp::search::LeafPair,
+        children: Vec<Branchings>,
     },
 }
 
@@ -308,14 +310,24 @@ pub fn solve_inner(reduced: &Instance) -> Option<Vec<Tree>> {
 
     let mut scratch = PricerScratch::new(trees);
     let mut pricer = dispatch_by_m(trees);
-    // We tried strong branching (at every node, at depth ≤ 5, and root-
-    // only) — all three regressed both easy and hard slices. Each LP
-    // probe at root is slow (largest column set, no RCVF fixings yet:
-    // ~50–200 ms per probe), and the branching choice didn't translate
-    // into proportionally fewer nodes because the LP is intrinsically
-    // loose on hard m≥3 instances (ΔLP/branch ≈ 0.2-0.3 regardless of
-    // which pair we pick). Confirms the diagnosis memory: branching
-    // scheme is not the bottleneck — the LP gap is.
+    // Tried, all reverted with strong negative results — all three
+    // amounted to "branching scheme is the bottleneck", which the data
+    // refuted each time:
+    //
+    // 1. Strong branching (every node / depth≤5 / root-only): regressed
+    //    both slices. Root LP probe cost dominates the bound gain.
+    // 2. Best-first node ordering: regressed both slices ~2×. ΔLP/branch
+    //    is too small (~0.2) to make best-first work; behaves like BFS.
+    // 3. 4-way cluster branching on fractional triples: regressed easy
+    //    (0→21 timeouts) and hard (50→71). The three "isolated" children
+    //    only commit 2 cannot-link constraints each, which are weak; the
+    //    4× tree multiplier wasn't offset by the actual ΔLP rise.
+    //
+    // The diagnosis memory and Gemini's literature critique are
+    // converging: the LP relaxation on hard m≥3 instances is
+    // intrinsically loose, and no branching reform tightens it. Levers
+    // that *might* help are speed (per-node cost) and LP tightness
+    // itself (cuts that aren't dominated).
     let mut selector = crate::bp::search::selection::MostFractionalPair;
     let mut tel = Telemetry::default();
 
@@ -408,11 +420,16 @@ pub fn solve_inner(reduced: &Instance) -> Option<Vec<Tree>> {
             }
             NodeOutcome::Branch {
                 lp_obj,
-                pair,
+                children,
             } => {
-                let (left, right) = b.split_on(pair);
-                stack.push((right, lp_obj));
-                stack.push((left, lp_obj));
+                // Push children in reverse so the first one is popped
+                // next — matches the prior 2-way DFS ordering where
+                // `left` (the must-link side) was explored before
+                // `right` (cannot-link). For k-way branching, the
+                // selector's natural child ordering is preserved.
+                for child in children.into_iter().rev() {
+                    stack.push((child, lp_obj));
+                }
             }
         }
     }
@@ -738,7 +755,7 @@ fn solve_node<P: Pricer, S: BranchSelector>(
         }
     }
     let t0 = Instant::now();
-    let pair = selector.select(
+    let children = selector.select(
         &SelectionContext {
             columns: state.columns(),
             values: &lp.column_values,
@@ -749,13 +766,13 @@ fn solve_node<P: Pricer, S: BranchSelector>(
         rmp,
     );
     tel.timings.branching += t0.elapsed();
-    match pair {
-        Some(pair) => NodeOutcome::Branch {
+    match children {
+        Some(children) if !children.is_empty() => NodeOutcome::Branch {
             lp_obj: lp.objective,
-            pair,
+            children,
         },
-        None => {
-            debug!(target: LOG_TARGET, "selector returned None, but not integral. Pruning fractional solution!");
+        _ => {
+            debug!(target: LOG_TARGET, "selector returned no children, but not integral. Pruning fractional solution!");
             NodeOutcome::Pruned
         }
     }
