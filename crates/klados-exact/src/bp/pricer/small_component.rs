@@ -100,22 +100,41 @@ impl Pricer for SmallComponentPricer {
 
     fn price(&mut self, ctx: &PricingContext, scratch: &mut PricerScratch) -> PricingResult {
         self.ensure_cache(ctx);
-        scratch.pricing_stats.small_cache_cols = self.cache.as_ref().unwrap().len();
-        let mut cols = Vec::new();
-        for col in self.cache.as_ref().unwrap() {
+        let cache = self.cache.as_ref().unwrap();
+        scratch.pricing_stats.small_cache_cols = cache.len();
+
+        // Pass 1: index-only scan. Compute pricing_score for every
+        // surviving cache entry and collect `(score, idx)` pairs.
+        // Avoids cloning the AfColumn until we know it's in the top-K.
+        let mut scored: Vec<(f64, usize)> = Vec::new();
+        for (i, col) in cache.iter().enumerate() {
             if ctx.seen.contains(col.labels()) || ctx.branchings.forbids(col) {
                 continue;
             }
             let score = col.pricing_score(ctx.alpha, ctx.beta);
             if score > 1.0 + PRICING_EPS {
                 scratch.pricing_stats.small_profitable += 1;
-                cols.push(col.clone());
+                scored.push((score, i));
             }
         }
-        if cols.is_empty() {
+        if scored.is_empty() {
             return PricingResult::Exhausted;
         }
-        let out = scratch.emit_with_reserve(cols, ctx, MAX_PER_CALL);
-        PricingResult::Found(out)
+
+        // Sort by score (high first); only the top MAX_PER_CALL get
+        // cloned into the result. We deliberately *do not* feed leftovers
+        // into the column-reserve scratch: the cache is fixed across CG
+        // iterations, so any column we leave behind here will reappear in
+        // the next call's pass 1 at the same cost. Stashing them would
+        // just double-store the same labelsets.
+        scored.sort_unstable_by(|a, b| {
+            b.0.total_cmp(&a.0)
+                .then_with(|| cache[b.1].size().cmp(&cache[a.1].size()))
+                .then_with(|| cache[a.1].labels().cmp(cache[b.1].labels()))
+        });
+        let take = scored.len().min(MAX_PER_CALL);
+        let cols: Vec<AfColumn> =
+            scored.iter().take(take).map(|&(_, i)| cache[i].clone()).collect();
+        PricingResult::Found(cols)
     }
 }
