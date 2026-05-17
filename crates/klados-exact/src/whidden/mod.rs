@@ -60,14 +60,21 @@ impl Drop for SplitDiagPrinter {
         );
         // Day 6: report SPLIT rule entry-point firing (only if checked).
         if rs.split_rule_checked > 0 {
+            let avg_core_cut = rs.split_rule_core_edges as f64
+                / rs.split_rule_core_cutsets.max(1) as f64;
             eprintln!(
-                "[split-rule] checked={} overlap_found={} ({:.1}%) disjoint_found={} ({:.1}%) applied={}",
+                "[split-rule] checked={} overlap_found={} ({:.1}%) disjoint_found={} ({:.1}%) applied={} core_cutsets={} size1={} ({:.1}%) avg_cut_size={:.2}",
                 rs.split_rule_checked,
                 rs.split_rule_overlap_found,
                 100.0 * rs.split_rule_overlap_found as f64 / rs.split_rule_checked as f64,
                 rs.split_rule_disjoint_found,
                 100.0 * rs.split_rule_disjoint_found as f64 / rs.split_rule_checked as f64,
                 rs.split_rule_applied,
+                rs.split_rule_core_cutsets,
+                rs.split_rule_size1_cutsets,
+                100.0 * rs.split_rule_size1_cutsets as f64
+                    / rs.split_rule_core_cutsets.max(1) as f64,
+                avg_core_cut,
             );
         }
     }

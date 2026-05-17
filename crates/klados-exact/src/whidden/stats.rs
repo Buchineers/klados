@@ -87,6 +87,9 @@ pub struct WhiddenRuleStats {
     pub split_rule_overlap_found: u64,  // # times overlap detected → SPLIT would fire
     pub split_rule_disjoint_found: u64, // # times disjoint → DECOMPOSE would fire
     pub split_rule_applied: u64,        // # times SPLIT actually applied (Day 7+)
+    pub split_rule_core_cutsets: u64,   // total cutsets across constructed SPLIT cores
+    pub split_rule_core_edges: u64,     // total edge multiplicity across those cutsets
+    pub split_rule_size1_cutsets: u64,  // cutsets with exactly one edge
 
     // Bound cache & propagation
     pub bc_lookups: u64,
@@ -175,6 +178,9 @@ impl AddAssign<&WhiddenRuleStats> for WhiddenRuleStats {
         self.split_rule_overlap_found += rhs.split_rule_overlap_found;
         self.split_rule_disjoint_found += rhs.split_rule_disjoint_found;
         self.split_rule_applied += rhs.split_rule_applied;
+        self.split_rule_core_cutsets += rhs.split_rule_core_cutsets;
+        self.split_rule_core_edges += rhs.split_rule_core_edges;
+        self.split_rule_size1_cutsets += rhs.split_rule_size1_cutsets;
 
         self.bc_lookups += rhs.bc_lookups;
         self.bc_hits += rhs.bc_hits;
