@@ -70,6 +70,24 @@ pub struct WhiddenRuleStats {
     // Experimental rooted split-or-decompose rescue
     pub mestel6_checks: u64,
 
+    // SPLIT diagnostic: per-branching-node overlap/decomposition check.
+    // Counts whether the current TwinForest state, before branching, has
+    // overlapping component embeddings in T1 (Mestel's SPLIT triggers) or
+    // pairwise disjoint embeddings (Mestel's DECOMPOSE triggers).
+    pub split_diag_nodes: u64,           // # nodes where the check was run
+    pub split_diag_overlap: u64,         // # nodes with at least one overlapping pair
+    pub split_diag_disjoint: u64,        // # nodes where all pairs are disjoint (≥2 comps)
+    pub split_diag_single_component: u64,// # nodes with only one component (vacuous)
+    pub split_diag_disjoint_blocks_sum: u64,    // sum of block counts at disjoint nodes
+    pub split_diag_disjoint_max_block_sum: u64, // sum of max block sizes at disjoint nodes
+
+    // SPLIT rule (Mestel 2024) firing counters. Active when
+    // BBConfig::use_split_or_decompose is on.
+    pub split_rule_checked: u64,        // # times SPLIT rule entry point was hit
+    pub split_rule_overlap_found: u64,  // # times overlap detected → SPLIT would fire
+    pub split_rule_disjoint_found: u64, // # times disjoint → DECOMPOSE would fire
+    pub split_rule_applied: u64,        // # times SPLIT actually applied (Day 7+)
+
     // Bound cache & propagation
     pub bc_lookups: u64,
     pub bc_hits: u64,
@@ -145,6 +163,18 @@ impl AddAssign<&WhiddenRuleStats> for WhiddenRuleStats {
         self.tt_stores += rhs.tt_stores;
         self.tt_overwrites += rhs.tt_overwrites;
         self.mestel6_checks += rhs.mestel6_checks;
+
+        self.split_diag_nodes += rhs.split_diag_nodes;
+        self.split_diag_overlap += rhs.split_diag_overlap;
+        self.split_diag_disjoint += rhs.split_diag_disjoint;
+        self.split_diag_single_component += rhs.split_diag_single_component;
+        self.split_diag_disjoint_blocks_sum += rhs.split_diag_disjoint_blocks_sum;
+        self.split_diag_disjoint_max_block_sum += rhs.split_diag_disjoint_max_block_sum;
+
+        self.split_rule_checked += rhs.split_rule_checked;
+        self.split_rule_overlap_found += rhs.split_rule_overlap_found;
+        self.split_rule_disjoint_found += rhs.split_rule_disjoint_found;
+        self.split_rule_applied += rhs.split_rule_applied;
 
         self.bc_lookups += rhs.bc_lookups;
         self.bc_hits += rhs.bc_hits;

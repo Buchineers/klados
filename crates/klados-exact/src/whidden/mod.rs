@@ -18,6 +18,61 @@ use klados_core::{Instance, SolverStats, Tree};
 
 use crate::kernelize::{self, KernelizeConfig};
 
+std::thread_local! {
+    static SPLIT_DIAG_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+struct SplitDiagDepthDecrement;
+impl Drop for SplitDiagDepthDecrement {
+    fn drop(&mut self) {
+        SPLIT_DIAG_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// Prints the SPLIT diagnostic on drop. Holds a raw pointer to the
+/// solver's rule_stats so we can read final values regardless of which
+/// return path was taken. Safe because the guard lives strictly within
+/// the call frame that owns the WhiddenSolver.
+struct SplitDiagPrinter {
+    stats_ptr: *const WhiddenRuleStats,
+    n_input: u32,
+}
+impl Drop for SplitDiagPrinter {
+    fn drop(&mut self) {
+        let rs = unsafe { &*self.stats_ptr };
+        let n = rs.split_diag_nodes.max(1);
+        let avg_blocks = rs.split_diag_disjoint_blocks_sum as f64
+            / rs.split_diag_disjoint.max(1) as f64;
+        let avg_max_block = rs.split_diag_disjoint_max_block_sum as f64
+            / rs.split_diag_disjoint.max(1) as f64;
+        eprintln!(
+            "[split-diag] n_input={} sampled={} overlap={} ({:.1}%) disjoint={} ({:.1}%) single={} ({:.1}%) avg_blocks={:.2} avg_max_block={:.1}",
+            self.n_input,
+            rs.split_diag_nodes,
+            rs.split_diag_overlap,
+            100.0 * rs.split_diag_overlap as f64 / n as f64,
+            rs.split_diag_disjoint,
+            100.0 * rs.split_diag_disjoint as f64 / n as f64,
+            rs.split_diag_single_component,
+            100.0 * rs.split_diag_single_component as f64 / n as f64,
+            avg_blocks,
+            avg_max_block,
+        );
+        // Day 6: report SPLIT rule entry-point firing (only if checked).
+        if rs.split_rule_checked > 0 {
+            eprintln!(
+                "[split-rule] checked={} overlap_found={} ({:.1}%) disjoint_found={} ({:.1}%) applied={}",
+                rs.split_rule_checked,
+                rs.split_rule_overlap_found,
+                100.0 * rs.split_rule_overlap_found as f64 / rs.split_rule_checked as f64,
+                rs.split_rule_disjoint_found,
+                100.0 * rs.split_rule_disjoint_found as f64 / rs.split_rule_checked as f64,
+                rs.split_rule_applied,
+            );
+        }
+    }
+}
+
 pub struct WhiddenSolver {
     stats: SolverStats,
     rule_stats: WhiddenRuleStats,
@@ -32,10 +87,15 @@ impl Default for WhiddenSolver {
 
 impl WhiddenSolver {
     pub fn new() -> Self {
+        let mut bb_config = BBConfig::default();
+        // Env-var gate for the new split-or-decompose path (Day 6+).
+        if std::env::var("KLADOS_WHIDDEN_SPLIT_OR_DECOMPOSE").is_ok() {
+            bb_config.use_split_or_decompose = true;
+        }
         Self {
             stats: SolverStats::default(),
             rule_stats: WhiddenRuleStats::default(),
-            bb_config: BBConfig::default(),
+            bb_config,
         }
     }
 
@@ -79,6 +139,11 @@ impl WhiddenSolver {
         self
     }
 
+    pub fn with_split_or_decompose(mut self, enabled: bool) -> Self {
+        self.bb_config.use_split_or_decompose = enabled;
+        self
+    }
+
     fn merge_subsolver_stats(&mut self, sub: &WhiddenSolver) {
         self.stats.nodes_explored += sub.stats.nodes_explored;
         self.stats.branches_pruned += sub.stats.branches_pruned;
@@ -102,6 +167,22 @@ impl WhiddenSolver {
         instance: &Instance,
         mut progress: Option<&mut dyn FnMut(WhiddenProgressUpdate)>,
     ) -> Option<Vec<Tree>> {
+        let entry_depth = SPLIT_DIAG_DEPTH.with(|d| {
+            let v = d.get();
+            d.set(v + 1);
+            v
+        });
+        let _decr = SplitDiagDepthDecrement;
+        let is_outermost = entry_depth == 0;
+        // Diagnostic print runs unconditionally on outermost exit via Drop.
+        let _diag_guard = if is_outermost && std::env::var("KLADOS_WHIDDEN_SPLIT_DIAG").is_ok() {
+            Some(SplitDiagPrinter {
+                stats_ptr: &self.rule_stats as *const _,
+                n_input: instance.num_leaves,
+            })
+        } else {
+            None
+        };
         // Whidden is 2-tree only; fall back to SAT solver for multi-tree instances.
         if instance.num_trees() != 2 {
             eprintln!("[whidden] m={}, falling back to sat", instance.num_trees());
@@ -168,6 +249,9 @@ impl WhiddenSolver {
             cb,
         );
         self.rule_stats.k_total_elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+        // Diag print happens via _diag_guard Drop on return.
+        let _ = is_outermost;
 
         reduced_result.map(|components| {
             kernelize::expand_solution(components, &kern, &instance.trees[0], instance.num_leaves)

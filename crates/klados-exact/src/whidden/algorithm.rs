@@ -102,6 +102,14 @@ pub struct BBConfig {
     /// Apply a narrow version of Mestel et al. branching rule 6 when the
     /// current 3-component state matches its rooted overlap pattern.
     pub mestel_rule6: bool,
+
+    /// Apply Mestel et al. (2024) full split-or-decompose framework
+    /// before falling back to Whidden's case-based branching. When
+    /// components have overlapping embeddings in T1, branch via SPLIT
+    /// (Lemma 1's splitting core). When disjoint, apply DECOMPOSE
+    /// (recursion rule). Off by default — gated for safety until
+    /// validated.
+    pub use_split_or_decompose: bool,
 }
 
 impl Default for BBConfig {
@@ -135,6 +143,7 @@ impl Default for BBConfig {
             bound_cache_enabled: false,
             bound_cache_size_log2: 20,
             mestel_rule6: false,
+            use_split_or_decompose: false,
         }
     }
 }
@@ -170,6 +179,7 @@ impl BBConfig {
             bound_cache_enabled: false,
             bound_cache_size_log2: 20,
             mestel_rule6: false,
+            use_split_or_decompose: false,
         }
     }
 
@@ -458,11 +468,11 @@ where
                 k_attempts: rule_stats.k_attempts,
                 k_elapsed_ms,
                 nodes_explored: stats.nodes_explored,
-                solved: result >= 0,
+                solved: result.is_some(),
             });
         }
 
-        if result >= 0 {
+        if result.is_some() {
             rule_stats.k_success = Some(k);
             rule_stats.current_k = None;
             return Some(extract_components(&tf));
@@ -488,7 +498,7 @@ fn branch_and_bound(
     tt: &mut Option<TranspositionTable>,
     bc: &mut Option<BoundCache>,
     parent_bounds: ParentBounds,
-) -> i32 {
+) -> Option<u32> {
     bb_inner(
         tf,
         &mut k,
@@ -505,6 +515,17 @@ fn branch_and_bound(
 
 /// Inner B&B with optional forced pair (from CUT_ALL_B).
 /// When `forced_pair` is Some, skip pair scanning and use it directly.
+///
+/// **Return semantics (optimization framing)**: `Some(c)` means a MAF was
+/// found using `c` cuts within the budget `*k`. `None` means no feasible
+/// MAF exists within the budget. Under the outer iterative-deepening loop
+/// (which calls bb_inner with progressively larger budgets), the first
+/// successful budget gives the optimum, so "first success" semantics is
+/// equivalent to "min over branches" at that point.
+///
+/// The Mestel split-or-decompose rules (Phase 2/3) will take MIN over
+/// branches explicitly when the recursion rule's sub-instances need exact
+/// per-sub minimums.
 fn bb_inner(
     tf: &mut TwinForest,
     k: &mut i32,
@@ -516,8 +537,19 @@ fn bb_inner(
     bc: &mut Option<BoundCache>,
     parent_bounds: ParentBounds,
     forced_pair: Option<(NodeId, NodeId)>,
-) -> i32 {
+) -> Option<u32> {
     stats.nodes_explored += 1;
+
+    // SPLIT diagnostic — gated env var, sampled every 50 nodes to keep cost
+    // bounded. Reads `KLADOS_WHIDDEN_SPLIT_DIAG` once via a lazy static.
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        let on = *ENABLED.get_or_init(|| std::env::var("KLADOS_WHIDDEN_SPLIT_DIAG").is_ok());
+        if on && stats.nodes_explored % 50 == 0 {
+            split_diag_check(tf, rule_stats);
+        }
+    }
 
     // Macro for TT store on failure.
     macro_rules! tt_store_fail {
@@ -533,7 +565,7 @@ fn bb_inner(
         // Process singletons first (some may have been created by the B-cut)
         if !process_singletons(tf, k, um, rule_stats) {
             tt_store_fail!(tt, tf, *k, rule_stats);
-            return -1;
+            return None;
         }
         if config.mestel_rule6 {
             match try_mestel_rule6(tf, k, um, rule_stats) {
@@ -554,7 +586,7 @@ fn bb_inner(
                 MestelRule6Result::ExhaustedBudget => {
                     rule_stats.prune_k_exhausted += 1;
                     tt_store_fail!(tt, tf, *k, rule_stats);
-                    return -1;
+                    return None;
                 }
                 MestelRule6Result::NotApplicable => {}
             }
@@ -588,14 +620,14 @@ fn bb_inner(
                         if *k <= 0 {
                             rule_stats.prune_k_exhausted += 1;
                             tt_store_fail!(tt, tf, *k, rule_stats);
-                            return -1;
+                            return None;
                         }
                         let (should_prune, bounds) =
                             bb_should_prune(tf, um, *k, config, bc, parent_bounds, rule_stats);
                         if should_prune {
                             rule_stats.prune_bb_approx += 1;
                             tt_store_fail!(tt, tf, *k, rule_stats);
-                            return -1;
+                            return None;
                         }
                         // Force cut_b_only for the CAB forced pair
                         let result = do_case3_branch(
@@ -618,7 +650,7 @@ fn bb_inner(
                             false,
                             path_length,
                         );
-                        if result < 0 {
+                        if result.is_none() {
                             tt_store_fail!(tt, tf, *k, rule_stats);
                         }
                         return result;
@@ -637,7 +669,42 @@ fn bb_inner(
         // --- Phase 1: Process singletons ---
         if !process_singletons(tf, k, um, rule_stats) {
             tt_store_fail!(tt, tf, *k, rule_stats);
-            return -1; // k went negative
+            return None; // k went negative
+        }
+
+        // --- Mestel split-or-decompose entry point (Day 6 infrastructure;
+        //     actual branching arrives in Day 7+). When the SPLIT/DECOMPOSE
+        //     rule matches, this returns Applied(...) and we use that
+        //     result instead of Whidden's case-based branching. Otherwise
+        //     falls through.
+        match try_split_or_decompose(tf, k, um, stats, rule_stats, config) {
+            SplitRuleResult::NotApplicable => {}
+            SplitRuleResult::Applied(None) => {
+                // Budget exhausted inside SoD or sub-solver failed — prune.
+                tt_store_fail!(tt, tf, *k, rule_stats);
+                return None;
+            }
+            SplitRuleResult::Applied(Some(cuts)) => {
+                if cuts == 0 {
+                    // SoD claims success with zero cuts (all sub-MAFs are
+                    // trivial). Don't loop — let Whidden's normal flow
+                    // (case2 contracts, singleton processing) make
+                    // tangible progress instead.
+                } else {
+                    rule_stats.split_rule_applied += 1;
+                    // Charge the SoD cuts against the budget so the
+                    // remainder of the search (process_singletons +
+                    // normal branching, which projects T2 cuts into T1
+                    // components) sees the correct remaining budget.
+                    *k -= cuts as i32;
+                    if *k < 0 {
+                        rule_stats.prune_k_exhausted += 1;
+                        tt_store_fail!(tt, tf, *k, rule_stats);
+                        return None;
+                    }
+                    continue;
+                }
+            }
         }
 
         if config.mestel_rule6 {
@@ -646,7 +713,7 @@ fn bb_inner(
                 MestelRule6Result::ExhaustedBudget => {
                     rule_stats.prune_k_exhausted += 1;
                     tt_store_fail!(tt, tf, *k, rule_stats);
-                    return -1;
+                    return None;
                 }
                 MestelRule6Result::NotApplicable => {}
             }
@@ -659,7 +726,7 @@ fn bb_inner(
                 rule_stats.tt_hits += 1;
                 if config.tt_prune {
                     rule_stats.tt_prunes += 1;
-                    return -1; // no store needed: already in TT
+                    return None; // no store needed: already in TT
                 }
             }
         }
@@ -668,7 +735,10 @@ fn bb_inner(
         match find_sibling_pair(tf, config, rule_stats) {
             PairResult::NoPairs => {
                 rule_stats.action_done += 1;
-                return *k;
+                // Phase 1: value is placeholder; under iterative deepening
+                // first-success semantics is sufficient. Phase 2/3 will
+                // replace with actual cut counts for SPLIT/DECOMPOSE rules.
+                return Some(0);
             }
             PairResult::Case2 {
                 t1_parent,
@@ -693,14 +763,14 @@ fn bb_inner(
                 if *k <= 0 {
                     rule_stats.prune_k_exhausted += 1;
                     tt_store_fail!(tt, tf, *k, rule_stats);
-                    return -1;
+                    return None;
                 }
                 let (should_prune, bounds) =
                     bb_should_prune(tf, um, *k, config, bc, parent_bounds, rule_stats);
                 if should_prune {
                     rule_stats.prune_bb_approx += 1;
                     tt_store_fail!(tt, tf, *k, rule_stats);
-                    return -1;
+                    return None;
                 }
                 let result = do_case3_branch(
                     tf,
@@ -722,7 +792,7 @@ fn bb_inner(
                     cut_c_only,
                     path_length,
                 );
-                if result < 0 {
+                if result.is_none() {
                     tt_store_fail!(tt, tf, *k, rule_stats);
                 }
                 return result;
@@ -1413,6 +1483,913 @@ fn find_edge_with_descendant_leafset(
     found
 }
 
+/// Result of `detect_overlap`: the structural shape of `F'`'s components
+/// relative to their embeddings in T1. Drives Mestel's split-or-decompose
+/// rules.
+pub(super) enum OverlapResult {
+    /// Only one (or zero) components — neither SPLIT nor DECOMPOSE applies.
+    SingleComponent,
+    /// All components have pairwise disjoint T1-embeddings.
+    /// DECOMPOSE rule applies: solve each sub-instance independently.
+    AllDisjoint {
+        components: Vec<ComponentShape>,
+    },
+    /// At least two components share a T1 edge.
+    /// SPLIT rule applies: branch on which component "wins" the shared edge.
+    Overlap {
+        components: Vec<ComponentShape>,
+        comp_a: usize,
+        comp_b: usize,
+        /// The shared T1 edge (identified by its child NodeId).
+        shared_edge_t1: NodeId,
+    },
+}
+
+/// Detect overlapping vs disjoint component embeddings in T1.
+/// Deterministic choice of overlap pair (smallest shared edge, then
+/// smallest comp_a, then smallest comp_b) for reproducibility.
+pub(super) fn detect_overlap(tf: &TwinForest) -> OverlapResult {
+    let components = collect_component_shapes(tf);
+    if components.len() < 2 {
+        return OverlapResult::SingleComponent;
+    }
+
+    // Map each T1 edge → list of component indices that claim it.
+    use std::collections::HashMap;
+    let mut edge_uses: HashMap<NodeId, Vec<usize>> = HashMap::new();
+    for (idx, comp) in components.iter().enumerate() {
+        for &edge in &comp.t1_edges {
+            edge_uses.entry(edge).or_default().push(idx);
+        }
+    }
+
+    // Find first overlap edge in deterministic order.
+    let mut overlap_edges: Vec<_> = edge_uses
+        .into_iter()
+        .filter(|(_, comps)| comps.len() >= 2)
+        .collect();
+    if overlap_edges.is_empty() {
+        return OverlapResult::AllDisjoint { components };
+    }
+    overlap_edges.sort_by_key(|(edge, _)| *edge);
+    let (edge, mut comps) = overlap_edges.into_iter().next().unwrap();
+    comps.sort_unstable();
+    OverlapResult::Overlap {
+        components,
+        comp_a: comps[0],
+        comp_b: comps[1],
+        shared_edge_t1: edge,
+    }
+}
+
+/// A single cut in a splitting core: a set of T1 edges whose simultaneous
+/// removal splits T1 with respect to a bipartition. Each edge is
+/// identified by its child NodeId (the edge from parent to that child).
+pub(super) type SplittingCut = Vec<NodeId>;
+
+/// Classify a subtree relative to the (Y, Z) bipartition.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SubtreeClass {
+    Empty,
+    PureY,
+    PureZ,
+    Mixed,
+}
+
+fn classify_labels(labels: &FixedBitSet, y_labels: &FixedBitSet) -> SubtreeClass {
+    let mut has_y = false;
+    let mut has_z = false;
+    for lbl in labels.ones() {
+        if y_labels.contains(lbl) {
+            has_y = true;
+        } else {
+            has_z = true;
+        }
+        if has_y && has_z {
+            return SubtreeClass::Mixed;
+        }
+    }
+    match (has_y, has_z) {
+        (true, false) => SubtreeClass::PureY,
+        (false, true) => SubtreeClass::PureZ,
+        (true, true) => SubtreeClass::Mixed,
+        (false, false) => SubtreeClass::Empty,
+    }
+}
+
+/// Collect labels in active that fall within v's subtree in T1.
+fn active_labels_under(
+    tf: &TwinForest,
+    v: NodeId,
+    active: &FixedBitSet,
+) -> FixedBitSet {
+    let mut out = FixedBitSet::with_capacity(active.len());
+    let mut stack = vec![v];
+    while let Some(n) = stack.pop() {
+        if n == NONE {
+            continue;
+        }
+        if tf.is_leaf(T1, n) {
+            let lbl = tf.label[T1][n as usize] as usize;
+            if lbl > 0 && active.contains(lbl) {
+                out.insert(lbl);
+            }
+        } else {
+            let lc = tf.left[T1][n as usize];
+            let rc = tf.right[T1][n as usize];
+            if lc != NONE {
+                stack.push(lc);
+            }
+            if rc != NONE {
+                stack.push(rc);
+            }
+        }
+    }
+    out
+}
+
+/// Find the "embedding-child" of `v` reached by descending into `child`
+/// (which is one of v.left or v.right). Suppresses degree-2 embedding
+/// nodes: keeps descending while exactly one of the current node's
+/// children contains active labels.
+///
+/// Returns the NodeId of the embedding-child (the next embedding node
+/// down that subtree, or a leaf if a single active label is reached).
+/// Returns None if the subtree has no active labels.
+fn embedding_descent(
+    tf: &TwinForest,
+    child: NodeId,
+    active: &FixedBitSet,
+) -> Option<NodeId> {
+    if child == NONE {
+        return None;
+    }
+    let mut cur = child;
+    loop {
+        if tf.is_leaf(T1, cur) {
+            let lbl = tf.label[T1][cur as usize] as usize;
+            if lbl > 0 && active.contains(lbl) {
+                return Some(cur);
+            }
+            return None;
+        }
+        let lc = tf.left[T1][cur as usize];
+        let rc = tf.right[T1][cur as usize];
+        let left_has = lc != NONE
+            && active_labels_under(tf, lc, active).count_ones(..) > 0;
+        let right_has = rc != NONE
+            && active_labels_under(tf, rc, active).count_ones(..) > 0;
+        match (left_has, right_has) {
+            (true, true) => return Some(cur),
+            (true, false) => cur = lc,
+            (false, true) => cur = rc,
+            (false, false) => return None,
+        }
+    }
+}
+
+/// Splitting core (Mestel 2024, Lemma 1).
+///
+/// For a binary tree T (implicit: T1 restricted to `leafset`) and the
+/// bipartition `(Y, Z)` of its labels where `Y = y_labels ∩ leafset`,
+/// returns a set of cuts `C = {K_1, ..., K_n}` such that:
+///   - every cut that splits the tree w.r.t. `(Y, Z)` refines some `K_i ∈ C`
+///   - `Σ_{K ∈ C} 2^(-|K|) ≤ 1/2`
+///
+/// **Algorithm:**
+/// - Base case: if T's labels split cleanly across a single embedding
+///   edge `e` (one side all-Y, other all-Z), return `{{e}}`.
+/// - Inductive case: find an embedding node `v` with three pendant
+///   subtrees of classes `(PureY, PureZ, Mixed)`. Let the corresponding
+///   edges be `e_1, e_2, e_3` respectively. Recurse on `T \ pure_Y_pendant`
+///   and `T \ pure_Z_pendant`, get cores `C_1, C_2`. Return
+///   `{K ∪ {e_1} | K ∈ C_1} ∪ {K ∪ {e_2} | K ∈ C_2}`.
+///
+/// **Edge identification:** an edge is named by its child-side NodeId in T1.
+pub(super) fn splitting_core(
+    tf: &TwinForest,
+    embedding_root: NodeId,
+    leafset: &FixedBitSet,
+    y_labels: &FixedBitSet,
+) -> Vec<SplittingCut> {
+    splitting_core_impl(tf, embedding_root, leafset, y_labels)
+}
+
+fn splitting_core_impl(
+    tf: &TwinForest,
+    embedding_root: NodeId,
+    active: &FixedBitSet,
+    y_labels: &FixedBitSet,
+) -> Vec<SplittingCut> {
+    // Trivial cases.
+    if embedding_root == NONE || active.count_ones(..) <= 1 {
+        return Vec::new();
+    }
+    // Step 1: base case — does a single embedding edge split the tree?
+    if let Some(e) = single_edge_split(tf, embedding_root, active, y_labels) {
+        return vec![vec![e]];
+    }
+    // Step 2: inductive case — find a (PureY, PureZ, Mixed) pattern at
+    // some embedding node, recurse.
+    let Some(pat) = find_split_pattern(tf, embedding_root, active, y_labels) else {
+        // Shouldn't happen by the paper's claim, but be defensive.
+        return Vec::new();
+    };
+
+    // Recurse on T \ pendant_y. The new active set excludes pendant_y's
+    // leaves. The new tree's root is unchanged (the pendant being removed
+    // is not the root). y_labels restricted to new active is computed.
+    let new_active_1 = {
+        let mut s = active.clone();
+        s.difference_with(&pat.pendant_y_labels);
+        s
+    };
+    let new_active_2 = {
+        let mut s = active.clone();
+        s.difference_with(&pat.pendant_z_labels);
+        s
+    };
+    // Find the new embedding root in each recursive call. Removing a
+    // pendant may make the original root degree-2 in the new embedding,
+    // so we descend to find the new branching root.
+    let new_root_1 = re_root_embedding(tf, embedding_root, &new_active_1);
+    let new_root_2 = re_root_embedding(tf, embedding_root, &new_active_2);
+
+    let core_1 = splitting_core_impl(tf, new_root_1, &new_active_1, y_labels);
+    let core_2 = splitting_core_impl(tf, new_root_2, &new_active_2, y_labels);
+
+    let mut out = Vec::with_capacity(core_1.len() + core_2.len());
+    for mut k in core_1 {
+        k.push(pat.edge_y);
+        out.push(k);
+    }
+    for mut k in core_2 {
+        k.push(pat.edge_z);
+        out.push(k);
+    }
+
+    out
+}
+
+/// If a single embedding edge `e` cleanly bipartitions active labels into
+/// all-Y on one side and all-Z on the other, return `e`. Otherwise None.
+///
+/// Iterates over embedding edges (which are exactly the t1_edges of the
+/// component) and checks each.
+fn single_edge_split(
+    tf: &TwinForest,
+    embedding_root: NodeId,
+    active: &FixedBitSet,
+    y_labels: &FixedBitSet,
+) -> Option<NodeId> {
+    // The embedding edges are nodes `c` such that c has some active
+    // descendants and c is the child of some embedding-internal node.
+    // We enumerate them by walking T1 from the embedding root and
+    // checking each subtree's class.
+    let mut found: Option<NodeId> = None;
+    let mut walked_root_once = false;
+    walk_embedding(tf, embedding_root, active, &mut |c| {
+        if c == embedding_root {
+            // The root has no incoming embedding edge, skip.
+            walked_root_once = true;
+            return;
+        }
+        let below = active_labels_under(tf, c, active);
+        let below_class = classify_labels(&below, y_labels);
+        // Above = active \ below
+        let mut above = active.clone();
+        above.difference_with(&below);
+        let above_class = classify_labels(&above, y_labels);
+        // A clean single-edge split: below is pure (Y or Z) and above is
+        // pure of the opposite color.
+        let clean = matches!(
+            (below_class, above_class),
+            (SubtreeClass::PureY, SubtreeClass::PureZ)
+                | (SubtreeClass::PureZ, SubtreeClass::PureY)
+        );
+        if clean && found.is_none() {
+            found = Some(c);
+        }
+    });
+    let _ = walked_root_once;
+    found
+}
+
+/// Walk all embedding nodes reachable from `root`. For each, call
+/// `visit(node)`. An "embedding node" is one of:
+///   - the embedding root,
+///   - any T1 node with active labels in both its left and right subtrees,
+///   - any T1 leaf whose label is active.
+fn walk_embedding(
+    tf: &TwinForest,
+    root: NodeId,
+    active: &FixedBitSet,
+    visit: &mut impl FnMut(NodeId),
+) {
+    if root == NONE {
+        return;
+    }
+    if tf.is_leaf(T1, root) {
+        let lbl = tf.label[T1][root as usize] as usize;
+        if lbl > 0 && active.contains(lbl) {
+            visit(root);
+        }
+        return;
+    }
+    let lc = tf.left[T1][root as usize];
+    let rc = tf.right[T1][root as usize];
+    let left_has = lc != NONE && active_labels_under(tf, lc, active).count_ones(..) > 0;
+    let right_has = rc != NONE && active_labels_under(tf, rc, active).count_ones(..) > 0;
+    match (left_has, right_has) {
+        (true, true) => {
+            visit(root);
+            walk_embedding(tf, lc, active, visit);
+            walk_embedding(tf, rc, active, visit);
+        }
+        (true, false) => walk_embedding(tf, lc, active, visit),
+        (false, true) => walk_embedding(tf, rc, active, visit),
+        (false, false) => {}
+    }
+}
+
+/// Re-root the embedding after a pendant has been removed. Descends from
+/// the old root through degree-2 embedding nodes until reaching a true
+/// branching node (or a leaf).
+fn re_root_embedding(tf: &TwinForest, old_root: NodeId, active: &FixedBitSet) -> NodeId {
+    let mut cur = old_root;
+    while cur != NONE && !tf.is_leaf(T1, cur) {
+        let lc = tf.left[T1][cur as usize];
+        let rc = tf.right[T1][cur as usize];
+        let left_has = lc != NONE && active_labels_under(tf, lc, active).count_ones(..) > 0;
+        let right_has = rc != NONE && active_labels_under(tf, rc, active).count_ones(..) > 0;
+        match (left_has, right_has) {
+            (true, true) => return cur,
+            (true, false) => cur = lc,
+            (false, true) => cur = rc,
+            (false, false) => return NONE,
+        }
+    }
+    cur
+}
+
+struct SplitPattern {
+    /// The T1 NodeId at the branching point with the pattern
+    #[allow(dead_code)]
+    v: NodeId,
+    /// Embedding edge (child-side NodeId in T1) leading to pure-Y pendant
+    edge_y: NodeId,
+    /// Embedding edge leading to pure-Z pendant
+    edge_z: NodeId,
+    /// Embedding edge leading to mixed pendant (unused for recursion but
+    /// useful for debugging / verification)
+    #[allow(dead_code)]
+    edge_mixed: NodeId,
+    /// Labels in the pure-Y pendant
+    pendant_y_labels: FixedBitSet,
+    /// Labels in the pure-Z pendant
+    pendant_z_labels: FixedBitSet,
+}
+
+/// Find an embedding node `v` whose three incident pendants are
+/// `(PureY, PureZ, Mixed)` in some order. For rooted trees, the three
+/// pendants at an internal node `v` are its left embedding-child,
+/// its right embedding-child, and "outside `v`'s subtree" (= active \
+/// labels_under(v)).
+///
+/// Returns the pattern info if found.
+fn find_split_pattern(
+    tf: &TwinForest,
+    embedding_root: NodeId,
+    active: &FixedBitSet,
+    y_labels: &FixedBitSet,
+) -> Option<SplitPattern> {
+    let mut result: Option<SplitPattern> = None;
+    walk_embedding(tf, embedding_root, active, &mut |v| {
+        if result.is_some() {
+            return;
+        }
+        if tf.is_leaf(T1, v) {
+            return;
+        }
+        // Embedding children of v.
+        let lc = tf.left[T1][v as usize];
+        let rc = tf.right[T1][v as usize];
+        let lc_emb = embedding_descent(tf, lc, active);
+        let rc_emb = embedding_descent(tf, rc, active);
+        let (lc_emb, rc_emb) = match (lc_emb, rc_emb) {
+            (Some(a), Some(b)) => (a, b),
+            _ => return,
+        };
+        let left_labels = active_labels_under(tf, lc_emb, active);
+        let right_labels = active_labels_under(tf, rc_emb, active);
+        // Outside labels = active - labels under v.
+        let under_v = active_labels_under(tf, v, active);
+        let mut outside = active.clone();
+        outside.difference_with(&under_v);
+
+        let left_cls = classify_labels(&left_labels, y_labels);
+        let right_cls = classify_labels(&right_labels, y_labels);
+        let outside_cls = classify_labels(&outside, y_labels);
+
+        // Check for (PureY, PureZ, Mixed) pattern in any arrangement.
+        let classes = [
+            (left_cls, lc_emb, &left_labels),
+            (right_cls, rc_emb, &right_labels),
+            (outside_cls, NONE, &outside), // edge for outside has no NodeId
+        ];
+        let pure_y = classes.iter().find(|(c, _, _)| *c == SubtreeClass::PureY);
+        let pure_z = classes.iter().find(|(c, _, _)| *c == SubtreeClass::PureZ);
+        let mixed = classes.iter().find(|(c, _, _)| *c == SubtreeClass::Mixed);
+        let (Some(y_info), Some(z_info), Some(m_info)) = (pure_y, pure_z, mixed) else {
+            return;
+        };
+        // The outside slot has no edge NodeId — pattern requires the
+        // pure-Y AND pure-Z to be on child sides (so we have edges to
+        // them). Only the mixed slot may be "outside".
+        if y_info.1 == NONE || z_info.1 == NONE {
+            return;
+        }
+        result = Some(SplitPattern {
+            v,
+            edge_y: y_info.1,
+            edge_z: z_info.1,
+            edge_mixed: m_info.1,
+            pendant_y_labels: y_info.2.clone(),
+            pendant_z_labels: z_info.2.clone(),
+        });
+    });
+    result
+}
+
+/// Verify the splitting core's inequality at runtime. Asserts in debug
+/// builds, returns the inequality value (which must be ≤ 0.5).
+#[cfg(test)]
+pub(super) fn splitting_core_inequality(core: &[SplittingCut]) -> f64 {
+    core.iter()
+        .map(|k| 2f64.powi(-(k.len() as i32)))
+        .sum::<f64>()
+}
+
+/// Result of the SPLIT rule entry point.
+pub(super) enum SplitRuleResult {
+    /// SPLIT rule not applicable (single component, or config gate off).
+    NotApplicable,
+    /// Applied SPLIT (or DECOMPOSE in Phase 3) — caller should use this
+    /// result instead of falling through to Whidden's case-based logic.
+    /// `Some(c)` = MAF found with `c` cuts; `None` = no MAF within budget.
+    Applied(Option<u32>),
+}
+
+/// Entry point for Mestel's split-or-decompose framework. Detects the
+/// current state, and:
+///   - On `Overlap`: applies SPLIT rule (Day 7+: actually branches).
+///   - On `AllDisjoint`: applies DECOMPOSE rule (Day 7+: recursion).
+///   - On `SingleComponent`: returns NotApplicable.
+///
+/// **Day 6 status**: detection + stats only. Actual SPLIT/DECOMPOSE
+/// branching is Day 7's work. When this function detects overlap or
+/// disjoint state, it counts it in `split_rule_*` but returns
+/// `NotApplicable` so the existing Whidden branching takes over.
+///
+/// **Gated** by `BBConfig::use_split_or_decompose`.
+pub(super) fn try_split_or_decompose(
+    tf: &mut TwinForest,
+    _k: &mut i32,
+    um: &mut UndoMachine,
+    _stats: &mut SolverStats,
+    rule_stats: &mut WhiddenRuleStats,
+    config: &BBConfig,
+) -> SplitRuleResult {
+    if !config.use_split_or_decompose {
+        return SplitRuleResult::NotApplicable;
+    }
+    rule_stats.split_rule_checked += 1;
+    match detect_overlap(tf) {
+        OverlapResult::SingleComponent => SplitRuleResult::NotApplicable,
+        OverlapResult::Overlap { .. } => {
+            rule_stats.split_rule_overlap_found += 1;
+            // Day 7+: implement actual SPLIT branching here.
+            // For now, fall through to Whidden's existing logic so we
+            // don't break correctness while infrastructure is built.
+            SplitRuleResult::NotApplicable
+        }
+        OverlapResult::AllDisjoint { components } => {
+            rule_stats.split_rule_disjoint_found += 1;
+            let substantive: Vec<&ComponentShape> = components
+                .iter()
+                .filter(|c| c.leafset.count_ones(..) >= 2)
+                .collect();
+            if substantive.len() < 2 {
+                return SplitRuleResult::NotApplicable;
+            }
+            // Performance guard: don't bother decomposing when every
+            // substantive component is small enough that Whidden's
+            // case2/case3 will dispatch them quickly. Only fire SoD when
+            // at least one component is genuinely large.
+            let max_count = substantive.iter()
+                .map(|c| c.leafset.count_ones(..))
+                .max()
+                .unwrap_or(0);
+            // Cheap-out when no component is large enough for DECOMPOSE
+            // to plausibly save work over Whidden's case2/case3. Whidden's
+            // contracts already handle the trivial blocks fast; SoD only
+            // pays off when sub-MAFs do non-trivial work, which requires
+            // at least one substantive component of meaningful size.
+            if max_count < 4 {
+                return SplitRuleResult::NotApplicable;
+            }
+            match apply_decompose(tf, um, *_k, &substantive) {
+                Some(total_cuts) => SplitRuleResult::Applied(Some(total_cuts)),
+                None => SplitRuleResult::Applied(None),
+            }
+        }
+    }
+}
+
+/// Translate a sub-MAF (one Tree per sub-component, with relabeled leaves)
+/// into actual T2 cuts in `tf`. Each cut separates two adjacent
+/// sub-components in the main `tf`'s T2 subtree rooted at `component_root`.
+///
+/// **Algorithm**:
+/// 1. Color each leaf in main `tf` by which sub-MAF component it belongs to.
+/// 2. DFS the T2 subtree bottom-up, deciding cuts: at each internal node
+///    `v` with children `L` and `R` whose "anchor colors" (the color of
+///    the leaves still connected to `v` via that side) differ, record one
+///    cut (the edge to `L` or `R` — picked deterministically).
+/// 3. Apply recorded cuts in deepest-first order (so each cut's child
+///    edge is still alive when applied).
+///
+/// Returns the actual number of cuts applied. Each cut is registered with
+/// `um` so backtracking works.
+fn apply_sub_maf_cuts(
+    tf: &mut TwinForest,
+    um: &mut UndoMachine,
+    component_root: NodeId,
+    sub_maf: &[Tree],
+    label_to_orig: &[klados_core::tree::Label],
+) -> u32 {
+    if sub_maf.len() <= 1 {
+        return 0;
+    }
+    let n = tf.num_leaves as usize + 1;
+    // leaf_color[orig_label] = sub-component id, or -1 if unassigned.
+    //
+    // sub_tree.num_leaves is the per-component count; iterating
+    // 1..=sub_tree.num_leaves only covers low labels and misses any leaf
+    // whose label exceeds the component's leaf count. Instead, iterate
+    // over `label_to_orig`'s entire label space and check which sub-tree
+    // claims that label via label_to_node[lbl] != NONE.
+    let mut leaf_color: Vec<i32> = vec![-1; n];
+    for new_lbl in 1..label_to_orig.len() {
+        let orig_lbl = label_to_orig[new_lbl] as usize;
+        if orig_lbl == 0 || orig_lbl >= n {
+            continue;
+        }
+        for (sub_id, sub_tree) in sub_maf.iter().enumerate() {
+            if new_lbl < sub_tree.label_to_node.len()
+                && sub_tree.label_to_node[new_lbl] != NONE
+            {
+                leaf_color[orig_lbl] = sub_id as i32;
+                break;
+            }
+        }
+    }
+
+    // Compute total per-color leaf counts in this T2 subtree.
+    let num_colors = sub_maf.len();
+    let mut total_count: Vec<u32> = vec![0; num_colors];
+    {
+        let mut visited = std::collections::HashSet::new();
+        let mut stack = vec![component_root];
+        while let Some(node) = stack.pop() {
+            if node == NONE || !visited.insert(node) { continue; }
+            if tf.is_leaf(T2, node) {
+                let lbl = tf.label[T2][node as usize] as usize;
+                if lbl != 0 && lbl < leaf_color.len() {
+                    let c = leaf_color[lbl];
+                    if c >= 0 && (c as usize) < num_colors {
+                        total_count[c as usize] += 1;
+                    }
+                }
+            } else {
+                let l = tf.left[T2][node as usize];
+                let r = tf.right[T2][node as usize];
+                if l != NONE { stack.push(l); }
+                if r != NONE && r != l { stack.push(r); }
+            }
+        }
+    }
+
+    // Pass 1: bottom-up DFS computing per-color leaf counts in each subtree.
+    // Cut edge (parent, v) iff for every color c in subtree(v),
+    // counts_v[c] == total_count[c] (all c-leaves are inside subtree(v)).
+    // Equivalently: subtree(v) is a complete-and-separable color block.
+    // Skip the root: we don't cut above the component root.
+    let mut cuts_to_make: Vec<NodeId> = Vec::new();
+    fn count_colors(
+        tf: &TwinForest,
+        node: NodeId,
+        leaf_color: &[i32],
+        total_count: &[u32],
+        cuts_to_make: &mut Vec<NodeId>,
+        is_root: bool,
+    ) -> Vec<u32> {
+        let nc = total_count.len();
+        if node == NONE {
+            return vec![0; nc];
+        }
+        if tf.is_leaf(T2, node) {
+            let mut counts = vec![0u32; nc];
+            let lbl = tf.label[T2][node as usize] as usize;
+            if lbl != 0 && lbl < leaf_color.len() {
+                let c = leaf_color[lbl];
+                if c >= 0 && (c as usize) < nc {
+                    counts[c as usize] = 1;
+                }
+            }
+            // Even leaves can be "cut": isolating a single-leaf component.
+            // But only if not root and the leaf's color is wholly contained.
+            // For singletons (color appears once in T2 subtree), this is
+            // always self-contained, so the leaf can be cut.
+            if !is_root && counts.iter().enumerate().all(|(c, &n)| n == 0 || n == total_count[c]) {
+                cuts_to_make.push(node);
+            }
+            return counts;
+        }
+        let lc = tf.left[T2][node as usize];
+        let rc = tf.right[T2][node as usize];
+        let mut counts = vec![0u32; nc];
+        // Degenerate degree-1: `left == right` — recurse only once.
+        if lc != NONE && lc == rc {
+            let sub = count_colors(tf, lc, leaf_color, total_count, cuts_to_make, false);
+            for i in 0..nc { counts[i] += sub[i]; }
+        } else {
+            if lc != NONE {
+                let sub = count_colors(tf, lc, leaf_color, total_count, cuts_to_make, false);
+                for i in 0..nc { counts[i] += sub[i]; }
+            }
+            if rc != NONE {
+                let sub = count_colors(tf, rc, leaf_color, total_count, cuts_to_make, false);
+                for i in 0..nc { counts[i] += sub[i]; }
+            }
+        }
+        // Decide cut on the edge from this node up to its parent.
+        // Cut iff subtree is "color-complete" (every color in this subtree
+        // has all its leaves in this subtree). Skip for root.
+        if !is_root {
+            let any = counts.iter().any(|&n| n > 0);
+            let complete = counts.iter().enumerate().all(|(c, &n)| n == 0 || n == total_count[c]);
+            if any && complete {
+                cuts_to_make.push(node);
+            }
+        }
+        counts
+    }
+    let _ = count_colors(
+        tf, component_root, &leaf_color, &total_count, &mut cuts_to_make, true,
+    );
+
+    // The bottom-up pass can record nested cuts (e.g., a leaf and its
+    // parent when both are color-complete). Keep only the SHALLOWEST: a
+    // cut at an ancestor makes descendant cuts redundant. Walk from each
+    // queued cut up to the root; drop the cut if an ancestor is queued.
+    let queued: std::collections::HashSet<NodeId> = cuts_to_make.iter().copied().collect();
+    let cuts_to_make: Vec<NodeId> = cuts_to_make
+        .iter()
+        .copied()
+        .filter(|&child| {
+            let mut cur = tf.parent[T2][child as usize];
+            while cur != NONE {
+                if queued.contains(&cur) {
+                    return false;
+                }
+                cur = tf.parent[T2][cur as usize];
+            }
+            true
+        })
+        .collect();
+
+    // Pass 2: apply cuts in deepest-first order. Each cut: cut_parent +
+    // add_component + contract on the parent (so the tree maintains
+    // proper degree-2 internals). The contract may propagate up the
+    // chain and, if it reaches a component root that was already in
+    // tf.components[T2], splice that root out and replace it. Caller
+    // (apply_decompose) re-resolves t2_roots by walking from leaves to
+    // handle this case.
+    let mut applied = 0u32;
+    for &child in &cuts_to_make {
+        let parent = tf.parent[T2][child as usize];
+        if parent == NONE {
+            continue;
+        }
+        undo::cut_parent(tf, T2, child, um);
+        undo::add_component(tf, T2, child, um);
+        undo::contract(tf, T2, parent, um);
+        applied += 1;
+    }
+    applied
+}
+
+/// Find the current T2 component root that contains the given leaf label.
+/// Walks up from the leaf's T2 node via parent pointers to find a node
+/// with no parent (= a component root).
+fn find_t2_component_root_for_leaf(tf: &TwinForest, leaf_label: usize) -> NodeId {
+    let n = tf.label_to_node[T2][leaf_label];
+    if n == NONE {
+        return NONE;
+    }
+    let mut cur = n;
+    loop {
+        let p = tf.parent[T2][cur as usize];
+        if p == NONE {
+            return cur;
+        }
+        cur = p;
+    }
+}
+
+/// Mestel DECOMPOSE rule: solve each disjoint component as an
+/// independent sub-instance, sum the cuts.
+///
+/// Implementation: for each component, construct a sub-Instance with
+/// T1 restricted to the component's leafset and T2 restricted to the
+/// component's t2 subtree. Solve via a fresh `WhiddenSolver`. Sum the
+/// cut counts (= forest size − 1).
+///
+/// Returns `Some(total_cuts)` if all sub-instances solved successfully,
+/// `None` otherwise.
+///
+/// **Budget**: each sub-instance is bounded by the parent's remaining
+/// budget `k_remaining`, simplified from the paper's two-phase recursion
+/// rule. The paper's phase 1 (test each sub at depth `t=1` first) is a
+/// performance optimization we can add later — this version is correct
+/// but may do redundant work on subs that are trivially `0`.
+fn apply_decompose(
+    tf: &mut TwinForest,
+    um: &mut UndoMachine,
+    k_remaining: i32,
+    substantive: &[&ComponentShape],
+) -> Option<u32> {
+    if k_remaining < 0 {
+        return None;
+    }
+    let budget = k_remaining as u32;
+
+    // Build the original T1 once; we'll relabel it per component.
+    let t1_orig = tree_from_original(tf);
+
+    let mut total_cuts: u32 = 0;
+    for comp in substantive.iter() {
+        let leafset = &comp.leafset;
+        let count = leafset.count_ones(..);
+        if count <= 1 {
+            continue;
+        }
+        // Re-resolve this component's CURRENT t2_root by walking up from
+        // any of its leaves. Earlier cuts may have contracted the cached
+        // `comp.t2_root` out (replacing it with its child). Components are
+        // disjoint in T2 so other components don't affect this lookup.
+        let first_leaf = leafset.ones().next().unwrap_or(0);
+        let current_t2_root = find_t2_component_root_for_leaf(tf, first_leaf);
+        if current_t2_root == NONE {
+            continue;
+        }
+        // Build relabel map: in-component leaves get new labels 1..count,
+        // others get 0 (= drop). Also build the reverse map (new → orig).
+        let mut label_map: Vec<klados_core::tree::Label> =
+            vec![0; tf.num_leaves as usize + 1];
+        let mut label_to_orig: Vec<klados_core::tree::Label> = vec![0; (count + 1) as usize];
+        let mut new_label: u32 = 1;
+        for old_lbl in leafset.ones() {
+            label_map[old_lbl] = new_label as klados_core::tree::Label;
+            label_to_orig[new_label as usize] = old_lbl as klados_core::tree::Label;
+            new_label += 1;
+        }
+        let new_num_leaves = count as u32;
+        let sub_t1 = t1_orig.relabel(&label_map, new_num_leaves);
+        let t2_comp_tree = tree_from_t2_subtree(tf, current_t2_root);
+        let sub_t2 = t2_comp_tree.relabel(&label_map, new_num_leaves);
+        if sub_t1.root == NONE || sub_t2.root == NONE {
+            continue;
+        }
+        let sub_instance = Instance::new(vec![sub_t1, sub_t2], new_num_leaves);
+        let mut sub_solver =
+            crate::whidden::WhiddenSolver::new().with_split_or_decompose(false);
+        let sub_solution = match crate::ExactSolver::solve(&mut sub_solver, &sub_instance) {
+            Some(s) => s,
+            None => {
+                if std::env::var("KLADOS_WHIDDEN_SOD_TRACE").is_ok() {
+                    eprintln!(
+                        "[sod-trace] sub-solver returned None: n={} t1_root={} t1_nodes={} t1_num_leaves={} t2_root={} t2_nodes={} t2_num_leaves={}",
+                        new_num_leaves,
+                        sub_instance.trees[0].root,
+                        sub_instance.trees[0].parent.len(),
+                        sub_instance.trees[0].num_leaves,
+                        sub_instance.trees[1].root,
+                        sub_instance.trees[1].parent.len(),
+                        sub_instance.trees[1].num_leaves,
+                    );
+                    // Print labels in each tree for debug
+                    let t1_labels: Vec<u32> = (1..=new_num_leaves)
+                        .filter(|&l| sub_instance.trees[0].label_to_node[l as usize] != NONE)
+                        .collect();
+                    let t2_labels: Vec<u32> = (1..=new_num_leaves)
+                        .filter(|&l| sub_instance.trees[1].label_to_node[l as usize] != NONE)
+                        .collect();
+                    eprintln!(
+                        "[sod-trace] t1_labels={:?} t2_labels={:?}",
+                        t1_labels, t2_labels,
+                    );
+                }
+                return None;
+            }
+        };
+        let cuts_applied =
+            apply_sub_maf_cuts(tf, um, current_t2_root, &sub_solution, &label_to_orig);
+        total_cuts = total_cuts.saturating_add(cuts_applied);
+        if total_cuts > budget {
+            return None;
+        }
+    }
+    Some(total_cuts)
+}
+
+/// Reconstruct a single T2 component (rooted at `comp_root`) as a `Tree`.
+///
+/// **Important**: clones tf.label[T2] but zeros out labels of "dead"
+/// nodes — those that have a label but are not the canonical owner in
+/// `tf.label_to_node[T2]`. Dead leaves arise from contract_sibling_pair
+/// and similar reductions: the parent absorbs a child's label, but the
+/// orphaned children still have their old labels in `tf.label[T2]`. Left
+/// uncleaned, those duplicate labels confuse `Tree::relabel`, which
+/// would push them as additional leaves with the same new label.
+fn tree_from_t2_subtree(tf: &TwinForest, comp_root: NodeId) -> Tree {
+    let mut t = Tree::with_capacity(tf.num_leaves);
+    t.parent = tf.parent[T2].clone();
+    t.left = tf.left[T2].clone();
+    t.right = tf.right[T2].clone();
+    t.label = tf.label[T2].clone();
+    // Zero out labels of dead leaves: keep only the canonical owner per
+    // tf.label_to_node[T2].
+    for node in 0..tf.num_nodes[T2] as NodeId {
+        let lbl = t.label[node as usize];
+        if lbl != 0 {
+            let canonical = tf.label_to_node[T2][lbl as usize];
+            if canonical != node {
+                t.label[node as usize] = 0;
+            }
+        }
+    }
+    // Normalize degenerate degree-1 internals: TwinForest mutations can
+    // leave nodes where left == right (both pointers to same child) as a
+    // way to express degree-1 without a NONE. Tree::relabel would walk
+    // the duplicate child twice, producing phantom subtrees. Rewrite to
+    // a proper degree-1 (left=child, right=NONE).
+    for node in 0..tf.num_nodes[T2] as NodeId {
+        let l = t.left[node as usize];
+        let r = t.right[node as usize];
+        if l != NONE && l == r {
+            t.right[node as usize] = NONE;
+        }
+    }
+    t.label_to_node = tf.label_to_node[T2].clone();
+    t.num_leaves = tf.num_leaves;
+    t.root = comp_root;
+    t.depth = vec![0; tf.num_nodes[T2]];
+    t.subtree_size = vec![0; tf.num_nodes[T2]];
+    t
+}
+
+/// SPLIT diagnostic: check whether the current TwinForest state would
+/// trigger Mestel's SPLIT (overlapping component embeddings in T1) or
+/// DECOMPOSE (disjoint instance with ≥ 2 components).
+///
+/// Gated by `KLADOS_WHIDDEN_SPLIT_DIAG=1`. Sampled every `SPLIT_DIAG_SAMPLE`
+/// nodes by `nodes_explored` to keep cost bounded — `collect_component_shapes`
+/// is O(n) per call and we don't want to inflate the search by 10×.
+#[inline]
+fn split_diag_check(tf: &TwinForest, rule_stats: &mut WhiddenRuleStats) {
+    rule_stats.split_diag_nodes += 1;
+    match detect_overlap(tf) {
+        OverlapResult::SingleComponent => {
+            rule_stats.split_diag_single_component += 1;
+        }
+        OverlapResult::Overlap { .. } => {
+            rule_stats.split_diag_overlap += 1;
+        }
+        OverlapResult::AllDisjoint { components } => {
+            rule_stats.split_diag_disjoint += 1;
+            rule_stats.split_diag_disjoint_blocks_sum += components.len() as u64;
+            let max_block = components
+                .iter()
+                .map(|c| c.leafset.count_ones(..))
+                .max()
+                .unwrap_or(0);
+            rule_stats.split_diag_disjoint_max_block_sum += max_block as u64;
+        }
+    }
+}
+
 fn find_mestel_rule6_cut(tf: &TwinForest) -> Option<NodeId> {
     let shapes = collect_component_shapes(tf);
     if shapes.len() != 3 {
@@ -1783,7 +2760,7 @@ fn do_case3_branch(
     cut_a_only: bool,
     cut_c_only: bool,
     path_length: u16,
-) -> i32 {
+) -> Option<u32> {
     // Determine which branches to try based on optimization flags.
     // COB: cut_b_only → only B
     // RCOB: cut_a_only → only A; cut_c_only → only C
@@ -1886,7 +2863,7 @@ fn do_case3_branch(
 
         rule_stats.branch_a_attempts += 1;
         let result = branch_and_bound(tf, k - 1, um, stats, rule_stats, config, tt, bc, bounds);
-        if result >= 0 {
+        if result.is_some() {
             rule_stats.branch_a_successes += 1;
             return result;
         }
@@ -1922,7 +2899,7 @@ fn do_case3_branch(
         } else {
             branch_and_bound(tf, k - 1, um, stats, rule_stats, config, tt, bc, bounds)
         };
-        if result >= 0 {
+        if result.is_some() {
             rule_stats.branch_b_successes += 1;
             return result;
         }
@@ -1945,7 +2922,7 @@ fn do_case3_branch(
 
         rule_stats.branch_c_attempts += 1;
         let result = branch_and_bound(tf, k - 1, um, stats, rule_stats, config, tt, bc, bounds);
-        if result >= 0 {
+        if result.is_some() {
             rule_stats.branch_c_successes += 1;
             return result;
         }
@@ -1956,7 +2933,7 @@ fn do_case3_branch(
         rule_stats.prune_no_enabled_branches += 1;
     }
 
-    -1
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -2068,4 +3045,163 @@ pub fn approx_3_for_instance(t1: &Tree, t2: &Tree, num_leaves: u32) -> i32 {
     let mut tf = TwinForest::from_trees(t1, t2, num_leaves);
     let mut um = UndoMachine::new();
     approx_3(&mut tf, &mut um)
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests for splitting core (Mestel 2024, Lemma 1)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod splitting_core_tests {
+    use super::*;
+    use klados_core::tree::{Label, NodeId};
+
+    /// Build a tiny rooted binary tree from a manual construction.
+    /// Returns the tree. Helper for constructing test cases.
+    fn make_tree_balanced_4(labels: [Label; 4]) -> Tree {
+        // ((l0, l1), (l2, l3))
+        let mut t = Tree::with_capacity(4);
+        let mk_leaf = |t: &mut Tree, lbl: Label| -> NodeId {
+            let id = t.parent.len() as NodeId;
+            t.parent.push(NONE);
+            t.left.push(NONE);
+            t.right.push(NONE);
+            t.label.push(lbl);
+            t.label_to_node[lbl as usize] = id;
+            id
+        };
+        let mk_internal = |t: &mut Tree, l: NodeId, r: NodeId| -> NodeId {
+            let id = t.parent.len() as NodeId;
+            t.parent.push(NONE);
+            t.left.push(l);
+            t.right.push(r);
+            t.label.push(0);
+            t.parent[l as usize] = id;
+            t.parent[r as usize] = id;
+            id
+        };
+        let l0 = mk_leaf(&mut t, labels[0]);
+        let l1 = mk_leaf(&mut t, labels[1]);
+        let l2 = mk_leaf(&mut t, labels[2]);
+        let l3 = mk_leaf(&mut t, labels[3]);
+        let l01 = mk_internal(&mut t, l0, l1);
+        let l23 = mk_internal(&mut t, l2, l3);
+        let root = mk_internal(&mut t, l01, l23);
+        t.root = root;
+        t.compute_metadata();
+        t
+    }
+
+    fn bits(labels: &[Label], capacity: usize) -> FixedBitSet {
+        let mut s = FixedBitSet::with_capacity(capacity);
+        for &l in labels {
+            s.insert(l as usize);
+        }
+        s
+    }
+
+    /// **Test 1: Base case — single-edge clean split.**
+    /// `((1,2),(3,4))` with Y={1,2}, Z={3,4}. The cherry `(1,2)` is
+    /// pendant via one edge, opposite cherry `(3,4)` is pendant on the
+    /// other side. Single edge cut suffices.
+    #[test]
+    fn splitting_core_base_case_clean_cherry_split() {
+        let t1 = make_tree_balanced_4([1, 2, 3, 4]);
+        // For this test we don't need an actual TwinForest with a paired
+        // tree; we just need t1's structure and the active leafset.
+        let t2 = make_tree_balanced_4([1, 2, 3, 4]); // same shape, irrelevant
+        let tf = TwinForest::from_trees(&t1, &t2, 4);
+
+        let active = bits(&[1, 2, 3, 4], 5);
+        let y = bits(&[1, 2], 5);
+
+        let core = splitting_core(&tf, t1.root, &active, &y);
+        let ineq = splitting_core_inequality(&core);
+        assert!(ineq <= 0.5 + 1e-9, "inequality violated: {}", ineq);
+        // Expect a single cut of size 1.
+        assert_eq!(core.len(), 1, "expected exactly one cut, got {:?}", core);
+        assert_eq!(core[0].len(), 1, "expected size-1 cut, got {:?}", core);
+    }
+
+    /// **Test 2: Inductive case — interleaved Y/Z.**
+    /// `((1,3),(2,4))` with Y={1,2}, Z={3,4}. The cherries mix Y and Z,
+    /// so no single edge splits cleanly. Inductive case must fire.
+    #[test]
+    fn splitting_core_inductive_case_interleaved() {
+        let t1 = make_tree_balanced_4([1, 3, 2, 4]);
+        let t2 = make_tree_balanced_4([1, 3, 2, 4]);
+        let tf = TwinForest::from_trees(&t1, &t2, 4);
+
+        let active = bits(&[1, 2, 3, 4], 5);
+        let y = bits(&[1, 2], 5);
+
+        let core = splitting_core(&tf, t1.root, &active, &y);
+        let ineq = splitting_core_inequality(&core);
+        assert!(ineq <= 0.5 + 1e-9, "inequality violated: {} cuts={:?}", ineq, core);
+        // The inductive case MUST produce a non-empty core. The paper
+        // guarantees Lemma 1's existence.
+        assert!(!core.is_empty(), "inductive case produced empty core for {:?}", core);
+        // For ((1,3),(2,4)) with Y={1,2}: at v_left (cherry of 1,3) we
+        // have (PureY={1}, PureZ={3}, Mixed_outside={2,4}). Recursion on
+        // T \ {1} and T \ {3} should produce cores of size 1 each, and
+        // each is prepended with e_1 or e_2 respectively. So we expect
+        // two cuts, each of size 2: {edge_to_1, ...} and {edge_to_3, ...}.
+        eprintln!("interleaved core: {:?}, inequality = {}", core, ineq);
+    }
+
+    /// **Test 3: Larger balanced tree.**
+    /// Build a tree on 8 leaves with bipartition placing all "low" labels
+    /// on Y and all "high" on Z. Verify the inequality.
+    #[test]
+    fn splitting_core_balanced_8() {
+        // (((1,2),(3,4)),((5,6),(7,8))). Y = {1..4}, Z = {5..8}.
+        // T[Y] and T[Z] are pendant, joined by a single edge → base case.
+        // Build manually.
+        let mut t = Tree::with_capacity(8);
+        let mk_leaf = |t: &mut Tree, lbl: Label| -> NodeId {
+            let id = t.parent.len() as NodeId;
+            t.parent.push(NONE);
+            t.left.push(NONE);
+            t.right.push(NONE);
+            t.label.push(lbl);
+            t.label_to_node[lbl as usize] = id;
+            id
+        };
+        let mk_internal = |t: &mut Tree, l: NodeId, r: NodeId| -> NodeId {
+            let id = t.parent.len() as NodeId;
+            t.parent.push(NONE);
+            t.left.push(l);
+            t.right.push(r);
+            t.label.push(0);
+            t.parent[l as usize] = id;
+            t.parent[r as usize] = id;
+            id
+        };
+        let l1 = mk_leaf(&mut t, 1);
+        let l2 = mk_leaf(&mut t, 2);
+        let l3 = mk_leaf(&mut t, 3);
+        let l4 = mk_leaf(&mut t, 4);
+        let l5 = mk_leaf(&mut t, 5);
+        let l6 = mk_leaf(&mut t, 6);
+        let l7 = mk_leaf(&mut t, 7);
+        let l8 = mk_leaf(&mut t, 8);
+        let l12 = mk_internal(&mut t, l1, l2);
+        let l34 = mk_internal(&mut t, l3, l4);
+        let l56 = mk_internal(&mut t, l5, l6);
+        let l78 = mk_internal(&mut t, l7, l8);
+        let l1234 = mk_internal(&mut t, l12, l34);
+        let l5678 = mk_internal(&mut t, l56, l78);
+        let root = mk_internal(&mut t, l1234, l5678);
+        t.root = root;
+        t.compute_metadata();
+        let tf = TwinForest::from_trees(&t, &t, 8);
+
+        let active = bits(&[1, 2, 3, 4, 5, 6, 7, 8], 9);
+        let y = bits(&[1, 2, 3, 4], 9);
+        let core = splitting_core(&tf, t.root, &active, &y);
+        let ineq = splitting_core_inequality(&core);
+        assert!(ineq <= 0.5 + 1e-9, "inequality violated: {} cuts={:?}", ineq, core);
+        // Clean split: should find a single edge cut.
+        assert_eq!(core.len(), 1, "expected 1 cut for clean split, got {:?}", core);
+    }
 }
