@@ -272,6 +272,12 @@ impl Tree {
         let mut out = Tree::with_capacity(new_num_leaves);
 
         fn build(src: &Tree, label_map: &[Label], out: &mut Tree, node: NodeId) -> Option<NodeId> {
+            // Handle NONE — can arise when source has a degree-1 internal
+            // (one valid child, one NONE) such as a stale state during
+            // dynamic decomposition.
+            if node == NONE {
+                return None;
+            }
             if src.is_leaf(node) {
                 let old_lbl = src.label[node as usize];
                 if old_lbl == 0 {
