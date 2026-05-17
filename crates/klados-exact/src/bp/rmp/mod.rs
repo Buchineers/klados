@@ -460,6 +460,14 @@ impl Rmp {
     }
 
     pub fn solve_mip(&mut self) -> Result<Option<RmpSolution>, String> {
+        let mip_time_limit: f64 = std::env::var("KLADOS_BP_MIP_TIME_LIMIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.1);
+        self.solve_mip_with_time_limit(mip_time_limit)
+    }
+
+    pub fn solve_mip_with_time_limit(&mut self, mip_time_limit: f64) -> Result<Option<RmpSolution>, String> {
         let num_cols = self.col_handle.len();
         if num_cols == 0 {
             return Ok(None);
@@ -478,13 +486,6 @@ impl Rmp {
         let mut model = self.model.take().expect("model present");
         model.set_option("presolve", "on");
         model.set_option("solver", "choose");
-        // Cap MIP solve at 100ms — this is a heuristic, not a proof. If we
-        // can't find an integer incumbent in 100ms the LP-only path is
-        // strictly cheaper than continuing to grind.
-        let mip_time_limit: f64 = std::env::var("KLADOS_BP_MIP_TIME_LIMIT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0.1);
         model.set_option("time_limit", mip_time_limit);
 
         let solved = model.solve();

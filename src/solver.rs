@@ -31,13 +31,22 @@ pub enum SolverChoice {
     GreedyPartition,
     #[value(name = "agglomerative")]
     Agglomerative,
+    #[value(name = "overlay-exchange")]
+    OverlayExchange,
+    #[value(name = "root-pool")]
+    RootPool,
+    #[value(name = "root-corridor")]
+    RootCorridor,
+    #[value(name = "corridor")]
+    Corridor,
 }
 
 impl SolverChoice {
     pub fn kind(&self) -> SolverKind {
         use SolverChoice::*;
         match self {
-            GreedyPartition | Agglomerative => SolverKind::Heuristic,
+            GreedyPartition | Agglomerative | OverlayExchange | RootPool => SolverKind::Heuristic,
+            RootCorridor | Corridor => SolverKind::Exact,
             _ => SolverKind::Exact,
         }
     }
@@ -54,6 +63,10 @@ impl SolverChoice {
             Bp => "Branch & Price (rewrite, in progress)",
             GreedyPartition => "Greedy partition heuristic with union-add-one refinement",
             Agglomerative => "Agglomerative clustering heuristic",
+            OverlayExchange => "Incumbent-overlay replacement prototype",
+            RootPool => "Root column generation + integer pool cover prototype",
+            RootCorridor => "Certified root-corridor probe with exact B&P fallback",
+            Corridor => "Reduced-cost corridor solver (m=2 native; m≥3 routes to B&P)",
         }
     }
 
@@ -86,6 +99,36 @@ impl SolverChoice {
             Bp => &[],
             GreedyPartition => &[("KLADOS_HEURISTIC_TEST_MODE", "extended search budget")],
             Agglomerative => &[],
+            OverlayExchange => &[
+                ("KLADOS_OVERLAY_MAX_H", "maximum incumbent neighborhood size"),
+                ("KLADOS_OVERLAY_MAX_ROUNDS", "maximum improvement rounds"),
+                ("KLADOS_OVERLAY_LOCAL_LEAF_CAP", "skip split neighborhoods above this many leaves"),
+                ("KLADOS_OVERLAY_MAX_NEIGHBORHOODS", "neighborhood checks per round cap"),
+                ("KLADOS_OVERLAY_GEN_CAP", "per-neighborhood local generation cap"),
+                ("KLADOS_OVERLAY_TRACE", "print diagnostics"),
+            ],
+            RootPool => &[
+                ("KLADOS_ROOT_POOL_MAX_CG", "maximum root column-generation iterations"),
+                ("KLADOS_ROOT_POOL_MAX_MS", "soft root-pool wall budget in milliseconds"),
+                ("KLADOS_ROOT_POOL_MIP_PASSES", "lazy-cut MIP repair passes"),
+                ("KLADOS_ROOT_POOL_MIP_TIME_LIMIT", "HiGHS MIP time limit per pass in seconds"),
+                ("KLADOS_ROOT_POOL_SEEDS", "randomized incumbent seed budget"),
+                ("KLADOS_ROOT_POOL_TRACE", "print diagnostics"),
+            ],
+            RootCorridor => &[
+                ("KLADOS_ROOT_CORRIDOR_MAX_PROBE_LEAVES", "skip root probe above this leaf count"),
+                ("KLADOS_ROOT_CORRIDOR_PROBE_MS", "soft root probe wall budget in milliseconds"),
+                ("KLADOS_ROOT_CORRIDOR_MIP_TIME_LIMIT", "HiGHS pool-MIP time limit per probe pass"),
+                ("KLADOS_ROOT_CORRIDOR_TRACE", "print diagnostics"),
+            ],
+            Corridor => &[
+                ("KLADOS_CORRIDOR_MAX_CG", "max root CG iterations per outer iter"),
+                ("KLADOS_CORRIDOR_MAX_OUTER", "max outer (γ-shrink) iterations"),
+                ("KLADOS_CORRIDOR_MAX_MS", "soft wall-time budget in milliseconds"),
+                ("KLADOS_CORRIDOR_MIP_TIME_LIMIT", "per-MIP HiGHS time limit in seconds"),
+                ("KLADOS_CORRIDOR_SEEDS", "primal-seed budget for randomized cherry partitions"),
+                ("KLADOS_CORRIDOR_TRACE", "print per-iteration diagnostics"),
+            ],
         }
     }
 
@@ -102,6 +145,14 @@ impl SolverChoice {
                 from_exact(klados_exact::maf_branch_price_multi::MafBranchPriceMultiSolver::new())
             }
             SolverChoice::Bp => from_exact(klados_exact::bp::BpSolver::new()),
+            SolverChoice::OverlayExchange => {
+                from_exact(klados_exact::overlay_exchange::OverlayExchangeSolver::new())
+            }
+            SolverChoice::RootPool => from_exact(klados_exact::root_pool::RootPoolSolver::new()),
+            SolverChoice::RootCorridor => {
+                from_exact(klados_exact::root_corridor::RootCorridorSolver::new())
+            }
+            SolverChoice::Corridor => from_exact(klados_exact::corridor::CorridorSolver::new()),
             SolverChoice::GreedyPartition => from_heuristic(
                 klados_heuristic::partition::PartitionHeuristicSolver::greedy_union_add_one(),
             ),

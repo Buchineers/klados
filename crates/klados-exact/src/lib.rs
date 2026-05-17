@@ -8,9 +8,13 @@ pub use klados_core::kernelize;
 pub use klados_core::lower_bound;
 pub mod bp;
 pub mod chen_rspr;
+pub mod corridor;
 pub mod maf_branch_price_multi;
 pub mod maf_ilp;
 pub mod maf_sat;
+pub mod overlay_exchange;
+pub mod root_corridor;
+pub mod root_pool;
 pub mod whidden;
 pub mod whidden_cluster;
 
@@ -44,6 +48,10 @@ pub fn available_solvers() -> Vec<Box<dyn ExactSolver>> {
         Box::new(whidden::WhiddenSolver::new()),
         Box::new(maf_branch_price_multi::MafBranchPriceMultiSolver::new()),
         Box::new(bp::BpSolver::new()),
+        Box::new(overlay_exchange::OverlayExchangeSolver::new()),
+        Box::new(root_corridor::RootCorridorSolver::new()),
+        Box::new(root_pool::RootPoolSolver::new()),
+        Box::new(corridor::CorridorSolver::new()),
     ]
 }
 
@@ -92,6 +100,24 @@ mod tests {
     #[test]
     fn test_registry_has_chen_rspr() {
         let solver = solver_by_name("chen-rspr");
+        assert!(solver.is_some());
+    }
+
+    #[test]
+    fn test_registry_has_overlay_exchange() {
+        let solver = solver_by_name("overlay-exchange");
+        assert!(solver.is_some());
+    }
+
+    #[test]
+    fn test_registry_has_root_pool() {
+        let solver = solver_by_name("root-pool");
+        assert!(solver.is_some());
+    }
+
+    #[test]
+    fn test_registry_has_root_corridor() {
+        let solver = solver_by_name("root-corridor");
         assert!(solver.is_some());
     }
 }

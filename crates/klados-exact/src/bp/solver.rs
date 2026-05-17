@@ -5,7 +5,8 @@
 //! never reference column ids. See [`crate::bp::search::branchings`] for
 //! the rationale.
 
-use std::collections::BTreeMap;
+use std::cell::Cell;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
 use fixedbitset::FixedBitSet;
@@ -27,6 +28,10 @@ use crate::chen_rspr::chen_pair_agreement;
 use crate::whidden_cluster::try_whidden_relaxed_incumbent_2tree;
 
 const LOG_TARGET: &str = "klados::bp";
+
+thread_local! {
+    static IN_OBSTRUCTION_PROBE: Cell<bool> = const { Cell::new(false) };
+}
 
 struct LocalBounds {
     best_partition: Option<Vec<usize>>,
@@ -234,7 +239,15 @@ fn can_prune_by_bound(lb: usize, best_ub: usize) -> bool {
 pub fn solve_inner(reduced: &Instance) -> Option<Vec<Tree>> {
     let trees = &reduced.trees;
     let n = reduced.num_leaves as usize;
-    debug_assert!(trees.len() >= 2 && n >= 2);
+    if trees.is_empty() {
+        return None;
+    }
+    if trees.len() == 1 {
+        return Some(trees.clone());
+    }
+    if n <= 1 {
+        return Some(trees[0..1].to_vec());
+    }
 
     // Seed singletons via a temporary builder; the runtime builder lives in
     // PricerScratch so all pricer tiers share it.
@@ -330,6 +343,7 @@ pub fn solve_inner(reduced: &Instance) -> Option<Vec<Tree>> {
     // itself (cuts that aren't dominated).
     let mut selector = crate::bp::search::selection::MostFractionalPair;
     let mut tel = Telemetry::default();
+    let mut root_regions: Option<RootSupportRegions> = None;
 
     // DFS stack carrying parent LP bounds. We tried best-first (min-heap
     // by parent_lp) and it regressed badly (~2× on both easy and hard
@@ -399,6 +413,7 @@ pub fn solve_inner(reduced: &Instance) -> Option<Vec<Tree>> {
             &mut scratch,
             &mut selector,
             &mut tel,
+            &mut root_regions,
         );
         match outcome {
             NodeOutcome::Pruned => {}
@@ -414,6 +429,12 @@ pub fn solve_inner(reduced: &Instance) -> Option<Vec<Tree>> {
                         trees.len(),
                         b.depth(),
                         tel.nodes_explored,
+                    );
+                    maybe_log_bridge_footprint(
+                        "incumbent-update",
+                        state.incumbent(),
+                        state.columns(),
+                        root_regions.as_ref(),
                     );
                     // RCVF replay happens at the top of the next solve_node.
                 }
@@ -477,6 +498,7 @@ fn solve_node<P: Pricer, S: BranchSelector>(
     scratch: &mut PricerScratch,
     selector: &mut S,
     tel: &mut Telemetry,
+    root_regions: &mut Option<RootSupportRegions>,
 ) -> NodeOutcome {
     tel.nodes_explored += 1;
 
@@ -644,6 +666,135 @@ fn solve_node<P: Pricer, S: BranchSelector>(
             lp.node_duals.clone(),
             state.best_ub(),
         );
+
+        // Diagnostic only: expose the global fractional support obstruction
+        // before the ordinary branch tree starts.  The current Class-B
+        // hypothesis is that almost the whole LP gap lives in one connected
+        // overlap component of the positive support; if that component's
+        // induced subinstance has a substantially larger exact rank than the
+        // LP mass currently paid inside it, then the missing proof object is a
+        // global obstruction cut rather than another local branch.
+        if root_regions.is_none()
+            && (std::env::var("KLADOS_BP_OBSTRUCTION_PROBE").is_ok()
+                || std::env::var("KLADOS_BP_BRIDGE_PROBE").is_ok()
+                || std::env::var("KLADOS_BP_ROOT_SUPPORT_INCUMBENT").is_ok())
+        {
+            *root_regions = build_root_support_regions(state, &lp);
+        }
+        if std::env::var("KLADOS_BP_ROOT_SUPPORT_INCUMBENT").is_ok()
+            && let Some(regions) = root_regions.as_ref()
+        {
+            let t0 = Instant::now();
+            if let Some(inc) = try_root_support_incumbent(reduced, state, regions) {
+                let k = inc.k;
+                if state.update_incumbent(inc) {
+                    info!(
+                        target: LOG_TARGET,
+                        "root-support incumbent: k={} support_cols={} solve_ms={:.1}",
+                        k,
+                        regions.comps.iter().map(|comp| comp.column_ids.len()).sum::<usize>(),
+                        t0.elapsed().as_secs_f64() * 1000.0,
+                    );
+                    rmp.reapply_root_rcvf(state.columns(), state.best_ub());
+                }
+            }
+        }
+        maybe_probe_root_obstruction(reduced, state, &lp, root_regions.as_ref());
+        maybe_log_bridge_footprint(
+            "root-incumbent",
+            state.incumbent(),
+            state.columns(),
+            root_regions.as_ref(),
+        );
+
+        // ── Corridor-enriched B&P (DISABLED by default; ablation only) ─
+        // After root CG converges, the pool contains every column with
+        // `rc < 0` under root duals; the corridor theorem says any
+        // column in an improving integer solution has `rc ≤ γ`. We
+        // tried pre-enumerating the root corridor and adding it to the
+        // pool to skip B&P's deep-node DP work. **Empirically didn't
+        // help**: on v2 50/100 timeouts unchanged, valid-sum got
+        // *slower* by ~30%, because (a) at root duals corridor columns
+        // have `rc ≥ 0` and don't enter any LP basis, (b) at deep
+        // nodes B&P's pricer finds columns that aren't in the *root*
+        // corridor (their `rc_root > γ_root` but `rc_local < 0`), so
+        // pre-loading doesn't shortcut the deep DP, and (c) the
+        // enriched pool slows every LP solve in the search tree.
+        // Conclusion: B&P's incremental dual-modulation discovers
+        // exactly the columns it needs; the root-corridor theorem
+        // is *informative* about completeness but the upfront-add
+        // formulation isn't a shortcut.
+        // Re-enable with `KLADOS_BP_CORRIDOR_ENRICH=1` for further
+        // experimentation.
+        let corridor_enrich = std::env::var("KLADOS_BP_CORRIDOR_ENRICH")
+            .ok()
+            .map(|v| v != "0")
+            .unwrap_or(false);
+        if corridor_enrich && trees.len() == 2 {
+            let upper = state.best_ub();
+            let lb = (lp.objective - 1.0e-6).ceil() as usize;
+            // Only enumerate if there's slack to close. `γ < 0` means
+            // ⌈L⌉ ≥ U already, no improving column possible.
+            if lb < upper {
+                let gamma = (upper as f64) - 1.0 - lp.objective;
+                let threshold = 1.0 - gamma - 1.0e-8;
+                let max_k = std::env::var("KLADOS_BP_CORRIDOR_K")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(1);
+                let n0 = trees[0].num_nodes();
+                let n1 = trees[1].num_nodes();
+                let mut cache = scratch
+                    .topk_dp_cache
+                    .take()
+                    .filter(|c| c.fits(n0, n1, state.num_leaves()))
+                    .unwrap_or_else(|| {
+                        crate::corridor::topk_m2::TopKDpCache::new(
+                            n0,
+                            n1,
+                            state.num_leaves(),
+                        )
+                    });
+                let cols = crate::corridor::topk_m2::enumerate_corridor(
+                    &crate::corridor::topk_m2::CorridorInput {
+                        t0: &trees[0],
+                        t1: &trees[1],
+                        alpha: &lp.leaf_duals,
+                        beta_t0: &lp.node_duals[0],
+                        beta_t1: &lp.node_duals[1],
+                        threshold,
+                        max_k,
+                    },
+                    &mut cache,
+                );
+                scratch.topk_dp_cache = Some(cache);
+
+                let mut added = 0usize;
+                let pool_before = state.columns().len();
+                let builder = &mut scratch.builder;
+                for cand in cols {
+                    if state.seen().contains(&cand.labels) {
+                        continue;
+                    }
+                    let column = builder.build_unchecked(cand.labels, trees);
+                    if let Some(_id) = state.add_column(column) {
+                        rmp.add_column(state.columns().last().unwrap());
+                        added += 1;
+                    }
+                }
+                if added > 0 {
+                    debug!(
+                        target: LOG_TARGET,
+                        "corridor enrich: +{} cols (pool {}→{}, γ={:.3}, K={})",
+                        added,
+                        pool_before,
+                        state.columns().len(),
+                        gamma,
+                        max_k,
+                    );
+                }
+            }
+        }
     } else {
         // Subtree-local RCVF: the LP at a branched node is tighter than
         // root because the branching constraints have raised its optimum,
@@ -776,6 +927,619 @@ fn solve_node<P: Pricer, S: BranchSelector>(
             NodeOutcome::Pruned
         }
     }
+}
+
+#[derive(Clone, Debug)]
+struct SupportComponentSummary {
+    column_ids: Vec<usize>,
+    leaves: FixedBitSet,
+    lp_mass: f64,
+    fractional_columns: usize,
+}
+
+impl SupportComponentSummary {
+    fn leaf_count(&self) -> usize {
+        self.leaves.count_ones(..)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RootSupportRegions {
+    comps: Vec<SupportComponentSummary>,
+    region_of_leaf: Vec<usize>,
+    component_ceil_sum: usize,
+    lp_objective: f64,
+}
+
+fn build_root_support_regions(
+    state: &SearchState,
+    lp: &crate::bp::rmp::RmpSolution,
+) -> Option<RootSupportRegions> {
+    let mut support_cols = Vec::new();
+    for (ci, &value) in lp.column_values.iter().enumerate() {
+        if value > 1.0e-6 {
+            support_cols.push(ci);
+        }
+    }
+    if support_cols.is_empty() {
+        return None;
+    }
+
+    // Union support columns whenever they share at least one leaf.
+    let mut parent: Vec<usize> = (0..support_cols.len()).collect();
+    let mut rank = vec![0u8; support_cols.len()];
+    let mut first_owner_by_leaf = vec![None; state.num_leaves() + 1];
+
+    fn find(parent: &mut [usize], x: usize) -> usize {
+        if parent[x] != x {
+            let root = find(parent, parent[x]);
+            parent[x] = root;
+        }
+        parent[x]
+    }
+    fn union(parent: &mut [usize], rank: &mut [u8], a: usize, b: usize) {
+        let mut ra = find(parent, a);
+        let mut rb = find(parent, b);
+        if ra == rb {
+            return;
+        }
+        if rank[ra] < rank[rb] {
+            std::mem::swap(&mut ra, &mut rb);
+        }
+        parent[rb] = ra;
+        if rank[ra] == rank[rb] {
+            rank[ra] += 1;
+        }
+    }
+
+    for (local_idx, &ci) in support_cols.iter().enumerate() {
+        for &leaf in state.columns()[ci].labels() {
+            let slot = &mut first_owner_by_leaf[leaf as usize];
+            if let Some(prev_local) = *slot {
+                union(&mut parent, &mut rank, local_idx, prev_local);
+            } else {
+                *slot = Some(local_idx);
+            }
+        }
+    }
+
+    let mut by_root: HashMap<usize, SupportComponentSummary> = HashMap::new();
+    for (local_idx, &ci) in support_cols.iter().enumerate() {
+        let root = find(&mut parent, local_idx);
+        let entry = by_root.entry(root).or_insert_with(|| SupportComponentSummary {
+            column_ids: Vec::new(),
+            leaves: FixedBitSet::with_capacity(state.num_leaves() + 1),
+            lp_mass: 0.0,
+            fractional_columns: 0,
+        });
+        entry.column_ids.push(ci);
+        entry.lp_mass += lp.column_values[ci];
+        if lp.column_values[ci] > 1.0e-6 && lp.column_values[ci] < 1.0 - 1.0e-6 {
+            entry.fractional_columns += 1;
+        }
+        for &leaf in state.columns()[ci].labels() {
+            entry.leaves.insert(leaf as usize);
+        }
+    }
+
+    let mut comps: Vec<_> = by_root.into_values().collect();
+    comps.sort_by(|a, b| {
+        b.leaf_count()
+            .cmp(&a.leaf_count())
+            .then_with(|| b.column_ids.len().cmp(&a.column_ids.len()))
+    });
+    let component_ceil_sum: usize = comps
+        .iter()
+        .map(|comp| (comp.lp_mass - 1.0e-6).ceil() as usize)
+        .sum();
+    let mut region_of_leaf = vec![usize::MAX; state.num_leaves() + 1];
+    for (rid, comp) in comps.iter().enumerate() {
+        for leaf in comp.leaves.ones() {
+            region_of_leaf[leaf] = rid;
+        }
+    }
+
+    Some(RootSupportRegions {
+        comps,
+        region_of_leaf,
+        component_ceil_sum,
+        lp_objective: lp.objective,
+    })
+}
+
+fn maybe_probe_root_obstruction(
+    reduced: &Instance,
+    state: &SearchState,
+    lp: &crate::bp::rmp::RmpSolution,
+    root_regions: Option<&RootSupportRegions>,
+) {
+    if std::env::var("KLADOS_BP_OBSTRUCTION_PROBE").is_err() {
+        return;
+    }
+
+    let already_inside = IN_OBSTRUCTION_PROBE.with(|flag| flag.get());
+    if already_inside {
+        return;
+    }
+
+    IN_OBSTRUCTION_PROBE.with(|flag| flag.set(true));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        probe_root_obstruction_impl(reduced, state, lp, root_regions)
+    }));
+    IN_OBSTRUCTION_PROBE.with(|flag| flag.set(false));
+    if result.is_err() {
+        info!(target: LOG_TARGET, "obstruction-probe: panicked; skipping diagnostic");
+    }
+}
+
+fn probe_root_obstruction_impl(
+    reduced: &Instance,
+    state: &SearchState,
+    lp: &crate::bp::rmp::RmpSolution,
+    root_regions: Option<&RootSupportRegions>,
+) {
+    let Some(regions) = root_regions else {
+        info!(target: LOG_TARGET, "obstruction-probe: empty LP support");
+        return;
+    };
+
+    info!(
+        target: LOG_TARGET,
+        "obstruction-probe: root lp={:.4} support_cols={} support_components={}",
+        regions.lp_objective,
+        regions.comps.iter().map(|comp| comp.column_ids.len()).sum::<usize>(),
+        regions.comps.len(),
+    );
+    info!(
+        target: LOG_TARGET,
+        "obstruction-probe: component_ceil_sum={} ceil_gap={:.4}",
+        regions.component_ceil_sum,
+        regions.component_ceil_sum as f64 - regions.lp_objective,
+    );
+    for (idx, comp) in regions.comps.iter().take(12).enumerate() {
+        info!(
+            target: LOG_TARGET,
+            "obstruction-probe: comp#{idx} cols={} leaves={} frac_cols={} lp_mass={:.4}",
+            comp.column_ids.len(),
+            comp.leaf_count(),
+            comp.fractional_columns,
+            comp.lp_mass,
+        );
+    }
+
+    if std::env::var("KLADOS_BP_ROOT_SUPPORT_MIP").is_ok() {
+        probe_root_support_mip(reduced, state, lp, regions);
+    }
+
+    let Some(largest) = regions.comps.first() else {
+        return;
+    };
+    if largest.fractional_columns == 0 || largest.leaf_count() <= 1 {
+        info!(target: LOG_TARGET, "obstruction-probe: largest component is integral/trivial");
+        return;
+    }
+
+    let want_local_lb = std::env::var("KLADOS_BP_OBSTRUCTION_LOCAL_LB").is_ok();
+    let want_exact_core = std::env::var("KLADOS_BP_OBSTRUCTION_SOLVE_CORE").is_ok();
+    if !want_local_lb && !want_exact_core {
+        return;
+    }
+
+    let (core, reverse_map) =
+        klados_core::kernelize::restrict_instance_simple(reduced, &largest.leaves);
+    let reverse_labels: Vec<u32> = reverse_map.iter().copied().skip(1).collect();
+    info!(
+        target: LOG_TARGET,
+        "obstruction-probe: solving largest core leaves={} lp_mass={:.4} labels={:?}",
+        core.num_leaves,
+        largest.lp_mass,
+        reverse_labels,
+    );
+
+    if want_local_lb {
+        let mut local = crate::root_pool::RootPoolSolver::for_corridor_probe();
+        let t_lb = Instant::now();
+        match local.solve_with_outcome(&core) {
+            Some(out) => info!(
+                target: LOG_TARGET,
+                "obstruction-probe: largest core local_lb={:?} local_k={} local_conv={} support_mass={:.4} lb_ms={:.1}",
+                out.lower_bound,
+                out.forest.len(),
+                out.converged,
+                largest.lp_mass,
+                t_lb.elapsed().as_secs_f64() * 1000.0,
+            ),
+            None => info!(
+                target: LOG_TARGET,
+                "obstruction-probe: largest core local LB solve failed after {:.1}ms",
+                t_lb.elapsed().as_secs_f64() * 1000.0,
+            ),
+        }
+    }
+
+    if std::env::var("KLADOS_BP_REGION_SUPPORT_MIP").is_ok() {
+        probe_region_support_mip(reduced, state, largest);
+    }
+    if std::env::var("KLADOS_BP_ALL_REGION_SUPPORT_MIP").is_ok() {
+        probe_all_region_support_mips(reduced, state, regions);
+    }
+
+    if !want_exact_core {
+        return;
+    }
+
+    let t0 = Instant::now();
+    let exact = crate::bp::solve_subinstance(&core, &crate::bp::BpConfig::default());
+    match exact {
+        Some(forest) => info!(
+            target: LOG_TARGET,
+            "obstruction-probe: largest core exact_rank={} lp_mass={:.4} gap={:.4} solve_ms={:.1}",
+            forest.len(),
+            largest.lp_mass,
+            forest.len() as f64 - largest.lp_mass,
+            t0.elapsed().as_secs_f64() * 1000.0,
+        ),
+        None => info!(
+            target: LOG_TARGET,
+            "obstruction-probe: largest core exact solve failed after {:.1}ms",
+            t0.elapsed().as_secs_f64() * 1000.0,
+        ),
+    }
+}
+
+fn probe_root_support_mip(
+    reduced: &Instance,
+    state: &SearchState,
+    lp: &crate::bp::rmp::RmpSolution,
+    regions: &RootSupportRegions,
+) {
+    let t0 = Instant::now();
+    let (support_cols, cuts_total, result) =
+        solve_root_support_mip(reduced, state, regions);
+    let shell = result
+        .as_ref()
+        .map(|inc| summarize_root_reduced_cost_shell(state, lp, regions, inc.k));
+    info!(
+        target: LOG_TARGET,
+        "obstruction-probe: root-support-mip support_cols={} lp={:.4} cuts={} result={} solve_ms={:.1}",
+        support_cols,
+        regions.lp_objective,
+        cuts_total,
+        result
+            .as_ref()
+            .map(|inc| format!("k={}", inc.k))
+            .unwrap_or_else(|| "none".to_string()),
+        t0.elapsed().as_secs_f64() * 1000.0,
+    );
+    if let Some(shell) = shell {
+        info!(
+            target: LOG_TARGET,
+            "obstruction-probe: root-shell gamma={:.4} generated_total={} generated_in_shell={} support_in_shell={} nonsupport_in_shell={} min_nonsupport_rc={:.4}",
+            shell.gamma,
+            shell.generated_total,
+            shell.generated_in_shell,
+            shell.support_in_shell,
+            shell.nonsupport_in_shell,
+            shell.min_nonsupport_rc,
+        );
+    }
+}
+
+fn try_root_support_incumbent(
+    reduced: &Instance,
+    state: &SearchState,
+    regions: &RootSupportRegions,
+) -> Option<Incumbent> {
+    let (_, _, result) = solve_root_support_mip(reduced, state, regions);
+    result
+}
+
+fn solve_root_support_mip(
+    reduced: &Instance,
+    state: &SearchState,
+    regions: &RootSupportRegions,
+) -> (usize, usize, Option<Incumbent>) {
+    let mut support_ids = regions
+        .comps
+        .iter()
+        .flat_map(|comp| comp.column_ids.iter().copied())
+        .collect::<Vec<_>>();
+    support_ids.sort_unstable();
+    let support_columns = support_ids
+        .iter()
+        .map(|&ci| state.columns()[ci].clone())
+        .collect::<Vec<_>>();
+    if support_columns.is_empty() {
+        return (0, 0, None);
+    }
+
+    let mut rmp = Rmp::new(&support_columns, &reduced.trees, reduced.num_leaves as usize);
+    let mut cuts_total = 0usize;
+    for _ in 0..32 {
+        let Ok(Some(mip)) = rmp.solve_mip_with_time_limit(2.0) else {
+            break;
+        };
+        let cuts = rmp.separate_and_add_cuts(&support_columns, &mip.column_values, 0.5);
+        cuts_total += cuts;
+        if cuts > 0 {
+            continue;
+        }
+        let chosen = mip
+            .column_values
+            .iter()
+            .enumerate()
+            .filter_map(|(local_ci, &v)| (v > 0.5).then_some(support_ids[local_ci]))
+            .collect::<Vec<_>>();
+        return (
+            support_columns.len(),
+            cuts_total,
+            Some(Incumbent {
+                k: chosen.len(),
+                component_columns: chosen,
+            }),
+        );
+    }
+    (support_columns.len(), cuts_total, None)
+}
+
+struct RootShellSummary {
+    gamma: f64,
+    generated_total: usize,
+    generated_in_shell: usize,
+    support_in_shell: usize,
+    nonsupport_in_shell: usize,
+    min_nonsupport_rc: f64,
+}
+
+fn summarize_root_reduced_cost_shell(
+    state: &SearchState,
+    lp: &crate::bp::rmp::RmpSolution,
+    regions: &RootSupportRegions,
+    incumbent_k: usize,
+) -> RootShellSummary {
+    let gamma = incumbent_k as f64 - 1.0 - regions.lp_objective;
+    let mut support_ids = FixedBitSet::with_capacity(state.columns().len());
+    for comp in &regions.comps {
+        for &ci in &comp.column_ids {
+            support_ids.insert(ci);
+        }
+    }
+    let mut generated_in_shell = 0usize;
+    let mut support_in_shell = 0usize;
+    let mut nonsupport_in_shell = 0usize;
+    let mut min_nonsupport_rc = f64::INFINITY;
+    for (ci, col) in state.columns().iter().enumerate() {
+        let rc = 1.0 - col.pricing_score(&lp.leaf_duals, &lp.node_duals);
+        if !support_ids.contains(ci) {
+            min_nonsupport_rc = min_nonsupport_rc.min(rc);
+        }
+        if rc <= gamma + 1.0e-6 {
+            generated_in_shell += 1;
+            if support_ids.contains(ci) {
+                support_in_shell += 1;
+            } else {
+                nonsupport_in_shell += 1;
+            }
+        }
+    }
+    RootShellSummary {
+        gamma,
+        generated_total: state.columns().len(),
+        generated_in_shell,
+        support_in_shell,
+        nonsupport_in_shell,
+        min_nonsupport_rc,
+    }
+}
+
+fn probe_region_support_mip(
+    reduced: &Instance,
+    state: &SearchState,
+    region: &SupportComponentSummary,
+) {
+    let t0 = Instant::now();
+    let (leaves, local_cols, rejected, cuts_total, result) =
+        solve_region_support_mip(reduced, state, region);
+    info!(
+        target: LOG_TARGET,
+        "obstruction-probe: support-mip leaves={} support_cols={} local_cols={} rejected={} lp_mass={:.4} cuts={} result={} solve_ms={:.1}",
+        leaves,
+        region.column_ids.len(),
+        local_cols,
+        rejected,
+        region.lp_mass,
+        cuts_total,
+        result
+            .map(|k| format!("k={k}"))
+            .unwrap_or_else(|| "none".to_string()),
+        t0.elapsed().as_secs_f64() * 1000.0,
+    );
+}
+
+fn probe_all_region_support_mips(
+    reduced: &Instance,
+    state: &SearchState,
+    regions: &RootSupportRegions,
+) {
+    let t0 = Instant::now();
+    let mut solved = 0usize;
+    let mut sum_k = 0usize;
+    let mut failed = 0usize;
+    let mut details = Vec::with_capacity(regions.comps.len());
+    for (rid, region) in regions.comps.iter().enumerate() {
+        let (_, _, _, _, result) = solve_region_support_mip(reduced, state, region);
+        if let Some(k) = result {
+            solved += 1;
+            sum_k += k;
+            details.push(format!("{rid}:{k}"));
+        } else {
+            failed += 1;
+            details.push(format!("{rid}:x"));
+        }
+    }
+    info!(
+        target: LOG_TARGET,
+        "obstruction-probe: all-region-support-mips solved={} failed={} sum_k={} detail=[{}] solve_ms={:.1}",
+        solved,
+        failed,
+        sum_k,
+        details.join(","),
+        t0.elapsed().as_secs_f64() * 1000.0,
+    );
+}
+
+fn solve_region_support_mip(
+    reduced: &Instance,
+    state: &SearchState,
+    region: &SupportComponentSummary,
+) -> (u32, usize, usize, usize, Option<usize>) {
+    let (core, reverse_map) =
+        klados_core::kernelize::restrict_instance_simple(reduced, &region.leaves);
+    let mut old_to_new = vec![0u32; reduced.num_leaves as usize + 1];
+    for (new_label, &old_label) in reverse_map.iter().enumerate().skip(1) {
+        old_to_new[old_label as usize] = new_label as u32;
+    }
+
+    let mut builder = ColumnBuilder::new(&core.trees);
+    let mut local_columns = Vec::with_capacity(region.column_ids.len());
+    let mut rejected = 0usize;
+    for &ci in &region.column_ids {
+        // Reconstruct the region column in the local label space.
+        // The caller only passes columns from one support region, so every
+        // label is guaranteed to map.
+        let labels = state.columns()[ci]
+            .labels()
+            .iter()
+            .map(|&old_label| old_to_new[old_label as usize])
+            .collect::<Vec<_>>();
+        if labels.iter().any(|&label| label == 0) {
+            rejected += 1;
+            continue;
+        }
+        if let Some(col) = builder.try_build(labels, &core.trees) {
+            local_columns.push(col);
+        } else {
+            rejected += 1;
+        }
+    }
+
+    if local_columns.is_empty() {
+        return (core.num_leaves, 0, rejected, 0, None);
+    }
+
+    let mut rmp = Rmp::new(&local_columns, &core.trees, core.num_leaves as usize);
+    let mut cuts_total = 0usize;
+    for _ in 0..32 {
+        let Ok(Some(mip)) = rmp.solve_mip_with_time_limit(2.0) else {
+            break;
+        };
+        let cuts = rmp.separate_and_add_cuts(&local_columns, &mip.column_values, 0.5);
+        cuts_total += cuts;
+        if cuts > 0 {
+            continue;
+        }
+        let chosen = mip
+            .column_values
+            .iter()
+            .filter(|&&v| v > 0.5)
+            .count();
+        return (
+            core.num_leaves,
+            local_columns.len(),
+            rejected,
+            cuts_total,
+            Some(chosen),
+        );
+    }
+    (
+        core.num_leaves,
+        local_columns.len(),
+        rejected,
+        cuts_total,
+        None,
+    )
+}
+
+fn maybe_log_bridge_footprint(
+    label: &str,
+    incumbent: Option<&Incumbent>,
+    columns: &[AfColumn],
+    root_regions: Option<&RootSupportRegions>,
+) {
+    if std::env::var("KLADOS_BP_BRIDGE_PROBE").is_err() {
+        return;
+    }
+    let (Some(inc), Some(regions)) = (incumbent, root_regions) else {
+        return;
+    };
+
+    let mut bridge_columns = 0usize;
+    let mut bridge_savings = 0usize;
+    let mut max_regions_touched = 0usize;
+    let mut touched_hist = vec![0usize; regions.comps.len().max(1) + 1];
+    let mut off_support_columns = 0usize;
+    let mut local_component_counts = vec![0usize; regions.comps.len()];
+    let mut support_ids = FixedBitSet::with_capacity(columns.len());
+    for comp in &regions.comps {
+        for &ci in &comp.column_ids {
+            support_ids.insert(ci);
+        }
+    }
+
+    for &ci in &inc.component_columns {
+        if !support_ids.contains(ci) {
+            off_support_columns += 1;
+        }
+        let mut touched = FixedBitSet::with_capacity(regions.comps.len());
+        for &leaf in columns[ci].labels() {
+            let rid = regions.region_of_leaf[leaf as usize];
+            if rid != usize::MAX {
+                touched.insert(rid);
+            }
+        }
+        let q = touched.count_ones(..);
+        if q < touched_hist.len() {
+            touched_hist[q] += 1;
+        }
+        if q == 1 {
+            if let Some(rid) = touched.ones().next() {
+                local_component_counts[rid] += 1;
+            }
+        }
+        if q > 1 {
+            bridge_columns += 1;
+            bridge_savings += q - 1;
+            max_regions_touched = max_regions_touched.max(q);
+        }
+    }
+
+    info!(
+        target: LOG_TARGET,
+        "bridge-probe: {label} k={} ceil_sum={} delta={} bridge_cols={} bridge_savings={} off_support_cols={} max_regions_touched={} touched_hist={:?}",
+        inc.k,
+        regions.component_ceil_sum,
+        inc.k as isize - regions.component_ceil_sum as isize,
+        bridge_columns,
+        bridge_savings,
+        off_support_columns,
+        max_regions_touched,
+        touched_hist,
+    );
+    let per_region = regions
+        .comps
+        .iter()
+        .enumerate()
+        .map(|(rid, comp)| {
+            let ceil = (comp.lp_mass - 1.0e-6).ceil() as usize;
+            format!("{rid}:{}|{}|{:.3}", local_component_counts[rid], ceil, comp.lp_mass)
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    info!(
+        target: LOG_TARGET,
+        "bridge-probe: {label} per_region local|ceil|mass=[{}]",
+        per_region,
+    );
 }
 
 /// Greedy primal heuristic: pick columns in descending `x_c` order, skipping

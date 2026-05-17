@@ -184,11 +184,69 @@ pub(crate) fn collect_positive_candidates(
     collect_positive_candidates_ref(ctx, cache, 1, forbidden_anchors)
 }
 
+/// Corridor enumeration for m=2: returns every (anchor-best) AF column
+/// whose reduced cost under the current duals is ≤ `gamma`. Equivalently,
+/// every column with `pricing_score(c) ≥ 1 − gamma`.
+///
+/// **Soundness.** After root CG converges with LP value `L` and incumbent
+/// `U`, by LP duality every column in any improving integer solution
+/// (size < U) has reduced cost `≤ γ := U − 1 − L`. So the union of
+/// (a) every column already in the pool (rc < 0 after CG) and
+/// (b) every column returned here (rc ≤ γ, anchor-best)
+/// contains the columns of any improving solution **at the anchor level**:
+/// any anchor (u, v) whose best column has rc ≤ γ is captured here.
+///
+/// **What's not enumerated.** If multiple valid AF columns share the
+/// same `(LCA_{T0}, LCA_{T1})` anchor and a non-best one has rc ≤ γ but
+/// the best at that anchor has rc < threshold-eligible, the non-best is
+/// missed. In practice the DP picks the smallest valid column at each
+/// anchor (the leaf-minimal one), so larger columns at the same anchor
+/// have strictly higher score — meaning when an anchor enters the
+/// corridor, its biggest valid column does. This characterization is
+/// not a completeness proof; for proven-optimal corridor solving the
+/// reconstruction also needs to enumerate top-K per anchor (deferred).
+pub(crate) fn collect_corridor_candidates(
+    ctx: &PricingContext,
+    cache: &mut ExactPairDpCache,
+    gamma: f64,
+    forbidden_anchors: &[(u32, u32)],
+) -> PairDpOutput {
+    collect_corridor_candidates_ref(ctx, cache, 1, gamma, forbidden_anchors)
+}
+
+pub(crate) fn collect_corridor_candidates_ref(
+    ctx: &PricingContext,
+    cache: &mut ExactPairDpCache,
+    ref_tree_idx: usize,
+    gamma: f64,
+    forbidden_anchors: &[(u32, u32)],
+) -> PairDpOutput {
+    let threshold = 1.0 - gamma - PRICING_EPS;
+    collect_candidates_above(ctx, cache, ref_tree_idx, forbidden_anchors, threshold)
+}
+
 pub(crate) fn collect_positive_candidates_ref(
     ctx: &PricingContext,
     cache: &mut ExactPairDpCache,
     ref_tree_idx: usize,
     forbidden_anchors: &[(u32, u32)],
+) -> PairDpOutput {
+    // Original pricer behaviour: enumerate every anchor-best column with
+    // strictly positive reduced cost (`score > 1 + ε`), i.e. score > the
+    // "strictly improving" threshold. Routed through the generic threshold
+    // path with `threshold = 1 + ε`.
+    collect_candidates_above(ctx, cache, ref_tree_idx, forbidden_anchors, 1.0 + PRICING_EPS)
+}
+
+/// Run the m=2 DP and return every anchor-best column whose score is
+/// strictly above `threshold`. The DP and reconstruction logic is the
+/// same; only the inclusion filter is parametrised.
+fn collect_candidates_above(
+    ctx: &PricingContext,
+    cache: &mut ExactPairDpCache,
+    ref_tree_idx: usize,
+    forbidden_anchors: &[(u32, u32)],
+    threshold: f64,
 ) -> PairDpOutput {
     let t0 = &ctx.trees[0];
     let t1 = &ctx.trees[ref_tree_idx];
@@ -434,7 +492,7 @@ pub(crate) fn collect_positive_candidates_ref(
             if score > max_allowed_closed {
                 max_allowed_closed = score;
             }
-            if score > 1.0 + PRICING_EPS {
+            if score > threshold {
                 let mut labels = Vec::new();
                 extract_closed(u as u32, v as u32, t0, dp_closed, dp_open, n1, &mut labels);
                 labels.sort_unstable();
