@@ -54,6 +54,10 @@ pub struct PricerScratch {
     /// to match the legacy `Dp2TreeCache` pattern (allocated once,
     /// filled per call with current duals).
     pub exact_dp_cache: Option<super::exact_pair_dp::ExactPairDpCache>,
+    /// Top-K threshold DP cache (m=2) for corridor enumeration. Lives
+    /// here so it can be reused across γ-iterations within one solver
+    /// call; allocated lazily.
+    pub topk_dp_cache: Option<crate::corridor::topk_m2::TopKDpCache>,
     pub column_reserve: Vec<AfColumn>,
     pub pricing_stats: PricingStats,
 }
@@ -65,6 +69,7 @@ impl PricerScratch {
             candidate_pool: Vec::new(),
             pair_dp_table: None,
             exact_dp_cache: None,
+            topk_dp_cache: None,
             column_reserve: Vec::new(),
             pricing_stats: PricingStats::default(),
         }
