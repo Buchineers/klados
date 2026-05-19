@@ -53,6 +53,14 @@ use super::{Pricer, PricerScratch, PricingContext, PricingResult};
 
 const PRICING_EPS: f64 = 1.0e-8;
 const NEG_INF: f64 = f64::NEG_INFINITY;
+
+/// Read the `KLADOS_BP_USE_ANCHOR_CACHE` env var once and cache the
+/// result. Cached-positive reuse is opt-in via this flag.
+fn anchor_cache_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("KLADOS_BP_USE_ANCHOR_CACHE").is_ok())
+}
 /// Sentinel in `memo_side_split` meaning "leaf-only side, no extension chosen".
 const SPLIT_LEAF_ONLY: u32 = u32::MAX - 1;
 /// `solve_side` hoists per-tree bitset slice pointers into a stack array of
@@ -448,6 +456,47 @@ impl LeafPairDpPricer {
             .sum()
     }
 
+    /// Diagnostic gap from the chosen side extensions to the leaf-only
+    /// alternatives.
+    ///
+    /// The leaf-pair DP decomposes `s(a, b) = -root_penalty + solve_side(a, b)
+    /// + solve_side(b, a)`. On each side, the optimum is either "leaf-only"
+    /// (just `a` alone, scored `α[a] − pair_singleton_penalty`) or some
+    /// extension `c` (`solve_pair(a, c) − pen(a, c)`). The "leaf-only"
+    /// alternative is always a valid competing column at this anchor.
+    ///
+    /// This is *not* the true second-best gap and must not be used as a
+    /// sound skip/optimality certificate. It is retained only as a cheap
+    /// statistic while the cache acts as positive-column reuse.
+    ///
+    /// When the optimum on either side is "leaf-only", the diagnostic value
+    /// is 0.
+    ///
+    /// Must be called AFTER `solve_pair(a, b)` so memos are populated.
+    fn anchor_gap_diagnostic(&self, a: usize, b: usize, alpha: &[f64]) -> f64 {
+        let side_ab_gap = self.side_gap_to_leaf_only(a, b, alpha);
+        let side_ba_gap = self.side_gap_to_leaf_only(b, a, alpha);
+        // Either side might be leaf-only-optimal (gap = 0).
+        side_ab_gap.min(side_ba_gap).max(0.0)
+    }
+
+    /// Gap from `solve_side(a, b)`'s optimum to the leaf-only alternative
+    /// at the same side. Returns 0 if leaf-only IS the optimum.
+    fn side_gap_to_leaf_only(&self, a: usize, b: usize, alpha: &[f64]) -> f64 {
+        let idx = self.pair_idx(a, b);
+        let split = self.memo_side_split[idx];
+        if split == SPLIT_LEAF_ONLY {
+            return 0.0;
+        }
+        let side_score = self.memo_side_score[idx];
+        if !side_score.is_finite() {
+            return 0.0;
+        }
+        let label_a = self.active_labels[a] as usize;
+        let leaf_only = alpha[label_a] - self.pair_singleton_penalty[idx];
+        (side_score - leaf_only).max(0.0)
+    }
+
     fn solve_pair(&mut self, a: usize, b: usize, alpha: &[f64], beta: &[Vec<f64>]) -> f64 {
         debug_assert!(a != b);
         let idx = self.pair_idx(a, b);
@@ -553,7 +602,8 @@ impl LeafPairDpPricer {
         // (m=8–36) this function is invoked ~2500× per CG iter, so the
         // hoisted slice pointers save tens of thousands of pointer chases
         // per iter without changing the algorithm.
-        let cannot_a = self.cannot_pair[label_a as usize] as u32; // constant across wi
+        // Constant across wi.
+        let cannot_a = self.cannot_pair[label_a as usize] as u32;
         // Reuse the scratch candidates buffer; swap it out so recursive
         // solve_pair → solve_side calls get their own empty buffer.
         let mut candidates: Vec<(u32, u32)> = std::mem::take(&mut self.solve_side_candidates);
@@ -721,6 +771,9 @@ impl LeafPairDpPricer {
         let p = self.active_labels.len();
         let mut found: Vec<(f64, AfColumn)> = Vec::new();
 
+        let cache_active =
+            anchor_cache_enabled() && ctx.trees.len() == 2 && scratch.anchor_cache.is_some();
+
         for &(_, a, b) in order.iter().take(trial_limit) {
             if found.len() >= target {
                 break;
@@ -745,8 +798,53 @@ impl LeafPairDpPricer {
                 continue;
             }
 
+            // --- Anchor cache fast path ---
+            if cache_active {
+                let cache_hit = {
+                    let cache = scratch.anchor_cache.as_mut().unwrap();
+                    cache.try_emit(la, lb, ctx.alpha, &ctx.beta[0], &ctx.beta[1], PRICING_EPS)
+                };
+                match cache_hit {
+                    super::anchor_cache::CacheResult::Emit { score: _ } => {
+                        // Rebuild column from cached leaves. If the cached
+                        // column is already seen or blocked, do NOT skip this
+                        // anchor: a different column at the same anchor may
+                        // still be improving, so fall through to the DP.
+                        let labels = scratch
+                            .anchor_cache
+                            .as_ref()
+                            .unwrap()
+                            .entry_for(la, lb)
+                            .unwrap()
+                            .column_leaves
+                            .clone();
+                        if labels.len() >= 2 && !ctx.seen.contains(&labels) {
+                            let column = scratch.builder.build_unchecked(labels, ctx.trees);
+                            if !ctx.branchings.forbids(&column) {
+                                // Re-score via the canonical column coverage as
+                                // a final exact guard before returning.
+                                let full_score = column.pricing_score(ctx.alpha, ctx.beta);
+                                if full_score > 1.0 + PRICING_EPS {
+                                    found.push((full_score, column));
+                                    continue;
+                                }
+                            }
+                        }
+                        // Fall through to DP.
+                    }
+                    super::anchor_cache::CacheResult::Stale
+                    | super::anchor_cache::CacheResult::Miss => {
+                        // Fall through to DP.
+                    }
+                }
+            }
+
             let score = self.solve_pair(a, b, ctx.alpha, ctx.beta);
             if score <= 1.0 + PRICING_EPS {
+                // Refresh cache with a "non-improving" entry (gap=0,
+                // empty column would be wrong; instead just skip the
+                // refresh — the cache will treat this anchor as a Miss
+                // next time and re-run the DP if duals change).
                 continue;
             }
             let labels = self.pair_labels(a, b, ctx.alpha, ctx.beta);
@@ -760,6 +858,41 @@ impl LeafPairDpPricer {
             if ctx.branchings.forbids(&column) {
                 continue;
             }
+
+            // Refresh cache entry with the freshly computed column.
+            // The stored gap is diagnostic only. The cache's hot path
+            // re-scores cached columns exactly and never uses this value to
+            // certify a skip or anchor optimality.
+            if cache_active {
+                let gap = self.anchor_gap_diagnostic(a, b, ctx.alpha);
+                let nodes_t0: Vec<u32> = column
+                    .coverage()
+                    .iter_per_tree()
+                    .nth(0)
+                    .map(|s| s.iter().map(|&x| x as u32).collect())
+                    .unwrap_or_default();
+                let nodes_t1: Vec<u32> = column
+                    .coverage()
+                    .iter_per_tree()
+                    .nth(1)
+                    .map(|s| s.iter().map(|&x| x as u32).collect())
+                    .unwrap_or_default();
+                let leaves_sorted: Vec<u32> = column.labels().to_vec();
+                let cache = scratch.anchor_cache.as_mut().unwrap();
+                cache.refresh(
+                    la,
+                    lb,
+                    leaves_sorted,
+                    nodes_t0,
+                    nodes_t1,
+                    score,
+                    gap,
+                    ctx.alpha,
+                    &ctx.beta[0],
+                    &ctx.beta[1],
+                );
+            }
+
             found.push((score, column));
         }
 
@@ -780,6 +913,20 @@ impl Pricer for LeafPairDpPricer {
         }
         self.refresh_dual_tables(ctx.trees, ctx.alpha, ctx.beta);
         self.reset_memos();
+
+        // --- Anchor cache (cached-positive reuse) ---
+        // Gated by env var. Lazy-init; allocate label-pair storage once.
+        // Indexing is by leaf label, so structural data is invariant
+        // across active-label-set changes.
+        if anchor_cache_enabled() && ctx.trees.len() == 2 {
+            if scratch.anchor_cache.is_none() {
+                scratch.anchor_cache = Some(super::anchor_cache::AnchorCache::new(self.num_leaves));
+            }
+            let cache = scratch.anchor_cache.as_mut().unwrap();
+            if !cache.is_built() {
+                cache.refresh_static(ctx.trees);
+            }
+        }
 
         // --- Branch-awareness: build lookup maps from current branchings ---
         self.cannot_pair.resize(self.num_leaves + 1, 0);
@@ -854,6 +1001,24 @@ impl Pricer for LeafPairDpPricer {
                 r.0.partial_cmp(&l.0).unwrap_or(std::cmp::Ordering::Equal)
             });
             found = self.collect_from_order(&order, order.len(), target, ctx, scratch);
+        }
+
+        // Optional anchor-cache stats logging.
+        if anchor_cache_enabled() {
+            if let Some(cache) = scratch.anchor_cache.as_ref() {
+                let avg_gap = if cache.gap_positive_refreshes > 0 {
+                    cache.gap_sum / cache.gap_positive_refreshes as f64
+                } else {
+                    0.0
+                };
+                log::debug!(
+                    target: "klados::bp",
+                    "anchor-cache: hits={} skips={} stales={} misses={} refreshes={} gap_pos={} gap_zero={} avg_pos_gap={:.4}",
+                    cache.hits, cache.skips, cache.stales, cache.misses,
+                    cache.refreshes, cache.gap_positive_refreshes,
+                    cache.gap_zero_refreshes, avg_gap,
+                );
+            }
         }
 
         if found.is_empty() {
