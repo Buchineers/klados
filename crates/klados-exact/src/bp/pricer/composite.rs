@@ -1,13 +1,12 @@
 //! Composite tiered pricer.
 //!
-//! Two-tier design for m=2:
-//! 1. [`LeafPairDpPricer`] — column generation.  Evaluates all pairs with
-//!    `pair_ub − root_penalty > 1+ε` (sound upper bound on RC).  No
-//!    artificial trial limits.  Branch-aware (checks cannot-link/must-link
-//!    during solve_side).
-//! 2. [`ExactPairDpPricer`] — convergence proof.  Only fires when the
-//!    leaf-pair DP returns `Exhausted`.  Proves no positive-RC column
-//!    exists in O(n²) time, terminating column generation.
+//! m=2 dispatch:
+//! - Use [`ExactPairDpPricer`] first when its O(n²) table fits. Empirically
+//!   this is far faster than the recursive leaf-pair generator on the
+//!   reduced m=2 subinstances that dominate pricing.
+//! - Fall back to [`LeafPairDpPricer`] for large trees where the exact
+//!   table would exceed the memory budget. It evaluates promising pairs
+//!   first and falls back to a full scan when needed for convergence.
 //!
 //! For m≥3: DSSR exact relaxed 2-tree DP with full multi-tree validation.
 //! Leaf-pair DP is kept as a heuristic column generator only; it must not
@@ -250,7 +249,6 @@ impl CompositePricer {
 pub fn dispatch_by_m(trees: &[Tree]) -> CompositePricer {
     let mut tiers: Vec<Box<dyn Pricer>> = Vec::new();
     if trees.len() == 2 {
-        tiers.push(Box::new(LeafPairDpPricer::new(trees).with_max_per_call(32)));
         // The exact DP's O(n²) table is infeasible above ~1000 leaves
         // (~1M cells, 16MB).  On large instances the leaf-pair DP's
         // `pair_ub` bound provides the convergence proof.
@@ -259,6 +257,12 @@ pub fn dispatch_by_m(trees: &[Tree]) -> CompositePricer {
         if n0 * n1 <= 1_000_000 {
             tiers.push(Box::new(ExactPairDpPricer::new(trees)));
         }
+        tiers.push(Box::new(
+            LeafPairDpPricer::new(trees)
+                .with_pair_trial_limit(m2_leaf_pair_trial_limit())
+                .with_fallback_full_when_empty(true)
+                .with_max_per_call(32),
+        ));
     } else {
         let batch = adaptive_batch_size_for(trees.len(), trees[0].num_leaves as usize);
         if use_fast_leaf_first(trees) {
@@ -295,6 +299,14 @@ pub fn dispatch_by_m(trees: &[Tree]) -> CompositePricer {
     } else {
         pricer
     }
+}
+
+fn m2_leaf_pair_trial_limit() -> u32 {
+    std::env::var("KLADOS_BP_M2_LEAF_PAIR_TRIALS")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(64)
 }
 
 fn use_fast_leaf_first(trees: &[Tree]) -> bool {

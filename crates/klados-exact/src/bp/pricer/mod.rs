@@ -25,6 +25,7 @@
 //! - `Converged` — proved no positive-RC column exists in the entire valid
 //!   space, given current branchings. Strongest guarantee.
 
+pub mod anchor_cache;
 pub mod anchor_extend;
 pub mod column_aggregation;
 pub mod composite;
@@ -46,6 +47,7 @@ pub use multi_pair_dp::MultiTreePairDpPricer;
 pub use small_component::SmallComponentPricer;
 
 // --- Tier infrastructure ---
+pub use anchor_cache::{AnchorCache, AnchorEntry, CacheResult};
 pub use scratch::{PairDpTable, PricerScratch};
 
 // --- Experimental / heuristic extras (not in default dispatch) ---

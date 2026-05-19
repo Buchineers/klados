@@ -141,28 +141,45 @@ fn price_exact_pair_dp(
 
     let mut found = Vec::new();
     let mut blocked_positive = false;
+    let mut seen_positive = false;
+    let reserve_cap = exact_reserve_cap(max_per_call);
     for (_, labels) in candidates {
+        if ctx.seen.contains(&labels) {
+            seen_positive = true;
+            continue;
+        }
         let column = scratch.builder.build_unchecked(labels, ctx.trees);
         if ctx.branchings.forbids(&column) {
             blocked_positive = true;
             continue;
         }
-        if ctx.seen.contains(column.labels()) {
-            continue;
-        }
         found.push(column);
-        if found.len() >= max_per_call {
+        // Keep a bounded reserve of exact-DP positives. The composite pricer
+        // drains this before invoking any tier on later CG iterations, so a
+        // batch of useful columns can avoid several full exact-DP calls.
+        if found.len() >= reserve_cap {
             break;
         }
     }
 
     if !found.is_empty() {
-        PricingResult::Found(found)
-    } else if blocked_positive {
+        let cols = scratch.emit_with_reserve(found, ctx, max_per_call);
+        PricingResult::Found(cols)
+    } else if blocked_positive || seen_positive {
         PricingResult::Exhausted
     } else {
         PricingResult::Converged
     }
+}
+
+fn exact_reserve_cap(max_per_call: usize) -> usize {
+    let default_cap = max_per_call.saturating_mul(8).max(max_per_call);
+    std::env::var("KLADOS_BP_M2_EXACT_RESERVE_CAP")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(default_cap)
+        .max(max_per_call)
 }
 
 pub(crate) fn collect_positive_columns(

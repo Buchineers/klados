@@ -178,7 +178,11 @@ fn solve_recursive(instance: &Instance, cfg: &BpConfig) -> Option<Vec<Tree>> {
     // bp-multi's solve_branch_price_multi_cached which kernelizes before
     // trying any decomposition.
     let kern = if cfg.kernelize {
-        klados_core::kernelize::kernelize_best(instance, &Default::default())
+        let mut kernel_cfg = klados_core::kernelize::KernelizeConfig::default();
+        if !instance.protected_labels.is_empty() {
+            kernel_cfg.protected_labels = instance.protected_labels.clone();
+        }
+        klados_core::kernelize::kernelize_best(instance, &kernel_cfg)
     } else {
         klados_core::kernelize::KernelizeResult {
             instance: instance.clone(),
