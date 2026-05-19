@@ -29,12 +29,14 @@ use fixedbitset::FixedBitSet;
 use std::collections::BTreeMap;
 
 pub use expansion::{build_rep_to_all, expand_solution};
-pub use instance_ops::{compose_reverse_maps, reduce_instance, restrict_instance_simple};
+pub use instance_ops::{
+    compose_reverse_maps, reduce_instance, restrict_instance_remove_label, restrict_instance_simple,
+};
 pub use rule::{ReductionAction, ReductionRule, RuleContext, RuleEvent, VictimStrategy};
 pub use stats::{KernelizeStats, build_surviving_taxa, print_stats, print_taxa_detail};
 
 use chain::ChainRule;
-use cherry::CherryRule;
+use cherry::{CherryRule, find_common_cherry_batch};
 
 /// Which reduction rules are enabled.
 #[derive(Clone, Debug)]
@@ -136,6 +138,50 @@ pub fn kernelize(instance: &Instance, config: &KernelizeConfig) -> KernelizeResu
             victim_strategy: config.victim_strategy,
         };
 
+        // Subtree/cherry reductions are parameter-preserving and disjoint
+        // cherries visible in the same instance can be collapsed together.
+        // This preserves the priority-restart semantics at the pass level, but
+        // avoids rebuilding all trees once per cherry on large instances.
+        if config.subtree {
+            let find_start = std::time::Instant::now();
+            let cherries = find_common_cherry_batch(&ctx);
+            if !cherries.is_empty() {
+                *rule_counts.entry("cherry").or_default() += cherries.len();
+
+                let mut keep_set = FixedBitSet::with_capacity(reduced.num_leaves as usize + 1);
+                keep_set.insert_range(1..(reduced.num_leaves as usize + 1));
+
+                let leaves_after_start = reduced.num_leaves;
+                let mut events = Vec::with_capacity(cherries.len());
+                for (i, (keep, remove)) in cherries.iter().copied().enumerate() {
+                    let orig_keep = composite_rev[keep as usize];
+                    let orig_remove = composite_rev[remove as usize];
+                    all_collapses_original.push((orig_keep, vec![orig_remove]));
+                    keep_set.set(remove as usize, false);
+                    events.push(RuleEvent {
+                        rule_name: "cherry",
+                        action: ReductionAction::Collapse {
+                            keep: orig_keep,
+                            remove: orig_remove,
+                        },
+                        original_labels: vec![orig_keep, orig_remove],
+                        duration: std::time::Duration::ZERO,
+                        leaves_after: leaves_after_start - (i as u32) - 1,
+                    });
+                }
+
+                let (r, rev) = restrict_instance_simple(&reduced, &keep_set);
+                composite_rev = compose_reverse_maps(&composite_rev, &rev, r.num_leaves);
+                reduced = r;
+                if let Some(first) = events.first_mut() {
+                    first.duration = find_start.elapsed();
+                }
+                trace.extend(events);
+
+                continue 'outer;
+            }
+        }
+
         for rule in &rules {
             let find_start = std::time::Instant::now();
             let found = rule.find(&ctx);
@@ -170,26 +216,14 @@ pub fn kernelize(instance: &Instance, config: &KernelizeConfig) -> KernelizeResu
                         let orig_remove = original_labels[1];
                         all_collapses_original.push((orig_keep, vec![orig_remove]));
 
-                        let mut keep_set =
-                            FixedBitSet::with_capacity(reduced.num_leaves as usize + 1);
-                        for lbl in 1..=reduced.num_leaves {
-                            keep_set.insert(lbl as usize);
-                        }
-                        keep_set.set(remove as usize, false);
-                        let (r, rev) = restrict_instance_simple(&reduced, &keep_set);
+                        let (r, rev) = restrict_instance_remove_label(&reduced, remove);
                         composite_rev = compose_reverse_maps(&composite_rev, &rev, r.num_leaves);
                         reduced = r;
                     }
                     ReductionAction::Delete { victim } => {
                         deleted_labels_original.push(original_labels[0]);
 
-                        let mut keep_set =
-                            FixedBitSet::with_capacity(reduced.num_leaves as usize + 1);
-                        for lbl in 1..=reduced.num_leaves {
-                            keep_set.insert(lbl as usize);
-                        }
-                        keep_set.set(victim as usize, false);
-                        let (r, rev) = restrict_instance_simple(&reduced, &keep_set);
+                        let (r, rev) = restrict_instance_remove_label(&reduced, victim);
                         composite_rev = compose_reverse_maps(&composite_rev, &rev, r.num_leaves);
                         reduced = r;
                     }
