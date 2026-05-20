@@ -889,15 +889,15 @@ fn solve_node<P: Pricer, S: BranchSelector>(
         }
     }
 
-    // MIP-on-pool primal heuristic. Enabled by default; disable with
-    // KLADOS_BP_MIP_HEURISTIC=0. Fires when the LP objective is at an
+    // MIP-on-pool primal heuristic. Disabled by default; enable with
+    // KLADOS_BP_MIP_HEURISTIC=1. Fires when the LP objective is at an
     // integer boundary but the support is fractional — exactly the case
     // where pure branching nudges the LP by ε per node and a MIP solve
     // over the existing pool finds the missing integer combination
     // directly. Time-capped (100ms by default) so the failure mode is
     // bounded.
     let lp_frac = lp.objective.ceil() - lp.objective;
-    if std::env::var("KLADOS_BP_MIP_HEURISTIC").map_or(true, |v| v != "0")
+    if std::env::var("KLADOS_BP_MIP_HEURISTIC").is_ok_and(|v| v != "0")
         && lb < state.best_ub()
         && lp_frac < 1e-4
     {

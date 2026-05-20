@@ -265,7 +265,7 @@ pub fn dispatch_by_m(trees: &[Tree]) -> CompositePricer {
                     .with_max_per_call(64),
             ))));
         }
-        if n0 * n1 <= 1_000_000 {
+        if n0 * n1 <= m2_exact_dp_cell_cap() {
             tiers.push(Box::new(ExactPairDpPricer::new(trees)));
         }
         tiers.push(Box::new(
@@ -329,6 +329,20 @@ fn m2_leaf_pair_trial_limit() -> u32 {
         .unwrap_or(64)
 }
 
+fn m2_exact_dp_cell_cap() -> usize {
+    std::env::var("KLADOS_BP_M2_EXACT_DP_CELLS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        // Old bp-multi always keeps the exact 2-tree DP available.  The
+        // rewrite's former 1M-cell cutoff accidentally disabled the exact
+        // convergence tier on the remaining hard ~550-620 leaf subcores,
+        // leaving only the leaf-pair repair pricer and causing huge branch
+        // trees/timeouts.  4M cells is still modest memory for one active
+        // B&P solve while covering those legacy-fast cores.
+        .unwrap_or(4_000_000)
+}
+
 fn use_m2_leaf_first() -> bool {
     std::env::var("KLADOS_BP_M2_LEAF_FIRST")
         .ok()
@@ -340,13 +354,13 @@ fn m2_leaf_pair_full_fallback(trees: &[Tree]) -> bool {
     std::env::var("KLADOS_BP_M2_LEAF_FULL_FALLBACK")
         .ok()
         .map(|v| v != "0")
-        // The full p² scan is still needed on exact-track sized cores: e.g.
+        // The full p² scan is still needed on some exact-track cores: e.g.
         // reduced n=290 from the 350-leaf public instance 05/5d needs a
-        // branch-feasible same-anchor alternative to hit k=223.  On the
-        // larger decomposed heuristic cores (>350 leaves), the same fallback
-        // dominates runtime and the bounded leaf scan is enough as a repair
-        // tier after the exact anchor DP.
-        .unwrap_or_else(|| trees[0].num_leaves <= 350)
+        // branch-feasible same-anchor alternative to hit k=223.  But at
+        // n≈343+ it dominates the remaining hard heuristic cases (07/e9 spent
+        // ~79s there).  Keep it only below that empirical correctness/speed
+        // boundary; exact-DP remains the convergence tier above it.
+        .unwrap_or_else(|| trees[0].num_leaves <= 300)
 }
 
 fn use_m3_leaf_only() -> bool {
