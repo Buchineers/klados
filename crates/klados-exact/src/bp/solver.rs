@@ -232,11 +232,38 @@ fn can_prune_by_bound(lb: usize, best_ub: usize) -> bool {
     lb >= best_ub
 }
 
+fn is_tiny_two_tree_core(reduced: &Instance, trees: &[Tree]) -> bool {
+    trees.len() == 2 && reduced.num_leaves <= 64
+}
+
+fn use_bound_prune_shortcuts(reduced: &Instance, trees: &[Tree]) -> bool {
+    let _ = (reduced, trees);
+    true
+}
+
+fn use_rcvf_shortcuts(reduced: &Instance, trees: &[Tree]) -> bool {
+    if std::env::var("KLADOS_BP_TINY_RCVF").is_ok() {
+        return true;
+    }
+    !is_tiny_two_tree_core(reduced, trees)
+}
+
 /// Solve a kernelized, undecomposable subinstance.
 ///
 /// Caller must guarantee `m ≥ 2` and `n ≥ 2` (the pipeline's
 /// `trivial_solution` short-circuit handles the trivial cases).
 pub fn solve_inner(reduced: &Instance) -> Option<Vec<Tree>> {
+    solve_inner_with_subsolver(reduced, &mut |sub| {
+        crate::bp::solve_subinstance(sub, &crate::bp::BpConfig::default())
+    })
+}
+
+/// Variant of [`solve_inner`] that lets the recursive decomposition caller
+/// provide the same subproblem solver/memo to primal heuristics.
+pub fn solve_inner_with_subsolver<F>(reduced: &Instance, solve_sub: &mut F) -> Option<Vec<Tree>>
+where
+    F: FnMut(&Instance) -> Option<Vec<Tree>>,
+{
     let trees = &reduced.trees;
     let n = reduced.num_leaves as usize;
     if trees.is_empty() {
@@ -307,10 +334,10 @@ pub fn solve_inner(reduced: &Instance) -> Option<Vec<Tree>> {
     // integer solution and we lose by branching needlessly. Matches
     // bp-multi's behavior; this was the missing primal heuristic that
     // explains the recurring "LP=optimum but support fractional" gap.
-    if trees.len() == 2 && reduced.num_leaves >= 20 {
-        if let Some(incumbent_forest) = try_whidden_relaxed_incumbent_2tree(reduced, &mut |sub| {
-            crate::bp::solve_subinstance(sub, &crate::bp::BpConfig::default())
-        }) {
+    let relaxed_incumbent_enabled =
+        std::env::var("KLADOS_BP_RELAXED_INCUMBENT").map_or(true, |v| v != "0");
+    if relaxed_incumbent_enabled && trees.len() == 2 && reduced.num_leaves >= 20 {
+        if let Some(incumbent_forest) = try_whidden_relaxed_incumbent_2tree(reduced, solve_sub) {
             install_incumbent(
                 &mut state,
                 &mut rmp,
@@ -357,6 +384,8 @@ pub fn solve_inner(reduced: &Instance) -> Option<Vec<Tree>> {
     // the gap.
     let mut stack: Vec<(Branchings, f64)> = vec![(Branchings::default(), f64::NEG_INFINITY)];
     let mut last_progress_log = std::time::Instant::now();
+    let allow_bound_prune = use_bound_prune_shortcuts(reduced, trees);
+    let allow_rcvf = use_rcvf_shortcuts(reduced, trees);
     while let Some((b, parent_lp_bound)) = stack.pop() {
         // Periodic progress log so we can see telemetry on timeouts, not
         // just on successful completion. Every 5 seconds is rare enough
@@ -399,7 +428,7 @@ pub fn solve_inner(reduced: &Instance) -> Option<Vec<Tree>> {
         } else {
             0
         };
-        if can_prune_by_bound(inherited_lb, state.best_ub()) {
+        if allow_bound_prune && can_prune_by_bound(inherited_lb, state.best_ub()) {
             tel.bound_prunes += 1;
             continue;
         }
@@ -414,6 +443,8 @@ pub fn solve_inner(reduced: &Instance) -> Option<Vec<Tree>> {
             &mut selector,
             &mut tel,
             &mut root_regions,
+            allow_bound_prune,
+            allow_rcvf,
         );
         match outcome {
             NodeOutcome::Pruned => {}
@@ -499,6 +530,8 @@ fn solve_node<P: Pricer, S: BranchSelector>(
     selector: &mut S,
     tel: &mut Telemetry,
     root_regions: &mut Option<RootSupportRegions>,
+    allow_bound_prune: bool,
+    allow_rcvf: bool,
 ) -> NodeOutcome {
     tel.nodes_explored += 1;
 
@@ -507,7 +540,11 @@ fn solve_node<P: Pricer, S: BranchSelector>(
     // free on the hot path; when an in-node primal heuristic (rounding /
     // MIP-on-pool) cut best_ub, the next node entry picks up the new
     // fixings before we touch the LP.
-    let newly = rmp.reapply_root_rcvf(state.columns(), state.best_ub());
+    let newly = if allow_rcvf {
+        rmp.reapply_root_rcvf(state.columns(), state.best_ub())
+    } else {
+        0
+    };
     if newly > 0 {
         debug!(
             target: LOG_TARGET,
@@ -618,7 +655,7 @@ fn solve_node<P: Pricer, S: BranchSelector>(
 
     let lb = (lp.objective - 1e-6).ceil() as usize;
 
-    if can_prune_by_bound(lb, state.best_ub()) {
+    if allow_bound_prune && can_prune_by_bound(lb, state.best_ub()) {
         debug!(
             target: LOG_TARGET,
             "node pruned by bound: lp={:.4} ub={}",
@@ -639,7 +676,7 @@ fn solve_node<P: Pricer, S: BranchSelector>(
     // problem too, so columns barred from the unrestricted improving region
     // are barred everywhere. Non-root RCVF would tighten further within its
     // subtree but requires per-subtree undo machinery; deferred.
-    if branchings.depth() == 0 {
+    if branchings.depth() == 0 && allow_rcvf {
         let rcvf_newly_fixed = rmp.apply_rcvf(
             lp.objective,
             state.columns(),
@@ -795,7 +832,7 @@ fn solve_node<P: Pricer, S: BranchSelector>(
                 }
             }
         }
-    } else {
+    } else if allow_rcvf {
         // Subtree-local RCVF: the LP at a branched node is tighter than
         // root because the branching constraints have raised its optimum,
         // so the same rc-bound condition fixes columns that root duals
@@ -844,7 +881,7 @@ fn solve_node<P: Pricer, S: BranchSelector>(
                     state.best_ub(), tel.cg_iters,
                 );
 
-                if can_prune_by_bound(lb, state.best_ub()) {
+                if allow_bound_prune && can_prune_by_bound(lb, state.best_ub()) {
                     tel.bound_prunes += 1;
                     return NodeOutcome::Pruned;
                 }
@@ -890,7 +927,7 @@ fn solve_node<P: Pricer, S: BranchSelector>(
                                 state.best_ub(), tel.cg_iters, branchings.depth(),
                             );
 
-                            if can_prune_by_bound(lb, state.best_ub()) {
+                            if allow_bound_prune && can_prune_by_bound(lb, state.best_ub()) {
                                 tel.bound_prunes += 1;
                                 return NodeOutcome::Pruned;
                             }

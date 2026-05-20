@@ -83,3 +83,42 @@ pub trait Pricer {
     fn name(&self) -> &'static str;
     fn price(&mut self, ctx: &PricingContext, scratch: &mut PricerScratch) -> PricingResult;
 }
+
+/// Legacy-compatible batch cap for the m=2 column generator.
+///
+/// The old monolithic solver deliberately emitted smaller batches on
+/// medium-sized two-tree subproblems (and at most 16 away from the root).
+/// The rewrite had grown to 64-column batches everywhere, which tends to
+/// flood the RMP with weaker columns and makes the LP/search loop much larger
+/// on the hard decomposed heuristic subinstances.
+pub(crate) fn adaptive_m2_batch_size(ctx: &PricingContext) -> usize {
+    if let Ok(raw) = std::env::var("KLADOS_BP_M2_BATCH") {
+        if let Ok(n) = raw.parse::<usize>() {
+            if n > 0 {
+                return n;
+            }
+        }
+    }
+
+    let active = ctx
+        .alpha
+        .iter()
+        .skip(1)
+        .filter(|&&a| a > 1.0e-12)
+        .count();
+    let mut batch = if active >= 1200 {
+        64
+    } else if active >= 768 {
+        48
+    } else if active >= 384 {
+        32
+    } else if active >= 256 {
+        24
+    } else {
+        16
+    };
+    if ctx.branchings.depth() > 0 {
+        batch = batch.min(16);
+    }
+    batch
+}
