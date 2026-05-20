@@ -52,7 +52,15 @@ const WHIDDEN_MIN_LEAVES: u32 = 20;
 const DIRECT_M2_SMALL_CORE_MAX_LEAVES: u32 = 64;
 const MEMO_MIN_LEAVES: u32 = 4;
 const MEMO_MAX_LEAVES: u32 = 512;
-const CANON_WL_MAX_ROUNDS: usize = 6;
+/// Cap on individualization-refinement search nodes. If a subinstance is so
+/// symmetric that canonicalization would exceed this, we abort and skip the
+/// memo for it (correctness preserved, just no caching).
+const CANON_IR_BUDGET: usize = 2000;
+
+thread_local! {
+    static KERN_NANOS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static CANON_NANOS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 #[derive(Default)]
 struct SubinstanceMemo {
@@ -162,11 +170,13 @@ impl ExactSolver for BpSolver {
         if memo_stats.hits > 0 || memo_stats.stores > 0 || memo_stats.skipped_ambiguous > 0 {
             info!(
                 target: LOG_TARGET,
-                "bp memo: hits={} stores={} entries={} skipped_ambiguous={}",
+                "bp memo: hits={} stores={} entries={} skipped_ambiguous={} kern={:.1}ms canon={:.1}ms",
                 memo_stats.hits,
                 memo_stats.stores,
                 memo_stats.solutions.len(),
                 memo_stats.skipped_ambiguous,
+                KERN_NANOS.with(|c| c.get()) as f64 / 1e6,
+                CANON_NANOS.with(|c| c.get()) as f64 / 1e6,
             );
         }
         Some(components)
@@ -225,7 +235,10 @@ fn solve_recursive_memo(
         if !instance.protected_labels.is_empty() {
             kernel_cfg.protected_labels = instance.protected_labels.clone();
         }
-        klados_core::kernelize::kernelize_best(instance, &kernel_cfg)
+        let t = Instant::now();
+        let r = klados_core::kernelize::kernelize_best(instance, &kernel_cfg);
+        KERN_NANOS.with(|c| c.set(c.get() + t.elapsed().as_nanos() as u64));
+        r
     } else {
         klados_core::kernelize::KernelizeResult {
             instance: instance.clone(),
@@ -255,8 +268,17 @@ fn solve_recursive_memo(
     let memo_view = if reduced.num_trees() == 2
         && (MEMO_MIN_LEAVES..=MEMO_MAX_LEAVES).contains(&reduced.num_leaves)
     {
-        match canonicalize_two_tree_instance(reduced) {
+        let t_canon = Instant::now();
+        let canon = canonicalize_two_tree_instance(reduced);
+        CANON_NANOS.with(|c| c.set(c.get() + t_canon.elapsed().as_nanos() as u64));
+        match canon {
             Some(view) => {
+                if std::env::var("KLADOS_BP_DUMP_MEMO_KEYS").is_ok() {
+                    eprintln!(
+                        "MEMOKEY\tn={}\tkey={}",
+                        reduced.num_leaves, view.key
+                    );
+                }
                 let cached_partition = {
                     let mut memo_ref = memo.borrow_mut();
                     if let Some(cached) = memo_ref.solutions.get(&view.key).cloned() {
@@ -380,6 +402,130 @@ fn solve_recursive_memo(
     ))
 }
 
+/// Weisfeiler-Leman colour refinement on the leaf set, shared by both trees.
+/// Refines `leaf_color` in place to a stable colouring; returns the class
+/// count. The leaf's own current colour is part of its signature, so an
+/// externally-imposed split (individualization) is preserved across rounds.
+fn wl_refine(t0: &Tree, t1: &Tree, leaf_color: &mut [u32], n: usize) -> usize {
+    let mut classes = {
+        let mut seen = leaf_color[1..=n].to_vec();
+        seen.sort_unstable();
+        seen.dedup();
+        seen.len()
+    };
+    for _round in 0..=n {
+        let (codes0, codes1) = canonical_subtree_codes(t0, t1, leaf_color);
+
+        let mut entries: Vec<(u32, Vec<u32>, Vec<u32>, u32)> = Vec::with_capacity(n);
+        for label in 1..=n as u32 {
+            let p0 = leaf_path_codes_ids(t0, label, &codes0);
+            let p1 = leaf_path_codes_ids(t1, label, &codes1);
+            entries.push((leaf_color[label as usize], p0, p1, label));
+        }
+        entries.sort_unstable();
+
+        let mut new_color = vec![0u32; n + 1];
+        let mut cur_id: u32 = 0;
+        for i in 0..entries.len() {
+            if i > 0
+                && (entries[i].0 != entries[i - 1].0
+                    || entries[i].1 != entries[i - 1].1
+                    || entries[i].2 != entries[i - 1].2)
+            {
+                cur_id += 1;
+            }
+            new_color[entries[i].3 as usize] = cur_id;
+        }
+        let new_classes = cur_id as usize + 1;
+        let stable = new_color[1..=n] == leaf_color[1..=n];
+        leaf_color[1..=n].copy_from_slice(&new_color[1..=n]);
+        classes = new_classes;
+        if classes == n || stable {
+            break;
+        }
+    }
+    classes
+}
+
+struct IrState {
+    best_key: Option<String>,
+    best_l2c: Vec<u32>,
+    best_c2l: Vec<u32>,
+    budget: usize,
+    aborted: bool,
+}
+
+/// Individualization-refinement search. Explores every WL-consistent complete
+/// leaf labelling and keeps the one with the lexicographically smallest key.
+/// That minimum is a true canonical form: isomorphic instances explore
+/// isomorphic search trees and therefore agree on the minimum. If the search
+/// exceeds its node budget the canonicalization is aborted (memo skipped).
+fn ir_search(t0: &Tree, t1: &Tree, n: usize, color: &[u32], classes: usize, st: &mut IrState) {
+    if st.aborted {
+        return;
+    }
+    if st.budget == 0 {
+        st.aborted = true;
+        return;
+    }
+    st.budget -= 1;
+
+    if classes == n {
+        let mut entries: Vec<(u32, u32)> =
+            (1..=n as u32).map(|l| (color[l as usize], l)).collect();
+        entries.sort_unstable();
+        let mut l2c = vec![0u32; n + 1];
+        let mut c2l = vec![0u32; n + 1];
+        for (idx, (_, label)) in entries.iter().enumerate() {
+            let canon = (idx + 1) as u32;
+            l2c[*label as usize] = canon;
+            c2l[canon as usize] = *label;
+        }
+        let r0 = t0.relabel(&l2c, n as u32);
+        let r1 = t1.relabel(&l2c, n as u32);
+        let key = format!(
+            "{}||{}",
+            labeled_tree_signature(&r0, r0.root),
+            labeled_tree_signature(&r1, r1.root)
+        );
+        if st.best_key.as_ref().map_or(true, |bk| key < *bk) {
+            st.best_key = Some(key);
+            st.best_l2c = l2c;
+            st.best_c2l = c2l;
+        }
+        return;
+    }
+
+    let mut counts = vec![0u32; classes];
+    for l in 1..=n {
+        counts[color[l] as usize] += 1;
+    }
+    let target = (0..classes).find(|&c| counts[c] > 1).unwrap() as u32;
+    let members: Vec<u32> = (1..=n as u32)
+        .filter(|&l| color[l as usize] == target)
+        .collect();
+
+    for &v in &members {
+        if st.aborted {
+            return;
+        }
+        // Split `target`: every leaf's colour is doubled, then the non-`v`
+        // members of the class are bumped — individualizing `v`. wl_refine
+        // renormalizes colours afterwards.
+        let mut nc = color.to_vec();
+        for l in 1..=n {
+            nc[l] *= 2;
+        }
+        for &w in &members {
+            if w != v {
+                nc[w as usize] += 1;
+            }
+        }
+        let classes2 = wl_refine(t0, t1, &mut nc, n);
+        ir_search(t0, t1, n, &nc, classes2, st);
+    }
+}
+
 fn canonicalize_two_tree_instance(instance: &Instance) -> Option<CanonicalMemoView> {
     debug_assert_eq!(instance.num_trees(), 2);
     let t0 = &instance.trees[0];
@@ -387,92 +533,97 @@ fn canonicalize_two_tree_instance(instance: &Instance) -> Option<CanonicalMemoVi
     let n = instance.num_leaves as usize;
 
     let mut leaf_color: Vec<u32> = vec![0; n + 1];
-    let mut prev_classes: usize = 1;
+    let classes = wl_refine(t0, t1, &mut leaf_color, n);
 
-    for _round in 0..CANON_WL_MAX_ROUNDS {
-        let codes0 = colored_subtree_codes_ids(t0, &leaf_color);
-        let codes1 = colored_subtree_codes_ids(t1, &leaf_color);
+    let mut st = IrState {
+        best_key: None,
+        best_l2c: Vec::new(),
+        best_c2l: Vec::new(),
+        budget: CANON_IR_BUDGET,
+        aborted: false,
+    };
+    ir_search(t0, t1, n, &leaf_color, classes, &mut st);
 
-        let mut entries: Vec<(Vec<u32>, Vec<u32>, u32)> = Vec::with_capacity(n);
-        for label in 1..=n as u32 {
-            let p0 = leaf_path_codes_ids(t0, label, &codes0);
-            let p1 = leaf_path_codes_ids(t1, label, &codes1);
-            entries.push((p0, p1, label));
-        }
-        entries.sort_unstable_by(|a, b| {
-            a.0.cmp(&b.0)
-                .then_with(|| a.1.cmp(&b.1))
-                .then_with(|| a.2.cmp(&b.2))
-        });
-
-        let mut new_color = vec![0u32; n + 1];
-        let mut cur_id: u32 = 0;
-        for i in 0..entries.len() {
-            if i > 0 && (entries[i].0 != entries[i - 1].0 || entries[i].1 != entries[i - 1].1) {
-                cur_id += 1;
-            }
-            new_color[entries[i].2 as usize] = cur_id;
-        }
-        let classes = cur_id as usize + 1;
-
-        let stable = new_color == leaf_color;
-        leaf_color = new_color;
-        if classes == n || stable || classes == prev_classes {
-            break;
-        }
-        prev_classes = classes;
+    if st.aborted {
+        return None;
     }
-
-    let mut entries: Vec<(u32, u32)> = (1..=n as u32)
-        .map(|l| (leaf_color[l as usize], l))
-        .collect();
-    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-
-    let mut label_to_canonical = vec![0u32; n + 1];
-    let mut canonical_to_label = vec![0u32; n + 1];
-    for (new_idx, (_, label)) in entries.iter().enumerate() {
-        let canon = (new_idx + 1) as u32;
-        label_to_canonical[*label as usize] = canon;
-        canonical_to_label[canon as usize] = *label;
-    }
-
-    let relabeled0 = t0.relabel(&label_to_canonical, instance.num_leaves);
-    let relabeled1 = t1.relabel(&label_to_canonical, instance.num_leaves);
-    let key = format!(
-        "{}||{}",
-        labeled_tree_signature(&relabeled0, relabeled0.root),
-        labeled_tree_signature(&relabeled1, relabeled1.root)
-    );
-
+    let key = st.best_key?;
     Some(CanonicalMemoView {
         key,
-        label_to_canonical,
-        canonical_to_label,
+        label_to_canonical: st.best_l2c,
+        canonical_to_label: st.best_c2l,
     })
 }
 
-fn colored_subtree_codes_ids(tree: &Tree, leaf_color: &[u32]) -> Vec<u32> {
-    const INTERNAL_ID_OFFSET: u32 = 1_000_000_000;
-    let mut codes = vec![0u32; tree.num_nodes()];
-    let mut mapper: FxHashMap<(u32, u32), u32> = FxHashMap::default();
-    let mut next_internal: u32 = INTERNAL_ID_OFFSET;
+fn node_heights(tree: &Tree) -> Vec<u32> {
+    let mut h = vec![0u32; tree.num_nodes()];
     for node in tree.post_order() {
-        codes[node as usize] = if tree.is_leaf(node) {
-            let lbl = tree.label[node as usize] as usize;
-            leaf_color[lbl]
-        } else {
+        if !tree.is_leaf(node) {
             let (l, r) = tree.children_pair(node);
-            let a = codes[l as usize];
-            let b = codes[r as usize];
-            let key = if a <= b { (a, b) } else { (b, a) };
-            *mapper.entry(key).or_insert_with(|| {
-                let id = next_internal;
-                next_internal += 1;
-                id
-            })
-        };
+            h[node as usize] = 1 + h[l as usize].max(h[r as usize]);
+        }
     }
-    codes
+    h
+}
+
+/// Assign each node of both trees an integer code that depends only on the
+/// colored subtree shape (leaf colours + topology), not on traversal order.
+/// Codes are allocated in sorted order, level by level, so the code ordering
+/// is itself isomorphism-canonical — essential for canonical cell ordering.
+fn canonical_subtree_codes(t0: &Tree, t1: &Tree, leaf_color: &[u32]) -> (Vec<u32>, Vec<u32>) {
+    let mut codes0 = vec![0u32; t0.num_nodes()];
+    let mut codes1 = vec![0u32; t1.num_nodes()];
+    let h0 = node_heights(t0);
+    let h1 = node_heights(t1);
+    let max_h = h0
+        .iter()
+        .chain(h1.iter())
+        .copied()
+        .max()
+        .unwrap_or(0);
+
+    let mut next_code: u32 = 0;
+    for level in 0..=max_h {
+        let shape_key = |tree: &Tree, codes: &[u32], node: u32| -> (u32, u32, u32) {
+            if tree.is_leaf(node) {
+                (0, leaf_color[tree.label[node as usize] as usize], 0)
+            } else {
+                let (l, r) = tree.children_pair(node);
+                let a = codes[l as usize];
+                let b = codes[r as usize];
+                (1, a.min(b), a.max(b))
+            }
+        };
+        let mut keys: Vec<(u32, u32, u32)> = Vec::new();
+        for node in 0..t0.num_nodes() as u32 {
+            if h0[node as usize] == level {
+                keys.push(shape_key(t0, &codes0, node));
+            }
+        }
+        for node in 0..t1.num_nodes() as u32 {
+            if h1[node as usize] == level {
+                keys.push(shape_key(t1, &codes1, node));
+            }
+        }
+        keys.sort_unstable();
+        keys.dedup();
+        let mut map: FxHashMap<(u32, u32, u32), u32> = FxHashMap::default();
+        for k in keys {
+            map.insert(k, next_code);
+            next_code += 1;
+        }
+        for node in 0..t0.num_nodes() as u32 {
+            if h0[node as usize] == level {
+                codes0[node as usize] = map[&shape_key(t0, &codes0, node)];
+            }
+        }
+        for node in 0..t1.num_nodes() as u32 {
+            if h1[node as usize] == level {
+                codes1[node as usize] = map[&shape_key(t1, &codes1, node)];
+            }
+        }
+    }
+    (codes0, codes1)
 }
 
 fn leaf_path_codes_ids(tree: &Tree, label: u32, subtree_codes: &[u32]) -> Vec<u32> {
@@ -568,4 +719,133 @@ fn make_leafset(labels: &[u32], num_leaves: u32) -> FixedBitSet {
         bits.insert(label as usize);
     }
     bits
+}
+
+#[cfg(test)]
+mod canon_tests {
+    use super::*;
+    use klados_core::tree::{Label, NodeId, NONE};
+
+    fn parse(nw: &str, n: u32) -> Tree {
+        let mut t = Tree::with_capacity(n);
+        let b = nw.as_bytes();
+        let mut pos = 0usize;
+        fn rec(b: &[u8], pos: &mut usize, t: &mut Tree) -> NodeId {
+            if b[*pos] == b'(' {
+                *pos += 1;
+                let l = rec(b, pos, t);
+                assert_eq!(b[*pos], b',');
+                *pos += 1;
+                let r = rec(b, pos, t);
+                assert_eq!(b[*pos], b')');
+                *pos += 1;
+                let id = t.parent.len() as NodeId;
+                t.parent.push(NONE);
+                t.left.push(l);
+                t.right.push(r);
+                t.label.push(0);
+                t.parent[l as usize] = id;
+                t.parent[r as usize] = id;
+                id
+            } else {
+                let start = *pos;
+                while *pos < b.len() && b[*pos].is_ascii_digit() {
+                    *pos += 1;
+                }
+                let lbl: u32 = std::str::from_utf8(&b[start..*pos]).unwrap().parse().unwrap();
+                let id = t.parent.len() as NodeId;
+                t.parent.push(NONE);
+                t.left.push(NONE);
+                t.right.push(NONE);
+                t.label.push(lbl as Label);
+                t.label_to_node[lbl as usize] = id;
+                id
+            }
+        }
+        t.root = rec(b, &mut pos, &mut t);
+        t.compute_metadata();
+        t
+    }
+
+    /// Rebuild `src` with the left/right children of every internal node
+    /// swapped (a full mirror) — a rotation that canonicalization must ignore.
+    fn mirror(src: &Tree) -> Tree {
+        let mut t = Tree::with_capacity(src.num_leaves);
+        fn rec(src: &Tree, node: NodeId, t: &mut Tree) -> NodeId {
+            if src.is_leaf(node) {
+                let lbl = src.label[node as usize];
+                let id = t.parent.len() as NodeId;
+                t.parent.push(NONE);
+                t.left.push(NONE);
+                t.right.push(NONE);
+                t.label.push(lbl);
+                t.label_to_node[lbl as usize] = id;
+                id
+            } else {
+                let (l, r) = src.children_pair(node);
+                let rr = rec(src, r, t);
+                let ll = rec(src, l, t);
+                let id = t.parent.len() as NodeId;
+                t.parent.push(NONE);
+                t.left.push(rr);
+                t.right.push(ll);
+                t.label.push(0);
+                t.parent[rr as usize] = id;
+                t.parent[ll as usize] = id;
+                id
+            }
+        }
+        t.root = rec(src, src.root, &mut t);
+        t.compute_metadata();
+        t
+    }
+
+    fn check_invariant(nw0: &str, nw1: &str, n: u32) {
+        let t0 = parse(nw0, n);
+        let t1 = parse(nw1, n);
+        let base = canonicalize_two_tree_instance(&Instance::new(vec![t0.clone(), t1.clone()], n))
+            .expect("base canonicalizes")
+            .key;
+        for shift in 1..n {
+            let mut map = vec![0 as Label; n as usize + 1];
+            for l in 1..=n {
+                map[l as usize] = ((l - 1 + shift) % n) + 1;
+            }
+            let r0 = t0.relabel(&map, n);
+            let r1 = t1.relabel(&map, n);
+            // mirror tree 0 only: tests rotation + relabeling together.
+            let inst = Instance::new(vec![mirror(&r0), r1], n);
+            let k = canonicalize_two_tree_instance(&inst).expect("perm canonicalizes").key;
+            assert_eq!(base, k, "key not invariant at shift={shift}");
+        }
+    }
+
+    #[test]
+    fn canon_invariant_generic() {
+        check_invariant(
+            "(((1,2),(3,4)),((5,6),(7,8)))",
+            "((1,(3,(5,7))),((2,4),(6,8)))",
+            8,
+        );
+    }
+
+    #[test]
+    fn canon_invariant_symmetric() {
+        // Highly symmetric: both trees fully balanced — exercises the
+        // individualization-refinement branching.
+        check_invariant(
+            "(((1,2),(3,4)),((5,6),(7,8)))",
+            "(((1,2),(3,4)),((5,6),(7,8)))",
+            8,
+        );
+    }
+
+    #[test]
+    fn canon_invariant_caterpillar() {
+        check_invariant(
+            "(1,(2,(3,(4,(5,6)))))",
+            "(((((1,6),2),5),3),4)",
+            6,
+        );
+    }
 }
