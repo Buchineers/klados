@@ -49,7 +49,7 @@ use klados_core::{NONE, Tree};
 
 use crate::bp::column::AfColumn;
 
-use super::{Pricer, PricerScratch, PricingContext, PricingResult};
+use super::{adaptive_m2_batch_size, Pricer, PricerScratch, PricingContext, PricingResult};
 
 const PRICING_EPS: f64 = 1.0e-8;
 const NEG_INF: f64 = f64::NEG_INFINITY;
@@ -977,7 +977,11 @@ impl Pricer for LeafPairDpPricer {
             }
             return PricingResult::Exhausted;
         }
-        let target = self.max_per_call;
+        let target = if ctx.trees.len() == 2 {
+            self.max_per_call.min(adaptive_m2_batch_size(ctx))
+        } else {
+            self.max_per_call
+        };
         let trial_limit = (self.pair_trial_limit as usize).min(order.len());
 
         if trial_limit < order.len() {

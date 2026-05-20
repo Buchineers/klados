@@ -9,7 +9,7 @@
 
 use klados_core::{NONE, Tree};
 
-use super::{Pricer, PricerScratch, PricingContext, PricingResult};
+use super::{adaptive_m2_batch_size, Pricer, PricerScratch, PricingContext, PricingResult};
 
 const PRICING_EPS: f64 = 1.0e-8;
 const NEG_INF: f64 = f64::NEG_INFINITY;
@@ -112,7 +112,7 @@ impl Pricer for ExactPairDpPricer {
 
     fn price(&mut self, ctx: &PricingContext, scratch: &mut PricerScratch) -> PricingResult {
         debug_assert_eq!(ctx.trees.len(), 2);
-        price_exact_pair_dp(ctx, scratch, self.max_per_call)
+        price_exact_pair_dp(ctx, scratch, self.max_per_call.min(adaptive_m2_batch_size(ctx)))
     }
 }
 
@@ -165,8 +165,18 @@ fn price_exact_pair_dp(
     if !found.is_empty() {
         let cols = scratch.emit_with_reserve(found, ctx, max_per_call);
         PricingResult::Found(cols)
-    } else if blocked_positive || seen_positive {
+    } else if blocked_positive {
         PricingResult::Exhausted
+    } else if seen_positive {
+        // Match the legacy bp-multi behaviour on unconstrained 2-tree CG:
+        // if the exact anchor DP found only columns that are already in the
+        // global pool, there is no *new* positive column to add.  Falling
+        // through to the leaf-pair tier here is both redundant and extremely
+        // expensive on hard decomposed subproblems (it repeatedly full-scans
+        // p² leaf anchors just to rediscover pool columns).  Under branch
+        // constraints we still return Exhausted for blocked positives above,
+        // because a different same-anchor column may satisfy the branch.
+        PricingResult::Converged
     } else {
         PricingResult::Converged
     }

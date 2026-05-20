@@ -16,8 +16,8 @@ use klados_core::Tree;
 use log::trace;
 
 use super::{
-    ExactPairDpPricer, LeafPairDpPricer, MultiTreePairDpPricer, Pricer, PricerScratch,
-    PricingContext, PricingResult, SmallComponentPricer,
+    adaptive_m2_batch_size, ExactPairDpPricer, LeafPairDpPricer, MultiTreePairDpPricer, Pricer,
+    PricerScratch, PricingContext, PricingResult, SmallComponentPricer,
 };
 
 const LOG_TARGET: &str = "klados::bp::composite";
@@ -254,17 +254,37 @@ pub fn dispatch_by_m(trees: &[Tree]) -> CompositePricer {
         // `pair_ub` bound provides the convergence proof.
         let n0 = trees[0].num_nodes();
         let n1 = trees[1].num_nodes();
+        if use_m2_leaf_first() {
+            // Legacy bp-multi tried the fast leaf-pair generator before the
+            // exact anchor DP.  This can seed the RMP with structurally better
+            // columns and shrink the B&B tree on some hard 2-tree subproblems.
+            tiers.push(Box::new(HeuristicOnlyPricer::new(Box::new(
+                LeafPairDpPricer::new(trees)
+                    .with_pair_trial_limit(m2_leaf_pair_trial_limit())
+                    .with_fallback_full_when_empty(false)
+                    .with_max_per_call(64),
+            ))));
+        }
         if n0 * n1 <= 1_000_000 {
             tiers.push(Box::new(ExactPairDpPricer::new(trees)));
         }
         tiers.push(Box::new(
             LeafPairDpPricer::new(trees)
                 .with_pair_trial_limit(m2_leaf_pair_trial_limit())
-                .with_fallback_full_when_empty(true)
+                .with_fallback_full_when_empty(m2_leaf_pair_full_fallback(trees))
                 .with_max_per_call(32),
         ));
     } else {
         let batch = adaptive_batch_size_for(trees.len(), trees[0].num_leaves as usize);
+        if use_m3_leaf_only() {
+            tiers.push(Box::new(
+                LeafPairDpPricer::new(trees)
+                    .with_pair_trial_limit(256)
+                    .with_fallback_full_when_empty(true)
+                    .with_max_per_call(batch),
+            ));
+            return CompositePricer::new(tiers);
+        }
         if use_fast_leaf_first(trees) {
             // Old bp-multi's speed on easy high-m benchmark instances comes
             // from this leaf-pair generator. Run it first as a heuristic only:
@@ -309,6 +329,33 @@ fn m2_leaf_pair_trial_limit() -> u32 {
         .unwrap_or(64)
 }
 
+fn use_m2_leaf_first() -> bool {
+    std::env::var("KLADOS_BP_M2_LEAF_FIRST")
+        .ok()
+        .map(|v| v != "0")
+        .unwrap_or(false)
+}
+
+fn m2_leaf_pair_full_fallback(trees: &[Tree]) -> bool {
+    std::env::var("KLADOS_BP_M2_LEAF_FULL_FALLBACK")
+        .ok()
+        .map(|v| v != "0")
+        // The full p² scan is still needed on exact-track sized cores: e.g.
+        // reduced n=290 from the 350-leaf public instance 05/5d needs a
+        // branch-feasible same-anchor alternative to hit k=223.  On the
+        // larger decomposed heuristic cores (>350 leaves), the same fallback
+        // dominates runtime and the bounded leaf scan is enough as a repair
+        // tier after the exact anchor DP.
+        .unwrap_or_else(|| trees[0].num_leaves <= 350)
+}
+
+fn use_m3_leaf_only() -> bool {
+    std::env::var("KLADOS_BP_M3_LEAF_ONLY")
+        .ok()
+        .map(|v| v != "0")
+        .unwrap_or(true)
+}
+
 fn use_fast_leaf_first(trees: &[Tree]) -> bool {
     let n = trees[0].num_leaves as usize;
     let m = trees.len();
@@ -319,6 +366,9 @@ fn use_fast_leaf_first(trees: &[Tree]) -> bool {
 }
 
 fn adaptive_batch_size(ctx: &PricingContext) -> usize {
+    if ctx.trees.len() == 2 {
+        return adaptive_m2_batch_size(ctx);
+    }
     adaptive_batch_size_for(ctx.trees.len(), ctx.num_leaves)
 }
 
