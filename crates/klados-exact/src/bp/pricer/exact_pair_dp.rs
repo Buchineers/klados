@@ -116,6 +116,19 @@ impl Pricer for ExactPairDpPricer {
     }
 }
 
+/// Cell budget for the exact DP's `n0 × n1` table. Each cell costs 32 bytes
+/// (`DpClosed` + `DpOpen`), so the default 64M cells ≈ 2 GB — comfortably
+/// within the 8 GB platform budget while covering every exact-track m=2 core.
+/// Above this the pricer declines (returns `Exhausted`) and the exhaustive
+/// leaf-pair tier behind it provides the sound convergence proof instead.
+fn exact_dp_cell_cap() -> usize {
+    std::env::var("KLADOS_BP_M2_EXACT_DP_CELLS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(64_000_000)
+}
+
 fn price_exact_pair_dp(
     ctx: &PricingContext,
     scratch: &mut PricerScratch,
@@ -126,6 +139,14 @@ fn price_exact_pair_dp(
     let n0 = t0.num_nodes();
     let n1 = t1.num_nodes();
     let nl = ctx.num_leaves;
+
+    // Memory guard: when the O(n²) table would exceed the cell budget, decline
+    // rather than allocate. Returning `Exhausted` (never `Converged`) keeps
+    // this tier sound — it cascades to the exhaustive leaf-pair verifier,
+    // which proves convergence without the dense table.
+    if n0.saturating_mul(n1) > exact_dp_cell_cap() {
+        return PricingResult::Exhausted;
+    }
 
     let mut cache = scratch
         .exact_dp_cache
