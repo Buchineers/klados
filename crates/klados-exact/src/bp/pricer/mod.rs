@@ -26,34 +26,17 @@
 //!   space, given current branchings. Strongest guarantee.
 
 pub mod anchor_cache;
-pub mod anchor_extend;
-pub mod column_aggregation;
-pub mod composite;
 pub mod exact_pair_dp;
-pub mod ilp;
 pub mod leaf_pair_dp;
-pub mod multi_pair_dp;
-pub mod pair_dp;
-pub mod pair_dp_filter;
+pub mod maf_pricer;
 pub mod scratch;
-pub mod small_component;
 
-// --- Used in the default dispatch_by_m() ---
-pub use column_aggregation::ColumnAggregationPricer;
-pub use composite::{CompositePricer, dispatch_by_m};
 pub use exact_pair_dp::ExactPairDpPricer;
 pub use leaf_pair_dp::LeafPairDpPricer;
-pub use multi_pair_dp::MultiTreePairDpPricer;
-pub use small_component::SmallComponentPricer;
+pub use maf_pricer::{dispatch_by_m, MafPricer};
 
-// --- Tier infrastructure ---
 pub use anchor_cache::{AnchorCache, AnchorEntry, CacheResult};
 pub use scratch::{PairDpTable, PricerScratch};
-
-// --- Experimental / heuristic extras (not in default dispatch) ---
-pub use anchor_extend::AnchorExtendPricer;
-pub use pair_dp::PairDpPricer;
-pub use pair_dp_filter::PairDpFilterPricer;
 
 use klados_core::Tree;
 
@@ -70,13 +53,18 @@ pub struct PricingContext<'a> {
     pub branchings: &'a Branchings,
 }
 
+/// Outcome of a pricing call. The solver trusts the LP bound (bound-prune,
+/// optimality certification) **only** on `Converged`.
 pub enum PricingResult {
-    /// Positive-RC columns found. Caller adds and re-prices.
+    /// At least one emittable improving column was found. CG continues.
     Found(Vec<AfColumn>),
-    /// No columns found but no convergence proof — LP-bound prune unsound.
-    Exhausted,
-    /// Proved no positive-RC valid column exists — LP-bound prune sound.
+    /// Proven that no improving column exists (valid or not). CG stops, the
+    /// LP bound is certified — bound-prune is sound.
     Converged,
+    /// An improving column provably exists, but none was emittable (every
+    /// candidate violates a branch constraint). CG stops, the LP bound is
+    /// NOT certified — the solver must branch, never bound-prune.
+    Improving,
 }
 
 pub trait Pricer {

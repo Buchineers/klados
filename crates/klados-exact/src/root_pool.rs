@@ -278,7 +278,7 @@ impl RootPoolSolver {
                     converged = true;
                     break;
                 }
-                PricingResult::Exhausted => break,
+                PricingResult::Improving => break,
             }
         }
 

@@ -24,7 +24,7 @@ use crate::bp::rmp::Rmp;
 use crate::bp::search::{
     BranchSelector, Branchings, Incumbent, SearchState, SelectionContext, Telemetry,
 };
-use crate::chen_rspr::chen_pair_agreement;
+use crate::chen_rspr::{chen_pair_agreement, chen_pair_bounds};
 use crate::whidden_cluster::try_whidden_relaxed_incumbent_2tree;
 
 const LOG_TARGET: &str = "klados::bp";
@@ -49,6 +49,27 @@ fn sampled_reference_indices(m: usize, limit: usize) -> Vec<usize> {
         }
     }
     out
+}
+
+/// A valid combinatorial lower bound on the MAF component count, from Chen's
+/// fast 2-approximation. For m=2 it is the pair's rSPR lower bound; for m≥3
+/// the maximum over **every** tree pair — the m-tree MAF must agree with each
+/// pair, so its component count is ≥ each pairwise MAF. Conservative on the
+/// rSPR-vs-component-count offset (no `+1`) so it can never over-bound.
+/// Cheap: each `chen_pair_bounds` is the fast 2-approx, not red-blue.
+fn chen_lower_bound(trees: &[Tree]) -> usize {
+    let m = trees.len();
+    if m < 2 {
+        return 0;
+    }
+    let mut lb = 0usize;
+    for i in 0..m {
+        for j in (i + 1)..m {
+            let (lo, _) = chen_pair_bounds(&trees[i], &trees[j]);
+            lb = lb.max(lo);
+        }
+    }
+    lb
 }
 
 fn compute_local_bounds(trees: &[Tree], num_leaves: u32) -> LocalBounds {
@@ -276,6 +297,10 @@ where
         return Some(trees[0..1].to_vec());
     }
 
+    // Chen pairwise lower bound — a sound combinatorial floor on the
+    // component count, valid for every B&B node of this (sub)instance.
+    let chen_lb = chen_lower_bound(trees);
+
     // Seed singletons via a temporary builder; the runtime builder lives in
     // PricerScratch so all pricer tiers share it.
     let mut seed_builder = ColumnBuilder::new(trees);
@@ -428,7 +453,10 @@ where
         } else {
             0
         };
-        if allow_bound_prune && can_prune_by_bound(inherited_lb, state.best_ub()) {
+        // The Chen lower bound is a sound floor independent of the LP.
+        if allow_bound_prune
+            && can_prune_by_bound(inherited_lb.max(chen_lb), state.best_ub())
+        {
             tel.bound_prunes += 1;
             continue;
         }
@@ -445,6 +473,7 @@ where
             &mut root_regions,
             allow_bound_prune,
             allow_rcvf,
+            chen_lb,
         );
         match outcome {
             NodeOutcome::Pruned => {}
@@ -532,6 +561,7 @@ fn solve_node<P: Pricer, S: BranchSelector>(
     root_regions: &mut Option<RootSupportRegions>,
     allow_bound_prune: bool,
     allow_rcvf: bool,
+    chen_lb: usize,
 ) -> NodeOutcome {
     tel.nodes_explored += 1;
 
@@ -558,6 +588,9 @@ fn solve_node<P: Pricer, S: BranchSelector>(
     tel.timings.bounds_apply += t0.elapsed();
 
     // Column generation.
+    // `node_converged` records whether CG ended on a genuine `Converged` from
+    // the pricer. The LP bound (bound-prune, RCVF) may be trusted ONLY then.
+    let mut node_converged = false;
     let lp = loop {
         let t0 = Instant::now();
         let lp = match rmp.solve() {
@@ -629,10 +662,13 @@ fn solve_node<P: Pricer, S: BranchSelector>(
                 );
                 continue;
             }
-            PricingResult::Exhausted => {
+            PricingResult::Improving => {
+                // An improving column provably exists but none was emittable
+                // (all violate branch constraints). The LP is NOT at its true
+                // optimum — bound is uncertified. CG stops; the node branches.
                 trace!(
                     target: LOG_TARGET,
-                    "cg iter={} lp={:.4} EXHAUSTED pricer_ms={:.1}",
+                    "cg iter={} lp={:.4} IMPROVING (uncertified) pricer_ms={:.1}",
                     tel.cg_iters,
                     lp.objective,
                     pt.as_secs_f64() * 1000.0
@@ -648,18 +684,27 @@ fn solve_node<P: Pricer, S: BranchSelector>(
                     pt.as_secs_f64() * 1000.0
                 );
                 tel.had_converged = true;
+                node_converged = true;
                 break lp;
             }
         }
     };
 
-    let lb = (lp.objective - 1e-6).ceil() as usize;
+    // The LP bound is a valid lower bound ONLY if CG genuinely converged
+    // (`Improving` leaves the LP objective below the true node optimum). The
+    // Chen lower bound is a sound combinatorial floor that holds regardless.
+    let lp_lb = (lp.objective - 1e-6).ceil() as usize;
+    let lb = if node_converged {
+        lp_lb.max(chen_lb)
+    } else {
+        chen_lb
+    };
 
     if allow_bound_prune && can_prune_by_bound(lb, state.best_ub()) {
         debug!(
             target: LOG_TARGET,
-            "node pruned by bound: lp={:.4} ub={}",
-            lp.objective, state.best_ub(),
+            "node pruned by bound: lb={} (lp={:.4} chen={}) ub={}",
+            lb, lp.objective, chen_lb, state.best_ub(),
         );
         tel.bound_prunes += 1;
         return NodeOutcome::Pruned;
@@ -676,7 +721,9 @@ fn solve_node<P: Pricer, S: BranchSelector>(
     // problem too, so columns barred from the unrestricted improving region
     // are barred everywhere. Non-root RCVF would tighten further within its
     // subtree but requires per-subtree undo machinery; deferred.
-    if branchings.depth() == 0 && allow_rcvf {
+    // RCVF reduced costs are valid only at the true LP optimum — gate on
+    // genuine convergence (root is unconstrained so it always converges).
+    if branchings.depth() == 0 && allow_rcvf && node_converged {
         let rcvf_newly_fixed = rmp.apply_rcvf(
             lp.objective,
             state.columns(),

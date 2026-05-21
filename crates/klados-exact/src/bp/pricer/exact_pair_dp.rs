@@ -121,7 +121,7 @@ impl Pricer for ExactPairDpPricer {
 /// within the 8 GB platform budget while covering every exact-track m=2 core.
 /// Above this the pricer declines (returns `Exhausted`) and the exhaustive
 /// leaf-pair tier behind it provides the sound convergence proof instead.
-fn exact_dp_cell_cap() -> usize {
+pub(crate) fn exact_dp_cell_cap() -> usize {
     std::env::var("KLADOS_BP_M2_EXACT_DP_CELLS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
@@ -145,7 +145,7 @@ fn price_exact_pair_dp(
     // this tier sound — it cascades to the exhaustive leaf-pair verifier,
     // which proves convergence without the dense table.
     if n0.saturating_mul(n1) > exact_dp_cell_cap() {
-        return PricingResult::Exhausted;
+        return PricingResult::Improving;
     }
 
     let mut cache = scratch
@@ -165,13 +165,18 @@ fn price_exact_pair_dp(
     let mut seen_positive = false;
     let reserve_cap = exact_reserve_cap(max_per_call);
     for (_, labels) in candidates {
-        if ctx.seen.contains(&labels) {
-            seen_positive = true;
-            continue;
-        }
         let column = scratch.builder.build_unchecked(labels, ctx.trees);
+        // `forbids` MUST be checked before `seen`. A column that is both
+        // already-in-pool and forbidden by branching is bounded to zero in
+        // this node's RMP — it does not serve the LP. Counting it as benign
+        // `seen` would let the pricer declare `Converged` while an allowed,
+        // improving column may still exist at the same anchor → unsound bound.
         if ctx.branchings.forbids(&column) {
             blocked_positive = true;
+            continue;
+        }
+        if ctx.seen.contains(column.labels()) {
+            seen_positive = true;
             continue;
         }
         found.push(column);
@@ -187,7 +192,7 @@ fn price_exact_pair_dp(
         let cols = scratch.emit_with_reserve(found, ctx, max_per_call);
         PricingResult::Found(cols)
     } else if blocked_positive {
-        PricingResult::Exhausted
+        PricingResult::Improving
     } else if seen_positive {
         // Match the legacy bp-multi behaviour on unconstrained 2-tree CG:
         // if the exact anchor DP found only columns that are already in the
@@ -318,8 +323,20 @@ fn collect_candidates_above(
     t1_active.fill(false);
     best_l0.fill((NEG_INF, 0u32));
     best_r0.fill((NEG_INF, 0u32));
+    // Must-linked leaves stay active even with alpha <= 0. A must-link
+    // constraint can force such a leaf into an improving column; excluding it
+    // would make the pricer unable to build that column and falsely report
+    // convergence — an unsound LP bound.
+    for pair in ctx.branchings.must_link() {
+        if (pair.a as usize) <= nl {
+            active_labels[pair.a as usize] = true;
+        }
+        if (pair.b as usize) <= nl {
+            active_labels[pair.b as usize] = true;
+        }
+    }
     for label in 1..=nl {
-        if ctx.alpha[label] <= 1.0e-12 {
+        if ctx.alpha[label] <= 1.0e-12 && !active_labels[label] {
             continue;
         }
         active_labels[label] = true;

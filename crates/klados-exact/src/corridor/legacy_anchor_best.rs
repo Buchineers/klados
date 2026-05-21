@@ -552,7 +552,7 @@ fn run_cg<P: Pricer>(
                     }
                 }
             }
-            PricingResult::Converged | PricingResult::Exhausted => {
+            PricingResult::Converged | PricingResult::Improving => {
                 converged = true;
                 break;
             }
