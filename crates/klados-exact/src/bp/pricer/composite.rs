@@ -249,15 +249,14 @@ impl CompositePricer {
 pub fn dispatch_by_m(trees: &[Tree]) -> CompositePricer {
     let mut tiers: Vec<Box<dyn Pricer>> = Vec::new();
     if trees.len() == 2 {
-        // The exact DP's O(n²) table is infeasible above ~1000 leaves
-        // (~1M cells, 16MB).  On large instances the leaf-pair DP's
-        // `pair_ub` bound provides the convergence proof.
-        let n0 = trees[0].num_nodes();
-        let n1 = trees[1].num_nodes();
+        // m=2 pricing must always end on an *exhaustive* tier so the CG loop
+        // only terminates on a genuine convergence proof. Heuristic tiers may
+        // only accelerate (short-circuit on `Found`); they must never be the
+        // tier whose empty result ends column generation.
         if use_m2_leaf_first() {
-            // Legacy bp-multi tried the fast leaf-pair generator before the
-            // exact anchor DP.  This can seed the RMP with structurally better
-            // columns and shrink the B&B tree on some hard 2-tree subproblems.
+            // Optional fast accelerator. `HeuristicOnlyPricer` downgrades
+            // `Converged` → `Exhausted`, so this tier can only ever
+            // short-circuit on `Found` — it can never certify convergence.
             tiers.push(Box::new(HeuristicOnlyPricer::new(Box::new(
                 LeafPairDpPricer::new(trees)
                     .with_pair_trial_limit(m2_leaf_pair_trial_limit())
@@ -265,13 +264,20 @@ pub fn dispatch_by_m(trees: &[Tree]) -> CompositePricer {
                     .with_max_per_call(64),
             ))));
         }
-        if n0 * n1 <= m2_exact_dp_cell_cap() {
-            tiers.push(Box::new(ExactPairDpPricer::new(trees)));
-        }
+        // Exact verifier — ALWAYS present. This is the convergence oracle.
+        // Its O(n²) table is memory-guarded inside the pricer: when it cannot
+        // fit, the pricer returns `Exhausted` (never a false `Converged`) and
+        // defers the proof to the exhaustive leaf-pair tier below.
+        tiers.push(Box::new(ExactPairDpPricer::new(trees)));
+        // Constraint-aware exhaustive verifier. `fallback_full_when_empty` is
+        // forced ON: this tier always scans every UB-surviving anchor pair, so
+        // it is sound and may legitimately certify convergence. It runs only
+        // when the exact tier defers (branch-blocked positives, or table too
+        // large for the cell budget).
         tiers.push(Box::new(
             LeafPairDpPricer::new(trees)
                 .with_pair_trial_limit(m2_leaf_pair_trial_limit())
-                .with_fallback_full_when_empty(m2_leaf_pair_full_fallback(trees))
+                .with_fallback_full_when_empty(true)
                 .with_max_per_call(32),
         ));
     } else {
@@ -329,38 +335,11 @@ fn m2_leaf_pair_trial_limit() -> u32 {
         .unwrap_or(64)
 }
 
-fn m2_exact_dp_cell_cap() -> usize {
-    std::env::var("KLADOS_BP_M2_EXACT_DP_CELLS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        // Old bp-multi always keeps the exact 2-tree DP available.  The
-        // rewrite's former 1M-cell cutoff accidentally disabled the exact
-        // convergence tier on the remaining hard ~550-620 leaf subcores,
-        // leaving only the leaf-pair repair pricer and causing huge branch
-        // trees/timeouts.  4M cells is still modest memory for one active
-        // B&P solve while covering those legacy-fast cores.
-        .unwrap_or(4_000_000)
-}
-
 fn use_m2_leaf_first() -> bool {
     std::env::var("KLADOS_BP_M2_LEAF_FIRST")
         .ok()
         .map(|v| v != "0")
         .unwrap_or(false)
-}
-
-fn m2_leaf_pair_full_fallback(trees: &[Tree]) -> bool {
-    std::env::var("KLADOS_BP_M2_LEAF_FULL_FALLBACK")
-        .ok()
-        .map(|v| v != "0")
-        // The full p² scan is still needed on some exact-track cores: e.g.
-        // reduced n=290 from the 350-leaf public instance 05/5d needs a
-        // branch-feasible same-anchor alternative to hit k=223.  But at
-        // n≈343+ it dominates the remaining hard heuristic cases (07/e9 spent
-        // ~79s there).  Keep it only below that empirical correctness/speed
-        // boundary; exact-DP remains the convergence tier above it.
-        .unwrap_or_else(|| trees[0].num_leaves <= 300)
 }
 
 fn use_m3_leaf_only() -> bool {

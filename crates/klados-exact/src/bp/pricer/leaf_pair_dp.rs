@@ -1027,7 +1027,12 @@ impl Pricer for LeafPairDpPricer {
 
         if found.is_empty() {
             let max_alpha = ctx.alpha.iter().copied().fold(NEG_INF, f64::max);
-            if max_alpha <= 1.0 + PRICING_EPS {
+            // `Converged` may only be claimed when the scan was exhaustive —
+            // every UB-surviving anchor pair actually evaluated. A partial
+            // (trial-limited) scan that found nothing proves nothing, so it
+            // must report `Exhausted` and never certify convergence.
+            let exhaustive = trial_limit >= order.len() || self.fallback_full_when_empty;
+            if exhaustive && max_alpha <= 1.0 + PRICING_EPS {
                 // No positive singleton and no positive multi-leaf column
                 // anchored at any pair → truly converged.
                 return PricingResult::Converged;
