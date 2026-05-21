@@ -277,17 +277,35 @@ impl LeafPairDpPricer {
 
     /// Collect active labels from alpha. Returns `true` if the set changed
     /// since the last call.
-    fn ensure_active_labels(&mut self, alpha: &[f64]) -> bool {
+    fn ensure_active_labels(&mut self, alpha: &[f64], ctx: &PricingContext) -> bool {
         let prev: Vec<u32> = std::mem::take(&mut self.active_labels);
         self.active_mask.clear();
         for v in self.label_to_active_idx.iter_mut() {
             *v = u32::MAX;
         }
+        let mut activate = |me: &mut Self, label: u32| {
+            if me.active_mask.contains(label as usize) {
+                return;
+            }
+            me.active_mask.insert(label as usize);
+            me.label_to_active_idx[label as usize] = me.active_labels.len() as u32;
+            me.active_labels.push(label);
+        };
         for label in 1..=self.num_leaves as u32 {
             if alpha[label as usize] > 1.0e-12 {
-                self.active_mask.insert(label as usize);
-                self.label_to_active_idx[label as usize] = self.active_labels.len() as u32;
-                self.active_labels.push(label);
+                activate(self, label);
+            }
+        }
+        // Must-linked leaves stay active even with alpha <= 0: a must-link
+        // constraint can force such a leaf into an improving column. Excluding
+        // it would make the pricer unable to build that column and falsely
+        // report convergence — an unsound LP bound.
+        for pair in ctx.branchings.must_link() {
+            if (pair.a as usize) <= self.num_leaves {
+                activate(self, pair.a);
+            }
+            if (pair.b as usize) <= self.num_leaves {
+                activate(self, pair.b);
             }
         }
         self.active_labels != prev
@@ -907,7 +925,7 @@ impl Pricer for LeafPairDpPricer {
 
     fn price(&mut self, ctx: &PricingContext, scratch: &mut PricerScratch) -> PricingResult {
         // --- Pricer caching: only rebuild when active set changes ---
-        let changed = self.ensure_active_labels(ctx.alpha);
+        let changed = self.ensure_active_labels(ctx.alpha, ctx);
         if changed {
             self.rebuild_pair_tables(ctx.trees);
         }
@@ -944,7 +962,7 @@ impl Pricer for LeafPairDpPricer {
 
         let p = self.active_labels.len();
         if p < 2 || p < self.min_active_labels {
-            return PricingResult::Exhausted;
+            return PricingResult::Improving;
         }
 
         // Collect all pairs where the tightest upper bound on RC exceeds
@@ -971,11 +989,10 @@ impl Pricer for LeafPairDpPricer {
             }
         }
         if order.is_empty() {
-            let max_alpha = ctx.alpha.iter().copied().fold(NEG_INF, f64::max);
-            if max_alpha <= 1.0 + PRICING_EPS && max_bound <= 1.0 + PRICING_EPS {
-                return PricingResult::Converged;
-            }
-            return PricingResult::Exhausted;
+            // leaf_pair_dp is a generation-only safety net for m>=3; its
+            // leaf-pair recurrence is not a complete oracle, so it must never
+            // certify. The sound m>=3 certifier is the DSSR tier.
+            return PricingResult::Improving;
         }
         let target = if ctx.trees.len() == 2 {
             self.max_per_call.min(adaptive_m2_batch_size(ctx))
@@ -1026,18 +1043,8 @@ impl Pricer for LeafPairDpPricer {
         }
 
         if found.is_empty() {
-            let max_alpha = ctx.alpha.iter().copied().fold(NEG_INF, f64::max);
-            // `Converged` may only be claimed when the scan was exhaustive —
-            // every UB-surviving anchor pair actually evaluated. A partial
-            // (trial-limited) scan that found nothing proves nothing, so it
-            // must report `Exhausted` and never certify convergence.
-            let exhaustive = trial_limit >= order.len() || self.fallback_full_when_empty;
-            if exhaustive && max_alpha <= 1.0 + PRICING_EPS {
-                // No positive singleton and no positive multi-leaf column
-                // anchored at any pair → truly converged.
-                return PricingResult::Converged;
-            }
-            return PricingResult::Exhausted;
+            // Generation-only: never certify (see the order.is_empty() branch).
+            return PricingResult::Improving;
         }
         // Sort by RC descending, cap at 128 to prevent RMP flooding
         // while still returning far more columns than the old limit of 32.
