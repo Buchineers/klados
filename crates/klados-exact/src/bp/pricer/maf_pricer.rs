@@ -1,32 +1,25 @@
 //! `MafPricer` — the pricing entry point.
 //!
-//! A pricing call has two distinct jobs, and this pricer names them as two
-//! roles with crisp contracts (see
-//! `papers/ours/Pricing Architecture Rework - Implementation Spec.md`):
+//! (see `papers/ours/Pricing Architecture Rework - Implementation Spec.md`.)
 //!
-//! - **Generator** — find emittable improving columns, fast. Constraint-aware.
-//!   May come up empty. *Never* claims convergence.
-//! - **Certifier** — prove no improving column exists. Sound, the sole
-//!   authority for `Converged`.
+//! - **m = 2**: the exact `(T₀,T₁)` anchor DP is the complete pricer — it both
+//!   generates and certifies. The leaf-pair DP runs only as a constraint-aware
+//!   generator when the exact DP defers (a branch-blocked positive).
 //!
-//! The generator is the multi-tree leaf-pair DP (builds columns valid across
-//! all `m` trees by construction, branch-constraint-aware).
+//! - **m ≥ 3**: the multi-tree leaf-pair DP is *both* generator and certifier.
+//!   It builds columns valid across all `m` trees by construction and is
+//!   constraint-aware (cannot-link masking in the recurrence, drop-repair at
+//!   emission), so the per-anchor best it emits is node-valid. Its full
+//!   all-anchor scan certifies directly: `solve_pair` dominates every column
+//!   at its anchor, so a global max ≤ 1+ε proves no improving column exists.
 //!
-//! The certifier is the exact `(T₀,T₁)` anchor DP. Key fact: a column valid
-//! across all `m` trees is valid in `(T₀,T₁)`, and its `m`-tree score (more β
-//! penalties) is ≤ its `(T₀,T₁)` score. So the `(T₀,T₁)` DP maximum is an
-//! upper bound on the true `m`-tree global maximum — `max ≤ 1+ε` certifies
-//! convergence for **any** `m`. No relaxation repair, no DSSR.
-//!
-//! There is no tier cascade and no `Exhausted`: `price` returns `Found`
-//! (CG continues), `Converged` (bound trusted), or `Improving` (an improving
-//! column provably exists but none was emittable — the solver must branch).
+//! `price` returns `Found` (CG continues), `Converged` (bound trusted), or
+//! `Improving` (an improving column provably exists but none was emittable —
+//! the solver must branch). No tier cascade, no `Exhausted`.
 
 use klados_core::Tree;
 
-use super::exact_pair_dp::{
-    collect_positive_candidates, exact_dp_cell_cap, ExactPairDpCache, ExactPairDpPricer,
-};
+use super::exact_pair_dp::ExactPairDpPricer;
 use super::leaf_pair_dp::LeafPairDpPricer;
 use super::{adaptive_m2_batch_size, Pricer, PricerScratch, PricingContext, PricingResult};
 
@@ -67,31 +60,6 @@ impl MafPricer {
         Vec::new()
     }
 
-    /// m≥3 certification: run the exact `(T₀,T₁)` anchor DP. Its global
-    /// maximum upper-bounds the true m-tree maximum, so `max ≤ 1+ε` is a
-    /// sound convergence proof. If the O(n²) table exceeds the cell budget
-    /// the DP cannot run — return `Improving` (uncertified), never a false
-    /// `Converged`.
-    fn certify_relaxation(ctx: &PricingContext, scratch: &mut PricerScratch) -> PricingResult {
-        let n0 = ctx.trees[0].num_nodes();
-        let n1 = ctx.trees[1].num_nodes();
-        let nl = ctx.num_leaves;
-        if n0.saturating_mul(n1) > exact_dp_cell_cap() {
-            return PricingResult::Improving;
-        }
-        let mut cache = scratch
-            .exact_dp_cache
-            .take()
-            .filter(|c| c.fits(n0, n1, nl))
-            .unwrap_or_else(|| ExactPairDpCache::new(n0, n1, nl));
-        let out = collect_positive_candidates(ctx, &mut cache, &[]);
-        scratch.exact_dp_cache = Some(cache);
-        if out.max_allowed_closed <= 1.0 + PRICING_EPS {
-            PricingResult::Converged
-        } else {
-            PricingResult::Improving
-        }
-    }
 }
 
 impl Pricer for MafPricer {
@@ -124,13 +92,13 @@ impl Pricer for MafPricer {
                     }
                 }
             },
-            // m≥3: the leaf-pair DP is the only generator of m-tree-valid
-            // columns; run it first. If it comes up empty, certify via the
-            // (T₀,T₁) relaxation maximum.
-            None => match self.generator.price(ctx, scratch) {
-                PricingResult::Found(cols) => PricingResult::Found(cols),
-                _ => Self::certify_relaxation(ctx, scratch),
-            },
+            // m≥3: the multi-tree leaf-pair DP is both generator and
+            // certifier. It builds columns valid across all m trees by
+            // construction, and its full all-anchor scan certifies
+            // convergence directly (§3): `solve_pair` dominates every column
+            // at its anchor, so a constraint-blind global max ≤ 1+ε proves no
+            // improving column exists for any m.
+            None => self.generator.price(ctx, scratch),
         }
     }
 }

@@ -36,13 +36,22 @@
 //! bitmask intersection inside `solve_side`'s extension loop, not in the
 //! state itself, so this scales cleanly to large m.
 //!
-//! ## Soundness
+//! ## Soundness — generator *and* certifier
 //!
-//! Heuristic: returns `Found` when any anchor pair (a, b) has positive
-//! score, `Exhausted` when none do. **Never returns `Converged`** — the DP
-//! optimises over leaf-pair anchors, and there might be valid columns
-//! whose best anchor pair is outside the active label set. Matching
-//! bp-multi's behaviour here.
+//! This pricer is both. `Found` when an emittable improving column exists;
+//! `Converged` when a **full** all-anchor scan proves none exists anywhere;
+//! `Improving` otherwise (improving column exists but none emittable, or the
+//! scan was trial-limited so convergence is undecided).
+//!
+//! The certification is the spec's load-bearing fact (§3 of the pricing
+//! rework spec): for any column `C` and any leaf pair `(a,b) ⊆ C`,
+//! `solve_pair(a,b) ≥ score(C)`. So the constraint-blind max of `solve_pair`
+//! over **every** anchor pair upper-bounds the score of every column. If that
+//! max is `≤ 1+ε`, no improving column exists — `Converged` is sound for any
+//! `m`. This requires the full scan: no `pair_trial_limit` cut and no early
+//! `target` break (the `completed` flag tracks this). The α-filtered active
+//! set is sound here because any improving column shrinks to an all-α>0
+//! sub-column of no-lesser score, and must-linked leaves are force-activated.
 
 use fixedbitset::FixedBitSet;
 use klados_core::{NONE, Tree};
@@ -129,14 +138,19 @@ pub struct LeafPairDpPricer {
     /// active).  Matches bp-multi's WIDEPRICER_MIN_ACTIVE_LABELS gate.
     min_active_labels: usize,
     /// ── Branch-awareness (set at each `price()` call) ──
-    /// `cannot_pair[l]` = partner that cannot appear in the same column as l,
-    /// or 0 if none.  Checked during `solve_side` to skip extension candidates
-    /// that would produce a forbidden column.
-    cannot_pair: Vec<u32>,
-    /// `must_pair[l]` = partner that must appear in the same column as l,
-    /// or 0 if none.  Checked during `solve_pair` to reject anchor pairs that
-    /// separate must-linked leaves.
-    must_pair: Vec<u32>,
+    /// `cannot_sets[l]` = bitset of every leaf cannot-linked to `l`. The
+    /// `solve_side` extension masks these out, so a column never extends a
+    /// side anchored at `l` with one of `l`'s cannot-partners — constraint-
+    /// aware generation along the recursion spine. Cross-anchor cannot-link
+    /// (both endpoints deep extensions on opposite sides) is repaired at
+    /// emission by [`Self::repair_to_valid`].
+    cannot_sets: Vec<FixedBitSet>,
+    /// Leaves whose `cannot_sets` entry is non-empty this call — used to
+    /// clear only the touched bitsets between calls.
+    cannot_dirty: Vec<u32>,
+    /// `has_cannot[l]` mirrors `!cannot_sets[l].is_clear()` for a cheap
+    /// per-anchor skip in the hot `solve_side` loop.
+    has_cannot: Vec<bool>,
     /// Reusable scratch for `solve_side`'s phase-1 candidate collection.
     /// Avoids a Vec allocation per call (~2500 per CG iter on Class B).
     solve_side_candidates: Vec<(u32, u32)>,
@@ -269,8 +283,9 @@ impl LeafPairDpPricer {
             pair_trial_limit: u32::MAX,
             fallback_full_when_empty: false,
             min_active_labels: 0,
-            cannot_pair: Vec::new(),
-            must_pair: Vec::new(),
+            cannot_sets: Vec::new(),
+            cannot_dirty: Vec::new(),
+            has_cannot: Vec::new(),
             solve_side_candidates: Vec::new(),
         }
     }
@@ -620,8 +635,16 @@ impl LeafPairDpPricer {
         // (m=8–36) this function is invoked ~2500× per CG iter, so the
         // hoisted slice pointers save tens of thousands of pointer chases
         // per iter without changing the algorithm.
-        // Constant across wi.
-        let cannot_a = self.cannot_pair[label_a as usize] as u32;
+        // Constraint-aware extension: mask out every leaf cannot-linked to the
+        // side anchor `label_a`. A column that extends `a`'s side is invalid
+        // if it contains a cannot-partner of `a`, so we never even enumerate
+        // those candidates — generation stays node-valid along the recursion
+        // spine, no post-filter rejection.
+        let cannot_a_blocks: &[usize] = if self.has_cannot[label_a as usize] {
+            self.cannot_sets[label_a as usize].as_slice()
+        } else {
+            &[]
+        };
         // Reuse the scratch candidates buffer; swap it out so recursive
         // solve_pair → solve_side calls get their own empty buffer.
         let mut candidates: Vec<(u32, u32)> = std::mem::take(&mut self.solve_side_candidates);
@@ -661,13 +684,13 @@ impl LeafPairDpPricer {
                 if wi == lb_w {
                     w &= !lb_m;
                 }
+                if let Some(&cb) = cannot_a_blocks.get(wi) {
+                    w &= !cb;
+                }
                 while w != 0 {
                     let bit = w.trailing_zeros() as usize;
                     w &= w - 1;
                     let c_label = (wi << BLOCK_SHIFT) + bit;
-                    if cannot_a != 0 && cannot_a == c_label as u32 {
-                        continue;
-                    }
                     let c = self.label_to_active_idx[c_label] as usize;
                     let idx_c = a * p + c;
                     let pen = self.pair_penalty[idx_c] - b_penalty_sum;
@@ -785,34 +808,40 @@ impl LeafPairDpPricer {
         target: usize,
         ctx: &PricingContext,
         scratch: &mut PricerScratch,
-    ) -> Vec<(f64, AfColumn)> {
+    ) -> CollectResult {
         let p = self.active_labels.len();
         let mut found: Vec<(f64, AfColumn)> = Vec::new();
+        // Constraint-blind global maximum of `solve_pair` over every anchor
+        // actually scanned. This is the certification quantity (§3 of the
+        // pricing rework spec): `solve_pair(a,b)` dominates every column at
+        // anchor `(a,b)`, so once every order-pair is scanned and this max is
+        // `≤ 1+ε`, no improving column exists anywhere → sound `Converged`.
+        let mut global_max: f64 = NEG_INF;
 
         let cache_active =
             anchor_cache_enabled() && ctx.trees.len() == 2 && scratch.anchor_cache.is_some();
 
-        for &(_, a, b) in order.iter().take(trial_limit) {
+        let scan = order.len().min(trial_limit);
+        // `completed` ⇒ every pair in `order` had its `solve_pair` evaluated;
+        // only then is `global_max` a valid convergence certificate.
+        let mut completed = scan == order.len();
+        for &(_, a, b) in order.iter().take(scan) {
             if found.len() >= target {
+                // Early stop: enough emittable columns. The scan is now
+                // incomplete, so `global_max` is not a valid convergence
+                // certificate — the caller must not certify on this result.
+                completed = false;
                 break;
             }
-            // `pair_ub` may have tightened since we built the order (the
-            // bound is recomputed each call).  Double-check here.
-            if self.pair_ub[a * p + b] <= 1.0 + PRICING_EPS {
-                continue;
-            }
-
-            // Branch-aware: skip anchor pairs that separate must-linked
-            // leaves or that are themselves cannot-linked.
             let la = self.active_labels[a];
             let lb = self.active_labels[b];
-            if self.must_pair[la as usize] != 0 && self.must_pair[la as usize] != lb {
-                continue;
-            }
-            if self.must_pair[lb as usize] != 0 && self.must_pair[lb as usize] != la {
-                continue;
-            }
-            if self.cannot_pair[la as usize] == lb {
+
+            // `pair_ub` may have tightened since we built the order (the
+            // bound is recomputed each call). If it dropped to `≤ 1+ε` then
+            // `solve_pair(a,b) ≤ pair_ub − root_penalty ≤ 1+ε`, so this anchor
+            // cannot beat the threshold — skip it without affecting the
+            // certification max.
+            if self.pair_ub[a * p + b] <= 1.0 + PRICING_EPS {
                 continue;
             }
 
@@ -823,7 +852,8 @@ impl LeafPairDpPricer {
                     cache.try_emit(la, lb, ctx.alpha, &ctx.beta[0], &ctx.beta[1], PRICING_EPS)
                 };
                 match cache_hit {
-                    super::anchor_cache::CacheResult::Emit { score: _ } => {
+                    super::anchor_cache::CacheResult::Emit { score: cached_score } => {
+                        global_max = global_max.max(cached_score);
                         // Rebuild column from cached leaves. If the cached
                         // column is already seen or blocked, do NOT skip this
                         // anchor: a different column at the same anchor may
@@ -857,22 +887,43 @@ impl LeafPairDpPricer {
                 }
             }
 
+            // `solve_pair` runs constraint-blind for *every* scanned anchor —
+            // it is the certification quantity. Constraint filtering applies
+            // only below, to emission.
             let score = self.solve_pair(a, b, ctx.alpha, ctx.beta);
+            global_max = global_max.max(score);
             if score <= 1.0 + PRICING_EPS {
-                // Refresh cache with a "non-improving" entry (gap=0,
-                // empty column would be wrong; instead just skip the
-                // refresh — the cache will treat this anchor as a Miss
-                // next time and re-run the DP if duals change).
                 continue;
             }
-            let labels = self.pair_labels(a, b, ctx.alpha, ctx.beta);
-            if labels.len() < 2 {
+            // An improving column exists at this anchor. The DP builds it
+            // constraint-blind; `solve_side`'s cannot-masking already keeps it
+            // node-valid along the recursion spine, but a cross-anchor
+            // cannot-link or a half-present must-group can still slip in.
+            // `repair_to_valid` drops the offending leaves — any subset of an
+            // agreement component is itself a valid agreement component — so
+            // the emitted column is node-valid by construction. If repair
+            // empties it below 2 leaves, this anchor contributes to the
+            // `Improving` residue and we skip it.
+            let raw_labels = self.pair_labels(a, b, ctx.alpha, ctx.beta);
+            if raw_labels.len() < 2 {
                 continue;
             }
+            let labels = match repair_to_valid(&raw_labels, ctx.branchings, ctx.alpha) {
+                Some(l) => l,
+                None => continue,
+            };
             if ctx.seen.contains(&labels) {
                 continue;
             }
             let column = scratch.builder.build_unchecked(labels, ctx.trees);
+            // Repair drops leaves, so the score changes — re-score exactly and
+            // re-check that the repaired column is still improving.
+            let score = column.pricing_score(ctx.alpha, ctx.beta);
+            if score <= 1.0 + PRICING_EPS {
+                continue;
+            }
+            // Guard: the repaired column must satisfy every branch constraint.
+            debug_assert!(!ctx.branchings.forbids(&column));
             if ctx.branchings.forbids(&column) {
                 continue;
             }
@@ -914,8 +965,84 @@ impl LeafPairDpPricer {
             found.push((score, column));
         }
 
-        found
+        CollectResult {
+            found,
+            global_max,
+            completed,
+        }
     }
+}
+
+/// Drop leaves from `labels` (sorted) until the set satisfies every branch
+/// constraint: no cannot-linked pair both present, no must-linked pair
+/// half-present. Returns the repaired sorted label set, or `None` if it
+/// shrinks below two leaves.
+///
+/// Soundness: any subset of a valid agreement component is itself a valid
+/// agreement component (restriction preserves cross-tree isomorphism), so the
+/// repaired set is always a constructible, node-valid column. When a leaf is
+/// dropped for one constraint it may strand a must-partner — the loop re-scans
+/// until a fixpoint, so a must-group is always wholly kept or wholly dropped.
+fn repair_to_valid(
+    labels: &[u32],
+    branchings: &crate::bp::search::Branchings,
+    alpha: &[f64],
+) -> Option<Vec<u32>> {
+    let cl = branchings.cannot_link();
+    let ml = branchings.must_link();
+    let mut out = labels.to_vec();
+    if cl.is_empty() && ml.is_empty() {
+        return Some(out);
+    }
+    loop {
+        let mut drop_label: Option<u32> = None;
+        for p in cl {
+            if out.binary_search(&p.a).is_ok() && out.binary_search(&p.b).is_ok() {
+                // Drop the lower-α endpoint — it costs the column less gain.
+                drop_label = Some(if alpha[p.a as usize] <= alpha[p.b as usize] {
+                    p.a
+                } else {
+                    p.b
+                });
+                break;
+            }
+        }
+        if drop_label.is_none() {
+            for p in ml {
+                let ha = out.binary_search(&p.a).is_ok();
+                let hb = out.binary_search(&p.b).is_ok();
+                if ha != hb {
+                    drop_label = Some(if ha { p.a } else { p.b });
+                    break;
+                }
+            }
+        }
+        match drop_label {
+            Some(d) => {
+                if let Ok(pos) = out.binary_search(&d) {
+                    out.remove(pos);
+                }
+            }
+            None => break,
+        }
+    }
+    if out.len() < 2 {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// Result of a `collect_from_order` scan.
+struct CollectResult {
+    /// Emittable improving columns (constraint-valid, not already seen).
+    found: Vec<(f64, AfColumn)>,
+    /// Constraint-blind max of `solve_pair` over every anchor scanned. Valid
+    /// as a convergence certificate only when `completed` is true.
+    global_max: f64,
+    /// True ⇔ every pair in `order` was scanned (no trial-limit cut, no
+    /// early `target` break).
+    completed: bool,
 }
 
 impl Pricer for LeafPairDpPricer {
@@ -946,18 +1073,34 @@ impl Pricer for LeafPairDpPricer {
             }
         }
 
-        // --- Branch-awareness: build lookup maps from current branchings ---
-        self.cannot_pair.resize(self.num_leaves + 1, 0);
-        self.cannot_pair.fill(0);
-        self.must_pair.resize(self.num_leaves + 1, 0);
-        self.must_pair.fill(0);
-        for pair in ctx.branchings.cannot_link() {
-            self.cannot_pair[pair.a as usize] = pair.b;
-            self.cannot_pair[pair.b as usize] = pair.a;
+        // --- Branch-awareness: cannot-link partner bitsets ---
+        // Generation is constraint-aware: `solve_side` masks out the side
+        // anchor's cannot-partners. Clear only the bitsets dirtied last call.
+        if self.cannot_sets.len() != self.num_leaves + 1 {
+            self.cannot_sets = (0..=self.num_leaves)
+                .map(|_| FixedBitSet::with_capacity(self.num_leaves + 1))
+                .collect();
+            self.has_cannot = vec![false; self.num_leaves + 1];
         }
-        for pair in ctx.branchings.must_link() {
-            self.must_pair[pair.a as usize] = pair.b;
-            self.must_pair[pair.b as usize] = pair.a;
+        for &l in &self.cannot_dirty {
+            self.cannot_sets[l as usize].clear();
+            self.has_cannot[l as usize] = false;
+        }
+        self.cannot_dirty.clear();
+        for pair in ctx.branchings.cannot_link() {
+            let (a, b) = (pair.a as usize, pair.b as usize);
+            if a <= self.num_leaves && b <= self.num_leaves {
+                self.cannot_sets[a].insert(b);
+                self.cannot_sets[b].insert(a);
+                if !self.has_cannot[a] {
+                    self.has_cannot[a] = true;
+                    self.cannot_dirty.push(a as u32);
+                }
+                if !self.has_cannot[b] {
+                    self.has_cannot[b] = true;
+                    self.cannot_dirty.push(b as u32);
+                }
+            }
         }
 
         let p = self.active_labels.len();
@@ -989,10 +1132,11 @@ impl Pricer for LeafPairDpPricer {
             }
         }
         if order.is_empty() {
-            // leaf_pair_dp is a generation-only safety net for m>=3; its
-            // leaf-pair recurrence is not a complete oracle, so it must never
-            // certify. The sound m>=3 certifier is the DSSR tier.
-            return PricingResult::Improving;
+            // Every anchor pair has a tight UB `pair_ub − root_penalty ≤ 1+ε`.
+            // That UB dominates `solve_pair` (§3), so no column anywhere — at
+            // any anchor, constraint-valid or not — can have score > 1+ε.
+            // No improving column exists: convergence is proven.
+            return PricingResult::Converged;
         }
         let target = if ctx.trees.len() == 2 {
             self.max_per_call.min(adaptive_m2_batch_size(ctx))
@@ -1015,13 +1159,16 @@ impl Pricer for LeafPairDpPricer {
             });
         }
 
-        let mut found = self.collect_from_order(&order, trial_limit, target, ctx, scratch);
+        let mut result = self.collect_from_order(&order, trial_limit, target, ctx, scratch);
 
-        if found.is_empty() && self.fallback_full_when_empty && trial_limit < order.len() {
+        // §3: the trial-limited pass is a fast *generation* shortcut. If it
+        // emitted nothing, the full all-anchor scan must run before pricing
+        // may certify (`Converged`) or rule out (`Improving`) convergence.
+        if result.found.is_empty() && self.fallback_full_when_empty && trial_limit < order.len() {
             order.sort_unstable_by(|l, r| {
                 r.0.partial_cmp(&l.0).unwrap_or(std::cmp::Ordering::Equal)
             });
-            found = self.collect_from_order(&order, order.len(), target, ctx, scratch);
+            result = self.collect_from_order(&order, order.len(), target, ctx, scratch);
         }
 
         // Optional anchor-cache stats logging.
@@ -1042,14 +1189,28 @@ impl Pricer for LeafPairDpPricer {
             }
         }
 
-        if found.is_empty() {
-            // Generation-only: never certify (see the order.is_empty() branch).
-            return PricingResult::Improving;
+        if !result.found.is_empty() {
+            // Sort by RC descending, cap at 128 to prevent RMP flooding
+            // while still returning far more columns than the old limit of 32.
+            let mut found = result.found;
+            found.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            let cap = 128usize.min(found.len());
+            return PricingResult::Found(found.into_iter().take(cap).map(|(_, c)| c).collect());
         }
-        // Sort by RC descending, cap at 128 to prevent RMP flooding
-        // while still returning far more columns than the old limit of 32.
-        found.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        let cap = 128usize.min(found.len());
-        PricingResult::Found(found.into_iter().take(cap).map(|(_, c)| c).collect())
+
+        // No emittable column. Decide between a proven `Converged` and an
+        // uncertified `Improving`.
+        if result.completed && result.global_max <= 1.0 + PRICING_EPS {
+            // The full all-anchor scan completed and the constraint-blind max
+            // anchor score is ≤ 1+ε: `solve_pair` dominates every column at
+            // its anchor (§3), so no improving column exists anywhere.
+            PricingResult::Converged
+        } else {
+            // Either the scan was incomplete (trial-limited, no fallback), or
+            // improving columns provably exist but every one is branch-blocked
+            // or already pooled. The LP bound is NOT certified — the solver
+            // must branch, never bound-prune.
+            PricingResult::Improving
+        }
     }
 }

@@ -62,6 +62,9 @@ fn chen_lower_bound(trees: &[Tree]) -> usize {
     if m < 2 {
         return 0;
     }
+    if std::env::var("KLADOS_BP_NO_CHEN_LB").is_ok() {
+        return 0;
+    }
     let mut lb = 0usize;
     for i in 0..m {
         for j in (i + 1)..m {
@@ -263,6 +266,9 @@ fn use_bound_prune_shortcuts(reduced: &Instance, trees: &[Tree]) -> bool {
 }
 
 fn use_rcvf_shortcuts(reduced: &Instance, trees: &[Tree]) -> bool {
+    if std::env::var("KLADOS_BP_NO_RCVF").is_ok() {
+        return false;
+    }
     if std::env::var("KLADOS_BP_TINY_RCVF").is_ok() {
         return true;
     }
@@ -879,7 +885,7 @@ fn solve_node<P: Pricer, S: BranchSelector>(
                 }
             }
         }
-    } else if allow_rcvf {
+    } else if allow_rcvf && node_converged {
         // Subtree-local RCVF: the LP at a branched node is tighter than
         // root because the branching constraints have raised its optimum,
         // so the same rc-bound condition fixes columns that root duals
@@ -887,6 +893,12 @@ fn solve_node<P: Pricer, S: BranchSelector>(
         // recorded on the rcvf_trail and undone on backtrack. Correct
         // only under DFS, which is the search order we use (best-first
         // tried and reverted — see the search loop's comment).
+        //
+        // Gated on `node_converged`: RCVF's rc-bound `lp.objective + rc ≥ ub`
+        // is valid only at the true LP optimum. On an uncertified `Improving`
+        // node the column generation stopped early — `lp.objective` is not a
+        // lower bound and the reduced costs are against incomplete duals, so
+        // fixing here could discard a column the optimum needs.
         let rcvf_newly_fixed = rmp.apply_subtree_rcvf(
             lp.objective,
             state.columns(),
