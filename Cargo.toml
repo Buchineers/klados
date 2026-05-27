@@ -52,6 +52,8 @@ env_logger = "0.11"
 default = []
 # Build optil.io submission binaries. Use: cargo build --release --features optil
 optil = []
+# Enable SIGTERM-based early termination with best-effort output.
+early-termination = ["klados-exact/early-termination"]
 
 [[bin]]
 name = "klados"

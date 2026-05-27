@@ -14,3 +14,6 @@ highs = { workspace = true }
 highs-sys = { workspace = true }
 rustsat = { workspace = true }
 rustsat-cadical = { workspace = true }
+
+[features]
+early-termination = []

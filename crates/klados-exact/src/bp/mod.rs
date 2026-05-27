@@ -32,14 +32,20 @@ pub mod solver;
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::atomic::AtomicBool;
+#[cfg(feature = "early-termination")]
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Instant;
 
 use fixedbitset::FixedBitSet;
 use fxhash::FxHashMap;
+use klados_core::af_validator::validate_agreement_forest;
 use klados_core::solve_pipeline::{ClusterAlgo, SolveConfig, solve_with_pipeline};
 use klados_core::{Instance, SolverStats, Tree};
 use log::{info, trace};
 
+use crate::chen_rspr::chen_pair_agreement;
 use crate::ExactSolver;
 use crate::whidden_cluster::try_whidden_decomp_2tree;
 
@@ -110,6 +116,7 @@ impl BpConfig {
 pub struct BpSolver {
     stats: SolverStats,
     config: BpConfig,
+    terminated: Arc<AtomicBool>,
 }
 
 impl Default for BpSolver {
@@ -131,6 +138,7 @@ impl BpSolver {
         Self {
             stats: SolverStats::default(),
             config,
+            terminated: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -138,6 +146,7 @@ impl BpSolver {
         Self {
             stats: SolverStats::default(),
             config,
+            terminated: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -155,7 +164,16 @@ impl ExactSolver for BpSolver {
         let t_total = Instant::now();
         let cfg = self.config.clone();
         let memo = Rc::new(RefCell::new(SubinstanceMemo::default()));
-        let components = solve_recursive_memo(instance, &cfg, &memo)?;
+        let mut components = solve_recursive_memo(instance, &cfg, &memo, &self.terminated)?;
+
+        // Post-validate: if Whidden decomp assembled invalid results
+        // (subproblems aborted), fall back to Chen 2-approximation.
+        if instance.num_trees() == 2
+            && !validate_agreement_forest(instance, &components).is_ok()
+        {
+            let (_, _, leafsets) = chen_pair_agreement(&instance.trees[0], &instance.trees[1]);
+            components = leafsets_to_trees(&leafsets, instance);
+        }
         self.stats.upper_bound = Some(components.len());
         self.stats.lower_bound = components.len();
         info!(
@@ -185,18 +203,24 @@ impl ExactSolver for BpSolver {
     fn stats(&self) -> &SolverStats {
         &self.stats
     }
+
+    #[cfg(feature = "early-termination")]
+    fn sigterm_handler(&self) {
+        self.terminated.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Re-entry point for primal heuristics that need to recursively solve
 /// sub-instances (e.g. Whidden relaxed decomposition).  Exposed `pub(crate)`
 /// so [`solver::solve_inner`] can call it.
-pub(crate) fn solve_subinstance(instance: &Instance, cfg: &BpConfig) -> Option<Vec<Tree>> {
-    solve_recursive(instance, cfg)
+pub(crate) fn solve_subinstance(instance: &Instance, cfg: &BpConfig, terminate: &Arc<AtomicBool>) -> Option<Vec<Tree>> {
+    let memo = Rc::new(RefCell::new(SubinstanceMemo::default()));
+    solve_recursive_memo(instance, cfg, &memo, terminate)
 }
 
-fn solve_recursive(instance: &Instance, cfg: &BpConfig) -> Option<Vec<Tree>> {
+fn solve_recursive(instance: &Instance, cfg: &BpConfig, terminate: &Arc<AtomicBool>) -> Option<Vec<Tree>> {
     let memo = Rc::new(RefCell::new(SubinstanceMemo::default()));
-    solve_recursive_memo(instance, cfg, &memo)
+    solve_recursive_memo(instance, cfg, &memo, terminate)
 }
 
 /// Recursive solve: tries decomposition strategies in effectiveness order,
@@ -216,6 +240,7 @@ fn solve_recursive_memo(
     instance: &Instance,
     cfg: &BpConfig,
     memo: &Rc<RefCell<SubinstanceMemo>>,
+    terminate: &Arc<AtomicBool>,
 ) -> Option<Vec<Tree>> {
     if instance.trees.is_empty() {
         return None;
@@ -225,6 +250,13 @@ fn solve_recursive_memo(
     }
     if instance.num_leaves <= 1 {
         return Some(instance.trees[0..1].to_vec());
+    }
+
+    if terminate.load(Ordering::Acquire) {
+        let forest: Vec<Tree> = (1..=instance.num_leaves)
+            .map(|l| klados_core::Tree::singleton(l, instance.num_leaves))
+            .collect();
+        return Some(forest);
     }
 
     // Kernelize first so Whidden runs on a reduced instance — matching
@@ -316,8 +348,8 @@ fn solve_recursive_memo(
         let cfg_inner = cfg.clone();
         let memo_inner = Rc::clone(memo);
         let reduced_components =
-            solver::solve_inner_with_subsolver(reduced, &mut |sub| {
-                solve_recursive_memo(sub, &cfg_inner, &memo_inner)
+            solver::solve_inner_with_subsolver(reduced, terminate, &mut |sub| {
+                solve_recursive_memo(sub, &cfg_inner, &memo_inner, terminate)
             })?;
         if let Some(view) = memo_view.as_ref() {
             store_cached_solution(&mut memo.borrow_mut(), view, &reduced_components);
@@ -335,7 +367,7 @@ fn solve_recursive_memo(
         let cfg_inner = cfg.clone();
         let memo_inner = Rc::clone(memo);
         if let Some(comps) =
-            try_whidden_decomp_2tree(reduced, &mut |sub| solve_recursive_memo(sub, &cfg_inner, &memo_inner))
+            try_whidden_decomp_2tree(reduced, &mut |sub| solve_recursive_memo(sub, &cfg_inner, &memo_inner, terminate))
         {
             trace!(
                 target: LOG_TARGET,
@@ -363,6 +395,7 @@ fn solve_recursive_memo(
     let inner_cfg = cfg.clone();
     let reduced_num_leaves = reduced.num_leaves;
     let memo_pipeline = Rc::clone(memo);
+    let t = Arc::clone(terminate);
     let reduced_components = solve_with_pipeline(
         reduced,
         &pipeline_cfg,
@@ -375,18 +408,18 @@ fn solve_recursive_memo(
                 let cfg2 = inner_cfg.clone();
                 let memo2 = Rc::clone(&memo_pipeline);
                 if let Some(comps) =
-                    try_whidden_decomp_2tree(sub, &mut |s| solve_recursive_memo(s, &cfg2, &memo2))
+                    try_whidden_decomp_2tree(sub, &mut |s| solve_recursive_memo(s, &cfg2, &memo2, &t))
                 {
                     return Some(comps);
                 }
             }
             if sub.num_leaves < reduced_num_leaves {
-                solve_recursive_memo(sub, &inner_cfg, &memo_pipeline)
+                solve_recursive_memo(sub, &inner_cfg, &memo_pipeline, &t)
             } else {
                 let cfg3 = inner_cfg.clone();
                 let memo3 = Rc::clone(&memo_pipeline);
-                solver::solve_inner_with_subsolver(sub, &mut |s| {
-                    solve_recursive_memo(s, &cfg3, &memo3)
+                solver::solve_inner_with_subsolver(sub, &t, &mut |s| {
+                    solve_recursive_memo(s, &cfg3, &memo3, &t)
                 })
             }
         },
@@ -848,4 +881,24 @@ mod canon_tests {
             6,
         );
     }
+}
+
+/// Convert Chen leaf-sets to agreement forest trees.
+fn leafsets_to_trees(leafsets: &[Vec<u32>], instance: &Instance) -> Vec<Tree> {
+    let t1 = &instance.trees[0];
+    let n = instance.num_leaves;
+    leafsets
+        .iter()
+        .map(|labels| {
+            if labels.len() == 1 {
+                Tree::singleton(labels[0], n)
+            } else {
+                let mut bitset = fixedbitset::FixedBitSet::with_capacity(n as usize + 1);
+                for &l in labels {
+                    bitset.insert(l as usize);
+                }
+                Tree::component_from_leafset(&bitset, t1, n)
+            }
+        })
+        .collect()
 }
