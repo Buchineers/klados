@@ -36,6 +36,12 @@ pub trait ExactSolver {
 
     /// Access statistics.
     fn stats(&self) -> &SolverStats;
+
+    /// Handle SIGTERM. Solvers that support early termination should
+    /// store this notification and gracefully return the best solution
+    /// found so far from `solve`.
+    #[cfg(feature = "early-termination")]
+    fn sigterm_handler(&self) {}
 }
 
 /// Return all available exact solvers.

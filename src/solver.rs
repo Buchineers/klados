@@ -8,6 +8,10 @@ use klados_core::Instance;
 use klados_core::Tree;
 use pace26io::newick::NewickWriter;
 use std::io::{self, Write};
+#[cfg(feature = "early-termination")]
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+#[cfg(feature = "early-termination")]
+use std::sync::Arc;
 
 // ── Solver choice enum ─────────────────────────────────────────────────────
 
@@ -205,6 +209,7 @@ pub fn list_solvers() {
 
 pub trait AnySolver {
     fn solve(&mut self, instance: &Instance) -> Option<Vec<Tree>>;
+    fn sigterm_handler(&self);
 }
 
 struct ExactWrapper(Box<dyn klados_exact::ExactSolver>);
@@ -214,11 +219,18 @@ impl AnySolver for ExactWrapper {
     fn solve(&mut self, instance: &Instance) -> Option<Vec<Tree>> {
         self.0.solve(instance)
     }
+    fn sigterm_handler(&self) {
+        #[cfg(feature = "early-termination")]
+        self.0.sigterm_handler()
+    }
 }
 
 impl AnySolver for HeuristicWrapper {
     fn solve(&mut self, instance: &Instance) -> Option<Vec<Tree>> {
         self.0.solve(instance)
+    }
+    fn sigterm_handler(&self) {
+        self.0.sigterm_handler()
     }
 }
 
@@ -232,6 +244,22 @@ fn from_heuristic(s: impl klados_heuristic::HeuristicSolver + 'static) -> Box<dy
 
 // ── Solve + print ──────────────────────────────────────────────────────────
 
+#[cfg(feature = "early-termination")]
+static SOLVER_DATA: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
+
+#[cfg(feature = "early-termination")]
+static SOLVER_VTABLE: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
+
+#[cfg(feature = "early-termination")]
+fn request_graceful_shutdown() {
+    let data = SOLVER_DATA.load(Ordering::SeqCst);
+    let vtable = SOLVER_VTABLE.load(Ordering::SeqCst);
+    if !data.is_null() && !vtable.is_null() {
+        let solver: &dyn AnySolver = unsafe { std::mem::transmute((data, vtable)) };
+        solver.sigterm_handler();
+    }
+}
+
 pub fn solve_and_print(
     instance: &Instance,
     choice: SolverChoice,
@@ -244,7 +272,52 @@ pub fn solve_and_print(
     );
 
     let mut solver = choice.build();
+
+    #[cfg(feature = "early-termination")]
+    let terminated = {
+        let solver_ref: &dyn AnySolver = &*solver;
+        let fat_ptr: (*const (), *const ()) = unsafe { std::mem::transmute(solver_ref) };
+        SOLVER_DATA.store(fat_ptr.0 as *mut (), Ordering::SeqCst);
+        SOLVER_VTABLE.store(fat_ptr.1 as *mut (), Ordering::SeqCst);
+
+        let terminated = Arc::new(AtomicBool::new(false));
+        let t_sigterm = Arc::clone(&terminated);
+        let t_sigint = Arc::clone(&terminated);
+        let sigterm_id = unsafe {
+            signal_hook::low_level::register(signal_hook::consts::SIGTERM, move || {
+                t_sigterm.store(true, Ordering::SeqCst);
+                request_graceful_shutdown();
+            })?
+        };
+        let sigint_id = unsafe {
+            signal_hook::low_level::register(signal_hook::consts::SIGINT, move || {
+                t_sigint.store(true, Ordering::SeqCst);
+                request_graceful_shutdown();
+            })?
+        };
+        let _ = sigterm_id;
+        let _ = sigint_id;
+        terminated
+    };
+
     let components = solver.solve(instance).expect("failed to find solution");
+
+    #[cfg(feature = "early-termination")]
+    {
+        SOLVER_DATA.store(std::ptr::null_mut(), Ordering::SeqCst);
+        SOLVER_VTABLE.store(std::ptr::null_mut(), Ordering::SeqCst);
+        let signalled = terminated.load(Ordering::SeqCst);
+        if signalled {
+            log::info!(
+                "terminated by signal: {} components (best-effort)",
+                components.len()
+            );
+        } else {
+            log::info!("solution: {} components", components.len());
+        }
+    }
+    #[cfg(not(feature = "early-termination"))]
+    log::info!("solution: {} components", components.len());
 
     let mut stdout = io::stdout().lock();
     for tree in &components {

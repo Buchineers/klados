@@ -7,6 +7,8 @@
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use fixedbitset::FixedBitSet;
@@ -279,15 +281,20 @@ fn use_rcvf_shortcuts(reduced: &Instance, trees: &[Tree]) -> bool {
 ///
 /// Caller must guarantee `m ≥ 2` and `n ≥ 2` (the pipeline's
 /// `trivial_solution` short-circuit handles the trivial cases).
-pub fn solve_inner(reduced: &Instance) -> Option<Vec<Tree>> {
-    solve_inner_with_subsolver(reduced, &mut |sub| {
-        crate::bp::solve_subinstance(sub, &crate::bp::BpConfig::default())
+pub fn solve_inner(reduced: &Instance, terminate: &Arc<AtomicBool>) -> Option<Vec<Tree>> {
+    let t = terminate;
+    solve_inner_with_subsolver(reduced, terminate, &mut |sub| {
+        crate::bp::solve_subinstance(sub, &crate::bp::BpConfig::default(), t)
     })
 }
 
 /// Variant of [`solve_inner`] that lets the recursive decomposition caller
 /// provide the same subproblem solver/memo to primal heuristics.
-pub fn solve_inner_with_subsolver<F>(reduced: &Instance, solve_sub: &mut F) -> Option<Vec<Tree>>
+pub fn solve_inner_with_subsolver<F>(
+    reduced: &Instance,
+    terminate: &Arc<AtomicBool>,
+    solve_sub: &mut F,
+) -> Option<Vec<Tree>>
 where
     F: FnMut(&Instance) -> Option<Vec<Tree>>,
 {
@@ -466,6 +473,19 @@ where
             tel.bound_prunes += 1;
             continue;
         }
+
+        // Graceful abort: return best incumbent (or all-singletons as fallback).
+        if terminate.load(Ordering::Acquire) {
+            let components = match state.incumbent() {
+                Some(inc) => { reconstruct_components(inc, state.columns(), reduced) }
+                None => {
+                    let num_leaves = reduced.num_leaves;
+                    (1..=num_leaves).map(|l| klados_core::Tree::singleton(l, num_leaves)).collect()
+                }
+            };
+            return Some(components);
+        }
+
         let outcome = solve_node(
             &mut state,
             &b,
@@ -480,6 +500,7 @@ where
             allow_bound_prune,
             allow_rcvf,
             chen_lb,
+            terminate.as_ref(),
         );
         match outcome {
             NodeOutcome::Pruned => {}
@@ -568,6 +589,7 @@ fn solve_node<P: Pricer, S: BranchSelector>(
     allow_bound_prune: bool,
     allow_rcvf: bool,
     chen_lb: usize,
+    terminate: &AtomicBool,
 ) -> NodeOutcome {
     tel.nodes_explored += 1;
 
@@ -608,6 +630,13 @@ fn solve_node<P: Pricer, S: BranchSelector>(
         };
         tel.timings.lp_solve += t0.elapsed();
         tel.cg_iters += 1;
+
+        // Abort check between CG rounds so signal doesn't get stuck
+        // waiting for a long pricing phase to complete.
+        if terminate.load(Ordering::Acquire) {
+            trace!(target: LOG_TARGET, "cg abort at iter {}", tel.cg_iters);
+            return NodeOutcome::Pruned;
+        }
 
         // Cut separation: materialise any violated node ≤1 constraints.
         // Must happen *before* pricing so the duals we feed the pricer
@@ -1265,7 +1294,7 @@ fn probe_root_obstruction_impl(
     }
 
     let t0 = Instant::now();
-    let exact = crate::bp::solve_subinstance(&core, &crate::bp::BpConfig::default());
+    let exact = crate::bp::solve_subinstance(&core, &crate::bp::BpConfig::default(), &Arc::new(AtomicBool::new(false)));
     match exact {
         Some(forest) => info!(
             target: LOG_TARGET,
