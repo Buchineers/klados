@@ -35,6 +35,8 @@ pub enum SolverChoice {
     GreedyPartition,
     #[value(name = "agglomerative")]
     Agglomerative,
+    #[value(name = "lagrangian")]
+    Lagrangian,
     #[value(name = "overlay-exchange")]
     OverlayExchange,
     #[value(name = "root-pool")]
@@ -49,7 +51,9 @@ impl SolverChoice {
     pub fn kind(&self) -> SolverKind {
         use SolverChoice::*;
         match self {
-            GreedyPartition | Agglomerative | OverlayExchange | RootPool => SolverKind::Heuristic,
+            GreedyPartition | Agglomerative | Lagrangian | OverlayExchange | RootPool => {
+                SolverKind::Heuristic
+            }
             RootCorridor | Corridor => SolverKind::Exact,
             _ => SolverKind::Exact,
         }
@@ -67,6 +71,7 @@ impl SolverChoice {
             Bp => "Branch & Price (rewrite, in progress)",
             GreedyPartition => "Greedy partition heuristic with union-add-one refinement",
             Agglomerative => "Agglomerative clustering heuristic",
+            Lagrangian => "Dual-guided set-packing (Lagrangian column generation, anytime)",
             OverlayExchange => "Incumbent-overlay replacement prototype",
             RootPool => "Root column generation + integer pool cover prototype",
             RootCorridor => "Certified root-corridor probe with exact B&P fallback",
@@ -103,6 +108,10 @@ impl SolverChoice {
             Bp => &[],
             GreedyPartition => &[("KLADOS_HEURISTIC_TEST_MODE", "extended search budget")],
             Agglomerative => &[],
+            Lagrangian => &[
+                ("KLADOS_HEUR_TIME_MS", "wall-time budget in ms (default 290000)"),
+                ("KLADOS_LAGR_TRACE", "print per-iteration diagnostics"),
+            ],
             OverlayExchange => &[
                 ("KLADOS_OVERLAY_MAX_H", "maximum incumbent neighborhood size"),
                 ("KLADOS_OVERLAY_MAX_ROUNDS", "maximum improvement rounds"),
@@ -162,6 +171,9 @@ impl SolverChoice {
             ),
             SolverChoice::Agglomerative => {
                 from_heuristic(klados_heuristic::agglomerative::AgglomerativeSolver::new())
+            }
+            SolverChoice::Lagrangian => {
+                from_heuristic(klados_heuristic::lagrangian::LagrangianSolver::new())
             }
         }
     }
