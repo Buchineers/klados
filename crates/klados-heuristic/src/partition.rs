@@ -17,15 +17,15 @@ pub struct PartitionHeuristicSolver {
     stats: SolverStats,
 }
 
-struct PartitionBlock {
-    weight: usize,
-    labels: Vec<u32>,
+pub(crate) struct PartitionBlock {
+    pub(crate) weight: usize,
+    pub(crate) labels: Vec<u32>,
 }
 
-struct PaperLpSolution {
-    alpha: Vec<f64>,
-    beta: Vec<Vec<f64>>,
-    candidate_columns: Vec<f64>,
+pub(crate) struct PaperLpSolution {
+    pub(crate) alpha: Vec<f64>,
+    pub(crate) beta: Vec<Vec<f64>>,
+    pub(crate) candidate_columns: Vec<f64>,
 }
 
 struct GlobalPricingResult {
@@ -2493,7 +2493,7 @@ fn add_reduced_candidate_to_stabilized_dual_model(
     }
 }
 
-fn solve_paper_rmp_lp_blocks(
+pub(crate) fn solve_paper_rmp_lp_blocks(
     candidates: &[PartitionBlock],
     trees: &[Tree],
     num_leaves: usize,
@@ -2956,5 +2956,173 @@ impl HeuristicSolver for PartitionHeuristicSolver {
 
     fn sigterm_handler(&self) {
         self.terminate_requested.store(true, Ordering::SeqCst);
+    }
+}
+
+// ===========================================================================
+// Dual-guided set-packing GAP EXPERIMENT (design doc §6, de-risking)
+//
+// Measures, on a fixed column pool, whether LP duals improve a greedy packing
+// and how large the integrality gap is. Reuses this module's master LP
+// (`solve_paper_rmp_lp_blocks` → leaf+node duals), the rooted dual pricer
+// (`run_rooted_paper_pricer`), greedy node-packing, and the exact node-pack
+// ILP. Size-aware: heavy O(n²) steps (pricer/LP) are gated so the run stays
+// inside memory/time on the largest instances.
+// ===========================================================================
+
+/// One row of experiment output.
+pub struct GapExperimentResult {
+    pub n: usize,
+    pub best_known: usize,
+    pub pool_size: usize,
+    pub cg_columns_added: usize,
+    pub lp_components: Option<f64>,      // fractional master objective over pool
+    pub greedy_priceless: Option<usize>, // (i) weight-first greedy packing
+    pub greedy_dual: Option<usize>,      // (ii) LP-basis-guided greedy packing
+    pub pool_ip: Option<usize>,          // (iii) exact node-pack ILP over pool
+    pub pool_ip_timed_out: bool,
+    pub timings_ms: Vec<(&'static str, f64)>,
+}
+
+fn comps_from_selection(n: usize, candidates: &[PartitionBlock], sel: &[usize]) -> usize {
+    let savings: usize = sel.iter().map(|&i| candidates[i].weight).sum();
+    n - savings
+}
+
+/// Run the §6 de-risking experiment on a single 2-tree instance.
+pub fn run_packing_gap_experiment(instance: &Instance, best_known: usize) -> GapExperimentResult {
+    use std::collections::HashSet;
+    use std::time::Instant;
+
+    let trees = &instance.trees;
+    let n = instance.num_leaves as usize;
+    let t1 = &trees[0];
+    let t2 = &trees[1];
+
+    // Size gates (node products to bound memory of the O(n1*n2) DP / LP).
+    let node_product = t1.num_nodes() * t2.num_nodes();
+    let allow_cg = node_product <= 30_000_000;
+    let allow_lp = n <= 8_000;
+    let num_seeds: u64 = if n <= 200 { 40 } else if n <= 2_000 { 16 } else if n <= 6_000 { 6 } else { 3 };
+
+    let mut timings = Vec::new();
+    let mut seen: HashSet<Vec<u32>> = HashSet::new();
+    let mut pool: Vec<PartitionBlock> = Vec::new();
+
+    let mut push_block = |labels: Vec<u32>, pool: &mut Vec<PartitionBlock>, seen: &mut HashSet<Vec<u32>>| {
+        if labels.len() < 2 { return; }
+        let mut l = labels; l.sort_unstable(); l.dedup();
+        if l.len() < 2 || !seen.insert(l.clone()) { return; }
+        if !is_set_compatible_all(trees, &l) { return; }
+        pool.push(PartitionBlock { weight: l.len() - 1, labels: l });
+    };
+
+    // ----- Pool: Chen 2-approx forest blocks -----
+    let t = Instant::now();
+    let (_lo, _up, chen_sets) = klados_exact::chen_rspr::chen_pair_agreement(t1, t2);
+    for s in chen_sets { push_block(s, &mut pool, &mut seen); }
+    timings.push(("chen_pool", t.elapsed().as_secs_f64() * 1000.0));
+
+    // ----- Pool: multi-seed greedy cherry partitions (overlapping blocks) -----
+    let t = Instant::now();
+    for ref_idx in 0..trees.len() {
+        for seed in 0..num_seeds {
+            let (_k, part) = klados_core::lower_bound::greedy_multi_tree_partition(trees, ref_idx, seed);
+            for g in partition_groups(&part) { push_block(g, &mut pool, &mut seen); }
+        }
+    }
+    timings.push(("seed_pool", t.elapsed().as_secs_f64() * 1000.0));
+
+    // ----- Column generation enrichment via the rooted dual pricer -----
+    let mut cg_added = 0usize;
+    let mut last_lp: Option<PaperLpSolution> = None;
+    if allow_cg && allow_lp {
+        let t = Instant::now();
+        let cg_budget = std::time::Duration::from_secs(if n <= 200 { 30 } else { 60 });
+        let cg_start = Instant::now();
+        let max_rounds = if n <= 200 { 400 } else { 150 };
+        for _round in 0..max_rounds {
+            if cg_start.elapsed() >= cg_budget { break; }
+            let lp = match solve_paper_rmp_lp_blocks(&pool, trees, n) {
+                Ok(lp) => lp,
+                Err(_) => break,
+            };
+            let priced = run_rooted_paper_pricer(t1, t2, &lp.alpha, &lp.beta);
+            last_lp = Some(lp);
+            match priced {
+                Ok(Some((score, labels))) if score > 1.0 + 1e-6 => {
+                    let before = pool.len();
+                    push_block(labels, &mut pool, &mut seen);
+                    if pool.len() == before { break; } // nothing new -> converged
+                    cg_added += 1;
+                }
+                _ => break,
+            }
+        }
+        timings.push(("column_gen", t.elapsed().as_secs_f64() * 1000.0));
+    }
+
+    // ----- Final LP solve for reported duals + fractional objective -----
+    let mut lp_components = None;
+    let mut dual_basis: Option<Vec<usize>> = None;
+    if allow_lp {
+        let t = Instant::now();
+        let lp = if last_lp.is_some() && cg_added == 0 {
+            last_lp
+        } else {
+            solve_paper_rmp_lp_blocks(&pool, trees, n).ok()
+        };
+        if let Some(lp) = lp {
+            let savings: f64 = pool
+                .iter()
+                .zip(lp.candidate_columns.iter())
+                .map(|(b, &x)| x * b.weight as f64)
+                .sum();
+            lp_components = Some(n as f64 - savings);
+            dual_basis = Some(lp_active_candidates(&lp.candidate_columns, &pool));
+        }
+        timings.push(("final_lp", t.elapsed().as_secs_f64() * 1000.0));
+    }
+
+    // ----- (i) priceless weight-first greedy -----
+    let t = Instant::now();
+    let sel_priceless = greedy_nodepack_selection(&pool, trees, None);
+    let greedy_priceless = Some(comps_from_selection(n, &pool, &sel_priceless));
+    timings.push(("greedy_priceless", t.elapsed().as_secs_f64() * 1000.0));
+
+    // ----- (ii) dual-guided greedy (LP basis as preference) -----
+    let greedy_dual = dual_basis.as_ref().map(|basis| {
+        let t = Instant::now();
+        let sel = greedy_nodepack_selection(&pool, trees, Some(basis));
+        let r = comps_from_selection(n, &pool, &sel);
+        timings.push(("greedy_dual", t.elapsed().as_secs_f64() * 1000.0));
+        r
+    });
+
+    // ----- (iii) exact node-pack ILP over the pool (best achievable from pool) -----
+    let t = Instant::now();
+    let ip_limit = if n <= 200 { 20.0 } else { 30.0 };
+    let (pool_ip, pool_ip_timed_out) =
+        match solve_nodepack_selection_with_limit(&pool, trees, Some(ip_limit)) {
+            Ok(sel) => {
+                let comps = comps_from_selection(n, &pool, &sel);
+                let elapsed = t.elapsed().as_secs_f64();
+                (Some(comps), elapsed >= ip_limit * 0.95)
+            }
+            Err(_) => (None, false),
+        };
+    timings.push(("pool_ip", t.elapsed().as_secs_f64() * 1000.0));
+
+    GapExperimentResult {
+        n,
+        best_known,
+        pool_size: pool.len(),
+        cg_columns_added: cg_added,
+        lp_components,
+        greedy_priceless,
+        greedy_dual,
+        pool_ip,
+        pool_ip_timed_out,
+        timings_ms: timings,
     }
 }
