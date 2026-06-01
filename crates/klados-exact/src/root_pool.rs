@@ -60,7 +60,8 @@ impl RootPoolSolver {
 
     pub(crate) fn for_corridor_probe() -> Self {
         let mut s = Self::new();
-        s.max_wall = Duration::from_millis(env_usize("KLADOS_ROOT_CORRIDOR_PROBE_MS", 1_000) as u64);
+        s.max_wall =
+            Duration::from_millis(env_usize("KLADOS_ROOT_CORRIDOR_PROBE_MS", 1_000) as u64);
         s.mip_time_limit = env_f64("KLADOS_ROOT_CORRIDOR_MIP_TIME_LIMIT", 0.5);
         s
     }
@@ -83,7 +84,8 @@ impl RootPoolSolver {
                         }
                         Some(out.forest)
                     };
-                    if let Some(reduced) = try_whidden_decomp_2tree(&kern.instance, &mut solve_sub) {
+                    if let Some(reduced) = try_whidden_decomp_2tree(&kern.instance, &mut solve_sub)
+                    {
                         let expanded = expand_solution(
                             reduced,
                             &kern,
@@ -110,9 +112,7 @@ impl RootPoolSolver {
                 self.stats.upper_bound = Some(expanded.len());
                 return Some(RootPoolOutcome {
                     forest: expanded,
-                    lower_bound: reduced
-                        .lower_bound
-                        .map(|lb| lb + kern.param_reduction),
+                    lower_bound: reduced.lower_bound.map(|lb| lb + kern.param_reduction),
                     converged: reduced.converged,
                     elapsed: total_started.elapsed(),
                 });
@@ -144,11 +144,15 @@ impl RootPoolSolver {
 }
 
 impl Default for RootPoolSolver {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ExactSolver for RootPoolSolver {
-    fn name(&self) -> &'static str { "root-pool" }
+    fn name(&self) -> &'static str {
+        "root-pool"
+    }
 
     fn description(&self) -> &'static str {
         "Root column generation + one integer pool cover heuristic"
@@ -156,10 +160,19 @@ impl ExactSolver for RootPoolSolver {
 
     fn options(&self) -> &'static [(&'static str, &'static str)] {
         &[
-            ("KLADOS_ROOT_POOL_MAX_CG", "maximum root column-generation iterations"),
-            ("KLADOS_ROOT_POOL_MAX_MS", "soft root-pool wall budget in milliseconds"),
+            (
+                "KLADOS_ROOT_POOL_MAX_CG",
+                "maximum root column-generation iterations",
+            ),
+            (
+                "KLADOS_ROOT_POOL_MAX_MS",
+                "soft root-pool wall budget in milliseconds",
+            ),
             ("KLADOS_ROOT_POOL_MIP_PASSES", "lazy-cut MIP repair passes"),
-            ("KLADOS_ROOT_POOL_MIP_TIME_LIMIT", "HiGHS MIP time limit per pass in seconds"),
+            (
+                "KLADOS_ROOT_POOL_MIP_TIME_LIMIT",
+                "HiGHS MIP time limit per pass in seconds",
+            ),
             ("KLADOS_ROOT_POOL_SEEDS", "randomized incumbent seed budget"),
             ("KLADOS_ROOT_POOL_TRACE", "print diagnostics"),
         ]
@@ -169,7 +182,9 @@ impl ExactSolver for RootPoolSolver {
         self.solve_with_outcome(instance).map(|out| out.forest)
     }
 
-    fn stats(&self) -> &SolverStats { &self.stats }
+    fn stats(&self) -> &SolverStats {
+        &self.stats
+    }
 }
 
 impl RootPoolSolver {
@@ -283,7 +298,9 @@ impl RootPoolSolver {
         }
 
         let root_lower_bound = if converged {
-            final_lp.as_ref().map(|lp| (lp.objective - 1.0e-6).ceil() as usize)
+            final_lp
+                .as_ref()
+                .map(|lp| (lp.objective - 1.0e-6).ceil() as usize)
         } else {
             None
         };
@@ -489,8 +506,7 @@ impl RootPoolSolver {
                 if started.elapsed() >= self.max_wall {
                     break;
                 }
-                let Ok(Some(mip)) = rmp.solve_mip_with_time_limit(downstream_mip_time_limit)
-                else {
+                let Ok(Some(mip)) = rmp.solve_mip_with_time_limit(downstream_mip_time_limit) else {
                     break;
                 };
                 let cuts = rmp.separate_and_add_cuts(&columns, &mip.column_values, 0.5);
@@ -508,7 +524,10 @@ impl RootPoolSolver {
         }
 
         let mut forest = labels_to_trees(instance, &best_cols);
-        if !matches!(validate_agreement_forest(instance, &forest), AfValidation::Ok) {
+        if !matches!(
+            validate_agreement_forest(instance, &forest),
+            AfValidation::Ok
+        ) {
             // Defensive fallback: if a lazy-cut or rounding bug slips through,
             // return the singleton forest rather than an invalid solution.
             forest = (1..=instance.num_leaves)
@@ -535,7 +554,9 @@ impl RootPoolSolver {
             let tiers = pricer
                 .tier_timings()
                 .into_iter()
-                .map(|(name, dur, calls)| format!("{}={:.1}ms/{}", name, dur.as_secs_f64() * 1000.0, calls))
+                .map(|(name, dur, calls)| {
+                    format!("{}={:.1}ms/{}", name, dur.as_secs_f64() * 1000.0, calls)
+                })
                 .collect::<Vec<_>>()
                 .join(" ");
             eprintln!("[root-pool] tiers {tiers}");
@@ -758,11 +779,13 @@ fn expand_shell_anchor_best(
         .exact_dp_cache
         .take()
         .filter(|c| c.fits(n0, n1, instance.num_leaves as usize))
-        .unwrap_or_else(|| crate::bp::pricer::exact_pair_dp::ExactPairDpCache::new(
-            n0,
-            n1,
-            instance.num_leaves as usize,
-        ));
+        .unwrap_or_else(|| {
+            crate::bp::pricer::exact_pair_dp::ExactPairDpCache::new(
+                n0,
+                n1,
+                instance.num_leaves as usize,
+            )
+        });
     let max_passes = env_usize("KLADOS_ROOT_POOL_SHELL_ENUM_PASSES", 32);
     let mut forbidden = Vec::<(u32, u32)>::new();
     let mut added = 0usize;
@@ -953,7 +976,10 @@ fn round_lp(columns: &[AfColumn], values: &[f64], n: usize) -> Option<Vec<Vec<u3
                 .map_or(1, |v| v + 1)
         })
         .collect();
-    let mut used_nodes = caps.into_iter().map(FixedBitSet::with_capacity).collect::<Vec<_>>();
+    let mut used_nodes = caps
+        .into_iter()
+        .map(FixedBitSet::with_capacity)
+        .collect::<Vec<_>>();
 
     let mut out = Vec::new();
     for (ci, _) in indexed {
@@ -1000,16 +1026,26 @@ fn labels_to_trees(instance: &Instance, labels: &[Vec<u32>]) -> Vec<Tree> {
                 for &l in block {
                     leafset.insert(l as usize);
                 }
-                Tree::component_from_leafset(&leafset, instance.reference_tree(), instance.num_leaves)
+                Tree::component_from_leafset(
+                    &leafset,
+                    instance.reference_tree(),
+                    instance.num_leaves,
+                )
             }
         })
         .collect()
 }
 
 fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }
 
 fn env_f64(name: &str, default: f64) -> f64 {
-    std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }

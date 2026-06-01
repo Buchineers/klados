@@ -240,12 +240,7 @@ impl Rmp {
             // need to restore it to FREE here so the LP sees it again.
             self.rcvf_zero[ci] = false;
             unsafe {
-                highs_sys::Highs_changeColBounds(
-                    ptr,
-                    self.col_handle[ci],
-                    0.0,
-                    f64::INFINITY,
-                );
+                highs_sys::Highs_changeColBounds(ptr, self.col_handle[ci], 0.0, f64::INFINITY);
             }
             self.cur_lo[ci] = 0.0;
             self.cur_hi[ci] = f64::INFINITY;
@@ -467,7 +462,10 @@ impl Rmp {
         self.solve_mip_with_time_limit(mip_time_limit)
     }
 
-    pub fn solve_mip_with_time_limit(&mut self, mip_time_limit: f64) -> Result<Option<RmpSolution>, String> {
+    pub fn solve_mip_with_time_limit(
+        &mut self,
+        mip_time_limit: f64,
+    ) -> Result<Option<RmpSolution>, String> {
         let num_cols = self.col_handle.len();
         if num_cols == 0 {
             return Ok(None);

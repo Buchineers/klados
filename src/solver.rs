@@ -9,9 +9,9 @@ use klados_core::Tree;
 use pace26io::newick::NewickWriter;
 use std::io::{self, Write};
 #[cfg(feature = "early-termination")]
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
-#[cfg(feature = "early-termination")]
 use std::sync::Arc;
+#[cfg(feature = "early-termination")]
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 // ── Solver choice enum ─────────────────────────────────────────────────────
 

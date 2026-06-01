@@ -32,8 +32,8 @@ pub mod solver;
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use fixedbitset::FixedBitSet;
@@ -43,8 +43,8 @@ use klados_core::solve_pipeline::{ClusterAlgo, SolveConfig, solve_with_pipeline}
 use klados_core::{Instance, SolverStats, Tree};
 use log::{info, trace};
 
-use crate::chen_rspr::chen_pair_agreement;
 use crate::ExactSolver;
+use crate::chen_rspr::chen_pair_agreement;
 use crate::whidden_cluster::try_whidden_decomp_2tree;
 
 const LOG_TARGET: &str = "klados::bp";
@@ -166,9 +166,7 @@ impl ExactSolver for BpSolver {
 
         // Post-validate: if Whidden decomp assembled invalid results
         // (subproblems aborted), fall back to Chen 2-approximation.
-        if instance.num_trees() == 2
-            && !validate_agreement_forest(instance, &components).is_ok()
-        {
+        if instance.num_trees() == 2 && !validate_agreement_forest(instance, &components).is_ok() {
             let (_, _, leafsets) = chen_pair_agreement(&instance.trees[0], &instance.trees[1]);
             components = leafsets_to_trees(&leafsets, instance);
         }
@@ -211,12 +209,37 @@ impl ExactSolver for BpSolver {
 /// Re-entry point for primal heuristics that need to recursively solve
 /// sub-instances (e.g. Whidden relaxed decomposition).  Exposed `pub(crate)`
 /// so [`solver::solve_inner`] can call it.
-pub(crate) fn solve_subinstance(instance: &Instance, cfg: &BpConfig, terminate: &Arc<AtomicBool>) -> Option<Vec<Tree>> {
+pub(crate) fn solve_subinstance(
+    instance: &Instance,
+    cfg: &BpConfig,
+    terminate: &Arc<AtomicBool>,
+) -> Option<Vec<Tree>> {
     let memo = Rc::new(RefCell::new(SubinstanceMemo::default()));
     solve_recursive_memo(instance, cfg, &memo, terminate)
 }
 
-fn solve_recursive(instance: &Instance, cfg: &BpConfig, terminate: &Arc<AtomicBool>) -> Option<Vec<Tree>> {
+/// Solve a 2-tree sub-instance exactly under an external termination flag.
+///
+/// This is used by callers outside `klados-exact` that want to cap an exact
+/// cluster/core solve with a watchdog. It returns only validated agreement
+/// forests; `None` means the solve was cut short or failed validation.
+pub fn bp_solve_capped(instance: &Instance, terminate: &Arc<AtomicBool>) -> Option<Vec<Tree>> {
+    if instance.num_trees() != 2 || instance.num_leaves < 2 {
+        return None;
+    }
+    let cfg = BpConfig::default();
+    let comps = solve_subinstance(instance, &cfg, terminate)?;
+    if !validate_agreement_forest(instance, &comps).is_ok() {
+        return None;
+    }
+    Some(comps)
+}
+
+fn solve_recursive(
+    instance: &Instance,
+    cfg: &BpConfig,
+    terminate: &Arc<AtomicBool>,
+) -> Option<Vec<Tree>> {
     let memo = Rc::new(RefCell::new(SubinstanceMemo::default()));
     solve_recursive_memo(instance, cfg, &memo, terminate)
 }
@@ -304,10 +327,7 @@ fn solve_recursive_memo(
         match canon {
             Some(view) => {
                 if std::env::var("KLADOS_BP_DUMP_MEMO_KEYS").is_ok() {
-                    eprintln!(
-                        "MEMOKEY\tn={}\tkey={}",
-                        reduced.num_leaves, view.key
-                    );
+                    eprintln!("MEMOKEY\tn={}\tkey={}", reduced.num_leaves, view.key);
                 }
                 let cached_partition = {
                     let mut memo_ref = memo.borrow_mut();
@@ -364,9 +384,9 @@ fn solve_recursive_memo(
     if allow_whidden && reduced.num_trees() == 2 && reduced.num_leaves >= WHIDDEN_MIN_LEAVES {
         let cfg_inner = cfg.clone();
         let memo_inner = Rc::clone(memo);
-        if let Some(comps) =
-            try_whidden_decomp_2tree(reduced, &mut |sub| solve_recursive_memo(sub, &cfg_inner, &memo_inner, terminate))
-        {
+        if let Some(comps) = try_whidden_decomp_2tree(reduced, &mut |sub| {
+            solve_recursive_memo(sub, &cfg_inner, &memo_inner, terminate)
+        }) {
             trace!(
                 target: LOG_TARGET,
                 "whidden strict decomp solved: n={} k={}",
@@ -405,9 +425,9 @@ fn solve_recursive_memo(
             {
                 let cfg2 = inner_cfg.clone();
                 let memo2 = Rc::clone(&memo_pipeline);
-                if let Some(comps) =
-                    try_whidden_decomp_2tree(sub, &mut |s| solve_recursive_memo(s, &cfg2, &memo2, &t))
-                {
+                if let Some(comps) = try_whidden_decomp_2tree(sub, &mut |s| {
+                    solve_recursive_memo(s, &cfg2, &memo2, &t)
+                }) {
                     return Some(comps);
                 }
             }
@@ -502,8 +522,7 @@ fn ir_search(t0: &Tree, t1: &Tree, n: usize, color: &[u32], classes: usize, st: 
     st.budget -= 1;
 
     if classes == n {
-        let mut entries: Vec<(u32, u32)> =
-            (1..=n as u32).map(|l| (color[l as usize], l)).collect();
+        let mut entries: Vec<(u32, u32)> = (1..=n as u32).map(|l| (color[l as usize], l)).collect();
         entries.sort_unstable();
         let mut l2c = vec![0u32; n + 1];
         let mut c2l = vec![0u32; n + 1];
@@ -606,12 +625,7 @@ fn canonical_subtree_codes(t0: &Tree, t1: &Tree, leaf_color: &[u32]) -> (Vec<u32
     let mut codes1 = vec![0u32; t1.num_nodes()];
     let h0 = node_heights(t0);
     let h1 = node_heights(t1);
-    let max_h = h0
-        .iter()
-        .chain(h1.iter())
-        .copied()
-        .max()
-        .unwrap_or(0);
+    let max_h = h0.iter().chain(h1.iter()).copied().max().unwrap_or(0);
 
     let mut next_code: u32 = 0;
     for level in 0..=max_h {
@@ -755,7 +769,7 @@ fn make_leafset(labels: &[u32], num_leaves: u32) -> FixedBitSet {
 #[cfg(test)]
 mod canon_tests {
     use super::*;
-    use klados_core::tree::{Label, NodeId, NONE};
+    use klados_core::tree::{Label, NONE, NodeId};
 
     fn parse(nw: &str, n: u32) -> Tree {
         let mut t = Tree::with_capacity(n);
@@ -783,7 +797,10 @@ mod canon_tests {
                 while *pos < b.len() && b[*pos].is_ascii_digit() {
                     *pos += 1;
                 }
-                let lbl: u32 = std::str::from_utf8(&b[start..*pos]).unwrap().parse().unwrap();
+                let lbl: u32 = std::str::from_utf8(&b[start..*pos])
+                    .unwrap()
+                    .parse()
+                    .unwrap();
                 let id = t.parent.len() as NodeId;
                 t.parent.push(NONE);
                 t.left.push(NONE);
@@ -846,7 +863,9 @@ mod canon_tests {
             let r1 = t1.relabel(&map, n);
             // mirror tree 0 only: tests rotation + relabeling together.
             let inst = Instance::new(vec![mirror(&r0), r1], n);
-            let k = canonicalize_two_tree_instance(&inst).expect("perm canonicalizes").key;
+            let k = canonicalize_two_tree_instance(&inst)
+                .expect("perm canonicalizes")
+                .key;
             assert_eq!(base, k, "key not invariant at shift={shift}");
         }
     }
@@ -873,11 +892,7 @@ mod canon_tests {
 
     #[test]
     fn canon_invariant_caterpillar() {
-        check_invariant(
-            "(1,(2,(3,(4,(5,6)))))",
-            "(((((1,6),2),5),3),4)",
-            6,
-        );
+        check_invariant("(1,(2,(3,(4,(5,6)))))", "(((((1,6),2),5),3),4)", 6);
     }
 }
 

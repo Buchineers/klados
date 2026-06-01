@@ -7,8 +7,8 @@
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use fixedbitset::FixedBitSet;
@@ -27,7 +27,9 @@ use crate::bp::search::{
     BranchSelector, Branchings, Incumbent, SearchState, SelectionContext, Telemetry,
 };
 use crate::chen_rspr::{chen_pair_agreement, chen_pair_bounds};
-use crate::whidden_cluster::try_whidden_relaxed_incumbent_2tree;
+use crate::whidden_cluster::{
+    analyze_whidden_decomp_potential, try_whidden_relaxed_incumbent_2tree,
+};
 
 const LOG_TARGET: &str = "klados::bp";
 
@@ -75,6 +77,39 @@ fn chen_lower_bound(trees: &[Tree]) -> usize {
         }
     }
     lb
+}
+
+fn maybe_log_core_decomp_potential(reduced: &Instance) {
+    if std::env::var("KLADOS_BP_CORE_DECOMP_ANALYZE").is_err() {
+        return;
+    }
+    let min_leaves = std::env::var("KLADOS_BP_CORE_DECOMP_MIN")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(150);
+    let n = reduced.num_leaves as usize;
+    if n < min_leaves || reduced.num_trees() != 2 {
+        return;
+    }
+    let Some(p) = analyze_whidden_decomp_potential(reduced) else {
+        return;
+    };
+    eprintln!(
+        "BP_CORE_DECOMP\tn={}\tstrict={}\trelaxed={}\tstrict_sel={}\tstrict_clustered={}\tstrict_rem={}\tstrict_largest={}\tbalanced_sel={}\tbalanced_clustered={}\tbalanced_rem={}\tbalanced_largest={}\ttop_strict={:?}\ttop_relaxed={:?}",
+        n,
+        p.strict_points,
+        p.relaxed_points,
+        p.strict_selected,
+        p.strict_clustered,
+        p.strict_remainder,
+        p.strict_largest_subproblem,
+        p.balanced_selected,
+        p.balanced_clustered,
+        p.balanced_remainder,
+        p.balanced_largest_subproblem,
+        p.top_strict_sizes,
+        p.top_relaxed_sizes,
+    );
 }
 
 fn compute_local_bounds(trees: &[Tree], num_leaves: u32) -> LocalBounds {
@@ -309,6 +344,7 @@ where
     if n <= 1 {
         return Some(trees[0..1].to_vec());
     }
+    maybe_log_core_decomp_potential(reduced);
 
     // Chen pairwise lower bound — a sound combinatorial floor on the
     // component count, valid for every B&B node of this (sub)instance.
@@ -467,9 +503,7 @@ where
             0
         };
         // The Chen lower bound is a sound floor independent of the LP.
-        if allow_bound_prune
-            && can_prune_by_bound(inherited_lb.max(chen_lb), state.best_ub())
-        {
+        if allow_bound_prune && can_prune_by_bound(inherited_lb.max(chen_lb), state.best_ub()) {
             tel.bound_prunes += 1;
             continue;
         }
@@ -477,10 +511,12 @@ where
         // Graceful abort: return best incumbent (or all-singletons as fallback).
         if terminate.load(Ordering::Acquire) {
             let components = match state.incumbent() {
-                Some(inc) => { reconstruct_components(inc, state.columns(), reduced) }
+                Some(inc) => reconstruct_components(inc, state.columns(), reduced),
                 None => {
                     let num_leaves = reduced.num_leaves;
-                    (1..=num_leaves).map(|l| klados_core::Tree::singleton(l, num_leaves)).collect()
+                    (1..=num_leaves)
+                        .map(|l| klados_core::Tree::singleton(l, num_leaves))
+                        .collect()
                 }
             };
             return Some(components);
@@ -526,10 +562,7 @@ where
                     // RCVF replay happens at the top of the next solve_node.
                 }
             }
-            NodeOutcome::Branch {
-                lp_obj,
-                children,
-            } => {
+            NodeOutcome::Branch { lp_obj, children } => {
                 // Push children in reverse so the first one is popped
                 // next — matches the prior 2-way DFS ordering where
                 // `left` (the must-link side) was explored before
@@ -566,9 +599,7 @@ where
     let tier_breakdown = pricer
         .tier_timings()
         .into_iter()
-        .map(|(name, dur, calls)| {
-            format!("{}={:.1}ms/{}", name, dur.as_secs_f64() * 1000.0, calls)
-        })
+        .map(|(name, dur, calls)| format!("{}={:.1}ms/{}", name, dur.as_secs_f64() * 1000.0, calls))
         .collect::<Vec<_>>()
         .join(" ");
     info!(target: LOG_TARGET, "bp pricer tiers: {}", tier_breakdown);
@@ -674,7 +705,10 @@ fn solve_node<P: Pricer, S: BranchSelector>(
         match result {
             PricingResult::Found(cols) => {
                 let ncols = cols.len();
-                let nseen = cols.iter().filter(|c| state.seen().contains(c.labels())).count();
+                let nseen = cols
+                    .iter()
+                    .filter(|c| state.seen().contains(c.labels()))
+                    .count();
                 let mut added = 0;
                 for c in cols {
                     if let Some(_id) = state.add_column(c) {
@@ -868,11 +902,7 @@ fn solve_node<P: Pricer, S: BranchSelector>(
                     .take()
                     .filter(|c| c.fits(n0, n1, state.num_leaves()))
                     .unwrap_or_else(|| {
-                        crate::corridor::topk_m2::TopKDpCache::new(
-                            n0,
-                            n1,
-                            state.num_leaves(),
-                        )
+                        crate::corridor::topk_m2::TopKDpCache::new(n0, n1, state.num_leaves())
                     });
                 let cols = crate::corridor::topk_m2::enumerate_corridor(
                     &crate::corridor::topk_m2::CorridorInput {
@@ -1131,12 +1161,14 @@ fn build_root_support_regions(
     let mut by_root: HashMap<usize, SupportComponentSummary> = HashMap::new();
     for (local_idx, &ci) in support_cols.iter().enumerate() {
         let root = find(&mut parent, local_idx);
-        let entry = by_root.entry(root).or_insert_with(|| SupportComponentSummary {
-            column_ids: Vec::new(),
-            leaves: FixedBitSet::with_capacity(state.num_leaves() + 1),
-            lp_mass: 0.0,
-            fractional_columns: 0,
-        });
+        let entry = by_root
+            .entry(root)
+            .or_insert_with(|| SupportComponentSummary {
+                column_ids: Vec::new(),
+                leaves: FixedBitSet::with_capacity(state.num_leaves() + 1),
+                lp_mass: 0.0,
+                fractional_columns: 0,
+            });
         entry.column_ids.push(ci);
         entry.lp_mass += lp.column_values[ci];
         if lp.column_values[ci] > 1.0e-6 && lp.column_values[ci] < 1.0 - 1.0e-6 {
@@ -1294,7 +1326,11 @@ fn probe_root_obstruction_impl(
     }
 
     let t0 = Instant::now();
-    let exact = crate::bp::solve_subinstance(&core, &crate::bp::BpConfig::default(), &Arc::new(AtomicBool::new(false)));
+    let exact = crate::bp::solve_subinstance(
+        &core,
+        &crate::bp::BpConfig::default(),
+        &Arc::new(AtomicBool::new(false)),
+    );
     match exact {
         Some(forest) => info!(
             target: LOG_TARGET,
@@ -1319,8 +1355,7 @@ fn probe_root_support_mip(
     regions: &RootSupportRegions,
 ) {
     let t0 = Instant::now();
-    let (support_cols, cuts_total, result) =
-        solve_root_support_mip(reduced, state, regions);
+    let (support_cols, cuts_total, result) = solve_root_support_mip(reduced, state, regions);
     let shell = result
         .as_ref()
         .map(|inc| summarize_root_reduced_cost_shell(state, lp, regions, inc.k));
@@ -1378,7 +1413,11 @@ fn solve_root_support_mip(
         return (0, 0, None);
     }
 
-    let mut rmp = Rmp::new(&support_columns, &reduced.trees, reduced.num_leaves as usize);
+    let mut rmp = Rmp::new(
+        &support_columns,
+        &reduced.trees,
+        reduced.num_leaves as usize,
+    );
     let mut cuts_total = 0usize;
     for _ in 0..32 {
         let Ok(Some(mip)) = rmp.solve_mip_with_time_limit(2.0) else {
@@ -1563,11 +1602,7 @@ fn solve_region_support_mip(
         if cuts > 0 {
             continue;
         }
-        let chosen = mip
-            .column_values
-            .iter()
-            .filter(|&&v| v > 0.5)
-            .count();
+        let chosen = mip.column_values.iter().filter(|&&v| v > 0.5).count();
         return (
             core.num_leaves,
             local_columns.len(),
@@ -1656,7 +1691,10 @@ fn maybe_log_bridge_footprint(
         .enumerate()
         .map(|(rid, comp)| {
             let ceil = (comp.lp_mass - 1.0e-6).ceil() as usize;
-            format!("{rid}:{}|{}|{:.3}", local_component_counts[rid], ceil, comp.lp_mass)
+            format!(
+                "{rid}:{}|{}|{:.3}",
+                local_component_counts[rid], ceil, comp.lp_mass
+            )
         })
         .collect::<Vec<_>>()
         .join(",");

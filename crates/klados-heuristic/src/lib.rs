@@ -12,7 +12,7 @@ use crate::lagrangian::LagrangianSolver;
 use crate::max_sat::MaxSatSolver;
 use crate::partition::PartitionHeuristicSolver;
 
-pub use crate::partition::{run_packing_gap_experiment, GapExperimentResult};
+pub use crate::partition::{GapExperimentResult, run_packing_gap_experiment};
 
 /// Trait for heuristic solver approaches.
 pub trait HeuristicSolver {

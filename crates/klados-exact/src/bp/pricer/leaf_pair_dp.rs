@@ -58,7 +58,7 @@ use klados_core::{NONE, Tree};
 
 use crate::bp::column::AfColumn;
 
-use super::{adaptive_m2_batch_size, Pricer, PricerScratch, PricingContext, PricingResult};
+use super::{Pricer, PricerScratch, PricingContext, PricingResult, adaptive_m2_batch_size};
 
 const PRICING_EPS: f64 = 1.0e-8;
 const NEG_INF: f64 = f64::NEG_INFINITY;
@@ -353,12 +353,7 @@ impl LeafPairDpPricer {
     /// Recompute dual-dependent tables in-place (prefix-β, subtree-α, pair
     /// penalties).  Much cheaper than `rebuild_pair_tables` — O(n·m + p²·m)
     /// but no LCA lookups.  Called on every CG call.
-    fn refresh_dual_tables(
-        &mut self,
-        trees: &[Tree],
-        alpha: &[f64],
-        beta: &[Vec<f64>],
-    ) {
+    fn refresh_dual_tables(&mut self, trees: &[Tree], alpha: &[f64], beta: &[Vec<f64>]) {
         let p = self.active_labels.len();
         let pair_count = p * p;
 
@@ -852,7 +847,9 @@ impl LeafPairDpPricer {
                     cache.try_emit(la, lb, ctx.alpha, &ctx.beta[0], &ctx.beta[1], PRICING_EPS)
                 };
                 match cache_hit {
-                    super::anchor_cache::CacheResult::Emit { score: cached_score } => {
+                    super::anchor_cache::CacheResult::Emit {
+                        score: cached_score,
+                    } => {
                         global_max = global_max.max(cached_score);
                         // Rebuild column from cached leaves. If the cached
                         // column is already seen or blocked, do NOT skip this
@@ -1026,11 +1023,7 @@ fn repair_to_valid(
             None => break,
         }
     }
-    if out.len() < 2 {
-        None
-    } else {
-        Some(out)
-    }
+    if out.len() < 2 { None } else { Some(out) }
 }
 
 /// Result of a `collect_from_order` scan.
