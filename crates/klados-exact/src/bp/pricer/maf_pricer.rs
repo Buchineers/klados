@@ -21,7 +21,7 @@ use klados_core::Tree;
 
 use super::exact_pair_dp::ExactPairDpPricer;
 use super::leaf_pair_dp::LeafPairDpPricer;
-use super::{adaptive_m2_batch_size, Pricer, PricerScratch, PricingContext, PricingResult};
+use super::{Pricer, PricerScratch, PricingContext, PricingResult, adaptive_m2_batch_size};
 
 const PRICING_EPS: f64 = 1.0e-8;
 
@@ -59,7 +59,6 @@ impl MafPricer {
     pub fn tier_timings(&self) -> Vec<(&'static str, std::time::Duration, u64)> {
         Vec::new()
     }
-
 }
 
 impl Pricer for MafPricer {
@@ -85,12 +84,10 @@ impl Pricer for MafPricer {
             Some(cert) => match cert.price(ctx, scratch) {
                 PricingResult::Found(cols) => PricingResult::Found(cols),
                 PricingResult::Converged => PricingResult::Converged,
-                PricingResult::Improving => {
-                    match self.generator.price(ctx, scratch) {
-                        PricingResult::Found(cols) => PricingResult::Found(cols),
-                        _ => PricingResult::Improving,
-                    }
-                }
+                PricingResult::Improving => match self.generator.price(ctx, scratch) {
+                    PricingResult::Found(cols) => PricingResult::Found(cols),
+                    _ => PricingResult::Improving,
+                },
             },
             // m≥3: the multi-tree leaf-pair DP is both generator and
             // certifier. It builds columns valid across all m trees by

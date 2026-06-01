@@ -33,7 +33,7 @@ pub mod scratch;
 
 pub use exact_pair_dp::ExactPairDpPricer;
 pub use leaf_pair_dp::LeafPairDpPricer;
-pub use maf_pricer::{dispatch_by_m, MafPricer};
+pub use maf_pricer::{MafPricer, dispatch_by_m};
 
 pub use anchor_cache::{AnchorCache, AnchorEntry, CacheResult};
 pub use scratch::{PairDpTable, PricerScratch};
@@ -88,12 +88,7 @@ pub(crate) fn adaptive_m2_batch_size(ctx: &PricingContext) -> usize {
         }
     }
 
-    let active = ctx
-        .alpha
-        .iter()
-        .skip(1)
-        .filter(|&&a| a > 1.0e-12)
-        .count();
+    let active = ctx.alpha.iter().skip(1).filter(|&&a| a > 1.0e-12).count();
     let mut batch = if active >= 1200 {
         64
     } else if active >= 768 {

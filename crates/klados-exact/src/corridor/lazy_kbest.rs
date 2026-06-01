@@ -347,10 +347,14 @@ impl<'a, 'c> LazyKBest<'a, 'c> {
             }
         }
 
-        let t0_post: Vec<u32> =
-            t0.post_order().filter(|&u| cache.t0_active[u as usize]).collect();
-        let t1_post: Vec<u32> =
-            t1.post_order().filter(|&v| cache.t1_active[v as usize]).collect();
+        let t0_post: Vec<u32> = t0
+            .post_order()
+            .filter(|&u| cache.t0_active[u as usize])
+            .collect();
+        let t1_post: Vec<u32> = t1
+            .post_order()
+            .filter(|&v| cache.t1_active[v as usize])
+            .collect();
         if t0_post.is_empty() || t1_post.is_empty() {
             return;
         }
@@ -465,16 +469,14 @@ impl<'a, 'c> LazyKBest<'a, 'c> {
                     }
                 }
                 if l0_active {
-                    let s = cache.dp_open[cell(n1, l0_idx, v_idx)].score
-                        - input.beta_t0[l0_idx];
+                    let s = cache.dp_open[cell(n1, l0_idx, v_idx)].score - input.beta_t0[l0_idx];
                     if s > best.score {
                         best.score = s;
                         best.choice = 1;
                     }
                 }
                 if r0_active {
-                    let s = cache.dp_open[cell(n1, r0_idx, v_idx)].score
-                        - input.beta_t0[r0_idx];
+                    let s = cache.dp_open[cell(n1, r0_idx, v_idx)].score - input.beta_t0[r0_idx];
                     if s > best.score {
                         best.score = s;
                         best.choice = 2;
@@ -617,20 +619,49 @@ impl<'a, 'c> LazyKBest<'a, 'c> {
         let pen1 = pen0; // same offset, different (v_l, v_r) sources
 
         // Pairing 0: v_l ∈ subtree(l1) using dp_open[l0, ·]; v_r ∈ subtree(r1) using dp_open[r0, ·].
-        let mut sorted_l0 =
-            collect_subtree_scores(t1, l1, l0 as usize, n1, &self.cache.dp_open,
-                self.input.beta_t1, &self.cache.t1_active);
-        let mut sorted_r0 =
-            collect_subtree_scores(t1, r1, r0 as usize, n1, &self.cache.dp_open,
-                self.input.beta_t1, &self.cache.t1_active);
+        let mut sorted_l0 = collect_subtree_scores(
+            t1,
+            l1,
+            l0 as usize,
+            n1,
+            &self.cache.dp_open,
+            self.input.beta_t1,
+            &self.cache.t1_active,
+        );
+        let mut sorted_r0 = collect_subtree_scores(
+            t1,
+            r1,
+            r0 as usize,
+            n1,
+            &self.cache.dp_open,
+            self.input.beta_t1,
+            &self.cache.t1_active,
+        );
         // Pairing 1: v_l ∈ subtree(r1) using dp_open[l0, ·]; v_r ∈ subtree(l1) using dp_open[r0, ·].
-        let mut sorted_l1 =
-            collect_subtree_scores(t1, r1, l0 as usize, n1, &self.cache.dp_open,
-                self.input.beta_t1, &self.cache.t1_active);
-        let mut sorted_r1 =
-            collect_subtree_scores(t1, l1, r0 as usize, n1, &self.cache.dp_open,
-                self.input.beta_t1, &self.cache.t1_active);
-        for v in [&mut sorted_l0, &mut sorted_r0, &mut sorted_l1, &mut sorted_r1] {
+        let mut sorted_l1 = collect_subtree_scores(
+            t1,
+            r1,
+            l0 as usize,
+            n1,
+            &self.cache.dp_open,
+            self.input.beta_t1,
+            &self.cache.t1_active,
+        );
+        let mut sorted_r1 = collect_subtree_scores(
+            t1,
+            l1,
+            r0 as usize,
+            n1,
+            &self.cache.dp_open,
+            self.input.beta_t1,
+            &self.cache.t1_active,
+        );
+        for v in [
+            &mut sorted_l0,
+            &mut sorted_r0,
+            &mut sorted_l1,
+            &mut sorted_r1,
+        ] {
             v.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
         }
 
@@ -799,10 +830,7 @@ fn fill_leaf(
             grounded_v_l: 0,
             grounded_v_r: 0,
         };
-        cache.dp_open[cell(n1, u_idx, v_idx)] = OpenBest {
-            score,
-            choice: 0,
-        };
+        cache.dp_open[cell(n1, u_idx, v_idx)] = OpenBest { score, choice: 0 };
     }
 }
 
@@ -863,9 +891,7 @@ mod tests {
     use super::*;
     use crate::bp::column::{AfColumn, ColumnBuilder, ColumnSet};
     use crate::bp::pricer::PricingContext;
-    use crate::bp::pricer::exact_pair_dp::{
-        ExactPairDpCache, collect_corridor_candidates_ref,
-    };
+    use crate::bp::pricer::exact_pair_dp::{ExactPairDpCache, collect_corridor_candidates_ref};
     use crate::bp::search::Branchings;
     use klados_core::tree::{Label, NodeId};
 
@@ -876,10 +902,7 @@ mod tests {
     #[test]
     fn lazy_kbest_k1_matches_pair_dp_on_balanced_4() {
         // T0 = ((1,2),(3,4))  ;  T1 = ((1,3),(2,4))
-        let trees = vec![
-            build_balanced_4(1, 2, 3, 4),
-            build_balanced_4(1, 3, 2, 4),
-        ];
+        let trees = vec![build_balanced_4(1, 2, 3, 4), build_balanced_4(1, 3, 2, 4)];
         check_k1_equivalence(&trees, 4);
     }
 
@@ -887,10 +910,7 @@ mod tests {
     fn lazy_kbest_k1_matches_pair_dp_on_identical_4() {
         // Identical trees: every leaf-subset is a valid AF column,
         // so the corridor at large γ should be substantial.
-        let trees = vec![
-            build_balanced_4(1, 2, 3, 4),
-            build_balanced_4(1, 2, 3, 4),
-        ];
+        let trees = vec![build_balanced_4(1, 2, 3, 4), build_balanced_4(1, 2, 3, 4)];
         check_k1_equivalence(&trees, 4);
     }
 
@@ -920,8 +940,7 @@ mod tests {
         };
 
         let mut existing_cache = ExactPairDpCache::new(n0, n1, nl);
-        let existing =
-            collect_corridor_candidates_ref(&ctx, &mut existing_cache, 1, gamma, &[]);
+        let existing = collect_corridor_candidates_ref(&ctx, &mut existing_cache, 1, gamma, &[]);
         let mut existing_keys: Vec<(Vec<u32>, f64)> = existing
             .candidates
             .into_iter()

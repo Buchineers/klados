@@ -12,8 +12,8 @@
 //! reduced-cost-corridor enumerator (`rc <= U-1-L`).  Keeping this as a
 //! separate solver lets us benchmark that path without endangering `bp`.
 
-use klados_core::{Instance, SolverStats, Tree};
 use klados_core::kernelize::kernelize_best;
+use klados_core::{Instance, SolverStats, Tree};
 use log::info;
 
 use crate::ExactSolver;
@@ -39,11 +39,15 @@ impl RootCorridorSolver {
 }
 
 impl Default for RootCorridorSolver {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ExactSolver for RootCorridorSolver {
-    fn name(&self) -> &'static str { "root-corridor" }
+    fn name(&self) -> &'static str {
+        "root-corridor"
+    }
 
     fn description(&self) -> &'static str {
         "Certified root-LP corridor probe with exact B&P fallback"
@@ -51,10 +55,22 @@ impl ExactSolver for RootCorridorSolver {
 
     fn options(&self) -> &'static [(&'static str, &'static str)] {
         &[
-            ("KLADOS_ROOT_CORRIDOR_MAX_PROBE_LEAVES", "skip root probe above this leaf count"),
-            ("KLADOS_ROOT_CORRIDOR_MAX_PROBE_2TREE_LEAVES", "also probe 2-tree instances up to this original leaf count"),
-            ("KLADOS_ROOT_CORRIDOR_PROBE_MS", "soft root probe wall budget in milliseconds"),
-            ("KLADOS_ROOT_CORRIDOR_MIP_TIME_LIMIT", "HiGHS pool-MIP time limit per probe pass"),
+            (
+                "KLADOS_ROOT_CORRIDOR_MAX_PROBE_LEAVES",
+                "skip root probe above this leaf count",
+            ),
+            (
+                "KLADOS_ROOT_CORRIDOR_MAX_PROBE_2TREE_LEAVES",
+                "also probe 2-tree instances up to this original leaf count",
+            ),
+            (
+                "KLADOS_ROOT_CORRIDOR_PROBE_MS",
+                "soft root probe wall budget in milliseconds",
+            ),
+            (
+                "KLADOS_ROOT_CORRIDOR_MIP_TIME_LIMIT",
+                "HiGHS pool-MIP time limit per probe pass",
+            ),
             ("KLADOS_ROOT_CORRIDOR_TRACE", "print diagnostics"),
         ]
     }
@@ -76,8 +92,7 @@ impl ExactSolver for RootCorridorSolver {
             n
         };
 
-        let allow_2tree_probe =
-            instance.num_trees() == 2 && n <= self.max_probe_original_2tree;
+        let allow_2tree_probe = instance.num_trees() == 2 && n <= self.max_probe_original_2tree;
 
         if probe_leaves <= self.max_probe_leaves || allow_2tree_probe {
             let mut root = RootPoolSolver::for_corridor_probe();
@@ -131,9 +146,14 @@ impl ExactSolver for RootCorridorSolver {
         Some(forest)
     }
 
-    fn stats(&self) -> &SolverStats { &self.stats }
+    fn stats(&self) -> &SolverStats {
+        &self.stats
+    }
 }
 
 fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }

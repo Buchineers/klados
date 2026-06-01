@@ -28,11 +28,7 @@ pub trait BranchSelector {
     /// `rmp` is provided mutable so selectors can perform speculative LP
     /// resolves (strong branching). The selector **must** restore the RMP
     /// to the caller's branching state before returning.
-    fn select(
-        &mut self,
-        ctx: &SelectionContext,
-        rmp: &mut Rmp,
-    ) -> Option<Vec<Branchings>>;
+    fn select(&mut self, ctx: &SelectionContext, rmp: &mut Rmp) -> Option<Vec<Branchings>>;
 }
 
 const ACTIVE_EPS: f64 = 1.0e-9;
@@ -107,13 +103,8 @@ fn fractional_pairs(
 pub struct MostFractionalPair;
 
 impl BranchSelector for MostFractionalPair {
-    fn select(
-        &mut self,
-        ctx: &SelectionContext,
-        _rmp: &mut Rmp,
-    ) -> Option<Vec<Branchings>> {
-        let (together, support) =
-            pair_mass_and_support(ctx.columns, ctx.values, ctx.num_leaves);
+    fn select(&mut self, ctx: &SelectionContext, _rmp: &mut Rmp) -> Option<Vec<Branchings>> {
+        let (together, support) = pair_mass_and_support(ctx.columns, ctx.values, ctx.num_leaves);
         let pairs = fractional_pairs(&together, &support, ctx.num_leaves);
         let pair = pairs.into_iter().next().map(|(p, _, _)| p)?;
         let (left, right) = ctx.branchings.split_on(pair);
@@ -162,13 +153,8 @@ impl Default for StrongBranching {
 }
 
 impl BranchSelector for StrongBranching {
-    fn select(
-        &mut self,
-        ctx: &SelectionContext,
-        rmp: &mut Rmp,
-    ) -> Option<Vec<Branchings>> {
-        let (together, support) =
-            pair_mass_and_support(ctx.columns, ctx.values, ctx.num_leaves);
+    fn select(&mut self, ctx: &SelectionContext, rmp: &mut Rmp) -> Option<Vec<Branchings>> {
+        let (together, support) = pair_mass_and_support(ctx.columns, ctx.values, ctx.num_leaves);
         let candidates = fractional_pairs(&together, &support, ctx.num_leaves);
         if candidates.is_empty() {
             return None;
@@ -275,13 +261,8 @@ impl Default for ClusterBranching {
 }
 
 impl BranchSelector for ClusterBranching {
-    fn select(
-        &mut self,
-        ctx: &SelectionContext,
-        _rmp: &mut Rmp,
-    ) -> Option<Vec<Branchings>> {
-        let (together, support) =
-            pair_mass_and_support(ctx.columns, ctx.values, ctx.num_leaves);
+    fn select(&mut self, ctx: &SelectionContext, _rmp: &mut Rmp) -> Option<Vec<Branchings>> {
+        let (together, support) = pair_mass_and_support(ctx.columns, ctx.values, ctx.num_leaves);
         let stride = ctx.num_leaves + 1;
 
         // Collect all leaves that appear in at least one fractional pair —
@@ -315,9 +296,7 @@ impl BranchSelector for ClusterBranching {
                     let c = hot_leaves[k];
                     let mac = together[a * stride + c];
                     let mbc = together[b * stride + c];
-                    if mac < self.min_triple_pair_mass
-                        || mbc < self.min_triple_pair_mass
-                    {
+                    if mac < self.min_triple_pair_mass || mbc < self.min_triple_pair_mass {
                         continue;
                     }
                     let m_min = mab.min(mac).min(mbc);

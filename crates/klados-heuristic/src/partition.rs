@@ -2976,10 +2976,10 @@ pub struct GapExperimentResult {
     pub best_known: usize,
     pub pool_size: usize,
     pub cg_columns_added: usize,
-    pub lp_components: Option<f64>,      // fractional master objective over pool
+    pub lp_components: Option<f64>, // fractional master objective over pool
     pub greedy_priceless: Option<usize>, // (i) weight-first greedy packing
-    pub greedy_dual: Option<usize>,      // (ii) LP-basis-guided greedy packing
-    pub pool_ip: Option<usize>,          // (iii) exact node-pack ILP over pool
+    pub greedy_dual: Option<usize>, // (ii) LP-basis-guided greedy packing
+    pub pool_ip: Option<usize>,     // (iii) exact node-pack ILP over pool
     pub pool_ip_timed_out: bool,
     pub timings_ms: Vec<(&'static str, f64)>,
 }
@@ -3003,32 +3003,57 @@ pub fn run_packing_gap_experiment(instance: &Instance, best_known: usize) -> Gap
     let node_product = t1.num_nodes() * t2.num_nodes();
     let allow_cg = node_product <= 30_000_000;
     let allow_lp = n <= 8_000;
-    let num_seeds: u64 = if n <= 200 { 40 } else if n <= 2_000 { 16 } else if n <= 6_000 { 6 } else { 3 };
+    let num_seeds: u64 = if n <= 200 {
+        40
+    } else if n <= 2_000 {
+        16
+    } else if n <= 6_000 {
+        6
+    } else {
+        3
+    };
 
     let mut timings = Vec::new();
     let mut seen: HashSet<Vec<u32>> = HashSet::new();
     let mut pool: Vec<PartitionBlock> = Vec::new();
 
-    let mut push_block = |labels: Vec<u32>, pool: &mut Vec<PartitionBlock>, seen: &mut HashSet<Vec<u32>>| {
-        if labels.len() < 2 { return; }
-        let mut l = labels; l.sort_unstable(); l.dedup();
-        if l.len() < 2 || !seen.insert(l.clone()) { return; }
-        if !is_set_compatible_all(trees, &l) { return; }
-        pool.push(PartitionBlock { weight: l.len() - 1, labels: l });
-    };
+    let mut push_block =
+        |labels: Vec<u32>, pool: &mut Vec<PartitionBlock>, seen: &mut HashSet<Vec<u32>>| {
+            if labels.len() < 2 {
+                return;
+            }
+            let mut l = labels;
+            l.sort_unstable();
+            l.dedup();
+            if l.len() < 2 || !seen.insert(l.clone()) {
+                return;
+            }
+            if !is_set_compatible_all(trees, &l) {
+                return;
+            }
+            pool.push(PartitionBlock {
+                weight: l.len() - 1,
+                labels: l,
+            });
+        };
 
     // ----- Pool: Chen 2-approx forest blocks -----
     let t = Instant::now();
     let (_lo, _up, chen_sets) = klados_exact::chen_rspr::chen_pair_agreement(t1, t2);
-    for s in chen_sets { push_block(s, &mut pool, &mut seen); }
+    for s in chen_sets {
+        push_block(s, &mut pool, &mut seen);
+    }
     timings.push(("chen_pool", t.elapsed().as_secs_f64() * 1000.0));
 
     // ----- Pool: multi-seed greedy cherry partitions (overlapping blocks) -----
     let t = Instant::now();
     for ref_idx in 0..trees.len() {
         for seed in 0..num_seeds {
-            let (_k, part) = klados_core::lower_bound::greedy_multi_tree_partition(trees, ref_idx, seed);
-            for g in partition_groups(&part) { push_block(g, &mut pool, &mut seen); }
+            let (_k, part) =
+                klados_core::lower_bound::greedy_multi_tree_partition(trees, ref_idx, seed);
+            for g in partition_groups(&part) {
+                push_block(g, &mut pool, &mut seen);
+            }
         }
     }
     timings.push(("seed_pool", t.elapsed().as_secs_f64() * 1000.0));
@@ -3042,7 +3067,9 @@ pub fn run_packing_gap_experiment(instance: &Instance, best_known: usize) -> Gap
         let cg_start = Instant::now();
         let max_rounds = if n <= 200 { 400 } else { 150 };
         for _round in 0..max_rounds {
-            if cg_start.elapsed() >= cg_budget { break; }
+            if cg_start.elapsed() >= cg_budget {
+                break;
+            }
             let lp = match solve_paper_rmp_lp_blocks(&pool, trees, n) {
                 Ok(lp) => lp,
                 Err(_) => break,
@@ -3053,7 +3080,9 @@ pub fn run_packing_gap_experiment(instance: &Instance, best_known: usize) -> Gap
                 Ok(Some((score, labels))) if score > 1.0 + 1e-6 => {
                     let before = pool.len();
                     push_block(labels, &mut pool, &mut seen);
-                    if pool.len() == before { break; } // nothing new -> converged
+                    if pool.len() == before {
+                        break;
+                    } // nothing new -> converged
                     cg_added += 1;
                 }
                 _ => break,

@@ -52,10 +52,10 @@ use crate::ExactSolver;
 use crate::bp::BpSolver;
 use crate::bp::column::{AfColumn, ColumnBuilder, ColumnSet};
 use crate::bp::pricer::exact_pair_dp::{ExactPairDpCache, collect_corridor_candidates};
-use crate::corridor::topk_m2;
 use crate::bp::pricer::{Pricer, PricerScratch, PricingContext, PricingResult, dispatch_by_m};
 use crate::bp::rmp::Rmp;
 use crate::bp::search::Branchings;
+use crate::corridor::topk_m2;
 use crate::root_pool::seed_columns_and_incumbent;
 use crate::whidden_cluster::try_whidden_decomp_2tree;
 
@@ -187,8 +187,12 @@ impl CorridorSolver {
         }
 
         let reduced_forest = self.solve_m2_core(reduced)?;
-        let expanded =
-            expand_solution(reduced_forest, &kern, instance.reference_tree(), instance.num_leaves);
+        let expanded = expand_solution(
+            reduced_forest,
+            &kern,
+            instance.reference_tree(),
+            instance.num_leaves,
+        );
         self.stats.upper_bound = Some(expanded.len());
         self.stats.lower_bound = expanded.len();
         Some(expanded)
@@ -303,7 +307,13 @@ impl CorridorSolver {
                 if self.trace {
                     eprintln!(
                         "[corridor] certified-lp-bound n={} k={} lp={:.4} lb={} outer={} cg={} corridor_added={} ms={:.0}",
-                        n, upper, lp_obj, lb, outer, total_cg_iters, total_corridor_added,
+                        n,
+                        upper,
+                        lp_obj,
+                        lb,
+                        outer,
+                        total_cg_iters,
+                        total_corridor_added,
                         started.elapsed().as_secs_f64() * 1000.0,
                     );
                 }
@@ -356,9 +366,8 @@ impl CorridorSolver {
                     .and_then(|s| s.parse::<usize>().ok())
                     .unwrap_or(1);
                 let candidates: Vec<(f64, Vec<u32>, u32, u32)> = if topk <= 1 {
-                    let corridor = collect_corridor_candidates(
-                        &ctx, &mut cache, gamma, &forbidden_anchors,
-                    );
+                    let corridor =
+                        collect_corridor_candidates(&ctx, &mut cache, gamma, &forbidden_anchors);
                     scratch.exact_dp_cache = Some(cache);
                     corridor
                         .candidates
@@ -372,11 +381,7 @@ impl CorridorSolver {
                         .take()
                         .filter(|c| c.fits(trees[0].num_nodes(), trees[1].num_nodes(), n))
                         .unwrap_or_else(|| {
-                            topk_m2::TopKDpCache::new(
-                                trees[0].num_nodes(),
-                                trees[1].num_nodes(),
-                                n,
-                            )
+                            topk_m2::TopKDpCache::new(trees[0].num_nodes(), trees[1].num_nodes(), n)
                         });
                     let cols = topk_m2::enumerate_corridor(
                         &topk_m2::CorridorInput {
@@ -485,13 +490,16 @@ fn assemble_forest(instance: &Instance, label_sets: &[Vec<u32>]) -> Option<Vec<T
             if block.len() == 1 {
                 Tree::singleton(block[0], instance.num_leaves)
             } else {
-                let mut leafset = fixedbitset::FixedBitSet::with_capacity(
-                    instance.num_leaves as usize + 1,
-                );
+                let mut leafset =
+                    fixedbitset::FixedBitSet::with_capacity(instance.num_leaves as usize + 1);
                 for &l in block {
                     leafset.insert(l as usize);
                 }
-                Tree::component_from_leafset(&leafset, instance.reference_tree(), instance.num_leaves)
+                Tree::component_from_leafset(
+                    &leafset,
+                    instance.reference_tree(),
+                    instance.num_leaves,
+                )
             }
         })
         .collect();
@@ -598,8 +606,10 @@ fn lp_round(columns: &[AfColumn], values: &[f64], n: usize) -> Option<Vec<Vec<u3
                 .map_or(1, |v| v + 1)
         })
         .collect();
-    let mut used_nodes =
-        caps.into_iter().map(fixedbitset::FixedBitSet::with_capacity).collect::<Vec<_>>();
+    let mut used_nodes = caps
+        .into_iter()
+        .map(fixedbitset::FixedBitSet::with_capacity)
+        .collect::<Vec<_>>();
 
     let mut out: Vec<Vec<u32>> = Vec::new();
     for (ci, _) in indexed {
@@ -635,11 +645,7 @@ fn lp_round(columns: &[AfColumn], values: &[f64], n: usize) -> Option<Vec<Vec<u3
     Some(out)
 }
 
-fn solve_mip_to_optimality(
-    rmp: &mut Rmp,
-    columns: &[AfColumn],
-    n: usize,
-) -> Option<Vec<Vec<u32>>> {
+fn solve_mip_to_optimality(rmp: &mut Rmp, columns: &[AfColumn], n: usize) -> Option<Vec<Vec<u32>>> {
     // Exact MIP solve with lazy cut separation. We loop until either:
     //   (a) the MIP optimum is integer-feasible with no node-cover
     //       violations, or
@@ -649,7 +655,10 @@ fn solve_mip_to_optimality(
     // budget, matching an exact-solver contract.
     let mut best: Option<Vec<Vec<u32>>> = None;
     for _ in 0..16 {
-        let mip = rmp.solve_mip_with_time_limit(f64::INFINITY).ok().flatten()?;
+        let mip = rmp
+            .solve_mip_with_time_limit(f64::INFINITY)
+            .ok()
+            .flatten()?;
         let cuts = rmp.separate_and_add_cuts(columns, &mip.column_values, 0.5);
         if cuts > 0 {
             continue;
@@ -685,11 +694,17 @@ fn integral_solution(columns: &[AfColumn], values: &[f64], n: usize) -> Option<V
 }
 
 fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }
 
 fn env_f64(name: &str, default: f64) -> f64 {
-    std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }
 
 #[allow(dead_code)]

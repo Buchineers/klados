@@ -215,8 +215,14 @@ pub fn enumerate_corridor(input: &CorridorInput, cache: &mut TopKDpCache) -> Vec
         }
     }
 
-    let t0_post: Vec<u32> = t0.post_order().filter(|&u| cache.t0_active[u as usize]).collect();
-    let t1_post: Vec<u32> = t1.post_order().filter(|&v| cache.t1_active[v as usize]).collect();
+    let t0_post: Vec<u32> = t0
+        .post_order()
+        .filter(|&u| cache.t0_active[u as usize])
+        .collect();
+    let t1_post: Vec<u32> = t1
+        .post_order()
+        .filter(|&v| cache.t1_active[v as usize])
+        .collect();
     if t0_post.is_empty() || t1_post.is_empty() {
         return Vec::new();
     }
@@ -515,7 +521,10 @@ fn combine_closed_candidates(
     if best_l0[side_a_idx].is_empty() || best_r0[side_b_idx].is_empty() {
         return;
     }
-    let pen = beta0[u_idx] + beta[v_idx] + beta0[l0_idx] + beta0[r0_idx]
+    let pen = beta0[u_idx]
+        + beta[v_idx]
+        + beta0[l0_idx]
+        + beta0[r0_idx]
         + beta[side_a_idx]
         + beta[side_b_idx];
     for ea in best_l0[side_a_idx].iter() {
@@ -563,13 +572,7 @@ fn push_closed_candidate(
     });
 }
 
-fn push_open_candidate(
-    list: &mut TopK<OpenEntry>,
-    score: f64,
-    choice: u8,
-    idx: u16,
-    max_k: usize,
-) {
+fn push_open_candidate(list: &mut TopK<OpenEntry>, score: f64, choice: u8, idx: u16, max_k: usize) {
     let _ = max_k;
     list.push(OpenEntry { score, choice, idx });
 }

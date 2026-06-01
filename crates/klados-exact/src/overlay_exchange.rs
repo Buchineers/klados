@@ -40,11 +40,15 @@ impl OverlayExchangeSolver {
 }
 
 impl Default for OverlayExchangeSolver {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ExactSolver for OverlayExchangeSolver {
-    fn name(&self) -> &'static str { "overlay-exchange" }
+    fn name(&self) -> &'static str {
+        "overlay-exchange"
+    }
 
     fn description(&self) -> &'static str {
         "Incumbent-overlay replacement prototype"
@@ -52,22 +56,42 @@ impl ExactSolver for OverlayExchangeSolver {
 
     fn options(&self) -> &'static [(&'static str, &'static str)] {
         &[
-            ("KLADOS_OVERLAY_MAX_H", "maximum incumbent neighborhood size"),
+            (
+                "KLADOS_OVERLAY_MAX_H",
+                "maximum incumbent neighborhood size",
+            ),
             ("KLADOS_OVERLAY_MAX_ROUNDS", "maximum improvement rounds"),
-            ("KLADOS_OVERLAY_LOCAL_LEAF_CAP", "skip split neighborhoods above this many leaves"),
-            ("KLADOS_OVERLAY_MAX_NEIGHBORHOODS", "neighborhood checks per round cap"),
-            ("KLADOS_OVERLAY_GEN_CAP", "per-neighborhood local candidate generation cap"),
+            (
+                "KLADOS_OVERLAY_LOCAL_LEAF_CAP",
+                "skip split neighborhoods above this many leaves",
+            ),
+            (
+                "KLADOS_OVERLAY_MAX_NEIGHBORHOODS",
+                "neighborhood checks per round cap",
+            ),
+            (
+                "KLADOS_OVERLAY_GEN_CAP",
+                "per-neighborhood local candidate generation cap",
+            ),
             ("KLADOS_OVERLAY_TRACE", "print diagnostics"),
         ]
     }
 
     fn solve(&mut self, instance: &Instance) -> Option<Vec<Tree>> {
         let n = instance.num_leaves as usize;
-        if n == 0 { return Some(Vec::new()); }
+        if n == 0 {
+            return Some(Vec::new());
+        }
         if instance.num_trees() <= 1 {
             let mut all = FixedBitSet::with_capacity(n + 1);
-            for l in 1..=n { all.insert(l); }
-            return Some(vec![Tree::component_from_leafset(&all, &instance.trees[0], instance.num_leaves)]);
+            for l in 1..=n {
+                all.insert(l);
+            }
+            return Some(vec![Tree::component_from_leafset(
+                &all,
+                &instance.trees[0],
+                instance.num_leaves,
+            )]);
         }
 
         let seed_count = env_usize("KLADOS_OVERLAY_UB_SEEDS", 64);
@@ -91,7 +115,15 @@ impl ExactSolver for OverlayExchangeSolver {
             let mut checks = 0u64;
             for h in 2..=self.max_h.min(comps.len()) {
                 let mut choice = Vec::with_capacity(h);
-                if let Some(rep) = self.find_exchange(instance, &comps, h, 0, &mut choice, &mut builder, &mut checks) {
+                if let Some(rep) = self.find_exchange(
+                    instance,
+                    &comps,
+                    h,
+                    0,
+                    &mut choice,
+                    &mut builder,
+                    &mut checks,
+                ) {
                     let opened = rep.open.clone();
                     let new_blocks = rep.blocks.len();
                     apply_replacement_with_builder(instance, &mut comps, rep, &mut builder)?;
@@ -109,7 +141,12 @@ impl ExactSolver for OverlayExchangeSolver {
                 }
             }
             if !improved {
-                eprintln!("[overlay] stopped comps={} rounds={} checked={}", comps.len(), round, checks);
+                eprintln!(
+                    "[overlay] stopped comps={} rounds={} checked={}",
+                    comps.len(),
+                    round,
+                    checks
+                );
                 break;
             }
         }
@@ -118,7 +155,9 @@ impl ExactSolver for OverlayExchangeSolver {
         Some(comps_to_trees(instance, &comps))
     }
 
-    fn stats(&self) -> &SolverStats { &self.stats }
+    fn stats(&self) -> &SolverStats {
+        &self.stats
+    }
 }
 
 #[derive(Clone)]
@@ -157,7 +196,8 @@ impl OverlayExchangeSolver {
         let need = h - choice.len();
         for i in start..=comps.len().saturating_sub(need) {
             choice.push(i);
-            if let Some(r) = self.find_exchange(instance, comps, h, i + 1, choice, builder, checks) {
+            if let Some(r) = self.find_exchange(instance, comps, h, i + 1, choice, builder, checks)
+            {
                 return Some(r);
             }
             choice.pop();
@@ -176,7 +216,10 @@ impl OverlayExchangeSolver {
         builder: &mut ColumnBuilder,
     ) -> Option<Replacement> {
         let n = instance.num_leaves as usize;
-        let open_set = open.iter().copied().collect::<std::collections::BTreeSet<_>>();
+        let open_set = open
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
         let mut labels = Vec::<u32>::new();
         for &idx in open {
             labels.extend_from_slice(&comps[idx].labels);
@@ -189,7 +232,10 @@ impl OverlayExchangeSolver {
         // Zero-split/coarsening fast path: all opened leaves become one block.
         if let Some(col) = builder.try_build(labels.clone(), &instance.trees) {
             if coverage_disjoint(&outside, col.coverage()) {
-                return Some(Replacement { open: open.to_vec(), blocks: vec![labels] });
+                return Some(Replacement {
+                    open: open.to_vec(),
+                    blocks: vec![labels],
+                });
             }
         }
 
@@ -226,7 +272,10 @@ impl OverlayExchangeSolver {
             );
         }
         let mut search = LocalSearch::new(n, instance, labels.clone(), lgen.out, target_saving);
-        search.run().map(|blocks| Replacement { open: open.to_vec(), blocks })
+        search.run().map(|blocks| Replacement {
+            open: open.to_vec(),
+            blocks,
+        })
     }
 }
 
@@ -243,7 +292,9 @@ struct LocalGen<'a, 'b> {
 
 impl<'a, 'b> LocalGen<'a, 'b> {
     fn enumerate(&mut self, pos: usize, cur: &mut Vec<u32>) {
-        if self.aborted { return; }
+        if self.aborted {
+            return;
+        }
         for i in pos..self.labels_universe.len() {
             cur.push(self.labels_universe[i]);
             if cur.len() >= 2 {
@@ -277,7 +328,13 @@ struct LocalSearch<'a> {
 }
 
 impl<'a> LocalSearch<'a> {
-    fn new(n: usize, instance: &'a Instance, universe: Vec<u32>, mut candidates: Vec<OComp>, target: usize) -> Self {
+    fn new(
+        n: usize,
+        instance: &'a Instance,
+        universe: Vec<u32>,
+        mut candidates: Vec<OComp>,
+        target: usize,
+    ) -> Self {
         candidates.sort_by(|a, b| b.labels.len().cmp(&a.labels.len()));
         let mut by_leaf = vec![Vec::new(); n + 1];
         for (i, c) in candidates.iter().enumerate() {
@@ -285,11 +342,21 @@ impl<'a> LocalSearch<'a> {
                 by_leaf[l as usize].push(i);
             }
         }
-        Self { n, instance, universe, candidates, by_leaf, target }
+        Self {
+            n,
+            instance,
+            universe,
+            candidates,
+            by_leaf,
+            target,
+        }
     }
 
     fn run(&mut self) -> Option<Vec<Vec<u32>>> {
-        let used_nodes = self.instance.trees.iter()
+        let used_nodes = self
+            .instance
+            .trees
+            .iter()
             .map(|t| FixedBitSet::with_capacity(t.num_nodes()))
             .collect::<Vec<_>>();
         let used_leaves = FixedBitSet::with_capacity(self.n + 1);
@@ -306,7 +373,11 @@ impl<'a> LocalSearch<'a> {
         if saving >= self.target {
             return Some(selected);
         }
-        let free = self.universe.iter().filter(|&&l| !used_leaves.contains(l as usize)).count();
+        let free = self
+            .universe
+            .iter()
+            .filter(|&&l| !used_leaves.contains(l as usize))
+            .count();
         if saving + free.saturating_sub(1) < self.target {
             return None;
         }
@@ -314,8 +385,12 @@ impl<'a> LocalSearch<'a> {
         let mut best_list: Vec<usize> = Vec::new();
         for &lbl in &self.universe {
             let l = lbl as usize;
-            if used_leaves.contains(l) { continue; }
-            let list = self.by_leaf[l].iter().copied()
+            if used_leaves.contains(l) {
+                continue;
+            }
+            let list = self.by_leaf[l]
+                .iter()
+                .copied()
                 .filter(|&idx| self.compatible(idx, &used_leaves, &used_nodes))
                 .collect::<Vec<_>>();
             if best_leaf.is_none() || list.len() < best_list.len() {
@@ -344,7 +419,12 @@ impl<'a> LocalSearch<'a> {
         self.dfs(nl, used_nodes, saving, selected)
     }
 
-    fn compatible(&self, idx: usize, used_leaves: &FixedBitSet, used_nodes: &[FixedBitSet]) -> bool {
+    fn compatible(
+        &self,
+        idx: usize,
+        used_leaves: &FixedBitSet,
+        used_nodes: &[FixedBitSet],
+    ) -> bool {
         let c = &self.candidates[idx];
         if used_leaves.intersection(&c.leaf_mask).next().is_some() {
             return false;
@@ -364,13 +444,21 @@ fn apply_replacement_with_builder(
     rep: Replacement,
     builder: &mut ColumnBuilder,
 ) -> Option<()> {
-    let open = rep.open.iter().copied().collect::<std::collections::BTreeSet<_>>();
+    let open = rep
+        .open
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
     let mut used = FixedBitSet::with_capacity(instance.num_leaves as usize + 1);
     for block in &rep.blocks {
-        for &l in block { used.insert(l as usize); }
+        for &l in block {
+            used.insert(l as usize);
+        }
     }
     let mut all_open = Vec::new();
-    for &idx in &rep.open { all_open.extend_from_slice(&comps[idx].labels); }
+    for &idx in &rep.open {
+        all_open.extend_from_slice(&comps[idx].labels);
+    }
     all_open.sort_unstable();
     all_open.dedup();
     let mut blocks = rep.blocks;
@@ -393,7 +481,11 @@ fn apply_replacement_with_builder(
     Some(())
 }
 
-fn comps_from_partition(instance: &Instance, part: &[usize], builder: &mut ColumnBuilder) -> Option<Vec<OComp>> {
+fn comps_from_partition(
+    instance: &Instance,
+    part: &[usize],
+    builder: &mut ColumnBuilder,
+) -> Option<Vec<OComp>> {
     let n = instance.num_leaves as usize;
     let max_comp = part.iter().copied().max().unwrap_or(0);
     let mut sets = vec![Vec::<u32>::new(); max_comp + 1];
@@ -405,7 +497,9 @@ fn comps_from_partition(instance: &Instance, part: &[usize], builder: &mut Colum
     }
     let mut out = Vec::new();
     for mut labels in sets {
-        if labels.is_empty() { continue; }
+        if labels.is_empty() {
+            continue;
+        }
         labels.sort_unstable();
         let col = builder.try_build(labels, &instance.trees)?;
         out.push(ocomp_from_col(instance, col));
@@ -416,21 +510,42 @@ fn comps_from_partition(instance: &Instance, part: &[usize], builder: &mut Colum
 fn ocomp_from_col(instance: &Instance, col: AfColumn) -> OComp {
     let n = instance.num_leaves as usize;
     let mut leaf_mask = FixedBitSet::with_capacity(n + 1);
-    for &l in col.labels() { leaf_mask.insert(l as usize); }
-    let node_masks = instance.trees.iter().enumerate().map(|(ti, t)| {
-        let mut mask = FixedBitSet::with_capacity(t.num_nodes());
-        for &v in col.coverage().nodes(ti) { mask.insert(v); }
-        mask
-    }).collect();
-    OComp { labels: col.labels().to_vec(), leaf_mask, node_masks }
+    for &l in col.labels() {
+        leaf_mask.insert(l as usize);
+    }
+    let node_masks = instance
+        .trees
+        .iter()
+        .enumerate()
+        .map(|(ti, t)| {
+            let mut mask = FixedBitSet::with_capacity(t.num_nodes());
+            for &v in col.coverage().nodes(ti) {
+                mask.insert(v);
+            }
+            mask
+        })
+        .collect();
+    OComp {
+        labels: col.labels().to_vec(),
+        leaf_mask,
+        node_masks,
+    }
 }
 
-fn outside_masks(instance: &Instance, comps: &[OComp], open: &std::collections::BTreeSet<usize>) -> Vec<FixedBitSet> {
-    let mut masks = instance.trees.iter()
+fn outside_masks(
+    instance: &Instance,
+    comps: &[OComp],
+    open: &std::collections::BTreeSet<usize>,
+) -> Vec<FixedBitSet> {
+    let mut masks = instance
+        .trees
+        .iter()
         .map(|t| FixedBitSet::with_capacity(t.num_nodes()))
         .collect::<Vec<_>>();
     for (i, c) in comps.iter().enumerate() {
-        if open.contains(&i) { continue; }
+        if open.contains(&i) {
+            continue;
+        }
         for (ti, m) in c.node_masks.iter().enumerate() {
             masks[ti].union_with(m);
         }
@@ -438,23 +553,36 @@ fn outside_masks(instance: &Instance, comps: &[OComp], open: &std::collections::
     masks
 }
 
-fn coverage_disjoint(used_nodes: &[FixedBitSet], coverage: &crate::bp::column::ColumnCoverage) -> bool {
+fn coverage_disjoint(
+    used_nodes: &[FixedBitSet],
+    coverage: &crate::bp::column::ColumnCoverage,
+) -> bool {
     for (ti, nodes) in coverage.iter_per_tree().enumerate() {
         for &v in nodes {
-            if used_nodes[ti].contains(v) { return false; }
+            if used_nodes[ti].contains(v) {
+                return false;
+            }
         }
     }
     true
 }
 
 fn comps_to_trees(instance: &Instance, comps: &[OComp]) -> Vec<Tree> {
-    comps.iter().map(|c| {
-        let mut set = FixedBitSet::with_capacity(instance.num_leaves as usize + 1);
-        for &l in &c.labels { set.insert(l as usize); }
-        Tree::component_from_leafset(&set, &instance.trees[0], instance.num_leaves)
-    }).collect()
+    comps
+        .iter()
+        .map(|c| {
+            let mut set = FixedBitSet::with_capacity(instance.num_leaves as usize + 1);
+            for &l in &c.labels {
+                set.insert(l as usize);
+            }
+            Tree::component_from_leafset(&set, &instance.trees[0], instance.num_leaves)
+        })
+        .collect()
 }
 
 fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }

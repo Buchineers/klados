@@ -37,21 +37,11 @@ where
     F: FnMut(&Instance) -> Option<Vec<Tree>>,
 {
     // The C++ rspr code does *not* solve relaxed/batch clusters as closed
-    // leaf-set subinstances.  It builds boundary-aware forests, possibly adds
+    // leaf-set subinstances. It builds boundary-aware forests, possibly adds
     // rho, and joins them back through ClusterForest/ClusterInstance state.
-    // The older Rust batch/relaxed prototypes are therefore opt-in only:
-    // validation proves feasibility, not optimality.  The default fallback is
-    // the exact strict common-cluster split below.
-    if env_flag("KLADOS_WHIDDEN_BATCH_STRICT") {
-        if let Some(r) = try_batch_decomp(instance, solve) {
-            return Some(r);
-        }
-    }
-    if env_flag("KLADOS_WHIDDEN_RSPR_GREEDY") {
-        if let Some(r) = try_rspr_decomp(instance, solve) {
-            return Some(r);
-        }
-    }
+    // The Rust batch/relaxed prototypes below validate feasibility but do not
+    // prove the lower-bound accounting needed for an exact solver return, so
+    // the exact path uses the certified strict split only.
     try_single_decomp(instance, solve)
 }
 
@@ -85,6 +75,157 @@ fn env_flag(name: &str) -> bool {
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RsprClusterPointKind {
+    Strict,
+    Relaxed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RsprClusterPoint {
+    t1_node: NodeId,
+    t2_twin: NodeId,
+    t1_round_trip: NodeId,
+    size: usize,
+    kind: RsprClusterPointKind,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct WhiddenDecompPotential {
+    pub strict_points: usize,
+    pub relaxed_points: usize,
+    pub balanced_selected: usize,
+    pub balanced_clustered: usize,
+    pub balanced_remainder: usize,
+    pub balanced_largest_subproblem: usize,
+    pub strict_selected: usize,
+    pub strict_clustered: usize,
+    pub strict_remainder: usize,
+    pub strict_largest_subproblem: usize,
+    pub top_strict_sizes: Vec<usize>,
+    pub top_relaxed_sizes: Vec<usize>,
+}
+
+pub(crate) fn analyze_whidden_decomp_potential(
+    instance: &Instance,
+) -> Option<WhiddenDecompPotential> {
+    if instance.num_trees() != 2 {
+        return None;
+    }
+    let n = instance.num_leaves as usize;
+    if n < 6 {
+        return None;
+    }
+
+    let t1 = &instance.trees[0];
+    let t2 = &instance.trees[1];
+    let leaf_sets = compute_leaf_sets(t1, n);
+    let tw12 = compute_twins(t1, t2);
+    let tw21 = compute_twins(t2, t1);
+    let points = collect_rspr_cluster_points(t1, t2, &leaf_sets, &tw12, &tw21, n);
+    if points.is_empty() {
+        return Some(WhiddenDecompPotential {
+            strict_remainder: n,
+            strict_largest_subproblem: n,
+            balanced_remainder: n,
+            balanced_largest_subproblem: n,
+            ..WhiddenDecompPotential::default()
+        });
+    }
+
+    let strict_points = points
+        .iter()
+        .filter(|p| p.kind == RsprClusterPointKind::Strict)
+        .count();
+    let relaxed_points = points.len().saturating_sub(strict_points);
+
+    let mut balanced_candidates: Vec<(NodeId, usize)> = points
+        .iter()
+        .filter(|p| p.size >= 2 && p.size <= n - 2)
+        .map(|p| (p.t1_node, p.size))
+        .collect();
+    balanced_candidates.sort_by_key(|(_, size)| -((*size).min(n - *size) as isize));
+
+    let mut strict_candidates: Vec<(NodeId, usize)> = points
+        .iter()
+        .filter(|p| p.kind == RsprClusterPointKind::Strict)
+        .filter(|p| p.size >= 2 && p.size <= n - 2)
+        .filter(|p| !t2.is_root(p.t2_twin))
+        .map(|p| (p.t1_node, p.size))
+        .collect();
+    strict_candidates.sort_by_key(|(_, size)| -((*size).min(n - *size) as isize));
+
+    let balanced = select_disjoint_cluster_stats(n, &leaf_sets, &balanced_candidates);
+    let strict = select_disjoint_cluster_stats(n, &leaf_sets, &strict_candidates);
+
+    let mut top_strict_sizes: Vec<usize> = points
+        .iter()
+        .filter(|p| p.kind == RsprClusterPointKind::Strict)
+        .map(|p| p.size)
+        .collect();
+    top_strict_sizes.sort_unstable_by(|a, b| b.cmp(a));
+    top_strict_sizes.truncate(8);
+
+    let mut top_relaxed_sizes: Vec<usize> = points
+        .iter()
+        .filter(|p| p.kind == RsprClusterPointKind::Relaxed)
+        .map(|p| p.size)
+        .collect();
+    top_relaxed_sizes.sort_unstable_by(|a, b| b.cmp(a));
+    top_relaxed_sizes.truncate(8);
+
+    Some(WhiddenDecompPotential {
+        strict_points,
+        relaxed_points,
+        balanced_selected: balanced.selected,
+        balanced_clustered: balanced.clustered,
+        balanced_remainder: balanced.remainder,
+        balanced_largest_subproblem: balanced.largest_subproblem,
+        strict_selected: strict.selected,
+        strict_clustered: strict.clustered,
+        strict_remainder: strict.remainder,
+        strict_largest_subproblem: strict.largest_subproblem,
+        top_strict_sizes,
+        top_relaxed_sizes,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DisjointClusterStats {
+    selected: usize,
+    clustered: usize,
+    remainder: usize,
+    largest_subproblem: usize,
+}
+
+fn select_disjoint_cluster_stats(
+    n: usize,
+    leaf_sets: &[FixedBitSet],
+    candidates: &[(NodeId, usize)],
+) -> DisjointClusterStats {
+    let cap = leaf_sets.first().map(|l| l.len()).unwrap_or(0);
+    let mut taken = FixedBitSet::with_capacity(cap);
+    let mut selected = 0usize;
+    let mut largest = 0usize;
+    for &(node, size) in candidates {
+        let leaves = &leaf_sets[node as usize];
+        if !taken.is_disjoint(leaves) {
+            continue;
+        }
+        taken.union_with(leaves);
+        selected += 1;
+        largest = largest.max(size);
+    }
+    let clustered = taken.count_ones(..);
+    let remainder = n.saturating_sub(clustered) + selected;
+    DisjointClusterStats {
+        selected,
+        clustered,
+        remainder,
+        largest_subproblem: largest.max(remainder),
+    }
+}
+
 /// rspr-style: find clusters, solve inners, keep anchors in tree, prune rest.
 fn try_rspr_decomp<F>(instance: &Instance, solve: &mut F) -> Option<Vec<Tree>>
 where
@@ -101,31 +242,12 @@ where
     let tw21 = compute_twins(t2, t1);
 
     // 1. Find cluster points (relaxed + child filter).
-    let mut is_cl = vec![false; t1.num_nodes()];
-    let mut pts = Vec::new();
-    for node in t1.post_order() {
-        if t1.is_leaf(node) || t1.is_root(node) {
-            continue;
-        }
-        let sz = leaf_sets[node as usize].count_ones(..);
-        if sz < 2 || sz > n - 2 {
-            continue;
-        }
-        let t2t = tw12[node as usize];
-        if t2t == NONE {
-            continue;
-        }
-        if t1.depth[node as usize] > t1.depth[tw21[t2t as usize] as usize] {
-            continue;
-        }
-        if let Some((l, r)) = t1.children(node) {
-            if is_cl[l as usize] && is_cl[r as usize] {
-                continue;
-            }
-        }
-        is_cl[node as usize] = true;
-        pts.push((node, sz.min(n - sz)));
-    }
+    let cluster_points = collect_rspr_cluster_points(t1, t2, &leaf_sets, &tw12, &tw21, n);
+    let mut pts: Vec<(NodeId, usize)> = cluster_points
+        .iter()
+        .filter(|point| point.size <= n - 2)
+        .map(|point| (point.t1_node, point.size.min(n - point.size)))
+        .collect();
     pts.sort_by_key(|(_, s)| -(*s as isize));
     if pts.is_empty() {
         return None;
@@ -231,7 +353,7 @@ where
     }
 
     if !result.is_empty() && validate_agreement_forest(instance, &result).is_ok() {
-        eprintln!(
+        log::trace!(
             "[whidden] rspr n={}: {} clusters -> {} comps",
             n,
             sel.len(),
@@ -257,7 +379,6 @@ where
     // uses for cluster points.  This intentionally does NOT use relaxed
     // depth-only cluster points: those require the full rspr ClusterInstance
     // boundary/rho/component-zero machinery during join.
-    let mut is_cl = vec![false; t1.num_nodes()];
     let mut pts = Vec::new();
     for node in t1.post_order() {
         if t1.is_leaf(node) || t1.is_root(node) {
@@ -284,12 +405,9 @@ where
         }
         // rspr filter: if all children are cluster points, this node is just
         // their union, not a separate cluster.
-        if let Some((l, r)) = t1.children(node) {
-            if is_cl[l as usize] && is_cl[r as usize] {
-                continue;
-            }
+        if children_are_rspr_cluster_candidates(t1, &tw12, &tw21, node) {
+            continue;
         }
-        is_cl[node as usize] = true;
         pts.push((node, sz.min(n - sz)));
     }
     pts.sort_by_key(|(_, s)| -(*s as isize));
@@ -749,7 +867,7 @@ where
         }
         return None;
     }
-    eprintln!(
+    log::trace!(
         "[whidden] batch n={}: {} clusters -> {} comps",
         n,
         solved.len(),
@@ -793,7 +911,47 @@ where
     let twin_t1_to_t2 = compute_twins(t1, t2);
     let twin_t2_to_t1 = compute_twins(t2, t1);
 
-    let cluster = find_best_cluster_point(t1, &leaf_sets_t1, &twin_t1_to_t2, &twin_t2_to_t1, n)?;
+    let mut candidates: Vec<(NodeId, usize)> =
+        collect_rspr_cluster_points(t1, t2, &leaf_sets_t1, &twin_t1_to_t2, &twin_t2_to_t1, n)
+            .into_iter()
+            .filter(|point| point.kind == RsprClusterPointKind::Strict)
+            .filter(|point| point.size >= 2 && point.size <= n - 2)
+            .filter(|point| point.t1_round_trip == point.t1_node)
+            .filter(|point| !t2.is_root(point.t2_twin))
+            .map(|point| (point.t1_node, point.size.min(n - point.size)))
+            .collect();
+    candidates.sort_by_key(|(_, score)| -(*score as isize));
+
+    for (cluster, _) in candidates {
+        if let Some(result) = try_single_decomp_at(instance, solve, cluster) {
+            return Some(result);
+        }
+    }
+
+    None
+}
+
+fn try_single_decomp_at<F>(
+    instance: &Instance,
+    solve: &mut F,
+    cluster: NodeId,
+) -> Option<Vec<Tree>>
+where
+    F: FnMut(&Instance) -> Option<Vec<Tree>>,
+{
+    if instance.num_trees() != 2 {
+        return None;
+    }
+    let n = instance.num_leaves as usize;
+    if n < 6 {
+        return None;
+    }
+
+    let t1 = &instance.trees[0];
+    let t2 = &instance.trees[1];
+
+    let leaf_sets_t1 = compute_leaf_sets(t1, n);
+    let twin_t1_to_t2 = compute_twins(t1, t2);
 
     let cluster_leaves = &leaf_sets_t1[cluster as usize];
     let cluster_size = cluster_leaves.count_ones(..);
@@ -924,7 +1082,7 @@ where
         candidate.push(merged);
 
         if validate_agreement_forest(instance, &candidate).is_ok() {
-            eprintln!(
+            log::trace!(
                 "[whidden] decomp n={}: inner={} outer={} (cluster_node={}, anchor_idx={}, {} comps)",
                 n,
                 cluster_size,
@@ -937,8 +1095,136 @@ where
         }
     }
 
+    // ── ρ fallback (Whidden boundary marker) ─────────────────────────────
+    //
+    // The anchorless search above failed: the inner solve returned an optimal
+    // AF that fragments the boundary leaves across several components, so no
+    // single inner component grafts validly at P. This is luck-dependent on
+    // the inner B&P's tie-breaking among equal optima.
+    //
+    // Re-solve the inner WITH a ρ pendant leaf — the boundary marker that
+    // mirrors P on the outer side (rspr's `add_rho()` /
+    // `ClusterInstance::join_cluster`, rspr.h:4305-4338). ρ is attached as the
+    // sibling of the cluster root in both inner trees. If the marker stays with
+    // real cluster leaves, it identifies the unique boundary component and does
+    // not change the inner distance.
+    // The component containing ρ is then the *unique* boundary component,
+    // robust to which optimal inner partition the solver returns. We merge that
+    // ρ-component (minus ρ) with the outer P-component exactly as the anchor
+    // loop would, and validate before accepting.
+    //
+    // Component-count accounting (identical optimum to a successful anchor):
+    //   |candidate| = (|inner_ρ| − 1) + (|outer| − 1) + 1 = |inner_ρ| + |outer| − 1
+    // and |inner_ρ| = |inner| (ρ is a free agreeing pendant), so this equals the
+    // strict-cluster optimum |inner| + |outer| − 1.
+    {
+        let rho_label = cluster_size as Label + 1;
+        let inner_rho_num_leaves = cluster_size as u32 + 1;
+        let inner_t1_rho =
+            build_inner_with_rho(t1, &inner_label_map, rho_label, inner_rho_num_leaves);
+        let inner_t2_rho =
+            build_inner_with_rho(t2, &inner_label_map, rho_label, inner_rho_num_leaves);
+        let mut inner_rho_instance =
+            Instance::new(vec![inner_t1_rho, inner_t2_rho], inner_rho_num_leaves);
+        inner_rho_instance.protected_labels = vec![rho_label];
+
+        if let Some(inner_rho_components) = solve(&inner_rho_instance) {
+            if let Some(rho_pos) = inner_rho_components
+                .iter()
+                .position(|c| component_contains_label(c, rho_label))
+            {
+                // Boundary B = ρ-component minus ρ, in original labels.
+                let boundary_inner = strip_label(
+                    &inner_rho_components[rho_pos],
+                    rho_label,
+                    cluster_size as u32,
+                );
+                let marker_increased_inner = inner_rho_components.len() > decoded_inner.len();
+                if boundary_inner.leaves().next().is_some() {
+                    let boundary_decoded =
+                        boundary_inner.relabel(&inner_to_orig, instance.num_leaves);
+                    let other_inner: Vec<Tree> = inner_rho_components
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| *i != rho_pos)
+                        .map(|(_, c)| c.relabel(&inner_to_orig, instance.num_leaves))
+                        .collect();
+                    let anchor_leaf = boundary_decoded
+                        .leaves()
+                        .next()
+                        .expect("boundary is non-empty");
+                    let merged = fuse_at_label(
+                        &outer_p_comp_decoded,
+                        &boundary_decoded,
+                        p_decoded,
+                        anchor_leaf,
+                        instance.num_leaves,
+                    );
+                    let mut candidate: Vec<Tree> = other_inner;
+                    candidate.extend(decoded_outer_non_p.clone());
+                    candidate.push(merged);
+                    // Optimality guard. The strict-cluster optimum is
+                    // |inner| + |outer| − 1 = decoded_inner.len() +
+                    // decoded_outer_non_p.len(). The ρ-fallback equals it only
+                    // when ρ was a free pendant (|inner_ρ| = |inner|); since
+                    // T1|X and T2|X differ in topology, ρ can instead force one
+                    // extra cut (|inner_ρ| = |inner| + 1), yielding a valid but
+                    // SUBoptimal forest. Accept only when the count matches the
+                    // optimum, else bail to full B&P (sound, as before).
+                    let expected = decoded_inner.len() + decoded_outer_non_p.len();
+                    if candidate.len() == expected
+                        && validate_agreement_forest(instance, &candidate).is_ok()
+                    {
+                        log::trace!(
+                            "[whidden] decomp n={}: inner={} outer={} (cluster_node={}, ρ-fallback, {} comps)",
+                            n,
+                            cluster_size,
+                            outer_size + 1,
+                            cluster,
+                            candidate.len()
+                        );
+                        return Some(candidate);
+                    }
+                }
+                if marker_increased_inner {
+                    // Boundary-cut/no-saving case: adding rho to the inner
+                    // cluster increased the optimum, so rspr's join_cluster
+                    // adjustment removes the cross-boundary -1 saving. The
+                    // top side must be solved without P (TP4); stripping P out
+                    // of the already solved top-with-P instance is only
+                    // feasible, not optimal.
+                    let outer_no_p_t1 = t1.relabel(&outer_label_map, outer_size as u32);
+                    let outer_no_p_t2 = t2.relabel(&outer_label_map, outer_size as u32);
+                    let outer_no_p_instance =
+                        Instance::new(vec![outer_no_p_t1, outer_no_p_t2], outer_size as u32);
+
+                    if let Some(outer_no_p_components) = solve(&outer_no_p_instance) {
+                        let mut candidate: Vec<Tree> = decoded_inner.clone();
+                        candidate.extend(
+                            outer_no_p_components
+                                .iter()
+                                .map(|c| c.relabel(&outer_to_orig, instance.num_leaves)),
+                        );
+
+                        if validate_agreement_forest(instance, &candidate).is_ok() {
+                            log::trace!(
+                                "[whidden] decomp n={}: inner={} outer={} (cluster_node={}, ρ-boundary-cut, {} comps)",
+                                n,
+                                cluster_size,
+                                outer_size + 1,
+                                cluster,
+                                candidate.len()
+                            );
+                            return Some(candidate);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // No valid anchor — decomposition fails for this cluster point.
-    eprintln!(
+    log::trace!(
         "[whidden] decomp n={}: inner={} outer={} — no valid anchor among {} inner components",
         n,
         cluster_size,
@@ -972,6 +1258,97 @@ fn strip_label(tree: &Tree, target: Label, new_num_leaves: u32) -> Tree {
         return Tree::with_capacity(new_num_leaves);
     }
     tree.prune_to_leafset(&s)
+}
+
+/// Build `T|X` (the cluster subtree, via `label_map` sending X-leaves to
+/// `1..=|X|` and non-X leaves to 0) with a pendant ρ leaf attached as the
+/// sibling of the cluster root — Whidden's boundary marker. When keeping ρ
+/// attached is optimal, the component containing ρ identifies the mergeable
+/// boundary. When ρ increases the marked optimum, the outer side is solved
+/// without its placeholder and the cluster is joined with no cross-boundary
+/// component saving.
+fn build_inner_with_rho(
+    src: &Tree,
+    label_map: &[Label],
+    rho_label: Label,
+    new_num_leaves: u32,
+) -> Tree {
+    let mut out = Tree::with_capacity(new_num_leaves);
+
+    // Copy `src` while relabelling leaves through `label_map` (label 0 ⇒ drop),
+    // exactly mirroring `Tree::relabel`'s recursion.
+    fn build(src: &Tree, label_map: &[Label], out: &mut Tree, node: NodeId) -> Option<NodeId> {
+        if node == NONE {
+            return None;
+        }
+        if src.is_leaf(node) {
+            let old_lbl = src.label[node as usize];
+            if old_lbl == 0 {
+                return None;
+            }
+            let new_lbl = if (old_lbl as usize) < label_map.len() {
+                label_map[old_lbl as usize]
+            } else {
+                0
+            };
+            if new_lbl == 0 {
+                return None;
+            }
+            let id = out.parent.len() as NodeId;
+            out.parent.push(NONE);
+            out.left.push(NONE);
+            out.right.push(NONE);
+            out.label.push(new_lbl);
+            out.label_to_node[new_lbl as usize] = id;
+            return Some(id);
+        }
+        let (left, right) = src.children(node).unwrap();
+        let l = build(src, label_map, out, left);
+        let r = build(src, label_map, out, right);
+        match (l, r) {
+            (None, None) => None,
+            (Some(c), None) | (None, Some(c)) => Some(c),
+            (Some(lc), Some(rc)) => {
+                let id = out.parent.len() as NodeId;
+                out.parent.push(NONE);
+                out.left.push(lc);
+                out.right.push(rc);
+                out.label.push(0);
+                out.parent[lc as usize] = id;
+                out.parent[rc as usize] = id;
+                Some(id)
+            }
+        }
+    }
+
+    let sub_root = match build(src, label_map, &mut out, src.root) {
+        Some(r) => r,
+        None => {
+            out.compute_metadata();
+            return out;
+        }
+    };
+
+    // ρ pendant leaf.
+    let rho_id = out.parent.len() as NodeId;
+    out.parent.push(NONE);
+    out.left.push(NONE);
+    out.right.push(NONE);
+    out.label.push(rho_label);
+    out.label_to_node[rho_label as usize] = rho_id;
+
+    // New root = (cluster subtree, ρ).
+    let root = out.parent.len() as NodeId;
+    out.parent.push(NONE);
+    out.left.push(sub_root);
+    out.right.push(rho_id);
+    out.label.push(0);
+    out.parent[sub_root as usize] = root;
+    out.parent[rho_id as usize] = root;
+    out.root = root;
+
+    out.compute_metadata();
+    out
 }
 
 /// Relabel an outer component where outer-side leaves go through `map` but
@@ -1379,7 +1756,7 @@ fn debug_assert_valid_tree(tree: &Tree, name: &str) {
             );
         }
     }
-    eprintln!(
+    log::trace!(
         "[whidden] {} ok: nodes={} leaves={} num_leaves_field={} root={}",
         name,
         tree.parent.len(),
@@ -1449,10 +1826,88 @@ fn compute_twins(src: &Tree, dst: &Tree) -> Vec<NodeId> {
     twin
 }
 
+fn is_rspr_cluster_candidate(
+    tree: &Tree,
+    twin_to_other: &[NodeId],
+    twin_back: &[NodeId],
+    node: NodeId,
+) -> bool {
+    if tree.is_leaf(node) || tree.is_root(node) {
+        return false;
+    }
+    let twin = twin_to_other[node as usize];
+    if twin == NONE {
+        return false;
+    }
+    let round_trip = twin_back[twin as usize];
+    round_trip != NONE && tree.depth[node as usize] <= tree.depth[round_trip as usize]
+}
+
+fn children_are_rspr_cluster_candidates(
+    tree: &Tree,
+    twin_to_other: &[NodeId],
+    twin_back: &[NodeId],
+    node: NodeId,
+) -> bool {
+    let Some((left, right)) = tree.children(node) else {
+        return false;
+    };
+    is_rspr_cluster_candidate(tree, twin_to_other, twin_back, left)
+        && is_rspr_cluster_candidate(tree, twin_to_other, twin_back, right)
+}
+
+fn collect_rspr_cluster_points(
+    t1: &Tree,
+    t2: &Tree,
+    leaf_sets_t1: &[FixedBitSet],
+    twin_t1_to_t2: &[NodeId],
+    twin_t2_to_t1: &[NodeId],
+    n: usize,
+) -> Vec<RsprClusterPoint> {
+    let mut points = Vec::new();
+    for node in t1.post_order() {
+        if t1.is_leaf(node) || t1.is_root(node) {
+            continue;
+        }
+        let size = leaf_sets_t1[node as usize].count_ones(..);
+        if size < 2 || size > n - 1 {
+            continue;
+        }
+        let twin_t2 = twin_t1_to_t2[node as usize];
+        if twin_t2 == NONE {
+            continue;
+        }
+        let round_trip = twin_t2_to_t1[twin_t2 as usize];
+        if round_trip == NONE || t1.depth[node as usize] > t1.depth[round_trip as usize] {
+            continue;
+        }
+        if children_are_rspr_cluster_candidates(t1, twin_t1_to_t2, twin_t2_to_t1, node) {
+            continue;
+        }
+        let kind = if round_trip == node {
+            RsprClusterPointKind::Strict
+        } else {
+            RsprClusterPointKind::Relaxed
+        };
+        // The exact solver cannot cut away the whole T2 root as an ordinary
+        // placeholder, but the seed remains useful for parity diagnostics.
+        let _twin_is_t2_root = t2.is_root(twin_t2);
+        points.push(RsprClusterPoint {
+            t1_node: node,
+            t2_twin: twin_t2,
+            t1_round_trip: round_trip,
+            size,
+            kind,
+        });
+    }
+    points
+}
+
 /// Pick the best cluster point: deepest valid (= smallest cluster) so that
 /// after one decomposition both pieces are substantially smaller than n.
 fn find_best_cluster_point(
     t1: &Tree,
+    t2: &Tree,
     leaf_sets_t1: &[FixedBitSet],
     twin_t1_to_t2: &[NodeId],
     twin_t2_to_t1: &[NodeId],
@@ -1474,6 +1929,9 @@ fn find_best_cluster_point(
         if twin_t2 == NONE {
             continue;
         }
+        if t2.is_root(twin_t2) {
+            continue;
+        }
         let round_trip = twin_t2_to_t1[twin_t2 as usize];
         if round_trip == NONE {
             continue;
@@ -1482,6 +1940,9 @@ fn find_best_cluster_point(
         // guarantees leaves(twin_in_t2) == leaves(node), so the inner /
         // outer split is on the same leaf set in both trees.
         if round_trip != node {
+            continue;
+        }
+        if children_are_rspr_cluster_candidates(t1, twin_t1_to_t2, twin_t2_to_t1, node) {
             continue;
         }
 
@@ -1561,6 +2022,28 @@ mod tests {
         for lbl in 1..=6 {
             assert!(seen.contains(lbl), "leaf {} missing", lbl);
         }
+    }
+
+    #[test]
+    fn test_strict_decomp_tries_next_cluster_after_subsolve_declines() {
+        let t = make_balanced_6();
+        let inst = Instance::new(vec![t.clone(), t.clone()], 6);
+        let mut calls = 0usize;
+        let result = try_whidden_decomp_2tree(&inst, &mut |sub| {
+            calls += 1;
+            if calls <= 2 {
+                return None;
+            }
+            Some(vec![sub.trees[0].clone()])
+        });
+
+        let comps = result.expect("later strict cluster should still be attempted");
+        assert_eq!(comps.len(), 1);
+        assert!(
+            calls >= 4,
+            "expected at least two failed inner attempts plus one successful inner/outer pair, got {}",
+            calls
+        );
     }
 
     #[test]
