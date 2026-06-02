@@ -27,10 +27,13 @@ use klados_core::tree::{NONE, NodeId, Tree};
 use klados_core::{Instance, SolverStats};
 use klados_exact::bp::column::{AfColumn, ColumnBuilder, ColumnSet, is_valid_af_component};
 use klados_exact::bp::pricer::{
-    ExactPairDpPricer, Pricer, PricerScratch, PricingContext, PricingResult,
+    dispatch_by_m, ExactPairDpPricer, MafPricer, Pricer, PricerScratch, PricingContext,
+    PricingResult,
 };
-use klados_exact::bp::rmp::Rmp;
-use klados_exact::bp::search::{Branchings, LeafPair};
+use klados_exact::bp::rmp::{Rmp, RmpSolution};
+use klados_exact::bp::search::{
+    BranchSelector, Branchings, LeafPair, MostFractionalPair, SelectionContext,
+};
 use klados_exact::chen_rspr::chen_pair_agreement;
 use klados_exact::whidden_cluster::try_whidden_decomp_2tree;
 
@@ -290,6 +293,20 @@ impl LagrangianSolver {
         let n = reduced.num_leaves;
         let nl = n as usize;
 
+        // Anytime Lagrangian branch-and-bound: branch on the dual (subgradient),
+        // NOT the LP. The flat subgradient plateaus at the LP↔integer gap because
+        // the unconstrained pricer never emits the columns the integer optimum
+        // needs; branching on a contended leaf-pair forces them, anytime.
+        if std::env::var("KLADOS_LAGR_LBNB").is_ok() {
+            return self.solve_lagrangian_bnb(reduced, deadline, start, trace);
+        }
+        // Lagrangian dive: warm the dual, then commit the best column and let
+        // the dual re-approximate on the residual, repeatedly — a direct descent
+        // that subdivides the solution space and is anytime by construction.
+        if std::env::var("KLADOS_LAGR_DIVE").is_ok() {
+            return self.solve_lagrangian_dive(reduced, deadline, start, trace);
+        }
+
         // ---- Tier cascade ----
         // When global pricing fits, the warm exact-LP RMP proves small/integral
         // instances in milliseconds (bp's small-instance speed). Try it first
@@ -485,14 +502,26 @@ impl LagrangianSolver {
         let mut no_new = 0usize;
         let mut iter = 0usize;
         let mut proved = false;
-        // Volume-algorithm buffers (experimental).
+        // ---- Volume algorithm (Barahona–Anbil) state ----
+        // The pure subgradient thrashes (the per-iter dual point and thus the
+        // primal scores oscillate). The volume algorithm fixes this with a
+        // *stability centre* (the best-bound dual point) that the step departs
+        // from, a *running-average primal estimate* `x̄` (per column) that
+        // drives a smooth descent direction, and serious/null step control.
+        // The primal is then rounded from `x̄` (stable) rather than the
+        // thrashing instantaneous reduced-cost scores.
         let volume = std::env::var("KLADOS_LAGR_VOLUME").is_ok();
         let avg_a = std::env::var("KLADOS_LAGR_VOLUME_A")
             .ok()
             .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(0.2);
-        let mut v_cov = vec![0.0f64; nl + 1];
-        let mut v_use: Vec<Vec<f64>> = trees.iter().map(|t| vec![0.0f64; t.num_nodes()]).collect();
+            .unwrap_or(0.1);
+        let mut xbar: Vec<f64> = Vec::new(); // per-column averaged selection
+        let mut xbar_sing = vec![0.0f64; nl + 1]; // per-leaf averaged singleton selection
+        let mut center_alpha: Vec<f64> = alpha.clone();
+        let mut center_beta: Vec<Vec<f64>> = beta.clone();
+        let mut center_lb = f64::NEG_INFINITY;
+        let mut serious_run = 0usize;
+        let mut null_run = 0usize;
 
         // ---- Hybrid: refresh subgradient duals from a warm exact RMP ----
         // The subgradient's oscillating duals build a DIVERSE pool (which wins
@@ -719,12 +748,16 @@ impl LagrangianSolver {
                     &scores,
                     &mut alpha,
                     &mut beta,
-                    &mut v_cov,
-                    &mut v_use,
-                    lambda,
+                    &mut xbar,
+                    &mut xbar_sing,
+                    &mut center_alpha,
+                    &mut center_beta,
+                    &mut center_lb,
+                    &mut serious_run,
+                    &mut null_run,
+                    &mut lambda,
                     avg_a,
                     best_components,
-                    iter == 1,
                 )
             } else {
                 self.subgradient_step(
@@ -741,7 +774,9 @@ impl LagrangianSolver {
             if lb > best_lb + 1e-6 {
                 best_lb = lb;
                 stall = 0;
-            } else {
+            } else if !volume {
+                // Volume adapts its own step via serious/null counters; only the
+                // plain subgradient uses the stall-halving rule here.
                 stall += 1;
                 let stall_thresh = std::env::var("KLADOS_LAGR_STALL")
                     .ok()
@@ -754,11 +789,15 @@ impl LagrangianSolver {
             }
 
             // ---- Dual-guided primal ----
+            // Volume: pack the stable per-column averaged estimate x̄ (the
+            // running fractional solution). Subgradient: the instantaneous
+            // reduced-cost scores. Both greedy, node-disjoint.
+            let primal_scores: &[f64] = if volume { &xbar } else { &scores };
             let improved = self.try_primal(
                 trees,
                 n,
                 &pool,
-                &scores,
+                primal_scores,
                 &mut best_forest,
                 &mut best_components,
             );
@@ -1062,6 +1101,573 @@ impl LagrangianSolver {
             return None;
         }
         res
+    }
+
+    /// One Lagrangian B&B node: run the subgradient under `branchings` until
+    /// `slice_deadline`, growing the shared pool. Constraint-aware pricing emits
+    /// the columns the constraints demand (the "gap columns" the flat dual never
+    /// generates). Returns the best packing found here: (#components, selected
+    /// column indices, best Lagrangian bound).
+    #[allow(clippy::too_many_arguments)]
+    fn subgradient_slice(
+        &self,
+        trees: &[Tree],
+        n: u32,
+        nl: usize,
+        pool: &mut Vec<Block>,
+        seen: &mut ColumnSet,
+        alpha: &mut Vec<f64>,
+        beta: &mut Vec<Vec<f64>>,
+        branchings: &Branchings,
+        pricer: &mut ExactPairDpPricer,
+        scratch: &mut PricerScratch,
+        slice_deadline: Instant,
+        ub: usize,
+    ) -> (usize, Vec<usize>, f64) {
+        let mut lambda = 1.0f64;
+        let mut best_lb = 0.0f64;
+        let mut stall = 0usize;
+        let mut scores: Vec<f64> = pool.iter().map(|b| block_score(b, alpha, beta)).collect();
+        let (mut best_k, mut best_sel) = greedy_pack(pool, &scores, trees, n, branchings);
+        loop {
+            if self.terminate.load(Ordering::Relaxed) || Instant::now() >= slice_deadline {
+                break;
+            }
+            // Constraint-aware pricing. BOOST the duals of must-linked leaves so
+            // the pricer actually emits their joint "gap" column — at the plain
+            // duals it has negative reduced cost and is never generated, which
+            // starves the must-link branch. The boost is for pricing only; the
+            // subgradient step and scoring use the real duals.
+            let mut price_alpha = alpha.clone();
+            for pair in branchings.must_link() {
+                if (pair.a as usize) <= nl {
+                    price_alpha[pair.a as usize] = price_alpha[pair.a as usize].max(2.0);
+                }
+                if (pair.b as usize) <= nl {
+                    price_alpha[pair.b as usize] = price_alpha[pair.b as usize].max(2.0);
+                }
+            }
+            let mut newc: Vec<Vec<u32>> = Vec::new();
+            {
+                let ctx = PricingContext {
+                    trees,
+                    num_leaves: nl,
+                    alpha: price_alpha.as_slice(),
+                    beta: beta.as_slice(),
+                    columns: &[],
+                    seen,
+                    branchings,
+                };
+                for col in scratch.drain_reserve(&ctx, 64) {
+                    newc.push(col.labels().to_vec());
+                }
+                if let PricingResult::Found(cols) = pricer.price(&ctx, scratch) {
+                    for c in cols {
+                        newc.push(c.labels().to_vec());
+                    }
+                }
+            }
+            for c in newc {
+                let mut l = c;
+                l.sort_unstable();
+                l.dedup();
+                if l.len() >= 2 && !seen.contains(&l) && is_valid_af_component(&l, trees) {
+                    if let Some(b) = make_block(trees, l.clone()) {
+                        seen.insert(l);
+                        pool.push(b);
+                    }
+                }
+            }
+            scores = pool.iter().map(|b| block_score(b, alpha, beta)).collect();
+            let lb = self.subgradient_step(trees, nl, pool, &scores, alpha, beta, lambda, ub);
+            if lb > best_lb + 1e-6 {
+                best_lb = lb;
+                stall = 0;
+            } else {
+                stall += 1;
+                if stall >= 20 {
+                    lambda *= 0.5;
+                    stall = 0;
+                }
+            }
+            // Re-energise when the step collapses (escape the dual plateau):
+            // reset λ and pull α halfway back to 1. Without this the condensed
+            // slice stalls ~3 components short of the full flat subgradient.
+            if lambda < 1.0e-3 {
+                lambda = 1.0;
+                for a in alpha.iter_mut().skip(1) {
+                    *a = 0.5 * *a + 0.5;
+                }
+            }
+            let scores2: Vec<f64> = pool.iter().map(|b| block_score(b, alpha, beta)).collect();
+            let (k, sel) = greedy_pack(pool, &scores2, trees, n, branchings);
+            if k < best_k {
+                best_k = k;
+                best_sel = sel;
+            }
+        }
+        (best_k, best_sel, best_lb)
+    }
+
+    /// Anytime Lagrangian branch-and-bound. DFS on must-link/cannot-link leaf
+    /// pairs; each node is a subgradient slice under its constraints (the fast
+    /// dual — no LP). The root converges the flat dual; each branch forces a
+    /// contended pair together so the pricer emits the gap columns the optimum
+    /// needs. Keeps the global best incumbent, returns it at the deadline.
+    fn solve_lagrangian_bnb(
+        &self,
+        reduced: &Instance,
+        deadline: Option<Instant>,
+        start: Instant,
+        trace: bool,
+    ) -> Vec<Tree> {
+        let trees = &reduced.trees;
+        let n = reduced.num_leaves;
+        let nl = n as usize;
+
+        // ---- Pool + warm start (Chen 2-approx + greedy seeds) ----
+        let mut pool: Vec<Block> = Vec::new();
+        let mut seen = ColumnSet::new();
+        let add = |labels: Vec<u32>, pool: &mut Vec<Block>, seen: &mut ColumnSet| {
+            let mut l = labels;
+            l.sort_unstable();
+            l.dedup();
+            if l.len() < 2 || seen.contains(&l) || !is_valid_af_component(&l, trees) {
+                return;
+            }
+            if let Some(b) = make_block(trees, l.clone()) {
+                seen.insert(l);
+                pool.push(b);
+            }
+        };
+        let (_, _, chen_sets) = chen_pair_agreement(&trees[0], &trees[1]);
+        let mut global_best_forest = forest_from_partition(&chen_sets, trees, n);
+        let mut global_best_k = global_best_forest.len();
+        for s in &chen_sets {
+            add(s.clone(), &mut pool, &mut seen);
+        }
+        let num_seeds: u64 = if n <= 2_000 {
+            12
+        } else if n <= 6_000 {
+            5
+        } else {
+            2
+        };
+        for ref_idx in 0..2usize {
+            for seed in 0..num_seeds {
+                if self.terminate.load(Ordering::Relaxed) {
+                    break;
+                }
+                let (_k, part) =
+                    klados_core::lower_bound::greedy_multi_tree_partition(trees, ref_idx, seed);
+                for g in groups_from_partition(&part, nl) {
+                    add(g, &mut pool, &mut seen);
+                }
+            }
+        }
+
+        let mut pricer = ExactPairDpPricer::new(trees);
+        let mut scratch = PricerScratch::new(trees);
+        let alpha0: Vec<f64> = (0..=nl).map(|i| if i == 0 { 0.0 } else { 1.0 }).collect();
+        let beta0: Vec<Vec<f64>> = trees.iter().map(|t| vec![0.0f64; t.num_nodes()]).collect();
+
+        let plan_deadline = deadline.unwrap_or_else(|| {
+            start
+                + Duration::from_millis(
+                    std::env::var("KLADOS_PLAN_MS")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(290_000),
+                )
+        });
+        let root_ms = std::env::var("KLADOS_LBNB_ROOT_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(20_000);
+        let node_ms = std::env::var("KLADOS_LBNB_NODE_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(2_500);
+
+        // DFS stack: (branchings, warm duals). Children warm-start from the
+        // parent's converged α/β.
+        let mut stack: Vec<(Branchings, Vec<f64>, Vec<Vec<f64>>)> =
+            vec![(Branchings::default(), alpha0, beta0)];
+        let mut nodes = 0usize;
+        while let Some((br, mut alpha, mut beta)) = stack.pop() {
+            if self.terminate.load(Ordering::Relaxed) || Instant::now() >= plan_deadline {
+                break;
+            }
+            let slice_ms = if nodes == 0 { root_ms } else { node_ms };
+            let slice_end =
+                (Instant::now() + Duration::from_millis(slice_ms)).min(plan_deadline);
+            let (k, sel, lb) = self.subgradient_slice(
+                trees,
+                n,
+                nl,
+                &mut pool,
+                &mut seen,
+                &mut alpha,
+                &mut beta,
+                &br,
+                &mut pricer,
+                &mut scratch,
+                slice_end,
+                global_best_k,
+            );
+            if k < global_best_k {
+                global_best_k = k;
+                global_best_forest = build_forest(&pool, &sel, trees, n);
+                if trace {
+                    eprintln!(
+                        "[lagr][lbnb] node={} depth={} k={} (best) t={:.1}s",
+                        nodes,
+                        br.depth(),
+                        global_best_k,
+                        start.elapsed().as_secs_f64()
+                    );
+                }
+            }
+            // The gap columns this branch generated are valid GLOBALLY (a column
+            // is a valid AF component regardless of branchings). Pack the
+            // enriched pool UNCONSTRAINED too — that's where branching pays off:
+            // it feeds the columns the flat dual never produced into the global
+            // packing.
+            {
+                let uscores: Vec<f64> =
+                    pool.iter().map(|b| block_score(b, &alpha, &beta)).collect();
+                let (uk, usel) =
+                    greedy_pack(&pool, &uscores, trees, n, &Branchings::default());
+                if uk < global_best_k {
+                    global_best_k = uk;
+                    global_best_forest = build_forest(&pool, &usel, trees, n);
+                    if trace {
+                        eprintln!(
+                            "[lagr][lbnb] node={} (unconstrained pack) k={} t={:.1}s",
+                            nodes,
+                            global_best_k,
+                            start.elapsed().as_secs_f64()
+                        );
+                    }
+                }
+            }
+            nodes += 1;
+            let pool_before = pool.len();
+
+            // Prune only at the root: with empty branchings the pool-wide
+            // Lagrangian bound is valid for the whole problem. Under branchings
+            // the same sum isn't a valid node bound, so we don't prune there
+            // (anytime keeps the best regardless).
+            if br.depth() == 0 && (lb - 1e-6).ceil() as usize >= global_best_k {
+                if trace {
+                    eprintln!("[lagr][lbnb] root certified: k={} lb={:.1}", global_best_k, lb);
+                }
+                break;
+            }
+
+            // Branch on the most-contended pair the node's incumbent splits.
+            let bp = pick_branch_pair(&pool, &sel, &alpha, &beta, nl, &br);
+            if trace {
+                eprintln!(
+                    "[lagr][lbnb]   node={} depth={} k={} lb={:.1} pool {}→{} pair={:?}",
+                    nodes - 1,
+                    br.depth(),
+                    k,
+                    lb,
+                    pool_before,
+                    pool.len(),
+                    bp.map(|p| (p.a, p.b))
+                );
+            }
+            if let Some(pair) = bp {
+                let (left, right) = br.split_on(pair);
+                if !right.is_inconsistent() {
+                    stack.push((right, alpha.clone(), beta.clone()));
+                }
+                if !left.is_inconsistent() {
+                    stack.push((left, alpha, beta)); // must-link explored first
+                }
+            }
+        }
+        if trace {
+            eprintln!(
+                "[lagr][lbnb] done nodes={} k={} pool={} t={:.1}s",
+                nodes,
+                global_best_k,
+                pool.len(),
+                start.elapsed().as_secs_f64()
+            );
+        }
+        global_best_forest
+    }
+
+    /// One subgradient iteration for the dive: price at the current duals (under
+    /// no branching), bank columns into the pool, take a subgradient step, then
+    /// FREEZE the duals of already-covered leaves at 0 so the residual dual
+    /// re-approximates only what's left to cover. Returns the Lagrangian bound.
+    #[allow(clippy::too_many_arguments)]
+    fn dive_sg_iter(
+        &self,
+        trees: &[Tree],
+        nl: usize,
+        pool: &mut Vec<Block>,
+        seen: &mut ColumnSet,
+        alpha: &mut Vec<f64>,
+        beta: &mut Vec<Vec<f64>>,
+        pricer: &mut ExactPairDpPricer,
+        scratch: &mut PricerScratch,
+        lambda: f64,
+        ub: usize,
+        covered: &FixedBitSet,
+    ) -> f64 {
+        let branchings = Branchings::default();
+        let mut newc: Vec<Vec<u32>> = Vec::new();
+        {
+            let ctx = PricingContext {
+                trees,
+                num_leaves: nl,
+                alpha: alpha.as_slice(),
+                beta: beta.as_slice(),
+                columns: &[],
+                seen,
+                branchings: &branchings,
+            };
+            for col in scratch.drain_reserve(&ctx, 64) {
+                newc.push(col.labels().to_vec());
+            }
+            if let PricingResult::Found(cols) = pricer.price(&ctx, scratch) {
+                for c in cols {
+                    newc.push(c.labels().to_vec());
+                }
+            }
+        }
+        for c in newc {
+            let mut l = c;
+            l.sort_unstable();
+            l.dedup();
+            if l.len() >= 2 && !seen.contains(&l) && is_valid_af_component(&l, trees) {
+                if let Some(b) = make_block(trees, l.clone()) {
+                    seen.insert(l);
+                    pool.push(b);
+                }
+            }
+        }
+        let scores: Vec<f64> = pool.iter().map(|b| block_score(b, alpha, beta)).collect();
+        let lb = self.subgradient_step(trees, nl, pool, &scores, alpha, beta, lambda, ub);
+        for l in covered.ones() {
+            if l <= nl {
+                alpha[l] = 0.0;
+            }
+        }
+        lb
+    }
+
+    /// Lagrangian dive. Warm the dual, then repeatedly: commit the best-scored
+    /// column that still fits (uncovered leaves, unused nodes), and run a few
+    /// subgradient steps with the covered leaves frozen so the dual sharpens for
+    /// the residual. Each commit subdivides the space; the partial forest
+    /// (committed columns + singletons) is the anytime incumbent.
+    fn solve_lagrangian_dive(
+        &self,
+        reduced: &Instance,
+        deadline: Option<Instant>,
+        start: Instant,
+        trace: bool,
+    ) -> Vec<Tree> {
+        let trees = &reduced.trees;
+        let n = reduced.num_leaves;
+        let nl = n as usize;
+
+        // ---- Pool + warm start ----
+        let mut pool: Vec<Block> = Vec::new();
+        let mut seen = ColumnSet::new();
+        let add = |labels: Vec<u32>, pool: &mut Vec<Block>, seen: &mut ColumnSet| {
+            let mut l = labels;
+            l.sort_unstable();
+            l.dedup();
+            if l.len() < 2 || seen.contains(&l) || !is_valid_af_component(&l, trees) {
+                return;
+            }
+            if let Some(b) = make_block(trees, l.clone()) {
+                seen.insert(l);
+                pool.push(b);
+            }
+        };
+        let (_, _, chen_sets) = chen_pair_agreement(&trees[0], &trees[1]);
+        let mut best_forest = forest_from_partition(&chen_sets, trees, n);
+        let mut best_k = best_forest.len();
+        for s in &chen_sets {
+            add(s.clone(), &mut pool, &mut seen);
+        }
+        let num_seeds: u64 = if n <= 2_000 {
+            12
+        } else if n <= 6_000 {
+            5
+        } else {
+            2
+        };
+        for ref_idx in 0..2usize {
+            for seed in 0..num_seeds {
+                if self.terminate.load(Ordering::Relaxed) {
+                    break;
+                }
+                let (_k, part) =
+                    klados_core::lower_bound::greedy_multi_tree_partition(trees, ref_idx, seed);
+                for g in groups_from_partition(&part, nl) {
+                    add(g, &mut pool, &mut seen);
+                }
+            }
+        }
+
+        let mut pricer = ExactPairDpPricer::new(trees);
+        let mut scratch = PricerScratch::new(trees);
+        let mut alpha: Vec<f64> = (0..=nl).map(|i| if i == 0 { 0.0 } else { 1.0 }).collect();
+        let mut beta: Vec<Vec<f64>> = trees.iter().map(|t| vec![0.0f64; t.num_nodes()]).collect();
+
+        let plan_deadline = deadline.unwrap_or_else(|| {
+            start
+                + Duration::from_millis(
+                    std::env::var("KLADOS_PLAN_MS")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(290_000),
+                )
+        });
+        let reopt_iters: usize = std::env::var("KLADOS_DIVE_REOPT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3);
+        // Warm-up gets a fraction of the budget; the dive uses the rest.
+        let warmup_frac: f64 = std::env::var("KLADOS_DIVE_WARMUP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.4);
+
+        let empty = FixedBitSet::with_capacity(nl + 1);
+        let total = plan_deadline.saturating_duration_since(Instant::now());
+        let warmup_end = (Instant::now() + total.mul_f64(warmup_frac)).min(plan_deadline);
+
+        // ---- Warm-up: converge the dual, keep the greedy incumbent ----
+        let mut lambda = 1.0f64;
+        let mut best_lb = 0.0f64;
+        let mut stall = 0usize;
+        while !self.terminate.load(Ordering::Relaxed) && Instant::now() < warmup_end {
+            let lb = self.dive_sg_iter(
+                trees, nl, &mut pool, &mut seen, &mut alpha, &mut beta, &mut pricer, &mut scratch,
+                lambda, best_k, &empty,
+            );
+            if lb > best_lb + 1e-6 {
+                best_lb = lb;
+                stall = 0;
+            } else {
+                stall += 1;
+                if stall >= 20 {
+                    lambda *= 0.5;
+                    stall = 0;
+                }
+            }
+            let scores: Vec<f64> = pool.iter().map(|b| block_score(b, &alpha, &beta)).collect();
+            let (k, sel) = greedy_pack(&pool, &scores, trees, n, &Branchings::default());
+            if k < best_k {
+                best_k = k;
+                best_forest = build_forest(&pool, &sel, trees, n);
+            }
+        }
+        if trace {
+            eprintln!(
+                "[lagr][dive] warm-up done: greedy_best={} pool={} t={:.1}s",
+                best_k,
+                pool.len(),
+                start.elapsed().as_secs_f64()
+            );
+        }
+
+        // ---- Dive: commit best-fitting column, re-approximate the residual ----
+        let mut committed: Vec<usize> = Vec::new();
+        let mut used: Vec<FixedBitSet> = trees
+            .iter()
+            .map(|t| FixedBitSet::with_capacity(t.num_nodes()))
+            .collect();
+        let mut covered = FixedBitSet::with_capacity(nl + 1);
+        loop {
+            if self.terminate.load(Ordering::Relaxed) || Instant::now() >= plan_deadline {
+                break;
+            }
+            // Residual dual re-approximation (covered leaves frozen).
+            for _ in 0..reopt_iters {
+                if Instant::now() >= plan_deadline {
+                    break;
+                }
+                self.dive_sg_iter(
+                    trees, nl, &mut pool, &mut seen, &mut alpha, &mut beta, &mut pricer,
+                    &mut scratch, lambda, best_k, &covered,
+                );
+            }
+            // Best dual-scored column that still fits. Any multi-leaf column
+            // saves |labels|−1 components, so we commit the highest-scored
+            // *fitting* one regardless of sign — the dual only sets the order.
+            let scores: Vec<f64> = pool.iter().map(|b| block_score(b, &alpha, &beta)).collect();
+            let mut best_i: Option<usize> = None;
+            let mut best_s = f64::NEG_INFINITY;
+            'col: for i in 0..pool.len() {
+                if scores[i] <= best_s || pool[i].labels.len() < 2 {
+                    continue;
+                }
+                let b = &pool[i];
+                for &l in &b.labels {
+                    if covered.contains(l as usize) {
+                        continue 'col;
+                    }
+                }
+                for (t, nodes) in b.cover.iter().enumerate() {
+                    for &v in nodes {
+                        if used[t].contains(v as usize) {
+                            continue 'col;
+                        }
+                    }
+                }
+                best_s = scores[i];
+                best_i = Some(i);
+            }
+            match best_i {
+                Some(i) => {
+                    committed.push(i);
+                    for &l in &pool[i].labels {
+                        covered.insert(l as usize);
+                    }
+                    for (t, nodes) in pool[i].cover.iter().enumerate() {
+                        for &v in nodes {
+                            used[t].insert(v as usize);
+                        }
+                    }
+                    let k = committed.len() + (nl - covered.count_ones(..));
+                    if k < best_k {
+                        best_k = k;
+                        best_forest = build_forest(&pool, &committed, trees, n);
+                        if trace {
+                            eprintln!(
+                                "[lagr][dive] commit #{} k={} covered={}/{} t={:.1}s",
+                                committed.len(),
+                                best_k,
+                                covered.count_ones(..),
+                                nl,
+                                start.elapsed().as_secs_f64()
+                            );
+                        }
+                    }
+                }
+                None => break, // nothing improving still fits
+            }
+        }
+        if trace {
+            eprintln!(
+                "[lagr][dive] done committed={} k={} t={:.1}s",
+                committed.len(),
+                best_k,
+                start.elapsed().as_secs_f64()
+            );
+        }
+        best_forest
     }
 
     /// Warm-started exact-LP column generation (bp's `Rmp`). Each iteration
@@ -1381,10 +1987,218 @@ impl LagrangianSolver {
                         iter, sol.objective, best_components, status
                     );
                 }
+                // Anytime branch-and-price: the root LP converged with an
+                // integrality gap. Branch (B&P-parity: most-fractional pair,
+                // constraint-aware MafPricer, certified LP-bound prune) to close
+                // it, keeping the best incumbent and stopping at the deadline.
+                if global && !proved && std::env::var("KLADOS_LAGR_BNB").is_ok() {
+                    let (bf, bc, bnb_proved) = self.bnb_anytime(
+                        trees,
+                        n,
+                        &mut rmp,
+                        &mut pool,
+                        &mut seen,
+                        &mut scratch,
+                        best_forest,
+                        best_components,
+                        deadline,
+                        start,
+                        trace,
+                    );
+                    best_forest = bf;
+                    best_components = bc;
+                    if bnb_proved {
+                        proved = true;
+                    }
+                }
                 break;
             }
         }
         (best_forest, proved)
+    }
+
+    /// Run column generation to convergence under `branchings`, reusing the
+    /// global pool/RMP. Returns the final LP solution and whether the pricer
+    /// **certified** convergence (`Converged`): only then is `objective` a valid
+    /// lower bound. On `Improving` (an improving column exists but is branch-
+    /// blocked) the bound is NOT trusted — the node must branch. Returns `None`
+    /// on deadline/terminate or LP error. Uses the composite `MafPricer` (with
+    /// the constraint-aware leaf-pair fallback) so constrained nodes price
+    /// exactly, exactly like bp.
+    #[allow(clippy::too_many_arguments)]
+    fn price_node(
+        &self,
+        rmp: &mut Rmp,
+        pool: &mut Vec<AfColumn>,
+        seen: &mut ColumnSet,
+        pricer: &mut MafPricer,
+        scratch: &mut PricerScratch,
+        branchings: &Branchings,
+        trees: &[Tree],
+        nl: usize,
+        deadline: Option<Instant>,
+    ) -> Option<(RmpSolution, bool)> {
+        loop {
+            if self.terminate.load(Ordering::Relaxed)
+                || deadline.is_some_and(|d| Instant::now() >= d)
+            {
+                return None;
+            }
+            rmp.apply_bounds(pool, branchings);
+            let mut sol = rmp.solve().ok()?;
+            loop {
+                let cuts = rmp.separate_and_add_cuts(pool, &sol.column_values, 1e-6);
+                if cuts == 0 {
+                    break;
+                }
+                rmp.apply_bounds(pool, branchings);
+                sol = rmp.solve().ok()?;
+            }
+
+            let (new_cols, converged) = {
+                let ctx = PricingContext {
+                    trees,
+                    num_leaves: nl,
+                    alpha: &sol.leaf_duals,
+                    beta: &sol.node_duals,
+                    columns: pool,
+                    seen,
+                    branchings,
+                };
+                let mut new_cols: Vec<AfColumn> = scratch.drain_reserve(&ctx, 64);
+                let r = pricer.price(&ctx, scratch);
+                let converged = matches!(r, PricingResult::Converged);
+                if let PricingResult::Found(cols) = r {
+                    new_cols.extend(cols);
+                }
+                (new_cols, converged)
+            };
+
+            let mut added = 0usize;
+            for c in new_cols {
+                let lbls = c.labels().to_vec();
+                if lbls.len() >= 2 && seen.insert(lbls) {
+                    rmp.add_column(&c);
+                    pool.push(c);
+                    added += 1;
+                }
+            }
+            if added == 0 {
+                return Some((sol, converged));
+            }
+        }
+    }
+
+    /// Anytime branch-and-price over the RMP pool. DFS on must-link/cannot-link
+    /// leaf-pair branchings (bp's `MostFractionalPair` rule), certified LP-bound
+    /// pruning, keeping the best incumbent and returning it at the deadline.
+    /// Returns `(best_forest, best_components, proved)`; `proved` is true only if
+    /// the tree was fully explored (every leaf integral or pruned by a valid
+    /// bound) — i.e. the incumbent is the optimum.
+    #[allow(clippy::too_many_arguments)]
+    fn bnb_anytime(
+        &self,
+        trees: &[Tree],
+        n: u32,
+        rmp: &mut Rmp,
+        pool: &mut Vec<AfColumn>,
+        seen: &mut ColumnSet,
+        scratch: &mut PricerScratch,
+        mut best_forest: Vec<Tree>,
+        mut best_components: usize,
+        deadline: Option<Instant>,
+        start: Instant,
+        trace: bool,
+    ) -> (Vec<Tree>, usize, bool) {
+        let nl = n as usize;
+        let mut pricer = dispatch_by_m(trees);
+        let mut selector = MostFractionalPair;
+        // DFS stack carrying the parent's *certified* LP bound (−∞ = unknown,
+        // never prunes). child_LP ≥ parent_LP, so a parent that met the prune
+        // threshold lets the child prune without re-solving.
+        let mut stack: Vec<(Branchings, f64)> = vec![(Branchings::default(), f64::NEG_INFINITY)];
+        let mut nodes = 0usize;
+        let mut hit_deadline = false;
+
+        while let Some((br, parent_lp)) = stack.pop() {
+            if self.terminate.load(Ordering::Relaxed)
+                || deadline.is_some_and(|d| Instant::now() >= d)
+            {
+                hit_deadline = true;
+                break;
+            }
+            // Inherited certified-bound prune.
+            if parent_lp.is_finite() && (parent_lp - 1e-6).ceil() as usize >= best_components {
+                continue;
+            }
+
+            let (sol, certified) =
+                match self.price_node(rmp, pool, seen, &mut pricer, scratch, &br, trees, nl, deadline)
+                {
+                    Some(x) => x,
+                    None => {
+                        if self.terminate.load(Ordering::Relaxed)
+                            || deadline.is_some_and(|d| Instant::now() >= d)
+                        {
+                            hit_deadline = true;
+                            break;
+                        }
+                        continue; // LP error / infeasible node
+                    }
+                };
+            let lp = sol.objective;
+            // Certified LP-bound prune (only Converged gives a valid bound).
+            if certified && (lp - 1e-6).ceil() as usize >= best_components {
+                continue;
+            }
+
+            // Incumbent from this node's LP support.
+            if let Some((forest, comps)) = forest_from_lp(pool, &sol.column_values, trees, n) {
+                if comps < best_components {
+                    best_components = comps;
+                    best_forest = forest;
+                    if trace {
+                        eprintln!(
+                            "[lagr][bnb] node={} incumbent={} lp={:.2} t={:.1}s",
+                            nodes,
+                            best_components,
+                            lp,
+                            start.elapsed().as_secs_f64()
+                        );
+                    }
+                }
+            }
+            nodes += 1;
+
+            // Branch on the most-fractional leaf-pair. Pass the certified LP
+            // bound to children (uncertified ⇒ −∞: children re-derive their own).
+            let child_bound = if certified { lp } else { f64::NEG_INFINITY };
+            let ctx = SelectionContext {
+                columns: pool,
+                values: &sol.column_values,
+                num_leaves: nl,
+                branchings: &br,
+                current_lp_obj: lp,
+            };
+            if let Some(children) = selector.select(&ctx, rmp) {
+                for child in children.into_iter().rev() {
+                    stack.push((child, child_bound));
+                }
+            }
+            // `None` ⇒ integral LP support: incumbent already captured above.
+        }
+
+        let proved = !hit_deadline;
+        if trace {
+            eprintln!(
+                "[lagr][bnb] done nodes={} best={} proved={} t={:.1}s",
+                nodes,
+                best_components,
+                proved,
+                start.elapsed().as_secs_f64()
+            );
+        }
+        (best_forest, best_components, proved)
     }
 
     /// Dual-guided greedy node-disjoint packing. Returns true if it improved
@@ -1536,6 +2350,15 @@ impl LagrangianSolver {
     /// damps the zigzag and converges to the LP dual in far fewer iterations.
     /// `v_cov`/`v_use` persist across calls; `avg_a` is the averaging weight.
     #[allow(clippy::too_many_arguments)]
+    /// One volume-algorithm iteration (Barahona–Anbil). Maintains a stability
+    /// centre (`center_*`, the best-bound dual point), a per-column primal
+    /// estimate `xbar` (running average of the subproblem solutions), and
+    /// serious/null step control. The dual point `alpha`/`beta` is set to
+    /// `centre + step·d`, where `d` is the residual of the *averaged* primal
+    /// `xbar` — a far smoother direction than the instantaneous subgradient.
+    /// Returns the centre's bound (monotone non-decreasing). The caller packs
+    /// the primal from `xbar`, not from the thrashing instantaneous scores.
+    #[allow(clippy::too_many_arguments)]
     fn volume_step(
         &self,
         trees: &[Tree],
@@ -1544,57 +2367,97 @@ impl LagrangianSolver {
         scores: &[f64],
         alpha: &mut [f64],
         beta: &mut [Vec<f64>],
-        v_cov: &mut [f64],
-        v_use: &mut [Vec<f64>],
-        lambda: f64,
+        xbar: &mut Vec<f64>,
+        xbar_sing: &mut [f64],
+        center_alpha: &mut [f64],
+        center_beta: &mut [Vec<f64>],
+        center_lb: &mut f64,
+        serious_run: &mut usize,
+        null_run: &mut usize,
+        lambda: &mut f64,
         avg_a: f64,
         ub_components: usize,
-        init: bool,
     ) -> f64 {
-        // Instantaneous Lagrangian subproblem solution x̂ (columns with rc<0).
-        let mut cov = vec![0.0f64; nl + 1];
-        let mut use_nodes: Vec<Vec<f64>> =
-            trees.iter().map(|t| vec![0.0f64; t.num_nodes()]).collect();
+        let first = !center_lb.is_finite();
+
+        // (1) Value L(u_t) of the instantaneous subproblem at the current duals.
         let mut sum_rc = 0.0f64;
-        for (i, b) in pool.iter().enumerate() {
-            if scores[i] > 1.0 {
-                sum_rc += 1.0 - scores[i];
-                for &l in &b.labels {
-                    cov[l as usize] += 1.0;
-                }
-                for (t, nodes) in b.cover.iter().enumerate() {
-                    for &v in nodes {
-                        use_nodes[t][v as usize] += 1.0;
-                    }
-                }
+        for (c, _) in pool.iter().enumerate() {
+            if scores[c] > 1.0 {
+                sum_rc += 1.0 - scores[c];
             }
         }
         for l in 1..=nl {
             if alpha[l] > 1.0 {
                 sum_rc += 1.0 - alpha[l];
-                cov[l] += 1.0;
             }
         }
         let sum_alpha: f64 = alpha[1..=nl].iter().sum();
         let sum_beta: f64 = beta.iter().flat_map(|b| b.iter()).sum();
-        let lagrangian = sum_alpha - sum_beta + sum_rc;
+        let l_t = sum_alpha - sum_beta + sum_rc;
 
-        // Primal estimate update: v ← a·x̂ + (1−a)·v. Seed v = x̂ on the first
-        // step so there's no startup lag (a zero seed inflates α uniformly).
-        let a = if init { 1.0 } else { avg_a };
-        for l in 0..=nl {
-            v_cov[l] = a * cov[l] + (1.0 - a) * v_cov[l];
-        }
-        for (t, tree) in trees.iter().enumerate() {
-            for v in 0..tree.num_nodes() {
-                v_use[t][v] = a * use_nodes[t][v] + (1.0 - a) * v_use[t][v];
+        // (2) Serious/null step: the current point becomes the centre iff it
+        //     improved the bound. Grow the step after a run of serious steps,
+        //     shrink it after a run of nulls.
+        if first || l_t > *center_lb + 1e-9 {
+            center_alpha.copy_from_slice(alpha);
+            for (t, cb) in center_beta.iter_mut().enumerate() {
+                cb.copy_from_slice(&beta[t]);
+            }
+            *center_lb = l_t;
+            *serious_run += 1;
+            *null_run = 0;
+            if *serious_run >= 3 {
+                *lambda = (*lambda * 1.1).min(2.0);
+                *serious_run = 0;
+            }
+        } else {
+            *null_run += 1;
+            *serious_run = 0;
+            if *null_run >= 10 {
+                *lambda = (*lambda * 0.67).max(1.0e-3);
+                *null_run = 0;
             }
         }
 
-        // Subgradient from the averaged primal estimate.
+        // (3) Running-average primal estimate x̄ ← a·x_t + (1−a)·x̄ (per column
+        //     and per implicit singleton). a=1 on the first step (seed = x_t).
+        xbar.resize(pool.len(), 0.0);
+        let a = if first { 1.0 } else { avg_a };
+        for (c, xb) in xbar.iter_mut().enumerate() {
+            let xt = if scores[c] > 1.0 { 1.0 } else { 0.0 };
+            *xb = a * xt + (1.0 - a) * *xb;
+        }
+        for l in 1..=nl {
+            let xt = if alpha[l] > 1.0 { 1.0 } else { 0.0 };
+            xbar_sing[l] = a * xt + (1.0 - a) * xbar_sing[l];
+        }
+
+        // (4) Descent direction d = b − A·x̄ from the averaged primal.
+        let mut cov = vec![0.0f64; nl + 1];
+        let mut use_nodes: Vec<Vec<f64>> =
+            trees.iter().map(|t| vec![0.0f64; t.num_nodes()]).collect();
+        for (c, b) in pool.iter().enumerate() {
+            let x = xbar[c];
+            if x <= 1.0e-12 {
+                continue;
+            }
+            for &l in &b.labels {
+                cov[l as usize] += x;
+            }
+            for (t, nodes) in b.cover.iter().enumerate() {
+                for &v in nodes {
+                    use_nodes[t][v as usize] += x;
+                }
+            }
+        }
+        for l in 1..=nl {
+            cov[l] += xbar_sing[l];
+        }
+
         let mut gnorm2 = 0.0f64;
         for l in 1..=nl {
-            let g = 1.0 - v_cov[l];
+            let g = 1.0 - cov[l];
             gnorm2 += g * g;
         }
         for (t, tree) in trees.iter().enumerate() {
@@ -1602,28 +2465,31 @@ impl LagrangianSolver {
                 if tree.is_leaf(v as u32) {
                     continue;
                 }
-                let g = v_use[t][v] - 1.0;
+                let g = use_nodes[t][v] - 1.0;
                 gnorm2 += g * g;
             }
         }
-        if gnorm2 < 1e-12 {
-            return lagrangian.max(0.0);
+        if gnorm2 < 1.0e-12 {
+            return center_lb.max(0.0);
         }
-        let target = (ub_components as f64 - lagrangian).max(0.5);
-        let step = lambda * target / gnorm2;
+
+        // (5) Step from the CENTRE along d (Polyak target toward the incumbent).
+        let target = (ub_components as f64 - *center_lb).max(0.5);
+        let step = *lambda * target / gnorm2;
         for l in 1..=nl {
-            alpha[l] += step * (1.0 - v_cov[l]);
+            alpha[l] = center_alpha[l] + step * (1.0 - cov[l]);
         }
         for (t, tree) in trees.iter().enumerate() {
             for v in 0..tree.num_nodes() {
                 if tree.is_leaf(v as u32) {
                     continue;
                 }
-                let nv = beta[t][v] + step * (v_use[t][v] - 1.0);
+                let nv = center_beta[t][v] + step * (use_nodes[t][v] - 1.0);
                 beta[t][v] = nv.max(0.0);
             }
         }
-        lagrangian.max(0.0)
+
+        center_lb.max(0.0)
     }
 }
 
@@ -1875,6 +2741,52 @@ fn block_forbidden(b: &Block, br: &Branchings) -> bool {
         }
     }
     false
+}
+
+/// Pick the leaf-pair to branch on: among positive-reduced-cost columns (the
+/// dual "wants" their leaves together), the highest-scoring one that the node's
+/// incumbent currently *splits* across components. Forcing it together
+/// (must-link) makes the constrained pricer emit that gap column. Skips pairs
+/// already constrained on this branch.
+fn pick_branch_pair(
+    pool: &[Block],
+    sel: &[usize],
+    alpha: &[f64],
+    beta: &[Vec<f64>],
+    nl: usize,
+    br: &Branchings,
+) -> Option<LeafPair> {
+    let mut comp_of = vec![usize::MAX; nl + 1];
+    for (ci, &pi) in sel.iter().enumerate() {
+        for &l in &pool[pi].labels {
+            if (l as usize) <= nl {
+                comp_of[l as usize] = ci;
+            }
+        }
+    }
+    let scores: Vec<f64> = pool.iter().map(|b| block_score(b, alpha, beta)).collect();
+    let mut order: Vec<usize> = (0..pool.len()).collect();
+    order.sort_unstable_by(|&i, &j| scores[j].total_cmp(&scores[i]));
+    // Highest-scored column the incumbent splits. (At dual convergence scores
+    // are tight ≈1, so we must NOT require score>1 or branching never starts.)
+    for &i in &order {
+        let lbls = &pool[i].labels;
+        for wi in 0..lbls.len() {
+            for wj in (wi + 1)..lbls.len() {
+                let (a, b) = (lbls[wi], lbls[wj]);
+                let (ca, cb) = (comp_of[a as usize], comp_of[b as usize]);
+                if ca == usize::MAX || cb == usize::MAX || ca == cb {
+                    continue;
+                }
+                let pair = LeafPair::new(a, b);
+                if br.must_link().contains(&pair) || br.cannot_link().contains(&pair) {
+                    continue;
+                }
+                return Some(pair);
+            }
+        }
+    }
+    None
 }
 
 /// Score-ordered greedy node-disjoint packing over the pool, skipping columns
