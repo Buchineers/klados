@@ -84,8 +84,11 @@ impl RootPoolSolver {
                         }
                         Some(out.forest)
                     };
-                    if let Some(reduced) = try_whidden_decomp_2tree(&kern.instance, &mut solve_sub)
-                    {
+                    if let Some(reduced) = try_whidden_decomp_2tree(
+                        &kern.instance,
+                        &mut solve_sub,
+                        &crate::whidden_cluster::NEVER_TERMINATE,
+                    ) {
                         let expanded = expand_solution(
                             reduced,
                             &kern,
@@ -128,7 +131,11 @@ impl RootPoolSolver {
                 }
                 Some(out.forest)
             };
-            if let Some(forest) = try_whidden_decomp_2tree(instance, &mut solve_sub) {
+            if let Some(forest) = try_whidden_decomp_2tree(
+                instance,
+                &mut solve_sub,
+                &crate::whidden_cluster::NEVER_TERMINATE,
+            ) {
                 self.stats.upper_bound = Some(forest.len());
                 let k = forest.len();
                 return Some(RootPoolOutcome {

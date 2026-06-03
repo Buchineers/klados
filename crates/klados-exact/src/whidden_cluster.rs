@@ -21,18 +21,33 @@
 //! old Rust prototypes for those variants remain opt-in below until that state
 //! is ported faithfully.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use fixedbitset::FixedBitSet;
 
 use klados_core::Instance;
 use klados_core::af_validator::validate_agreement_forest;
 use klados_core::tree::{Label, NONE, NodeId, Tree};
 
+/// Never-set termination flag for callers that don't supply their own. The
+/// decomposition is then uninterruptible (its prior behaviour). Hot anytime
+/// callers pass a real flag so a SIGTERM mid-decomposition bails promptly
+/// instead of grinding through the O(n^3) cluster-point recursion.
+pub static NEVER_TERMINATE: AtomicBool = AtomicBool::new(false);
+
 /// Try Whidden cluster decomposition on a 2-tree instance.
 ///
 /// `solve` is invoked on each sub-instance; pass the inner solver
 /// (e.g. B&P-Multi). Returns `None` if no useful cluster point is found
 /// or if any sub-solve returns `None`.
-pub fn try_whidden_decomp_2tree<F>(instance: &Instance, solve: &mut F) -> Option<Vec<Tree>>
+/// `terminate`: when set, the decomposition bails (returns `None`) instead of
+/// continuing the recursion — callers without their own flag pass
+/// [`NEVER_TERMINATE`].
+pub fn try_whidden_decomp_2tree<F>(
+    instance: &Instance,
+    solve: &mut F,
+    terminate: &AtomicBool,
+) -> Option<Vec<Tree>>
 where
     F: FnMut(&Instance) -> Option<Vec<Tree>>,
 {
@@ -42,7 +57,7 @@ where
     // The Rust batch/relaxed prototypes below validate feasibility but do not
     // prove the lower-bound accounting needed for an exact solver return, so
     // the exact path uses the certified strict split only.
-    try_single_decomp(instance, solve)
+    try_single_decomp(instance, solve, terminate)
 }
 
 /// Try the relaxed/batch rspr-inspired decompositions as a *feasible
@@ -892,11 +907,20 @@ fn lca_of_labels(tree: &Tree, leafset: &FixedBitSet) -> NodeId {
     acc
 }
 
-fn try_single_decomp<F>(instance: &Instance, solve: &mut F) -> Option<Vec<Tree>>
+fn try_single_decomp<F>(
+    instance: &Instance,
+    solve: &mut F,
+    terminate: &AtomicBool,
+) -> Option<Vec<Tree>>
 where
     F: FnMut(&Instance) -> Option<Vec<Tree>>,
 {
     if instance.num_trees() != 2 {
+        return None;
+    }
+    // Bail before the O(n^2) cluster-point detection so a SIGTERM landing
+    // mid-recursion unwinds promptly (each recursion level re-enters here).
+    if terminate.load(Ordering::Relaxed) {
         return None;
     }
     let n = instance.num_leaves as usize;
@@ -923,7 +947,10 @@ where
     candidates.sort_by_key(|(_, score)| -(*score as isize));
 
     for (cluster, _) in candidates {
-        if let Some(result) = try_single_decomp_at(instance, solve, cluster) {
+        if terminate.load(Ordering::Relaxed) {
+            return None;
+        }
+        if let Some(result) = try_single_decomp_at(instance, solve, cluster, terminate) {
             return Some(result);
         }
     }
@@ -935,6 +962,7 @@ fn try_single_decomp_at<F>(
     instance: &Instance,
     solve: &mut F,
     cluster: NodeId,
+    terminate: &AtomicBool,
 ) -> Option<Vec<Tree>>
 where
     F: FnMut(&Instance) -> Option<Vec<Tree>>,
@@ -1055,6 +1083,36 @@ where
         .filter(|(i, _)| *i != outer_p_idx)
         .map(|(_, c)| c.relabel(&outer_to_orig, instance.num_leaves))
         .collect();
+
+    // On termination, skip the O(k·n) per-anchor validation loop and the ρ
+    // re-solve below: graft the first inner component at P and return the
+    // best-effort join unvalidated. This PRESERVES the solved inner/outer
+    // structure (so the emitted forest keeps its quality) while unwinding the
+    // in-flight recursion within the SIGTERM grace window. The caller's final
+    // repair pass restores validity if this graft happens to be sub-optimal.
+    if terminate.load(Ordering::Relaxed) && !decoded_inner.is_empty() {
+        let anchor_idx = 0;
+        let anchor_leaf = decoded_inner[anchor_idx]
+            .leaves()
+            .next()
+            .expect("anchor must have at least one leaf");
+        let mut candidate: Vec<Tree> = decoded_inner
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != anchor_idx)
+            .map(|(_, c)| c.clone())
+            .collect();
+        candidate.extend(decoded_outer_non_p.clone());
+        let merged = fuse_at_label(
+            &outer_p_comp_decoded,
+            &decoded_inner[anchor_idx],
+            p_decoded,
+            anchor_leaf,
+            instance.num_leaves,
+        );
+        candidate.push(merged);
+        return Some(candidate);
+    }
 
     // Try each inner component as the anchor (boundary component).
     // The correct anchor is the one whose merge with P produces a valid AF.
@@ -2005,10 +2063,14 @@ mod tests {
     fn test_identical_trees_no_cuts() {
         let t = make_balanced_6();
         let inst = Instance::new(vec![t.clone(), t.clone()], 6);
-        let result = try_whidden_decomp_2tree(&inst, &mut |sub| {
-            // Identical => single component containing all leaves.
-            Some(vec![sub.trees[0].clone()])
-        });
+        let result = try_whidden_decomp_2tree(
+            &inst,
+            &mut |sub| {
+                // Identical => single component containing all leaves.
+                Some(vec![sub.trees[0].clone()])
+            },
+            &NEVER_TERMINATE,
+        );
         let comps = result.expect("decomp should fire");
         // 1 inner + 1 outer - 1 = 1 component
         assert_eq!(comps.len(), 1, "identical trees: 1 component expected");
@@ -2029,13 +2091,17 @@ mod tests {
         let t = make_balanced_6();
         let inst = Instance::new(vec![t.clone(), t.clone()], 6);
         let mut calls = 0usize;
-        let result = try_whidden_decomp_2tree(&inst, &mut |sub| {
-            calls += 1;
-            if calls <= 2 {
-                return None;
-            }
-            Some(vec![sub.trees[0].clone()])
-        });
+        let result = try_whidden_decomp_2tree(
+            &inst,
+            &mut |sub| {
+                calls += 1;
+                if calls <= 2 {
+                    return None;
+                }
+                Some(vec![sub.trees[0].clone()])
+            },
+            &NEVER_TERMINATE,
+        );
 
         let comps = result.expect("later strict cluster should still be attempted");
         assert_eq!(comps.len(), 1);
@@ -2108,11 +2174,15 @@ mod tests {
 
         // Run Whidden decomposition with B&P-Multi as the inner solver
         let mut solver = MafBranchPriceMultiSolver::new();
-        let result = try_whidden_decomp_2tree(&inst, &mut |sub| {
-            // Use B&P-Multi directly (without re-decomposition to avoid recursion)
-            // NOTE: this won't recurse into Whidden again since we call solve directly
-            solver.solve(sub)
-        });
+        let result = try_whidden_decomp_2tree(
+            &inst,
+            &mut |sub| {
+                // Use B&P-Multi directly (without re-decomposition to avoid recursion)
+                // NOTE: won't recurse into Whidden again since we call solve directly
+                solver.solve(sub)
+            },
+            &NEVER_TERMINATE,
+        );
 
         match result {
             Some(comps) => {

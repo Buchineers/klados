@@ -852,9 +852,13 @@ fn solve_branch_price_multi_cached(
     // an optimality certificate.
     if reduced.num_trees() == 2 && reduced.num_leaves >= WHIDDEN_DECOMP_MIN_LEAVES {
         if let Some(solution) =
-            crate::whidden_cluster::try_whidden_decomp_2tree(reduced, &mut |subinstance| {
-                solve_branch_price_multi_cached(subinstance, &mut SolverStats::default(), memo)
-            })
+            crate::whidden_cluster::try_whidden_decomp_2tree(
+                reduced,
+                &mut |subinstance| {
+                    solve_branch_price_multi_cached(subinstance, &mut SolverStats::default(), memo)
+                },
+                &crate::whidden_cluster::NEVER_TERMINATE,
+            )
         {
             if let Some(view) = memo_view.as_ref() {
                 store_cached_solution(memo, view, &solution);
