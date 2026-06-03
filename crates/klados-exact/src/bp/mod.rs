@@ -384,9 +384,11 @@ fn solve_recursive_memo(
     if allow_whidden && reduced.num_trees() == 2 && reduced.num_leaves >= WHIDDEN_MIN_LEAVES {
         let cfg_inner = cfg.clone();
         let memo_inner = Rc::clone(memo);
-        if let Some(comps) = try_whidden_decomp_2tree(reduced, &mut |sub| {
-            solve_recursive_memo(sub, &cfg_inner, &memo_inner, terminate)
-        }) {
+        if let Some(comps) = try_whidden_decomp_2tree(
+            reduced,
+            &mut |sub| solve_recursive_memo(sub, &cfg_inner, &memo_inner, terminate),
+            terminate,
+        ) {
             trace!(
                 target: LOG_TARGET,
                 "whidden strict decomp solved: n={} k={}",
@@ -425,9 +427,11 @@ fn solve_recursive_memo(
             {
                 let cfg2 = inner_cfg.clone();
                 let memo2 = Rc::clone(&memo_pipeline);
-                if let Some(comps) = try_whidden_decomp_2tree(sub, &mut |s| {
-                    solve_recursive_memo(s, &cfg2, &memo2, &t)
-                }) {
+                if let Some(comps) = try_whidden_decomp_2tree(
+                    sub,
+                    &mut |s| solve_recursive_memo(s, &cfg2, &memo2, &t),
+                    &t,
+                ) {
                     return Some(comps);
                 }
             }

@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use fixedbitset::FixedBitSet;
 use fxhash::FxHashSet;
+use klados_core::af_validator::validate_agreement_forest;
 use klados_core::tree::{NONE, NodeId, Tree};
 use klados_core::{Instance, SolverStats};
 use klados_exact::bp::column::{AfColumn, ColumnBuilder, ColumnSet, is_valid_af_component};
@@ -261,12 +262,30 @@ impl LagrangianSolver {
         // 2904 vs 3079) — the strict cluster reduction yields independent
         // subproblems the Lagrangian converges on far faster.
         let decomp = std::env::var("KLADOS_LAGR_NO_DECOMP").is_err();
-        let reduced_forest =
+        // LNS post-pass: reserve a tail of the budget to exactly re-solve clean
+        // regions of the *assembled* forest with the full remaining time (the
+        // per-cluster solves are budget-starved; the recombined forest is where
+        // the suboptimal cuts can be merged). Gated by KLADOS_LAGR_LNS.
+        let lns_on = std::env::var("KLADOS_LAGR_LNS").is_ok();
+        let lns_frac: f64 = std::env::var("KLADOS_LAGR_LNS_FRAC")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.35);
+        let core_budget = if lns_on {
+            budget.map(|b| b.mul_f64((1.0 - lns_frac).clamp(0.1, 1.0)))
+        } else {
+            budget
+        };
+        let core_deadline = core_budget.map(|b| start + b);
+        let mut reduced_forest =
             if decomp && reduced.num_trees() == 2 && reduced.num_leaves >= DECOMP_MIN_LEAVES {
-                self.solve_decomposed(reduced, budget, start, trace)
+                self.solve_decomposed(reduced, core_budget, start, trace)
             } else {
-                self.solve_reduced_core(reduced, deadline, start, trace)
+                self.solve_reduced_core(reduced, core_deadline, start, trace)
             };
+        if lns_on && reduced.num_trees() == 2 {
+            reduced_forest = self.lns_improve(reduced, reduced_forest, deadline, start, trace);
+        }
         let expanded = klados_core::kernelize::expand_solution(
             reduced_forest,
             &kern,
@@ -383,6 +402,9 @@ impl LagrangianSolver {
         let (_chen_lo, _chen_up, chen_sets) = chen_pair_agreement(&trees[0], &trees[1]);
         let mut best_forest = forest_from_partition(&chen_sets, trees, n);
         let mut best_components = best_forest.len();
+        // Column indices of the best packing so far (seed for the improvement
+        // loop). Empty ⇒ the Chen warm-start (all singletons w.r.t. the pool).
+        let mut best_sel: Vec<usize> = Vec::new();
         for s in &chen_sets {
             add_block(s.clone(), &mut pool, &mut seen);
         }
@@ -550,8 +572,33 @@ impl LagrangianSolver {
                 &scores,
                 &mut best_forest,
                 &mut best_components,
+                &mut best_sel,
             );
         }
+
+        // Reserve a tail of the budget for the primal improvement loop: the
+        // subgradient generates the columns; the local search then relentlessly
+        // re-selects a better packing over the same pool. ON by default
+        // (KLADOS_LAGR_LS=frac to tune, KLADOS_LAGR_NO_LS to disable) — it helps
+        // the hard fallback cores (n4465: 2910→2829) and never hurts (it only
+        // refines the subgradient's own plateaued incumbent).
+        let ls_frac: f64 = if std::env::var("KLADOS_LAGR_NO_LS").is_ok() {
+            0.0
+        } else {
+            std::env::var("KLADOS_LAGR_LS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.3)
+        };
+        let full_deadline = deadline;
+        let deadline = if ls_frac > 0.0 {
+            deadline.map(|d| {
+                let total = d.saturating_duration_since(start);
+                start + total.mul_f64((1.0 - ls_frac).clamp(0.1, 1.0))
+            })
+        } else {
+            deadline
+        };
 
         loop {
             if self.terminate.load(Ordering::Relaxed)
@@ -800,6 +847,7 @@ impl LagrangianSolver {
                 primal_scores,
                 &mut best_forest,
                 &mut best_components,
+                &mut best_sel,
             );
 
             if trace && (iter <= 5 || iter % 25 == 0 || improved) {
@@ -960,6 +1008,25 @@ impl LagrangianSolver {
             }
         }
 
+        // ---- Primal improvement loop (iterated local search over the pool) ----
+        // The subgradient has plateaued; spend the reserved tail relentlessly
+        // re-selecting a better node-disjoint packing over the columns it
+        // generated (the pool already contains the optimum's columns).
+        if ls_frac > 0.0 {
+            let scores: Vec<f64> = pool.iter().map(|b| block_score(b, &alpha, &beta)).collect();
+            // Seed from the subgradient's BEST incumbent (best over all
+            // iterations), not a final-dual greedy — the local search refines
+            // the strongest packing found, not a one-shot one.
+            let sel1 =
+                self.improve_packing(&pool, trees, n, &scores, &best_sel, full_deadline, start, trace);
+            let savings1: usize = sel1.iter().map(|&i| pool[i].labels.len() - 1).sum();
+            let k1 = nl - savings1;
+            if k1 < best_components {
+                best_components = k1;
+                best_forest = build_forest(&pool, &sel1, trees, n);
+            }
+        }
+
         if trace {
             eprintln!(
                 "[lagr] DONE reduced_n={} reduced_best={} lb={:.1} iters={} pool={} t={:.1}s",
@@ -1017,11 +1084,25 @@ impl LagrangianSolver {
                 vec![sub.trees[0].clone()]
             };
         }
+        // On termination, STOP decomposing. The Whidden cluster recursion is
+        // itself uninterruptible (a single deep decomposition can take many
+        // seconds on a giant instance), so without this guard a SIGTERM landing
+        // mid-decomposition leaves the solver unable to emit ANY forest before
+        // the harness SIGKILLs it (the cause of "no-response" timeouts on the
+        // largest instances). Since the recursion descends through this method,
+        // bailing here on every level makes the whole tree unwind within one
+        // bounded decomposition step. solve_reduced_core with an elapsed
+        // deadline returns this sub's Chen incumbent immediately — a valid (if
+        // unrefined) forest for the not-yet-reached part of the instance.
+        if self.terminate.load(Ordering::Relaxed) {
+            let now = Instant::now();
+            return self.solve_reduced_core(sub, Some(now), now, trace);
+        }
         if sub.num_trees() == 2 && sub.num_leaves >= DECOMP_MIN_LEAVES {
             let mut cb = |s: &Instance| -> Option<Vec<Tree>> {
                 Some(self.solve_cluster(s, remaining, plan_deadline, trace))
             };
-            if let Some(forest) = try_whidden_decomp_2tree(sub, &mut cb) {
+            if let Some(forest) = try_whidden_decomp_2tree(sub, &mut cb, &self.terminate) {
                 return forest;
             }
         }
@@ -1670,6 +1751,502 @@ impl LagrangianSolver {
         best_forest
     }
 
+    /// Primal improvement loop (iterated local search) over the Lagrangian pool.
+    /// The pool already contains the optimum's columns; the greedy just selected
+    /// them sub-optimally. Starting from `init_sel`, repeatedly: (1) **swap** —
+    /// for each unselected column whose weight exceeds the weight of the
+    /// selected columns it conflicts with, drop those and take it; (2) **re-fill**
+    /// — greedily add any column that now fits; (3) on a stalled pass, **perturb**
+    /// (restore best, eject a few random columns) to escape the local optimum.
+    /// Always-valid, anytime (keeps the best), O(pool) memory. Returns the best
+    /// node-disjoint selection found by the deadline.
+    #[allow(clippy::too_many_arguments)]
+    fn improve_packing(
+        &self,
+        pool: &[Block],
+        trees: &[Tree],
+        n: u32,
+        scores: &[f64],
+        init_sel: &[usize],
+        deadline: Option<Instant>,
+        start: Instant,
+        trace: bool,
+    ) -> Vec<usize> {
+        let nl = n as usize;
+        let ncol = pool.len();
+        let w = |ci: usize| -> i64 { pool[ci].labels.len() as i64 - 1 };
+
+        let mut leaf_owner = vec![usize::MAX; nl + 1];
+        let mut node_owner: Vec<Vec<usize>> =
+            trees.iter().map(|t| vec![usize::MAX; t.num_nodes()]).collect();
+        let mut in_sel = vec![false; ncol];
+        let mut savings: i64 = 0;
+
+        // Seed the working state from the initial selection.
+        for &ci in init_sel {
+            if ci >= ncol || in_sel[ci] {
+                continue;
+            }
+            in_sel[ci] = true;
+            savings += w(ci);
+            for &l in &pool[ci].labels {
+                leaf_owner[l as usize] = ci;
+            }
+            for (t, nodes) in pool[ci].cover.iter().enumerate() {
+                for &v in nodes {
+                    node_owner[t][v as usize] = ci;
+                }
+            }
+        }
+
+        // Candidate order: biggest columns first (most impactful), dual score
+        // breaks ties.
+        let mut order: Vec<usize> = (0..ncol).filter(|&i| pool[i].labels.len() >= 2).collect();
+        order.sort_by(|&a, &b| {
+            pool[b]
+                .labels
+                .len()
+                .cmp(&pool[a].labels.len())
+                .then_with(|| scores[b].total_cmp(&scores[a]))
+        });
+
+        let mut best_savings = savings;
+        let mut best_in_sel = in_sel.clone();
+        let mut conflicts: Vec<usize> = Vec::new();
+        let mut rng: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut stalls = 0usize;
+        let timed_out =
+            |s: &Self| s.terminate.load(Ordering::Relaxed) || deadline.is_some_and(|d| Instant::now() >= d);
+
+        while !timed_out(self) {
+            // ---- (1) improving swaps ----
+            for idx in 0..order.len() {
+                if idx % 512 == 0 && timed_out(self) {
+                    break;
+                }
+                let c = order[idx];
+                if in_sel[c] {
+                    continue;
+                }
+                conflicts.clear();
+                for &l in &pool[c].labels {
+                    let o = leaf_owner[l as usize];
+                    if o != usize::MAX && !conflicts.contains(&o) {
+                        conflicts.push(o);
+                    }
+                }
+                for (t, nodes) in pool[c].cover.iter().enumerate() {
+                    for &v in nodes {
+                        let o = node_owner[t][v as usize];
+                        if o != usize::MAX && !conflicts.contains(&o) {
+                            conflicts.push(o);
+                        }
+                    }
+                }
+                let cw: i64 = conflicts.iter().map(|&s| w(s)).sum();
+                if w(c) - cw <= 0 {
+                    continue;
+                }
+                for &s in &conflicts {
+                    in_sel[s] = false;
+                    savings -= w(s);
+                    for &l in &pool[s].labels {
+                        if leaf_owner[l as usize] == s {
+                            leaf_owner[l as usize] = usize::MAX;
+                        }
+                    }
+                    for (t, nodes) in pool[s].cover.iter().enumerate() {
+                        for &v in nodes {
+                            if node_owner[t][v as usize] == s {
+                                node_owner[t][v as usize] = usize::MAX;
+                            }
+                        }
+                    }
+                }
+                in_sel[c] = true;
+                savings += w(c);
+                for &l in &pool[c].labels {
+                    leaf_owner[l as usize] = c;
+                }
+                for (t, nodes) in pool[c].cover.iter().enumerate() {
+                    for &v in nodes {
+                        node_owner[t][v as usize] = c;
+                    }
+                }
+            }
+            // ---- (2) greedy re-fill of freed space ----
+            for &d in &order {
+                if in_sel[d] {
+                    continue;
+                }
+                let mut ok = true;
+                for &l in &pool[d].labels {
+                    if leaf_owner[l as usize] != usize::MAX {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    'nd: for (t, nodes) in pool[d].cover.iter().enumerate() {
+                        for &v in nodes {
+                            if node_owner[t][v as usize] != usize::MAX {
+                                ok = false;
+                                break 'nd;
+                            }
+                        }
+                    }
+                }
+                if ok {
+                    in_sel[d] = true;
+                    savings += w(d);
+                    for &l in &pool[d].labels {
+                        leaf_owner[l as usize] = d;
+                    }
+                    for (t, nodes) in pool[d].cover.iter().enumerate() {
+                        for &v in nodes {
+                            node_owner[t][v as usize] = d;
+                        }
+                    }
+                }
+            }
+            // ---- (2b) ejection pass: eject each selected column, re-fill the
+            //      freed space, keep only if it nets more savings. This is the
+            //      "1-out, ≥2-in" move that escapes the swap local optimum
+            //      (a random kick rarely lands it). Cheap snapshot-revert.
+            let selected_now: Vec<usize> = (0..ncol).filter(|&i| in_sel[i]).collect();
+            for (ei, &s) in selected_now.iter().enumerate() {
+                if !in_sel[s] {
+                    continue; // already removed by an earlier ejection's re-fill
+                }
+                if ei % 64 == 0 && timed_out(self) {
+                    break;
+                }
+                let before = savings;
+                let snap = in_sel.clone();
+                // eject s
+                in_sel[s] = false;
+                savings -= w(s);
+                for &l in &pool[s].labels {
+                    if leaf_owner[l as usize] == s {
+                        leaf_owner[l as usize] = usize::MAX;
+                    }
+                }
+                for (t, nodes) in pool[s].cover.iter().enumerate() {
+                    for &v in nodes {
+                        if node_owner[t][v as usize] == s {
+                            node_owner[t][v as usize] = usize::MAX;
+                        }
+                    }
+                }
+                // re-fill freed space
+                for &d in &order {
+                    if in_sel[d] {
+                        continue;
+                    }
+                    let mut ok = true;
+                    for &l in &pool[d].labels {
+                        if leaf_owner[l as usize] != usize::MAX {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if ok {
+                        'ej: for (t, nodes) in pool[d].cover.iter().enumerate() {
+                            for &v in nodes {
+                                if node_owner[t][v as usize] != usize::MAX {
+                                    ok = false;
+                                    break 'ej;
+                                }
+                            }
+                        }
+                    }
+                    if ok {
+                        in_sel[d] = true;
+                        savings += w(d);
+                        for &l in &pool[d].labels {
+                            leaf_owner[l as usize] = d;
+                        }
+                        for (t, nodes) in pool[d].cover.iter().enumerate() {
+                            for &v in nodes {
+                                node_owner[t][v as usize] = d;
+                            }
+                        }
+                    }
+                }
+                if savings <= before {
+                    // Not improving — revert to the snapshot and rebuild owners.
+                    in_sel.copy_from_slice(&snap);
+                    leaf_owner.iter_mut().for_each(|o| *o = usize::MAX);
+                    node_owner
+                        .iter_mut()
+                        .for_each(|t| t.iter_mut().for_each(|o| *o = usize::MAX));
+                    savings = 0;
+                    for ci in 0..ncol {
+                        if in_sel[ci] {
+                            savings += w(ci);
+                            for &l in &pool[ci].labels {
+                                leaf_owner[l as usize] = ci;
+                            }
+                            for (t, nodes) in pool[ci].cover.iter().enumerate() {
+                                for &v in nodes {
+                                    node_owner[t][v as usize] = ci;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // ---- (3) keep best, else perturb (iterated local search) ----
+            if savings > best_savings {
+                best_savings = savings;
+                best_in_sel.copy_from_slice(&in_sel);
+                stalls = 0;
+                if trace {
+                    eprintln!(
+                        "[lagr][ls] improved k={} t={:.1}s",
+                        nl - best_savings as usize,
+                        start.elapsed().as_secs_f64()
+                    );
+                }
+            } else {
+                stalls += 1;
+                // Restore the best, rebuild owners, then eject a few columns.
+                in_sel.copy_from_slice(&best_in_sel);
+                leaf_owner.iter_mut().for_each(|o| *o = usize::MAX);
+                node_owner
+                    .iter_mut()
+                    .for_each(|t| t.iter_mut().for_each(|o| *o = usize::MAX));
+                savings = 0;
+                let cur: Vec<usize> = (0..ncol).filter(|&i| in_sel[i]).collect();
+                for &ci in &cur {
+                    savings += w(ci);
+                    for &l in &pool[ci].labels {
+                        leaf_owner[l as usize] = ci;
+                    }
+                    for (t, nodes) in pool[ci].cover.iter().enumerate() {
+                        for &v in nodes {
+                            node_owner[t][v as usize] = ci;
+                        }
+                    }
+                }
+                if cur.is_empty() {
+                    break;
+                }
+                let kick = 2 + (stalls % 6);
+                for _ in 0..kick {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    let s = cur[(rng as usize) % cur.len()];
+                    if in_sel[s] {
+                        in_sel[s] = false;
+                        savings -= w(s);
+                        for &l in &pool[s].labels {
+                            if leaf_owner[l as usize] == s {
+                                leaf_owner[l as usize] = usize::MAX;
+                            }
+                        }
+                        for (t, nodes) in pool[s].cover.iter().enumerate() {
+                            for &v in nodes {
+                                if node_owner[t][v as usize] == s {
+                                    node_owner[t][v as usize] = usize::MAX;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        (0..ncol).filter(|&i| best_in_sel[i]).collect()
+    }
+
+    /// LNS (large-neighbourhood search): repeatedly pick a *clean* region of the
+    /// incumbent — a T₁ subtree whose leaves are exactly the union of some whole
+    /// incumbent components — re-solve that region **optimally with B&P** (small
+    /// → fast), and splice it back if it validates and has fewer components.
+    /// This injects the optimum's columns for the region directly (breaking the
+    /// pool cap) and produces new bests, while staying anytime and sound (every
+    /// accepted move is a validated AF with fewer components).
+    fn lns_improve(
+        &self,
+        reduced: &Instance,
+        mut incumbent: Vec<Tree>,
+        deadline: Option<Instant>,
+        start: Instant,
+        trace: bool,
+    ) -> Vec<Tree> {
+        let trees = &reduced.trees;
+        let n = reduced.num_leaves;
+        let nl = n as usize;
+        let t1 = &trees[0];
+        let region_max: usize = std::env::var("KLADOS_LNS_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(250);
+        let cap = Duration::from_millis(
+            std::env::var("KLADOS_LNS_CAP_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(2_000),
+        );
+
+        // leaf → incumbent component index
+        let mut comp_of = vec![usize::MAX; nl + 1];
+        for (ci, c) in incumbent.iter().enumerate() {
+            for l in c.leaves() {
+                if (l as usize) <= nl {
+                    comp_of[l as usize] = ci;
+                }
+            }
+        }
+
+        let internal: Vec<NodeId> = (0..t1.num_nodes() as u32).filter(|&v| !t1.is_leaf(v)).collect();
+        if internal.is_empty() {
+            return incumbent;
+        }
+        let mut rng: u64 = 0xD1B5_4A32_D192_ED03;
+        let (mut tries, mut accepts, mut invalid) = (0usize, 0usize, 0usize);
+
+        while !(self.terminate.load(Ordering::Relaxed)
+            || deadline.is_some_and(|d| Instant::now() >= d))
+        {
+            tries += 1;
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let v = internal[(rng as usize) % internal.len()];
+
+            // Leaves under v in T₁.
+            let mut region: Vec<u32> = Vec::new();
+            let mut stack = vec![v];
+            while let Some(u) = stack.pop() {
+                if t1.is_leaf(u) {
+                    region.push(t1.label[u as usize]);
+                } else {
+                    let (l, r) = t1.children_pair(u);
+                    stack.push(l);
+                    stack.push(r);
+                }
+            }
+            if region.len() < 4 || region.len() > region_max {
+                continue;
+            }
+            let mut in_region = vec![false; nl + 1];
+            for &l in &region {
+                in_region[l as usize] = true;
+            }
+            // Components touched by the region; require a CLEAN cut (every
+            // touched component is fully inside) so the splice can't overlap
+            // the rest.
+            let mut touched: Vec<usize> = Vec::new();
+            for &l in &region {
+                let ci = comp_of[l as usize];
+                if ci != usize::MAX && !touched.contains(&ci) {
+                    touched.push(ci);
+                }
+            }
+            let mut clean = true;
+            let mut l_leaves: Vec<u32> = Vec::new();
+            for &ci in &touched {
+                let mut inside = true;
+                for l in incumbent[ci].leaves() {
+                    if (l as usize) > nl || !in_region[l as usize] {
+                        inside = false;
+                        break;
+                    }
+                    l_leaves.push(l);
+                }
+                if !inside {
+                    clean = false;
+                    break;
+                }
+            }
+            if !clean || touched.len() < 2 || l_leaves.len() < 4 {
+                continue;
+            }
+
+            // Build the sub-instance (T₁|L, T₂|L) with a compact relabel.
+            l_leaves.sort_unstable();
+            l_leaves.dedup();
+            let m = l_leaves.len();
+            let mut orig_to_sub = vec![0u32; nl + 1];
+            let mut sub_to_orig = vec![0u32; m + 1];
+            for (i, &l) in l_leaves.iter().enumerate() {
+                orig_to_sub[l as usize] = (i + 1) as u32;
+                sub_to_orig[i + 1] = l;
+            }
+            let sub_inst = Instance::new(
+                vec![
+                    trees[0].relabel(&orig_to_sub, m as u32),
+                    trees[1].relabel(&orig_to_sub, m as u32),
+                ],
+                m as u32,
+            );
+
+            // Re-solve the region optimally with B&P (capped).
+            let sub_sol = match self.solve_cluster_exact(&sub_inst, Instant::now() + cap) {
+                Some(s) => s,
+                None => continue, // capped / invalid
+            };
+            if sub_sol.len() >= touched.len() {
+                continue; // no improvement available here
+            }
+
+            // Splice: replace the touched components with the decoded re-solve.
+            let touched_set: std::collections::HashSet<usize> = touched.iter().copied().collect();
+            let mut candidate: Vec<Tree> = incumbent
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !touched_set.contains(i))
+                .map(|(_, c)| c.clone())
+                .collect();
+            for comp in &sub_sol {
+                let mut bs = FixedBitSet::with_capacity(nl + 1);
+                for sl in comp.leaves() {
+                    bs.insert(sub_to_orig[sl as usize] as usize);
+                }
+                candidate.push(Tree::component_from_leafset(&bs, &trees[0], n));
+            }
+
+            if candidate.len() < incumbent.len()
+                && validate_agreement_forest(reduced, &candidate).is_ok()
+            {
+                incumbent = candidate;
+                accepts += 1;
+                for (ci, c) in incumbent.iter().enumerate() {
+                    for l in c.leaves() {
+                        if (l as usize) <= nl {
+                            comp_of[l as usize] = ci;
+                        }
+                    }
+                }
+                if trace {
+                    eprintln!(
+                        "[lagr][lns] accept k={} (region={} comps {}→{}) t={:.1}s",
+                        incumbent.len(),
+                        m,
+                        touched.len(),
+                        sub_sol.len(),
+                        start.elapsed().as_secs_f64()
+                    );
+                }
+            } else {
+                invalid += 1;
+            }
+        }
+        if trace {
+            eprintln!(
+                "[lagr][lns] done tries={} accepts={} invalid={} k={} t={:.1}s",
+                tries,
+                accepts,
+                invalid,
+                incumbent.len(),
+                start.elapsed().as_secs_f64()
+            );
+        }
+        incumbent
+    }
+
     /// Warm-started exact-LP column generation (bp's `Rmp`). Each iteration
     /// solves the restricted-master LP exactly (→ exact duals), lazily
     /// separates node `≤1` rows, prices at those duals, and extracts an
@@ -2203,6 +2780,7 @@ impl LagrangianSolver {
 
     /// Dual-guided greedy node-disjoint packing. Returns true if it improved
     /// the incumbent (and updates it).
+    #[allow(clippy::too_many_arguments)]
     fn try_primal(
         &self,
         trees: &[Tree],
@@ -2211,6 +2789,7 @@ impl LagrangianSolver {
         scores: &[f64],
         best_forest: &mut Vec<Tree>,
         best_components: &mut usize,
+        best_sel: &mut Vec<usize>,
     ) -> bool {
         if pool.is_empty() {
             return false;
@@ -2250,6 +2829,7 @@ impl LagrangianSolver {
         if components < *best_components {
             *best_components = components;
             *best_forest = build_forest(pool, &selected, trees, n);
+            *best_sel = selected;
             true
         } else {
             false

@@ -171,7 +171,11 @@ impl CorridorSolver {
                     None
                 }
             };
-            if let Some(forest) = try_whidden_decomp_2tree(reduced, &mut solve_sub) {
+            if let Some(forest) = try_whidden_decomp_2tree(
+                reduced,
+                &mut solve_sub,
+                &crate::whidden_cluster::NEVER_TERMINATE,
+            ) {
                 if !sub_failed {
                     let expanded = expand_solution(
                         forest,
