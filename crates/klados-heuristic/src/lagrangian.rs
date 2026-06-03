@@ -17,8 +17,8 @@
 //! Here the loop degrades gracefully to the Chen+seed pool at that scale.
 
 use std::cell::Cell;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use fixedbitset::FixedBitSet;
@@ -125,6 +125,13 @@ fn block_score(b: &Block, alpha: &[f64], beta: &[Vec<f64>]) -> f64 {
 pub struct LagrangianSolver {
     terminate: Arc<AtomicBool>,
     stats: SolverStats,
+    /// Best complete forest in ORIGINAL labels, ready to emit. A watcher thread
+    /// emits this the instant SIGTERM arrives, so the response never depends on
+    /// `solve` unwinding (the decomposition recursion can take seconds to
+    /// unwind, which would blow the grace window and score 0). Seeded with a
+    /// trivial-but-valid forest before any heavy work, then replaced as the
+    /// solver improves it.
+    incumbent: Arc<Mutex<Vec<Tree>>>,
 }
 
 impl LagrangianSolver {
@@ -132,6 +139,15 @@ impl LagrangianSolver {
         Self {
             terminate: Arc::new(AtomicBool::new(false)),
             stats: SolverStats::default(),
+            incumbent: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Replace the ready-to-emit incumbent (original labels). Cheap; called at
+    /// each point the solver has a better complete forest.
+    fn publish(&self, forest: &[Tree]) {
+        if let Ok(mut slot) = self.incumbent.lock() {
+            *slot = forest.to_vec();
         }
     }
 
@@ -160,6 +176,17 @@ impl LagrangianSolver {
         let start = Instant::now();
         let budget = Self::time_budget();
         let trace = std::env::var("KLADOS_LAGR_TRACE").is_ok();
+
+        // Publish a trivial-but-valid baseline immediately (original labels), so
+        // a SIGTERM arriving before the real solve has a complete forest still
+        // emits something non-zero. The Chen 2-approx is O(n) and far better
+        // than singletons (which would score 0: k=n).
+        {
+            let (_lo, _up, sets) = chen_pair_agreement(&instance.trees[0], &instance.trees[1]);
+            let base = forest_from_partition(&sets, &instance.trees, orig_n);
+            let (base, _) = repair_forest(base, &instance.trees, orig_n);
+            self.publish(&base);
+        }
 
         // ---- Kernelize first (optimality-preserving), solve the reduced core,
         //      expand at the end. Shrinks the instance so global pricing fits
@@ -293,6 +320,11 @@ impl LagrangianSolver {
             orig_n,
         );
         let (expanded, _) = repair_forest(expanded, &instance.trees, orig_n);
+        // Publish the final result so a SIGTERM racing the normal emit still
+        // sees the best forest (the watcher emits the incumbent).
+        if expanded.len() < self.snapshot().map_or(usize::MAX, |s| s.len()) {
+            self.publish(&expanded);
+        }
         self.stats.upper_bound = Some(expanded.len());
         Some(expanded)
     }
@@ -524,6 +556,16 @@ impl LagrangianSolver {
         let mut no_new = 0usize;
         let mut iter = 0usize;
         let mut proved = false;
+        // Convergence bookkeeping for the deadline-free stall exit.
+        const REENERGISE_DRY_LIMIT: usize = 3;
+        let mut reenergise_dry = 0usize;
+        let mut best_at_reenergise = best_components;
+        // Iteration-stall handoff to local search: exit once the primal
+        // incumbent has not improved for this many consecutive iterations
+        // (after a warm-up). Generous so a slow-but-real descent isn't cut off.
+        const PRIMAL_WARMUP: usize = 30;
+        const PRIMAL_STALL_LIMIT: usize = 120;
+        let mut since_primal_improve = 0usize;
         // ---- Volume algorithm (Barahona–Anbil) state ----
         // The pure subgradient thrashes (the per-iter dual point and thus the
         // primal scores oscillate). The volume algorithm fixes this with a
@@ -582,23 +624,11 @@ impl LagrangianSolver {
         // (KLADOS_LAGR_LS=frac to tune, KLADOS_LAGR_NO_LS to disable) — it helps
         // the hard fallback cores (n4465: 2910→2829) and never hurts (it only
         // refines the subgradient's own plateaued incumbent).
-        let ls_frac: f64 = if std::env::var("KLADOS_LAGR_NO_LS").is_ok() {
-            0.0
-        } else {
-            std::env::var("KLADOS_LAGR_LS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0.3)
-        };
-        let full_deadline = deadline;
-        let deadline = if ls_frac > 0.0 {
-            deadline.map(|d| {
-                let total = d.saturating_duration_since(start);
-                start + total.mul_f64((1.0 - ls_frac).clamp(0.1, 1.0))
-            })
-        } else {
-            deadline
-        };
+        // Local search runs AFTER the subgradient converges (stall-based), not
+        // on a reserved time fraction — so it works with no deadline (the
+        // default, SIGTERM-driven) instead of needing a hardcoded horizon to
+        // carve a tail from. KLADOS_LAGR_NO_LS disables it.
+        let ls_on = !std::env::var("KLADOS_LAGR_NO_LS").is_ok();
 
         loop {
             if self.terminate.load(Ordering::Relaxed)
@@ -849,6 +879,26 @@ impl LagrangianSolver {
                 &mut best_components,
                 &mut best_sel,
             );
+            // Primal-stall convergence: the greedy primal has plateaued (the LB
+            // may still trickle up, but the incumbent isn't moving). Hand off to
+            // the local search. Keys on the PRIMAL, not the bound, so it fires
+            // even while the dual keeps tightening — the robust deadline-free
+            // exit. Skipped until the dual has had a warm-up so we don't cut a
+            // still-improving early ascent short.
+            if improved {
+                since_primal_improve = 0;
+            } else {
+                since_primal_improve += 1;
+            }
+            if iter >= PRIMAL_WARMUP && since_primal_improve >= PRIMAL_STALL_LIMIT {
+                if trace {
+                    eprintln!(
+                        "[lagr] primal converged at iter={} (best={}, {} stalled iters)",
+                        iter, best_components, since_primal_improve
+                    );
+                }
+                break;
+            }
 
             if trace && (iter <= 5 || iter % 25 == 0 || improved) {
                 eprintln!(
@@ -893,6 +943,27 @@ impl LagrangianSolver {
                 no_new = 0;
             }
             if no_new >= 25 && lambda < 1e-3 {
+                // The dual has settled without proving optimality. Re-energise
+                // to escape the plateau — but bound the attempts: if several
+                // consecutive re-energises yield no primal improvement, the
+                // subgradient has converged to its best and we hand off to the
+                // local search. This is what lets the loop terminate on its own
+                // (no deadline needed) instead of spinning until SIGTERM.
+                if best_components < best_at_reenergise {
+                    reenergise_dry = 0;
+                } else {
+                    reenergise_dry += 1;
+                }
+                best_at_reenergise = best_components;
+                if reenergise_dry >= REENERGISE_DRY_LIMIT {
+                    if trace {
+                        eprintln!(
+                            "[lagr] subgradient converged at iter={} (best={}, {} dry re-energises)",
+                            iter, best_components, reenergise_dry
+                        );
+                    }
+                    break;
+                }
                 lambda = 1.0;
                 for a in alpha.iter_mut().skip(1) {
                     *a = 0.5 * *a + 0.5;
@@ -1009,16 +1080,17 @@ impl LagrangianSolver {
         }
 
         // ---- Primal improvement loop (iterated local search over the pool) ----
-        // The subgradient has plateaued; spend the reserved tail relentlessly
-        // re-selecting a better node-disjoint packing over the columns it
-        // generated (the pool already contains the optimum's columns).
-        if ls_frac > 0.0 {
+        // The subgradient has converged; now relentlessly re-select a better
+        // node-disjoint packing over the columns it generated (the pool already
+        // contains the optimum's columns). Runs until its own stall (or the
+        // deadline/SIGTERM) — see improve_packing.
+        if ls_on && !proved && !self.terminate.load(Ordering::Relaxed) {
             let scores: Vec<f64> = pool.iter().map(|b| block_score(b, &alpha, &beta)).collect();
             // Seed from the subgradient's BEST incumbent (best over all
             // iterations), not a final-dual greedy — the local search refines
             // the strongest packing found, not a one-shot one.
             let sel1 =
-                self.improve_packing(&pool, trees, n, &scores, &best_sel, full_deadline, start, trace);
+                self.improve_packing(&pool, trees, n, &scores, &best_sel, deadline, start, trace);
             let savings1: usize = sel1.iter().map(|&i| pool[i].labels.len() - 1).sum();
             let k1 = nl - savings1;
             if k1 < best_components {
@@ -1054,15 +1126,17 @@ impl LagrangianSolver {
         start: Instant,
         trace: bool,
     ) -> Vec<Tree> {
-        let plan = budget.unwrap_or_else(|| {
-            Duration::from_millis(
-                std::env::var("KLADOS_PLAN_MS")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(290_000),
-            )
+        // No internal time horizon by default: the solver is SIGTERM-driven and
+        // each cluster runs to its own convergence/stall. A budget is supplied
+        // ONLY for local testing (KLADOS_HEUR_TIME_MS), in which case it is
+        // sliced across clusters by leaf-share. (KLADOS_PLAN_MS likewise forces
+        // a horizon for experiments.)
+        let plan_deadline: Option<Instant> = budget.map(|b| start + b).or_else(|| {
+            std::env::var("KLADOS_PLAN_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .map(|ms| start + Duration::from_millis(ms))
         });
-        let plan_deadline = budget.map(|b| start + b).unwrap_or(start + plan);
         let remaining = Cell::new(reduced.num_leaves as u64);
         self.solve_cluster(reduced, &remaining, plan_deadline, trace)
     }
@@ -1074,7 +1148,7 @@ impl LagrangianSolver {
         &self,
         sub: &Instance,
         remaining: &Cell<u64>,
-        plan_deadline: Instant,
+        plan_deadline: Option<Instant>,
         trace: bool,
     ) -> Vec<Tree> {
         if sub.num_leaves <= 1 {
@@ -1107,18 +1181,23 @@ impl LagrangianSolver {
             }
         }
 
-        // Irreducible leaf cluster: leaf-share of the time still remaining.
+        // Irreducible leaf cluster. With a testing horizon, give it its
+        // leaf-share of the time still left; otherwise (the default) it runs to
+        // its own convergence/stall (deadline = None).
         let now = Instant::now();
         let rem = remaining.get().max(1);
-        let avail = plan_deadline.saturating_duration_since(now);
-        let dur = avail.mul_f64((sub.num_leaves as f64 / rem as f64).min(1.0));
         remaining.set(rem.saturating_sub(sub.num_leaves as u64));
-        let slice_end = (now + dur).min(plan_deadline);
+        let slice_end: Option<Instant> = plan_deadline.map(|pd| {
+            let avail = pd.saturating_duration_since(now);
+            let dur = avail.mul_f64((sub.num_leaves as f64 / rem as f64).min(1.0));
+            (now + dur).min(pd)
+        });
 
         // Probe with exact B&P (only small clusters, short cap): if it FINISHES
-        // (proves optimal) use it; otherwise fall to the anytime cascade for the
-        // rest of the slice. A capped B&P returns garbage, so solve_cluster_exact
-        // returns None unless it truly finished.
+        // (proves optimal) use it; otherwise fall to the anytime cascade. A
+        // capped B&P returns garbage, so solve_cluster_exact returns None unless
+        // it truly finished. The cap is a bounded *attempt*, not a phase
+        // timeout — it caps wasted effort on a cluster exact B&P can't crack.
         let exact_threshold = std::env::var("KLADOS_DECOMP_EXACT")
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
@@ -1130,7 +1209,10 @@ impl LagrangianSolver {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(10_000),
             );
-            let probe = (Instant::now() + exact_cap).min(slice_end);
+            let probe = match slice_end {
+                Some(se) => (Instant::now() + exact_cap).min(se),
+                None => Instant::now() + exact_cap,
+            };
             if let Some(forest) = self.solve_cluster_exact(sub, probe) {
                 if trace {
                     eprintln!(
@@ -1143,15 +1225,18 @@ impl LagrangianSolver {
             }
         }
         if trace {
+            let slice_s = slice_end
+                .map(|se| se.saturating_duration_since(Instant::now()).as_secs_f64());
             eprintln!(
-                "[lagr][decomp] cascade n={} slice={:.1}s",
+                "[lagr][decomp] cascade n={} slice={}",
                 sub.num_leaves,
-                slice_end
-                    .saturating_duration_since(Instant::now())
-                    .as_secs_f64()
+                match slice_s {
+                    Some(s) => format!("{s:.1}s"),
+                    None => "converge".to_string(),
+                }
             );
         }
-        self.solve_reduced_core(sub, Some(slice_end), Instant::now(), trace)
+        self.solve_reduced_core(sub, slice_end, Instant::now(), trace)
     }
 
     /// Exact B&P on a cluster, wall-capped by a watchdog. Returns `Some` ONLY if
@@ -1815,6 +1900,10 @@ impl LagrangianSolver {
         let mut conflicts: Vec<usize> = Vec::new();
         let mut rng: u64 = 0x9e37_79b9_7f4a_7c15;
         let mut stalls = 0usize;
+        // Perturbation rounds without improvement before the ILS is declared
+        // converged. Generous so quality isn't lost, but bounded so the search
+        // terminates without a deadline.
+        const LS_STALL_LIMIT: usize = 400;
         let timed_out =
             |s: &Self| s.terminate.load(Ordering::Relaxed) || deadline.is_some_and(|d| Instant::now() >= d);
 
@@ -2010,6 +2099,13 @@ impl LagrangianSolver {
                 }
             } else {
                 stalls += 1;
+                // Converge after many unproductive perturbations so the local
+                // search terminates on its own (no deadline needed). Productive
+                // use of any leftover time is the outer refinement's job, not
+                // an endlessly-perturbing local search.
+                if stalls >= LS_STALL_LIMIT {
+                    break;
+                }
                 // Restore the best, rebuild owners, then eject a few columns.
                 in_sel.copy_from_slice(&best_in_sel);
                 leaf_owner.iter_mut().for_each(|o| *o = usize::MAX);
@@ -3518,5 +3614,12 @@ impl HeuristicSolver for LagrangianSolver {
 
     fn sigterm_handler(&self) {
         self.terminate.store(true, Ordering::SeqCst);
+    }
+
+    fn snapshot(&self) -> Option<Vec<Tree>> {
+        match self.incumbent.lock() {
+            Ok(slot) if !slot.is_empty() => Some(slot.clone()),
+            _ => None,
+        }
     }
 }

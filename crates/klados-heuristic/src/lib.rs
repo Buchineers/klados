@@ -31,6 +31,15 @@ pub trait HeuristicSolver {
     fn stats(&self) -> &SolverStats;
     /// Handle SIGTERM signal.
     fn sigterm_handler(&self);
+
+    /// Best complete, ready-to-emit forest found so far (original labels).
+    /// Returned by an anytime solver so a watcher can emit it the instant a
+    /// SIGTERM arrives, WITHOUT waiting for `solve` to unwind. `None` ⇒ the
+    /// solver doesn't maintain a live incumbent (the harness then waits for
+    /// `solve` to return normally).
+    fn snapshot(&self) -> Option<Vec<Tree>> {
+        None
+    }
 }
 
 /// Return all available heuristic solvers.
