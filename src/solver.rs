@@ -222,6 +222,11 @@ pub fn list_solvers() {
 pub trait AnySolver {
     fn solve(&mut self, instance: &Instance) -> Option<Vec<Tree>>;
     fn sigterm_handler(&self);
+    /// Best ready-to-emit forest so far, for the SIGTERM watcher. `None` ⇒ no
+    /// live incumbent (wait for `solve` to return).
+    fn snapshot(&self) -> Option<Vec<Tree>> {
+        None
+    }
 }
 
 struct ExactWrapper(Box<dyn klados_exact::ExactSolver>);
@@ -243,6 +248,9 @@ impl AnySolver for HeuristicWrapper {
     }
     fn sigterm_handler(&self) {
         self.0.sigterm_handler()
+    }
+    fn snapshot(&self) -> Option<Vec<Tree>> {
+        self.0.snapshot()
     }
 }
 
@@ -270,6 +278,61 @@ fn request_graceful_shutdown() {
         let solver: &dyn AnySolver = unsafe { std::mem::transmute((data, vtable)) };
         solver.sigterm_handler();
     }
+}
+
+/// Set true by whichever path writes the solution first (the normal return, or
+/// the SIGTERM watcher) so it is emitted exactly once.
+#[cfg(feature = "early-termination")]
+static EMITTED: AtomicBool = AtomicBool::new(false);
+
+/// Guaranteed-fast response after SIGTERM. The solver is given this long to
+/// return its own (best) result and emit it; if it is still unwinding past it
+/// (the decomposition recursion can take seconds), the watcher emits the live
+/// incumbent and force-exits. Well inside the challenge's 10 s SIGTERM→SIGKILL
+/// grace, so a slow unwind can never cost the whole instance (a score-0
+/// timeout).
+#[cfg(feature = "early-termination")]
+const WATCHDOG_EMIT_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[cfg(feature = "early-termination")]
+fn emit_forest(forest: &[Tree]) {
+    let mut stdout = io::stdout().lock();
+    for tree in forest {
+        let _ = tree.cursor().write_newick(&mut stdout);
+        let _ = writeln!(stdout);
+    }
+    let _ = stdout.flush();
+}
+
+/// Background watcher: once SIGTERM/SIGINT fires, give the solver a brief window
+/// to return on its own; if it hasn't emitted by then, emit its live incumbent
+/// and force-exit so the harness always gets a forest within the grace window.
+#[cfg(feature = "early-termination")]
+fn spawn_emit_watchdog(terminated: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        while !terminated.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        std::thread::sleep(WATCHDOG_EMIT_DELAY);
+        // Only act for solvers that expose a live incumbent (anytime heuristic).
+        // Exact solvers return None — then the watchdog must NOT exit, or it
+        // would kill the process before the exact solve emits its result.
+        let data = SOLVER_DATA.load(Ordering::SeqCst);
+        let vtable = SOLVER_VTABLE.load(Ordering::SeqCst);
+        if data.is_null() || vtable.is_null() {
+            return;
+        }
+        let solver: &dyn AnySolver = unsafe { std::mem::transmute((data, vtable)) };
+        let Some(forest) = solver.snapshot() else {
+            return;
+        };
+        // We have an incumbent: emit it (unless the normal path beat us) and
+        // force-exit so a still-unwinding `solve` can't blow the grace window.
+        if !EMITTED.swap(true, Ordering::SeqCst) {
+            emit_forest(&forest);
+        }
+        std::process::exit(0);
+    });
 }
 
 pub fn solve_and_print(
@@ -309,6 +372,7 @@ pub fn solve_and_print(
         };
         let _ = sigterm_id;
         let _ = sigint_id;
+        spawn_emit_watchdog(Arc::clone(&terminated));
         terminated
     };
 
@@ -316,8 +380,6 @@ pub fn solve_and_print(
 
     #[cfg(feature = "early-termination")]
     {
-        SOLVER_DATA.store(std::ptr::null_mut(), Ordering::SeqCst);
-        SOLVER_VTABLE.store(std::ptr::null_mut(), Ordering::SeqCst);
         let signalled = terminated.load(Ordering::SeqCst);
         if signalled {
             log::info!(
@@ -326,6 +388,16 @@ pub fn solve_and_print(
             );
         } else {
             log::info!("solution: {} components", components.len());
+        }
+        // Emit exactly once. The watcher may already have written the incumbent
+        // (if `solve` was still unwinding past the grace window); claim the flag
+        // before clearing the solver pointer so a watcher that wakes meanwhile
+        // can still read a valid snapshot if it wins the race.
+        let we_emit = !EMITTED.swap(true, Ordering::SeqCst);
+        SOLVER_DATA.store(std::ptr::null_mut(), Ordering::SeqCst);
+        SOLVER_VTABLE.store(std::ptr::null_mut(), Ordering::SeqCst);
+        if !we_emit {
+            return Ok(()); // the watcher already wrote a forest
         }
     }
     #[cfg(not(feature = "early-termination"))]

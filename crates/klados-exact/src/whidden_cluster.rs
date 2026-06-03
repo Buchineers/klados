@@ -1091,25 +1091,20 @@ where
     // in-flight recursion within the SIGTERM grace window. The caller's final
     // repair pass restores validity if this graft happens to be sub-optimal.
     if terminate.load(Ordering::Relaxed) && !decoded_inner.is_empty() {
-        let anchor_idx = 0;
-        let anchor_leaf = decoded_inner[anchor_idx]
+        let anchor_leaf = decoded_inner[0]
             .leaves()
             .next()
             .expect("anchor must have at least one leaf");
-        let mut candidate: Vec<Tree> = decoded_inner
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != anchor_idx)
-            .map(|(_, c)| c.clone())
-            .collect();
-        candidate.extend(decoded_outer_non_p.clone());
         let merged = fuse_at_label(
             &outer_p_comp_decoded,
-            &decoded_inner[anchor_idx],
+            &decoded_inner[0],
             p_decoded,
             anchor_leaf,
             instance.num_leaves,
         );
+        // Move (don't clone) the already-decoded vectors — we return here.
+        let mut candidate = decoded_outer_non_p;
+        candidate.extend(decoded_inner.into_iter().skip(1));
         candidate.push(merged);
         return Some(candidate);
     }
