@@ -3603,39 +3603,71 @@ fn repair_forest(forest: Vec<Tree>, trees: &[Tree], n: u32) -> (Vec<Tree>, usize
         .iter()
         .map(|t| FixedBitSet::with_capacity(t.num_nodes()))
         .collect();
+    // Every leaf must appear in EXACTLY one emitted component. The exact unwind's
+    // best-effort join (and any upstream overlap) can repeat a leaf across
+    // components without sharing internal nodes, so leaf-disjointness must be
+    // enforced separately from node-disjointness — otherwise the emitted forest
+    // is not a valid agreement forest (duplicate leaves) and the harness rejects
+    // it. `used_leaf` tracks leaves already committed to a kept component.
+    let mut used_leaf = FixedBitSet::with_capacity(n as usize + 1);
     let mut out: Vec<Tree> = Vec::with_capacity(forest.len());
     let mut forest: Vec<Option<Tree>> = forest.into_iter().map(Some).collect();
     let mut exploded = 0usize;
 
     'comp: for &i in &order {
         let labels = &comp_leaves[i];
-        if labels.len() < 2 {
-            out.push(forest[i].take().unwrap());
-            continue;
-        }
-        // Must be a genuine agreement component, and node-disjoint from kept.
-        let valid = is_valid_af_component(labels, trees);
-        if valid {
-            let cov: Vec<Vec<u32>> = trees.iter().map(|t| vset_internal(t, labels)).collect();
-            let conflict = cov
-                .iter()
-                .enumerate()
-                .any(|(t, ns)| ns.iter().any(|&v| used[t].contains(v as usize)));
-            if !conflict {
-                for (t, ns) in cov.iter().enumerate() {
-                    for &v in ns {
-                        used[t].insert(v as usize);
-                    }
+        let any_dup = labels.iter().any(|&l| used_leaf.contains(l as usize));
+        // A genuine, node-disjoint, leaf-disjoint agreement component is kept
+        // as-is. Singletons (len<2) likewise, when their leaf is still free.
+        if !any_dup {
+            if labels.len() < 2 {
+                if let Some(&l) = labels.first() {
+                    used_leaf.insert(l as usize);
                 }
                 out.push(forest[i].take().unwrap());
-                continue 'comp;
+                continue;
+            }
+            if is_valid_af_component(labels, trees) {
+                let cov: Vec<Vec<u32>> = trees.iter().map(|t| vset_internal(t, labels)).collect();
+                let conflict = cov
+                    .iter()
+                    .enumerate()
+                    .any(|(t, ns)| ns.iter().any(|&v| used[t].contains(v as usize)));
+                if !conflict {
+                    for (t, ns) in cov.iter().enumerate() {
+                        for &v in ns {
+                            used[t].insert(v as usize);
+                        }
+                    }
+                    for &l in labels {
+                        used_leaf.insert(l as usize);
+                    }
+                    out.push(forest[i].take().unwrap());
+                    continue 'comp;
+                }
             }
         }
-        // Offender: explode into singletons (always valid, never overlaps).
+        // Offender (overlapping, invalid, or node-conflicting): explode into
+        // singletons for its still-free leaves only — never re-emitting a leaf
+        // already covered by a kept component.
+        let mut any = false;
         for &l in labels {
+            if !used_leaf.contains(l as usize) {
+                used_leaf.insert(l as usize);
+                out.push(Tree::singleton(l, n));
+                any = true;
+            }
+        }
+        if any {
+            exploded += 1;
+        }
+    }
+    // Safety net: any leaf never covered by the input forest becomes a singleton
+    // so the result is a complete partition of 1..=n.
+    for l in 1..=n {
+        if !used_leaf.contains(l as usize) {
             out.push(Tree::singleton(l, n));
         }
-        exploded += 1;
     }
     (out, exploded)
 }
