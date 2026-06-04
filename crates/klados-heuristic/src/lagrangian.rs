@@ -42,6 +42,18 @@ use crate::HeuristicSolver;
 
 const POOL_HARD_CAP: usize = 120_000;
 const POOL_PRUNE_TO: usize = 80_000;
+/// Memory ceiling for the column pool, measured in u32 "cells" (label + cover
+/// entries). On big cluster-free cores each column stores a full V-set cover
+/// (~thousands of cells), so the 120k COUNT cap alone let the pool reach 4-7 GB
+/// and OOM the 8 GB-limited instances. We bound the pool by total cells instead
+/// (~4 bytes each); 500M cells ≈ 2 GB, leaving headroom for trees/windows/seen
+/// under the limit. Pruning is by Lagrangian score, so the best columns survive.
+const POOL_CELL_BUDGET: usize = 500_000_000;
+
+/// Number of u32 cells a column occupies (labels + per-tree cover V-sets).
+fn block_cells(b: &Block) -> usize {
+    b.labels.len() + b.cover.iter().map(|c| c.len()).sum::<usize>()
+}
 /// B&P-whole tier: only try the full exact solver (with its internal Whidden
 /// decomposition) on instances up to this many leaves — beyond it B&P will just
 /// burn the cap. The cap itself bounds wasted time on within-range timeouts.
@@ -566,6 +578,8 @@ impl LagrangianSolver {
         let mut no_new = 0usize;
         let mut iter = 0usize;
         let mut proved = false;
+        // Running pool memory (u32 cells) for the budget-based prune.
+        let mut pool_cells: usize = pool.iter().map(block_cells).sum();
         // Convergence bookkeeping for the deadline-free stall exit.
         const REENERGISE_DRY_LIMIT: usize = 3;
         let mut reenergise_dry = 0usize;
@@ -735,10 +749,19 @@ impl LagrangianSolver {
             for c in new_cols {
                 if add_block(c, &mut pool, &mut seen) {
                     added += 1;
+                    pool_cells += block_cells(pool.last().unwrap());
                 }
             }
-            if pool.len() > POOL_HARD_CAP {
-                prune_pool(&mut pool, &alpha, &beta, POOL_PRUNE_TO);
+            if pool.len() > POOL_HARD_CAP || pool_cells > POOL_CELL_BUDGET {
+                prune_pool(
+                    &mut pool,
+                    &mut seen,
+                    &alpha,
+                    &beta,
+                    POOL_PRUNE_TO,
+                    POOL_CELL_BUDGET,
+                );
+                pool_cells = pool.iter().map(block_cells).sum();
             }
 
             // ---- Hybrid dual refresh: overwrite α/β with exact LP duals ----
@@ -3282,13 +3305,41 @@ fn node_images(restricted: &Tree, orig: &Tree, rev: &[u32]) -> Vec<u32> {
 }
 
 /// Drop the lowest-scoring blocks when the pool grows past the cap.
-fn prune_pool(pool: &mut Vec<Block>, alpha: &[f64], beta: &[Vec<f64>], keep: usize) {
+/// Prune the pool to the best columns under BOTH a count cap (`keep`) and the
+/// cell-memory budget (`max_cells`), keeping highest Lagrangian score first.
+/// Rebuilds `seen` from the survivors so the dedup set can't grow without bound
+/// (pruned columns may be re-priced later — fine, they were low value).
+fn prune_pool(
+    pool: &mut Vec<Block>,
+    seen: &mut ColumnSet,
+    alpha: &[f64],
+    beta: &[Vec<f64>],
+    keep: usize,
+    max_cells: usize,
+) {
     pool.sort_unstable_by(|a, b| {
         block_score(b, alpha, beta)
             .total_cmp(&block_score(a, alpha, beta))
             .then_with(|| b.weight.cmp(&a.weight))
     });
-    pool.truncate(keep);
+    let mut cells = 0usize;
+    let mut survivors = 0usize;
+    for b in pool.iter() {
+        if survivors >= keep {
+            break;
+        }
+        let c = block_cells(b);
+        if survivors > 0 && cells + c > max_cells {
+            break;
+        }
+        cells += c;
+        survivors += 1;
+    }
+    pool.truncate(survivors.max(1));
+    *seen = ColumnSet::new();
+    for b in pool.iter() {
+        seen.insert(b.labels.clone());
+    }
 }
 
 fn groups_from_partition(partition: &[usize], nl: usize) -> Vec<Vec<u32>> {
