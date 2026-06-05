@@ -61,6 +61,15 @@ const BP_TRY_MAX_LEAVES: u32 = 6000;
 /// Cluster router: don't attempt to split a sub-instance below this many leaves
 /// (decomposition overhead isn't worth it; just solve it).
 const DECOMP_MIN_LEAVES: u32 = 50;
+/// Above this reduced-leaf count we skip the decomposition attempt entirely:
+/// decomposition can't certify these and its O(n²) recombination would only
+/// waste budget — the flat engine owns them. (Well-decomposing instances up to
+/// ~6k leaves still prove fast via the attempt.)
+const DECOMP_TRY_MAX_LEAVES: u32 = 6_000;
+/// Wall-clock the decomposition attempt is allowed before we conclude the
+/// instance has a hard core and hand off to the flat engine. Well-decomposing
+/// instances prove well within this; hard ones forfeit only this much.
+const DECOMP_ATTEMPT: Duration = Duration::from_secs(25);
 /// Cluster router: irreducible clusters at or below this many leaves are PROBED
 /// with the exact B&P solver (used only if it proves optimal in the cap); larger
 /// ones, and probes that don't finish, go to the anytime cascade.
@@ -294,24 +303,46 @@ impl LagrangianSolver {
             }
         }
 
-        // Solve the reduced core — optionally via cluster decomposition (small
-        // clusters → exact B&P, large → this same cascade), else directly.
-        // Decomposition is the DEFAULT (disable via KLADOS_LAGR_NO_DECOMP).
-        // Across 16 instances it wins or ties every time vs no-decomp (n4465:
-        // 2904 vs 3079) — the strict cluster reduction yields independent
-        // subproblems the Lagrangian converges on far faster.
-        let decomp = std::env::var("KLADOS_LAGR_NO_DECOMP").is_err();
-        // ---- Phase 1: construct a complete forest ----
-        // Decompose and solve each cluster to its own convergence (the per-
-        // cluster stall is what lets the decomposition progress through every
-        // cluster instead of the first one eating all the time). Uses the full
-        // deadline — no reserved fraction.
-        let (mut reduced_forest, proved) =
-            if decomp && reduced.num_trees() == 2 && reduced.num_leaves >= DECOMP_MIN_LEAVES {
-                self.solve_decomposed(reduced, budget, start, trace)
-            } else {
-                self.solve_reduced_core(reduced, deadline, start, trace, 0)
-            };
+        // ---- Phase 1: construct a complete forest — decomposition router ----
+        //
+        // Route by PROVABILITY, not size. The cluster decomposition's strength
+        // is exact B&P on tiny clusters: on instances that split into provable
+        // clusters it certifies the optimum almost instantly. Its weakness is
+        // the hard-core / large case, where its recombination is O(n²) and it
+        // ends up emitting little better than Chen — there the flat anytime
+        // Lagrangian is far better (n=4669: 2789 vs 3253; n=15692: 7158 vs
+        // 8349) and maintains a complete incumbent that scales.
+        //
+        // So we give decomposition a *budgeted* attempt (it then slices the
+        // budget across clusters and RETURNS rather than grinding). If it proves
+        // the optimum → use it (the many fast-proving instances). If it cannot
+        // prove within the attempt, the instance has a hard core → discard and
+        // hand the whole reduced core to the flat engine for the rest of the
+        // time. Giants skip the attempt outright (decomposition can't help and
+        // its recombination would waste the budget).
+        let no_decomp = std::env::var("KLADOS_LAGR_NO_DECOMP").is_ok();
+        let try_decomp = !no_decomp
+            && reduced.num_trees() == 2
+            && reduced.num_leaves >= DECOMP_MIN_LEAVES
+            && reduced.num_leaves <= DECOMP_TRY_MAX_LEAVES;
+        let (mut reduced_forest, proved) = {
+            let mut proven = None;
+            if try_decomp {
+                let attempt = budget
+                    .map(|b| b.min(DECOMP_ATTEMPT))
+                    .unwrap_or(DECOMP_ATTEMPT);
+                let (forest, p) = self.solve_decomposed(reduced, Some(attempt), start, trace);
+                if p {
+                    proven = Some((forest, true)); // certified optimal — done
+                } else if trace {
+                    eprintln!(
+                        "[lagr] decomp attempt did not prove (hard core) — flat engine, t={:.1}s",
+                        start.elapsed().as_secs_f64()
+                    );
+                }
+            }
+            proven.unwrap_or_else(|| self.solve_reduced_core(reduced, deadline, start, trace, 0))
+        };
         if trace {
             eprintln!(
                 "[lagr] construction done: k={} proved={} t={:.1}s",
