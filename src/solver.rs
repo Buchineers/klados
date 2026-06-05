@@ -292,7 +292,7 @@ static EMITTED: AtomicBool = AtomicBool::new(false);
 /// grace, so a slow unwind can never cost the whole instance (a score-0
 /// timeout).
 #[cfg(feature = "early-termination")]
-const WATCHDOG_EMIT_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+const WATCHDOG_EMIT_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[cfg(feature = "early-termination")]
 fn emit_forest(forest: &[Tree]) {

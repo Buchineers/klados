@@ -282,6 +282,7 @@ impl RootPoolSolver {
                     columns: &columns,
                     seen: &seen,
                     branchings: &branchings,
+                    terminate: &crate::bp::pricer::NEVER_TERMINATE,
                 },
                 &mut scratch,
             );
@@ -808,6 +809,7 @@ fn expand_shell_anchor_best(
                 columns,
                 seen,
                 branchings: &branchings,
+                terminate: &crate::bp::pricer::NEVER_TERMINATE,
             };
             collect_corridor_candidates_ref(&ctx, &mut cache, 1, gamma, &forbidden)
         };

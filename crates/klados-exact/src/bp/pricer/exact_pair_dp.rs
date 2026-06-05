@@ -369,6 +369,13 @@ fn collect_candidates_above(
     best_r0.fill((NEG_INF, 0u32));
 
     for &u in &t0_post {
+        // Cooperative cancellation: this O(n0·n1) DP is the longest
+        // uninterruptible step in the solver; bail promptly on SIGTERM. The
+        // partial result is discarded by the caller on termination, so leaving
+        // the DP incomplete is safe.
+        if ctx.terminate.load(core::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
         let u_idx = u as usize;
 
         if t0.is_leaf(u) {

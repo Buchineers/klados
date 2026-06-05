@@ -674,6 +674,7 @@ impl LagrangianSolver {
                     columns: &[],
                     seen: &seen,
                     branchings: &branchings,
+                    terminate: self.terminate.as_ref(),
                 };
                 for col in scratch.drain_reserve(&ctx, 64) {
                     new_cols.push(col.labels().to_vec());
@@ -724,6 +725,7 @@ impl LagrangianSolver {
                             columns: &[],
                             seen: &w.seen,
                             branchings: &branchings,
+                            terminate: self.terminate.as_ref(),
                         };
                         let mut g = Vec::new();
                         for col in w.scratch.drain_reserve(&ctx, 64) {
@@ -1071,6 +1073,7 @@ impl LagrangianSolver {
                         columns: &[],
                         seen: &seen,
                         branchings: &br,
+                        terminate: self.terminate.as_ref(),
                     };
                     let mut got: Vec<Vec<u32>> = Vec::new();
                     if let PricingResult::Found(cols) = pricer.price(&ctx, &mut scratch) {
@@ -1292,7 +1295,8 @@ impl LagrangianSolver {
     /// Exact B&P on a cluster, wall-capped by a watchdog. Returns `Some` ONLY if
     /// B&P FINISHED (proved optimal) before the cap — a time-capped B&P returns a
     /// garbage near-Chen incumbent, which must NOT be trusted (the caller then
-    /// solves the cluster with the anytime cascade instead).
+    /// solves the cluster with the anytime cascade instead). The pricer now polls
+    /// the shared `term` flag, so a SIGTERM aborts the inner DP promptly.
     fn solve_cluster_exact(&self, sub: &Instance, deadline: Instant) -> Option<Vec<Tree>> {
         let term = Arc::new(AtomicBool::new(false));
         let capped = Arc::new(AtomicBool::new(false));
@@ -1312,7 +1316,6 @@ impl LagrangianSolver {
         let res = klados_exact::bp::bp_solve_capped(sub, &term);
         term.store(true, Ordering::Relaxed);
         let _ = wd.join();
-        // The watchdog fired ⇒ B&P was cut short ⇒ its incumbent is untrustworthy.
         if capped.load(Ordering::Relaxed) {
             return None;
         }
@@ -1373,6 +1376,7 @@ impl LagrangianSolver {
                     columns: &[],
                     seen,
                     branchings,
+                    terminate: self.terminate.as_ref(),
                 };
                 for col in scratch.drain_reserve(&ctx, 64) {
                     newc.push(col.labels().to_vec());
@@ -1647,6 +1651,7 @@ impl LagrangianSolver {
                 columns: &[],
                 seen,
                 branchings: &branchings,
+                terminate: self.terminate.as_ref(),
             };
             for col in scratch.drain_reserve(&ctx, 64) {
                 newc.push(col.labels().to_vec());
@@ -2559,6 +2564,7 @@ impl LagrangianSolver {
                     columns: &pool,
                     seen: &seen,
                     branchings: &branchings,
+                    terminate: self.terminate.as_ref(),
                 };
                 let mut new_cols: Vec<AfColumn> = scratch.drain_reserve(&ctx, 64);
                 if let PricingResult::Found(cols) = pricer.price(&ctx, &mut scratch) {
@@ -2611,6 +2617,7 @@ impl LagrangianSolver {
                             columns: &[],
                             seen: &w.seen,
                             branchings: &branchings,
+                            terminate: self.terminate.as_ref(),
                         };
                         let mut g = Vec::new();
                         for col in w.scratch.drain_reserve(&ctx, 64) {
@@ -2787,6 +2794,7 @@ impl LagrangianSolver {
                     columns: pool,
                     seen,
                     branchings,
+                    terminate: self.terminate.as_ref(),
                 };
                 let mut new_cols: Vec<AfColumn> = scratch.drain_reserve(&ctx, 64);
                 let r = pricer.price(&ctx, scratch);

@@ -51,7 +51,16 @@ pub struct PricingContext<'a> {
     pub columns: &'a [AfColumn],
     pub seen: &'a ColumnSet,
     pub branchings: &'a Branchings,
+    /// Cooperative cancellation for the (otherwise uninterruptible) inner DP.
+    /// The pricing recurrence on a large core can run for seconds; checking this
+    /// flag lets a SIGTERM abort it promptly. Callers without a real flag pass
+    /// [`NEVER_TERMINATE`].
+    pub terminate: &'a core::sync::atomic::AtomicBool,
 }
+
+/// Never-set cancellation flag for pricing callers that don't supply their own.
+pub static NEVER_TERMINATE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// Outcome of a pricing call. The solver trusts the LP bound (bound-prune,
 /// optimality certification) **only** on `Converged`.
