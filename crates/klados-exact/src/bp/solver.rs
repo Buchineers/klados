@@ -696,6 +696,7 @@ fn solve_node<P: Pricer, S: BranchSelector>(
                 columns: state.columns(),
                 seen: state.seen(),
                 branchings,
+                terminate: terminate,
             },
             scratch,
         );

@@ -938,6 +938,7 @@ where
     let mut candidates: Vec<(NodeId, usize)> =
         collect_rspr_cluster_points(t1, t2, &leaf_sets_t1, &twin_t1_to_t2, &twin_t2_to_t1, n)
             .into_iter()
+            .into_iter()
             .filter(|point| point.kind == RsprClusterPointKind::Strict)
             .filter(|point| point.size >= 2 && point.size <= n - 2)
             .filter(|point| point.t1_round_trip == point.t1_node)

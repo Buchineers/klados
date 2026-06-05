@@ -360,6 +360,7 @@ impl CorridorSolver {
                     columns: &columns,
                     seen: &seen,
                     branchings: &branchings,
+                    terminate: &crate::bp::pricer::NEVER_TERMINATE,
                 };
                 // Corridor enumeration: either anchor-best (legacy
                 // behaviour, K=1) or top-K threshold DP. The choice is
@@ -552,6 +553,7 @@ fn run_cg<P: Pricer>(
                 columns,
                 seen,
                 branchings,
+                terminate: &crate::bp::pricer::NEVER_TERMINATE,
             },
             scratch,
         );

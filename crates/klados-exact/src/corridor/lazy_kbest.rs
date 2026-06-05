@@ -937,6 +937,7 @@ mod tests {
             columns: &columns,
             seen: &seen,
             branchings: &branchings,
+            terminate: &crate::bp::pricer::NEVER_TERMINATE,
         };
 
         let mut existing_cache = ExactPairDpCache::new(n0, n1, nl);
