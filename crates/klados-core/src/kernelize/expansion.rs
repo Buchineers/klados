@@ -16,6 +16,42 @@ pub fn expand_solution(
     original_ref_tree: &Tree,
     original_num_leaves: u32,
 ) -> Vec<Tree> {
+    expand_impl(
+        reduced_components,
+        result,
+        original_ref_tree,
+        original_num_leaves,
+        true,
+    )
+}
+
+/// Like [`expand_solution`] but builds the expanded forest pieces WITHOUT the
+/// dense `label_to_node` index — O(total leaves) memory instead of
+/// O(#components · num_leaves). For heuristic output forests, which are only
+/// traversed/serialized (never label-queried). On a k-component solution over n
+/// leaves this is the difference between O(n) and O(k·n) ≈ O(n²) memory.
+pub fn expand_solution_unindexed(
+    reduced_components: Vec<Tree>,
+    result: &KernelizeResult,
+    original_ref_tree: &Tree,
+    original_num_leaves: u32,
+) -> Vec<Tree> {
+    expand_impl(
+        reduced_components,
+        result,
+        original_ref_tree,
+        original_num_leaves,
+        false,
+    )
+}
+
+fn expand_impl(
+    reduced_components: Vec<Tree>,
+    result: &KernelizeResult,
+    original_ref_tree: &Tree,
+    original_num_leaves: u32,
+    indexed: bool,
+) -> Vec<Tree> {
     let collapses = &result.collapses_original;
     let reverse_map = &result.reverse_map;
 
@@ -25,6 +61,7 @@ pub fn expand_solution(
             reverse_map,
             original_ref_tree,
             original_num_leaves,
+            indexed,
         )
     } else {
         expand_with_collapses(
@@ -33,6 +70,7 @@ pub fn expand_solution(
             reverse_map,
             original_ref_tree,
             original_num_leaves,
+            indexed,
         )
     };
 
@@ -44,17 +82,24 @@ pub fn expand_solution(
             for &l in all_labels {
                 ls.insert(l as usize);
             }
-            components.push(Tree::component_from_leafset(
-                &ls,
-                original_ref_tree,
-                original_num_leaves,
-            ));
-        } else {
+            components.push(make_component(&ls, original_ref_tree, original_num_leaves, indexed));
+        } else if indexed {
             components.push(Tree::singleton(orig_label, original_num_leaves));
+        } else {
+            components.push(Tree::forest_singleton(orig_label, original_num_leaves));
         }
     }
 
     components
+}
+
+/// Build a component (indexed or unindexed) from a leafset.
+fn make_component(ls: &FixedBitSet, reference: &Tree, num_leaves: u32, indexed: bool) -> Tree {
+    if indexed {
+        Tree::component_from_leafset(ls, reference, num_leaves)
+    } else {
+        Tree::forest_component(ls, reference, num_leaves)
+    }
 }
 
 /// Build map from collapse representative -> all labels it represents (itself + removed),
@@ -91,6 +136,7 @@ fn expand_with_collapses(
     reverse_map: &[u32],
     original_ref_tree: &Tree,
     original_num_leaves: u32,
+    indexed: bool,
 ) -> Vec<Tree> {
     let label_space = original_num_leaves as usize;
     let rep_to_all = build_rep_to_all(collapses);
@@ -109,10 +155,11 @@ fn expand_with_collapses(
             }
         }
 
-        result.push(Tree::component_from_leafset(
+        result.push(make_component(
             &expanded_ls,
             original_ref_tree,
             original_num_leaves,
+            indexed,
         ));
     }
     result
@@ -124,6 +171,7 @@ fn expand_with_reverse_map(
     reverse_map: &[u32],
     original_ref_tree: &Tree,
     original_num_leaves: u32,
+    indexed: bool,
 ) -> Vec<Tree> {
     let label_space = original_num_leaves as usize;
     let mut result = Vec::with_capacity(reduced_components.len());
@@ -133,10 +181,11 @@ fn expand_with_reverse_map(
             let old_lbl = reverse_map[new_lbl as usize];
             expanded_ls.insert(old_lbl as usize);
         }
-        result.push(Tree::component_from_leafset(
+        result.push(make_component(
             &expanded_ls,
             original_ref_tree,
             original_num_leaves,
+            indexed,
         ));
     }
     result

@@ -153,6 +153,14 @@ pub struct LagrangianSolver {
     /// trivial-but-valid forest before any heavy work, then replaced as the
     /// solver improves it.
     incumbent: Arc<Mutex<Vec<Tree>>>,
+    /// True while the current solve is the flat top-level (depth 0), whose
+    /// forests are terminal (→ LNS → expand → output) and never fed to
+    /// `whidden_cluster` recombination. Set at each `solve_reduced_core` entry.
+    /// Lets the primal packers (`solve_rmp`/`bnb_anytime`) build their
+    /// per-iteration forests WITHOUT the O(num_leaves) index — the bulk of the
+    /// during-solve forest memory on large flat cores. Cluster solves (depth ≥
+    /// 1) leave it false so their pieces stay label-queryable for recombination.
+    flat_terminal: AtomicBool,
 }
 
 impl LagrangianSolver {
@@ -161,6 +169,7 @@ impl LagrangianSolver {
             terminate: Arc::new(AtomicBool::new(false)),
             stats: SolverStats::default(),
             incumbent: Arc::new(Mutex::new(Vec::new())),
+            flat_terminal: AtomicBool::new(false),
         }
     }
 
@@ -204,7 +213,7 @@ impl LagrangianSolver {
         // than singletons (which would score 0: k=n).
         {
             let (_lo, _up, sets) = chen_pair_agreement(&instance.trees[0], &instance.trees[1]);
-            let base = forest_from_partition(&sets, &instance.trees, orig_n);
+            let base = forest_from_partition(&sets, &instance.trees, orig_n, true);
             let (base, _) = repair_forest(base, &instance.trees, orig_n);
             self.publish(&base);
         }
@@ -233,7 +242,7 @@ impl LagrangianSolver {
             } else {
                 vec![reduced.trees[0].clone()]
             };
-            let expanded = klados_core::kernelize::expand_solution(
+            let expanded = klados_core::kernelize::expand_solution_unindexed(
                 reduced_forest,
                 &kern,
                 &instance.trees[0],
@@ -285,7 +294,7 @@ impl LagrangianSolver {
                         start.elapsed().as_secs_f64()
                     );
                 }
-                let expanded = klados_core::kernelize::expand_solution(
+                let expanded = klados_core::kernelize::expand_solution_unindexed(
                     reduced_forest,
                     &kern,
                     &instance.trees[0],
@@ -362,7 +371,7 @@ impl LagrangianSolver {
         {
             reduced_forest = self.lns_improve(reduced, reduced_forest, deadline, start, trace);
         }
-        let expanded = klados_core::kernelize::expand_solution(
+        let expanded = klados_core::kernelize::expand_solution_unindexed(
             reduced_forest,
             &kern,
             &instance.trees[0],
@@ -396,6 +405,20 @@ impl LagrangianSolver {
         // Indent trace by decomposition depth so nested cluster solves are
         // visually attributable to their level.
         let ind = "  ".repeat(depth);
+
+        // depth == 0 is the flat top-level solve: its forest is TERMINAL — it
+        // flows to LNS → expand → output and is never fed to whidden_cluster
+        // recombination (that only consumes sub-cluster forests at depth ≥ 1).
+        // So at depth 0 we build the forest pieces WITHOUT the O(num_leaves)
+        // `label_to_node` index, turning a k-component forest from O(k·n) ≈
+        // O(n²) memory into O(n). depth ≥ 1 (cluster solves) MUST stay indexed —
+        // `whidden_cluster` label-queries those pieces during recombination.
+        let unindexed = depth == 0;
+        // Publish to the field so the primal packers (called via &self deep in
+        // the CG loop) pick the same indexing without threading a param through
+        // every signature. Single-threaded within a solve; nested cluster solves
+        // overwrite it and the depth-0 frame never has a nested core in-stack.
+        self.flat_terminal.store(unindexed, Ordering::Relaxed);
 
         // Anytime Lagrangian branch-and-bound: branch on the dual (subgradient),
         // NOT the LP. The flat subgradient plateaus at the LP↔integer gap because
@@ -485,7 +508,7 @@ impl LagrangianSolver {
 
         // ---- Warm start: Chen 2-approx forest ----
         let (_chen_lo, _chen_up, chen_sets) = chen_pair_agreement(&trees[0], &trees[1]);
-        let mut best_forest = forest_from_partition(&chen_sets, trees, n);
+        let mut best_forest = forest_from_partition(&chen_sets, trees, n, unindexed);
         let mut best_components = best_forest.len();
         // Column indices of the best packing so far (seed for the improvement
         // loop). Empty ⇒ the Chen warm-start (all singletons w.r.t. the pool).
@@ -1127,7 +1150,7 @@ impl LagrangianSolver {
                 let (comps, sel) = greedy_pack(&pool, &sc2, trees, n, &br);
                 if comps < best_components {
                     best_components = comps;
-                    best_forest = build_forest(&pool, &sel, trees, n);
+                    best_forest = build_forest(&pool, &sel, trees, n, unindexed);
                     if trace {
                         eprintln!(
                             "{ind}[lagr] branch must-link({},{}) improved: best={}",
@@ -1162,7 +1185,7 @@ impl LagrangianSolver {
             let k1 = nl - savings1;
             if k1 < best_components {
                 best_components = k1;
-                best_forest = build_forest(&pool, &sel1, trees, n);
+                best_forest = build_forest(&pool, &sel1, trees, n, unindexed);
             }
         }
 
@@ -1492,7 +1515,7 @@ impl LagrangianSolver {
             }
         };
         let (_, _, chen_sets) = chen_pair_agreement(&trees[0], &trees[1]);
-        let mut global_best_forest = forest_from_partition(&chen_sets, trees, n);
+        let mut global_best_forest = forest_from_partition(&chen_sets, trees, n, false);
         let mut global_best_k = global_best_forest.len();
         for s in &chen_sets {
             add(s.clone(), &mut pool, &mut seen);
@@ -1568,7 +1591,7 @@ impl LagrangianSolver {
             );
             if k < global_best_k {
                 global_best_k = k;
-                global_best_forest = build_forest(&pool, &sel, trees, n);
+                global_best_forest = build_forest(&pool, &sel, trees, n, false);
                 if trace {
                     eprintln!(
                         "[lagr][lbnb] node={} depth={} k={} (best) t={:.1}s",
@@ -1591,7 +1614,7 @@ impl LagrangianSolver {
                     greedy_pack(&pool, &uscores, trees, n, &Branchings::default());
                 if uk < global_best_k {
                     global_best_k = uk;
-                    global_best_forest = build_forest(&pool, &usel, trees, n);
+                    global_best_forest = build_forest(&pool, &usel, trees, n, false);
                     if trace {
                         eprintln!(
                             "[lagr][lbnb] node={} (unconstrained pack) k={} t={:.1}s",
@@ -1746,7 +1769,7 @@ impl LagrangianSolver {
             }
         };
         let (_, _, chen_sets) = chen_pair_agreement(&trees[0], &trees[1]);
-        let mut best_forest = forest_from_partition(&chen_sets, trees, n);
+        let mut best_forest = forest_from_partition(&chen_sets, trees, n, false);
         let mut best_k = best_forest.len();
         for s in &chen_sets {
             add(s.clone(), &mut pool, &mut seen);
@@ -1822,7 +1845,7 @@ impl LagrangianSolver {
             let (k, sel) = greedy_pack(&pool, &scores, trees, n, &Branchings::default());
             if k < best_k {
                 best_k = k;
-                best_forest = build_forest(&pool, &sel, trees, n);
+                best_forest = build_forest(&pool, &sel, trees, n, false);
             }
         }
         if trace {
@@ -1895,7 +1918,7 @@ impl LagrangianSolver {
                     let k = committed.len() + (nl - covered.count_ones(..));
                     if k < best_k {
                         best_k = k;
-                        best_forest = build_forest(&pool, &committed, trees, n);
+                        best_forest = build_forest(&pool, &committed, trees, n, false);
                         if trace {
                             eprintln!(
                                 "[lagr][dive] commit #{} k={} covered={}/{} t={:.1}s",
@@ -2387,7 +2410,10 @@ impl LagrangianSolver {
                 for sl in comp.leaves() {
                     bs.insert(sub_to_orig[sl as usize] as usize);
                 }
-                candidate.push(Tree::component_from_leafset(&bs, &trees[0], n));
+                // LNS runs only at the flat top level; its candidate forest is
+                // terminal (validated, then spliced into the returned incumbent),
+                // never recombined — so build it compact.
+                candidate.push(Tree::forest_component(&bs, &trees[0], n));
             }
 
             if candidate.len() < incumbent.len()
@@ -2447,7 +2473,7 @@ impl LagrangianSolver {
         let mut proved = false;
 
         let (_lo, _up, chen_sets) = chen_pair_agreement(&trees[0], &trees[1]);
-        let mut best_forest = forest_from_partition(&chen_sets, trees, n);
+        let mut best_forest = forest_from_partition(&chen_sets, trees, n, false);
         let mut best_components = best_forest.len();
 
         let mut builder = ColumnBuilder::new(trees);
@@ -2685,7 +2711,7 @@ impl LagrangianSolver {
                 .iter()
                 .map(|c| c.pricing_score(&sol.leaf_duals, &sol.node_duals))
                 .collect();
-            if let Some((forest, comps)) = greedy_pack_af(&pool, &scores, trees, n) {
+            if let Some((forest, comps)) = greedy_pack_af(&pool, &scores, trees, n, self.flat_terminal.load(Ordering::Relaxed)) {
                 if comps < best_components {
                     best_components = comps;
                     best_forest = forest;
@@ -2723,7 +2749,7 @@ impl LagrangianSolver {
                 {
                     if let Ok(Some(mip)) = rmp.solve_mip_with_time_limit(0.5) {
                         if let Some((forest, comps)) =
-                            forest_from_lp(&pool, &mip.column_values, trees, n)
+                            forest_from_lp(&pool, &mip.column_values, trees, n, self.flat_terminal.load(Ordering::Relaxed))
                         {
                             if comps < best_components {
                                 best_components = comps;
@@ -2915,7 +2941,7 @@ impl LagrangianSolver {
             }
 
             // Incumbent from this node's LP support.
-            if let Some((forest, comps)) = forest_from_lp(pool, &sol.column_values, trees, n) {
+            if let Some((forest, comps)) = forest_from_lp(pool, &sol.column_values, trees, n, self.flat_terminal.load(Ordering::Relaxed)) {
                 if comps < best_components {
                     best_components = comps;
                     best_forest = forest;
@@ -3013,7 +3039,7 @@ impl LagrangianSolver {
         let components = n as usize - savings;
         if components < *best_components {
             *best_components = components;
-            *best_forest = build_forest(pool, &selected, trees, n);
+            *best_forest = build_forest(pool, &selected, trees, n, false);
             *best_sel = selected;
             true
         } else {
@@ -3389,7 +3415,31 @@ fn groups_from_partition(partition: &[usize], nl: usize) -> Vec<Vec<u32>> {
     by_comp.into_values().filter(|g| g.len() >= 2).collect()
 }
 
-fn forest_from_partition(sets: &[Vec<u32>], trees: &[Tree], n: u32) -> Vec<Tree> {
+/// Build a singleton component, indexed or compact (unindexed) per `unindexed`.
+/// Unindexed pieces are O(1) memory and traverse-only — used for TERMINAL
+/// forests (held incumbent, flat depth-0 output) that are never label-queried
+/// or fed to `whidden_cluster` recombination. See [`Tree::forest_singleton`].
+#[inline]
+fn mk_singleton(l: u32, n: u32, unindexed: bool) -> Tree {
+    if unindexed {
+        Tree::forest_singleton(l, n)
+    } else {
+        Tree::singleton(l, n)
+    }
+}
+
+/// Build a leafset component, indexed or compact (unindexed) per `unindexed`.
+/// See [`mk_singleton`] for when unindexed is safe.
+#[inline]
+fn mk_component(bs: &FixedBitSet, tref: &Tree, n: u32, unindexed: bool) -> Tree {
+    if unindexed {
+        Tree::forest_component(bs, tref, n)
+    } else {
+        Tree::component_from_leafset(bs, tref, n)
+    }
+}
+
+fn forest_from_partition(sets: &[Vec<u32>], trees: &[Tree], n: u32, unindexed: bool) -> Vec<Tree> {
     let mut forest = Vec::with_capacity(sets.len());
     let mut covered = FixedBitSet::with_capacity(n as usize + 1);
     for s in sets {
@@ -3397,18 +3447,18 @@ fn forest_from_partition(sets: &[Vec<u32>], trees: &[Tree], n: u32) -> Vec<Tree>
             covered.insert(l as usize);
         }
         if s.len() == 1 {
-            forest.push(Tree::singleton(s[0], n));
+            forest.push(mk_singleton(s[0], n, unindexed));
         } else {
             let mut bs = FixedBitSet::with_capacity(n as usize + 1);
             for &l in s {
                 bs.insert(l as usize);
             }
-            forest.push(Tree::component_from_leafset(&bs, &trees[0], n));
+            forest.push(mk_component(&bs, &trees[0], n, unindexed));
         }
     }
     for l in 1..=n {
         if !covered.contains(l as usize) {
-            forest.push(Tree::singleton(l, n));
+            forest.push(mk_singleton(l, n, unindexed));
         }
     }
     // sanity: every leaf covered exactly once (Chen forest is a partition)
@@ -3425,6 +3475,7 @@ fn greedy_pack_af(
     scores: &[f64],
     trees: &[Tree],
     n: u32,
+    unindexed: bool,
 ) -> Option<(Vec<Tree>, usize)> {
     let mut order: Vec<usize> = (0..pool.len())
         .filter(|&i| pool[i].labels().len() >= 2)
@@ -3462,11 +3513,11 @@ fn greedy_pack_af(
             bs.insert(l as usize);
             covered.insert(l as usize);
         }
-        forest.push(Tree::component_from_leafset(&bs, &trees[0], n));
+        forest.push(mk_component(&bs, &trees[0], n, unindexed));
     }
     for l in 1..=n {
         if !covered.contains(l as usize) {
-            forest.push(Tree::singleton(l, n));
+            forest.push(mk_singleton(l, n, unindexed));
         }
     }
     let len = forest.len();
@@ -3481,6 +3532,7 @@ fn forest_from_lp(
     x: &[f64],
     trees: &[Tree],
     n: u32,
+    unindexed: bool,
 ) -> Option<(Vec<Tree>, usize)> {
     let mut used: Vec<FixedBitSet> = trees
         .iter()
@@ -3509,11 +3561,11 @@ fn forest_from_lp(
             bs.insert(l as usize);
             covered.insert(l as usize);
         }
-        forest.push(Tree::component_from_leafset(&bs, &trees[0], n));
+        forest.push(mk_component(&bs, &trees[0], n, unindexed));
     }
     for l in 1..=n {
         if !covered.contains(l as usize) {
-            forest.push(Tree::singleton(l, n));
+            forest.push(mk_singleton(l, n, unindexed));
         }
     }
     let len = forest.len();
@@ -3711,7 +3763,13 @@ fn repair_forest(forest: Vec<Tree>, trees: &[Tree], n: u32) -> (Vec<Tree>, usize
     (out, exploded)
 }
 
-fn build_forest(pool: &[Block], selected: &[usize], trees: &[Tree], n: u32) -> Vec<Tree> {
+fn build_forest(
+    pool: &[Block],
+    selected: &[usize],
+    trees: &[Tree],
+    n: u32,
+    unindexed: bool,
+) -> Vec<Tree> {
     let mut forest = Vec::with_capacity(selected.len());
     let mut covered = FixedBitSet::with_capacity(n as usize + 1);
     for &i in selected {
@@ -3721,11 +3779,11 @@ fn build_forest(pool: &[Block], selected: &[usize], trees: &[Tree], n: u32) -> V
             bs.insert(l as usize);
             covered.insert(l as usize);
         }
-        forest.push(Tree::component_from_leafset(&bs, &trees[0], n));
+        forest.push(mk_component(&bs, &trees[0], n, unindexed));
     }
     for l in 1..=n {
         if !covered.contains(l as usize) {
-            forest.push(Tree::singleton(l, n));
+            forest.push(mk_singleton(l, n, unindexed));
         }
     }
     forest

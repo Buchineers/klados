@@ -28,7 +28,7 @@ use crate::Instance;
 use fixedbitset::FixedBitSet;
 use std::collections::BTreeMap;
 
-pub use expansion::{build_rep_to_all, expand_solution};
+pub use expansion::{build_rep_to_all, expand_solution, expand_solution_unindexed};
 pub use instance_ops::{
     compose_reverse_maps, reduce_instance, restrict_instance_remove_label, restrict_instance_simple,
 };
