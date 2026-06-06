@@ -149,7 +149,15 @@ impl Tree {
     /// Get node by leaf label
     #[inline]
     pub fn node_by_label(&self, label: Label) -> NodeId {
-        self.label_to_node[label as usize]
+        // Bounds-checked: component trees (singletons, pruned/extracted forest
+        // pieces) carry an EMPTY `label_to_node` because they are only ever
+        // traversed, never label-indexed — building the dense O(n) index per
+        // component made a k-component forest O(n²) memory. A query for a label
+        // not in the index correctly means "not in this tree".
+        self.label_to_node
+            .get(label as usize)
+            .copied()
+            .unwrap_or(NONE)
     }
 
     /// Get sibling of a node (None for root)
@@ -196,9 +204,23 @@ impl Tree {
         self.parent.len()
     }
 
-    /// Iterate over all leaf labels
-    pub fn leaves(&self) -> impl Iterator<Item = Label> + '_ {
-        (1..=self.num_leaves).filter(move |&lbl| self.label_to_node[lbl as usize] != NONE)
+    /// Iterate over all leaf labels.
+    ///
+    /// Indexed trees (instances) enumerate via `label_to_node` (sorted by
+    /// label, as before). Unindexed forest pieces enumerate via the node
+    /// `label` array (tree order) — order is unspecified for those, but no
+    /// caller of a forest piece's leaves relies on label order. No allocation.
+    pub fn leaves(&self) -> LeafIter<'_> {
+        if self.label_to_node.is_empty() {
+            LeafIter::Scan {
+                labels: self.label.iter(),
+            }
+        } else {
+            LeafIter::Indexed {
+                tree: self,
+                next: 1,
+            }
+        }
     }
 
     /// Iterate over nodes in post-order (leaves before parents)
@@ -337,10 +359,33 @@ impl Tree {
     ///
     /// Suppresses degree-1 internal nodes to keep the tree binary.
     /// The label space (and `num_leaves`) is preserved from `self`.
+    /// The result carries the dense `label_to_node` index (label-queryable).
     pub fn prune_to_leafset(&self, keep: &FixedBitSet) -> Self {
-        let mut out = Tree::with_capacity(self.num_leaves);
+        self.prune_impl(keep, true)
+    }
 
-        fn build(src: &Tree, keep: &FixedBitSet, out: &mut Tree, node: NodeId) -> Option<NodeId> {
+    /// Unindexed counterpart of [`prune_to_leafset`](Self::prune_to_leafset) for
+    /// heuristic forest-output pieces: O(kept) memory, traverse-only.
+    pub fn prune_to_leafset_unindexed(&self, keep: &FixedBitSet) -> Self {
+        self.prune_impl(keep, false)
+    }
+
+    fn prune_impl(&self, keep: &FixedBitSet, indexed: bool) -> Self {
+        let mut out = if indexed {
+            Tree::with_capacity(self.num_leaves)
+        } else {
+            // Only traversed, so skip the O(instance) `label_to_node` index —
+            // `2·kept` nodes of topology only.
+            Tree::with_capacity_unindexed(2 * keep.count_ones(..).max(1), self.num_leaves)
+        };
+
+        fn build(
+            src: &Tree,
+            keep: &FixedBitSet,
+            out: &mut Tree,
+            indexed: bool,
+            node: NodeId,
+        ) -> Option<NodeId> {
             if src.is_leaf(node) {
                 let lbl = src.label[node as usize];
                 if lbl != 0 && keep.contains(lbl as usize) {
@@ -349,15 +394,17 @@ impl Tree {
                     out.left.push(NONE);
                     out.right.push(NONE);
                     out.label.push(lbl);
-                    out.label_to_node[lbl as usize] = id;
+                    if indexed {
+                        out.label_to_node[lbl as usize] = id;
+                    }
                     return Some(id);
                 }
                 return None;
             }
 
             let (left, right) = src.children(node).unwrap();
-            let l = build(src, keep, out, left);
-            let r = build(src, keep, out, right);
+            let l = build(src, keep, out, indexed, left);
+            let r = build(src, keep, out, indexed, right);
 
             match (l, r) {
                 (None, None) => None,
@@ -376,7 +423,7 @@ impl Tree {
         }
 
         if self.root != NONE {
-            if let Some(root) = build(self, keep, &mut out, self.root) {
+            if let Some(root) = build(self, keep, &mut out, indexed, self.root) {
                 out.root = root;
                 out.parent[root as usize] = NONE;
             } else {
@@ -388,11 +435,29 @@ impl Tree {
         out
     }
 
+    /// Like [`with_capacity`](Self::with_capacity) but WITHOUT the dense
+    /// `label_to_node` index — for "component" trees that are only traversed
+    /// (forest output pieces). Keeps memory O(component size) instead of
+    /// O(instance size); `node_by_label`/`leaves` work via the node arrays.
+    fn with_capacity_unindexed(reserve_nodes: usize, num_leaves: u32) -> Self {
+        Self {
+            parent: Vec::with_capacity(reserve_nodes),
+            left: Vec::with_capacity(reserve_nodes),
+            right: Vec::with_capacity(reserve_nodes),
+            label: Vec::with_capacity(reserve_nodes),
+            label_to_node: Vec::new(),
+            depth: Vec::with_capacity(reserve_nodes),
+            subtree_size: Vec::with_capacity(reserve_nodes),
+            num_leaves,
+            root: NONE,
+        }
+    }
+
     /// Create a singleton tree containing exactly one leaf with the given label.
     ///
     /// Ported from `shi_mestel::utils::make_singleton_tree`. The label space
     /// (`num_leaves`) is preserved so the tree is compatible with others on the
-    /// same instance.
+    /// same instance. Carries the dense index, so it is label-queryable.
     pub fn singleton(label: Label, num_leaves: u32) -> Self {
         let mut t = Tree::with_capacity(num_leaves);
         t.parent.push(NONE);
@@ -400,6 +465,19 @@ impl Tree {
         t.right.push(NONE);
         t.label.push(label);
         t.label_to_node[label as usize] = 0;
+        t.root = 0;
+        t.compute_metadata();
+        t
+    }
+
+    /// Unindexed counterpart of [`singleton`](Self::singleton) for heuristic
+    /// forest-output pieces: O(1) memory, traverse-only (no `label_to_node`).
+    pub fn forest_singleton(label: Label, num_leaves: u32) -> Self {
+        let mut t = Tree::with_capacity_unindexed(1, num_leaves);
+        t.parent.push(NONE);
+        t.left.push(NONE);
+        t.right.push(NONE);
+        t.label.push(label);
         t.root = 0;
         t.compute_metadata();
         t
@@ -421,6 +499,53 @@ impl Tree {
             Tree::singleton(lbl, num_leaves)
         } else {
             reference.prune_to_leafset(leafset)
+        }
+    }
+
+    /// Unindexed counterpart of [`component_from_leafset`](Self::component_from_leafset)
+    /// for heuristic forest output: builds the component in O(component size)
+    /// memory rather than O(num_leaves). The result is traverse-only — a forest
+    /// of `k` such pieces is O(total leaves), not O(k · num_leaves).
+    pub fn forest_component(leafset: &FixedBitSet, reference: &Tree, num_leaves: u32) -> Self {
+        if leafset.count_ones(..) == 1 {
+            let lbl = leafset.ones().next().unwrap() as Label;
+            Tree::forest_singleton(lbl, num_leaves)
+        } else {
+            reference.prune_to_leafset_unindexed(leafset)
+        }
+    }
+}
+
+/// Non-allocating iterator over a tree's leaf labels. Handles both indexed
+/// trees (enumerate sorted via `label_to_node`) and unindexed forest pieces
+/// (scan the node `label` array). Returned by [`Tree::leaves`].
+pub enum LeafIter<'a> {
+    Indexed { tree: &'a Tree, next: Label },
+    Scan { labels: core::slice::Iter<'a, Label> },
+}
+
+impl Iterator for LeafIter<'_> {
+    type Item = Label;
+    fn next(&mut self) -> Option<Label> {
+        match self {
+            LeafIter::Indexed { tree, next } => {
+                while *next <= tree.num_leaves {
+                    let cur = *next;
+                    *next += 1;
+                    if tree.label_to_node[cur as usize] != NONE {
+                        return Some(cur);
+                    }
+                }
+                None
+            }
+            LeafIter::Scan { labels } => {
+                for &lbl in labels.by_ref() {
+                    if lbl != 0 {
+                        return Some(lbl);
+                    }
+                }
+                None
+            }
         }
     }
 }

@@ -2,13 +2,6 @@
 //!
 //! κλάδος (klados) - Ancient Greek for "branch"
 
-// glibc malloc retains freed pages on this alloc-heavy workload (millions of
-// short-lived column vectors), letting RSS climb toward the 8 GB instance limit
-// on large cluster-free cores. mimalloc reclaims aggressively and fragments far
-// less, cutting peak RSS substantially.
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
 mod commands;
 mod solver;
 
