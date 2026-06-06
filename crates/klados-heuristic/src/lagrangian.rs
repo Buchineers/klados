@@ -62,10 +62,18 @@ const BP_TRY_MAX_LEAVES: u32 = 6000;
 /// (decomposition overhead isn't worth it; just solve it).
 const DECOMP_MIN_LEAVES: u32 = 50;
 /// Above this reduced-leaf count we skip the decomposition attempt entirely:
-/// decomposition can't certify these and its O(n²) recombination would only
-/// waste budget — the flat engine owns them. (Well-decomposing instances up to
-/// ~6k leaves still prove fast via the attempt.)
-const DECOMP_TRY_MAX_LEAVES: u32 = 6_000;
+/// decomposition descends into a deep cluster tree whose O(n²) recombination
+/// and per-cluster exact solves can burn the *entire* budget without proving,
+/// emitting only the Chen baseline — the flat engine does far better with that
+/// time (n=10037→5422 core: decomp 5000 vs flat 4277, best 4194). The attempt's
+/// budget can't reclaim this because the descent already built the deep tree and
+/// the recombination is uninterruptible, so we gate by size: only small cores,
+/// where the tree stays shallow and proving is genuinely fast, get the attempt.
+/// 4000 excludes the observed grinder (5422-leaf core: decomp 5000 → flat 4281)
+/// while keeping mid cores that decompose well (3295-leaf: decomp 2381 beats
+/// flat's 2455). The exact cut is benchmark-tunable — it trades the grinder fix
+/// against small regressions on any well-decomposing core in the 4000–6000 band.
+const DECOMP_TRY_MAX_LEAVES: u32 = 4_000;
 /// Wall-clock the decomposition attempt is allowed before we conclude the
 /// instance has a hard core and hand off to the flat engine. Well-decomposing
 /// instances prove well within this; hard ones forfeit only this much.
@@ -1266,8 +1274,18 @@ impl LagrangianSolver {
         // bounded decomposition step. solve_reduced_core with an elapsed
         // deadline returns this sub's Chen incumbent immediately — a valid (if
         // unrefined) forest for the not-yet-reached part of the instance.
-        if self.terminate.load(Ordering::Relaxed) {
-            // Interrupted before this cluster was solved ⇒ not proven.
+        // Bail the recursion on SIGTERM *or* when the decomposition attempt's
+        // budget (`plan_deadline`) is spent. The latter is essential: on a
+        // slow-proving instance the split recursion can grind for the entire
+        // 300 s and emit only the Chen baseline, when the flat engine would do
+        // far better with that time (n=10037: decomp→5000 vs flat→4277). The
+        // budget was previously used only to time-SLICE clusters, never to STOP
+        // the recursion, so the 25 s attempt overran indefinitely. Bailing here
+        // sets `unproved`, so `solve()` discards the partial decomposition and
+        // hands the whole core to the flat engine for the remaining time.
+        if self.terminate.load(Ordering::Relaxed)
+            || plan_deadline.is_some_and(|d| Instant::now() >= d)
+        {
             unproved.set(true);
             let now = Instant::now();
             return self.solve_reduced_core(sub, Some(now), now, trace, depth).0;
