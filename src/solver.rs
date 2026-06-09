@@ -45,6 +45,8 @@ pub enum SolverChoice {
     RootCorridor,
     #[value(name = "corridor")]
     Corridor,
+    #[value(name = "lower")]
+    Lower,
 }
 
 impl SolverChoice {
@@ -57,6 +59,11 @@ impl SolverChoice {
             RootCorridor | Corridor => SolverKind::Exact,
             _ => SolverKind::Exact,
         }
+    }
+
+    /// Whether this solver consumes the `#a` approximation parameters.
+    pub fn is_lower_track(&self) -> bool {
+        matches!(self, SolverChoice::Lower)
     }
 
     pub fn description(&self) -> &'static str {
@@ -76,6 +83,7 @@ impl SolverChoice {
             RootPool => "Root column generation + integer pool cover prototype",
             RootCorridor => "Certified root-corridor probe with exact B&P fallback",
             Corridor => "Reduced-cost corridor solver (m=2 native; m≥3 routes to B&P)",
+            Lower => "Lower-bound track racer: fastest #a-bounded forest (Chen 2-approx, bp fallback)",
         }
     }
 
@@ -142,6 +150,7 @@ impl SolverChoice {
                 ("KLADOS_CORRIDOR_SEEDS", "primal-seed budget for randomized cherry partitions"),
                 ("KLADOS_CORRIDOR_TRACE", "print per-iteration diagnostics"),
             ],
+            Lower => &[("KLADOS_LOWER_TRACE", "print per-instance tier decisions")],
         }
     }
 
@@ -175,6 +184,7 @@ impl SolverChoice {
             SolverChoice::Lagrangian => {
                 from_heuristic(klados_heuristic::lagrangian::LagrangianSolver::new())
             }
+            SolverChoice::Lower => Box::new(LowerWrapper),
         }
     }
 }
@@ -252,6 +262,18 @@ impl AnySolver for HeuristicWrapper {
     fn snapshot(&self) -> Option<Vec<Tree>> {
         self.0.snapshot()
     }
+}
+
+/// Lower-bound track racer. Not an `ExactSolver`/`HeuristicSolver`: it
+/// orchestrates several engines under the `#a` threshold, so it implements
+/// `AnySolver` directly.
+struct LowerWrapper;
+
+impl AnySolver for LowerWrapper {
+    fn solve(&mut self, instance: &Instance) -> Option<Vec<Tree>> {
+        crate::lower::solve_lower(instance)
+    }
+    fn sigterm_handler(&self) {}
 }
 
 fn from_exact(s: impl klados_exact::ExactSolver + 'static) -> Box<dyn AnySolver> {
@@ -376,7 +398,17 @@ pub fn solve_and_print(
         terminated
     };
 
-    let components = solver.solve(instance).expect("failed to find solution");
+    // `None` means "no solution to emit". For the lower-bound track that is the
+    // safe response when no forest can be certified within the `#a` bound:
+    // emitting nothing scores 0 on the instance but, unlike an oversized forest,
+    // never risks disqualification. An empty forest emits zero newick lines.
+    let components = match solver.solve(instance) {
+        Some(c) => c,
+        None => {
+            log::info!("solver returned no solution — emitting nothing");
+            Vec::new()
+        }
+    };
 
     #[cfg(feature = "early-termination")]
     {

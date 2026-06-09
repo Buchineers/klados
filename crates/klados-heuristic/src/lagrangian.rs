@@ -17,7 +17,7 @@
 //! Here the loop degrades gracefully to the Chen+seed pool at that scale.
 
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -169,6 +169,36 @@ pub struct LagrangianSolver {
     /// during-solve forest memory on large flat cores. Cluster solves (depth ≥
     /// 1) leave it false so their pieces stay label-queryable for recombination.
     flat_terminal: AtomicBool,
+    /// Caller-supplied soft budget. Overrides the `KLADOS_HEUR_TIME_MS` env
+    /// fallback. Used by the lower-track racer to bound the anytime cascade so
+    /// it always returns even without a SIGTERM.
+    budget_override: Option<Duration>,
+    /// Ceil of the dual lower bound from the most recent depth-0 flat solve, in
+    /// REDUCED units. `solve` lifts it to original units (adding the kernel
+    /// delta) and stores it in `stats.lower_bound`. Lets the lower-track racer
+    /// raise its acceptance threshold from this tight bound instead of Chen's.
+    reduced_dual_lb: AtomicUsize,
+    /// Lower-bound track acceptance parameters `(a, b)`. When set, the flat core
+    /// stops the instant its current forest satisfies `k <= floor(a*LB) + b`
+    /// against its OWN dual bound (the tightest available) — the speed-bonus
+    /// early-abort. `None` (default) ⇒ run to budget as usual (other tracks).
+    approx_target: Option<(f64, usize)>,
+    /// Kernel parameter reduction for the active solve: `expanded = reduced +
+    /// param_reduction`. Lets the core convert reduced sizes to original units
+    /// for the approx-target check without an expansion.
+    param_reduction: AtomicUsize,
+    /// Frozen early-abort target in REDUCED units: once the subgradient loop's
+    /// dual bound is final, any reduced forest of `<= abort_k_reduced` components
+    /// satisfies the track bound. The primal-improvement phases (local search,
+    /// LNS) watch this and stop the instant they reach it. `usize::MAX` ⇒ no
+    /// approx target / not yet frozen.
+    abort_k_reduced: AtomicUsize,
+    /// True only while the genuine flat top-level solve (and its LNS) is running.
+    /// The early-abort must NOT fire inside the decomposition attempt's cluster
+    /// solves — their local forest/bound describe a slice, not the whole
+    /// instance, and tripping the global `terminate` there would abandon the
+    /// real flat solve. Gates every approx-target check.
+    abort_armed: AtomicBool,
 }
 
 impl LagrangianSolver {
@@ -178,7 +208,27 @@ impl LagrangianSolver {
             stats: SolverStats::default(),
             incumbent: Arc::new(Mutex::new(Vec::new())),
             flat_terminal: AtomicBool::new(false),
+            budget_override: None,
+            reduced_dual_lb: AtomicUsize::new(0),
+            approx_target: None,
+            param_reduction: AtomicUsize::new(0),
+            abort_k_reduced: AtomicUsize::new(usize::MAX),
+            abort_armed: AtomicBool::new(false),
         }
+    }
+
+    /// Set a soft wall-time budget for this solve. Takes precedence over the
+    /// `KLADOS_HEUR_TIME_MS` env fallback.
+    pub fn set_budget(&mut self, budget: Duration) {
+        self.budget_override = Some(budget);
+    }
+
+    /// Enable the lower-bound track early-abort: stop as soon as the current
+    /// forest satisfies `k <= floor(a * LB) + b` against the solver's own dual
+    /// bound. Used by the lower-track racer to claim the speed bonus instead of
+    /// grinding the full budget after a valid forest is already in hand.
+    pub fn set_approx_target(&mut self, a: f64, b: usize) {
+        self.approx_target = Some((a, b));
     }
 
     /// Replace the ready-to-emit incumbent (original labels). Cheap; called at
@@ -212,18 +262,35 @@ impl LagrangianSolver {
         }
 
         let start = Instant::now();
-        let budget = Self::time_budget();
+        let budget = self.budget_override.or_else(Self::time_budget);
         let trace = std::env::var("KLADOS_LAGR_TRACE").is_ok();
+        self.reduced_dual_lb.store(0, Ordering::Relaxed);
+        self.abort_k_reduced.store(usize::MAX, Ordering::Relaxed);
+        self.abort_armed.store(false, Ordering::Relaxed);
+        self.stats.lower_bound = 0;
 
         // Publish a trivial-but-valid baseline immediately (original labels), so
         // a SIGTERM arriving before the real solve has a complete forest still
         // emits something non-zero. The Chen 2-approx is O(n) and far better
         // than singletons (which would score 0: k=n).
         {
-            let (_lo, _up, sets) = chen_pair_agreement(&instance.trees[0], &instance.trees[1]);
+            let (chen_lb_dist, _up, sets) =
+                chen_pair_agreement(&instance.trees[0], &instance.trees[1]);
             let base = forest_from_partition(&sets, &instance.trees, orig_n, true);
             let (base, _) = repair_forest(base, &instance.trees, orig_n);
             self.publish(&base);
+            // Lower-bound track fast path: Chen's own forest may already clear the
+            // approximation bound against Chen's (sound) lower bound `lb_dist + 1`.
+            // If so there is nothing to do — return it before any heavy work. This
+            // subsumes the racer's old separate "tier-1 Chen" pass.
+            if let Some((a, b)) = self.approx_target {
+                let chen_lb = chen_lb_dist + 1;
+                if base.len() <= (a * chen_lb as f64).floor() as usize + b {
+                    self.stats.lower_bound = chen_lb;
+                    self.stats.upper_bound = Some(base.len());
+                    return Some(base);
+                }
+            }
         }
 
         // ---- Kernelize first (optimality-preserving), solve the reduced core,
@@ -235,6 +302,8 @@ impl LagrangianSolver {
             kern_cfg.protected_labels = instance.protected_labels.clone();
         }
         let kern = klados_core::kernelize::kernelize_best(instance, &kern_cfg);
+        self.param_reduction
+            .store(kern.param_reduction, Ordering::Relaxed);
         let reduced = &kern.instance;
         if trace {
             eprintln!(
@@ -358,7 +427,13 @@ impl LagrangianSolver {
                     );
                 }
             }
-            proven.unwrap_or_else(|| self.solve_reduced_core(reduced, deadline, start, trace, 0))
+            proven.unwrap_or_else(|| {
+                // Arm the lower-track early-abort: the flat top-level solve (and
+                // the LNS that follows) is the only place a forest describes the
+                // whole instance, so it is the only place the abort may fire.
+                self.abort_armed.store(true, Ordering::Relaxed);
+                self.solve_reduced_core(reduced, deadline, start, trace, 0)
+            })
         };
         if trace {
             eprintln!(
@@ -379,6 +454,7 @@ impl LagrangianSolver {
         {
             reduced_forest = self.lns_improve(reduced, reduced_forest, deadline, start, trace);
         }
+        let reduced_len = reduced_forest.len();
         let expanded = klados_core::kernelize::expand_solution_unindexed(
             reduced_forest,
             &kern,
@@ -386,6 +462,16 @@ impl LagrangianSolver {
             orig_n,
         );
         let (expanded, _) = repair_forest(expanded, &instance.trees, orig_n);
+        // Lift the reduced dual bound to original units. Kernelization lowers the
+        // optimum by a fixed delta (the pendant/chain components re-added on
+        // expansion), so `k* >= ceil(reduced_dual_lb) + delta`. When the optimum
+        // was proven, LB = UB = expanded size.
+        let kernel_delta = expanded.len().saturating_sub(reduced_len);
+        self.stats.lower_bound = if proved {
+            expanded.len()
+        } else {
+            self.reduced_dual_lb.load(Ordering::Relaxed) + kernel_delta
+        };
         // Publish the final result so a SIGTERM racing the normal emit still
         // sees the best forest (the watcher emits the incumbent).
         if expanded.len() < self.snapshot().map_or(usize::MAX, |s| s.len()) {
@@ -976,6 +1062,21 @@ impl LagrangianSolver {
                 &mut best_components,
                 &mut best_sel,
             );
+            // ---- Lower-bound track early-abort ----
+            // Stop the instant the current forest already satisfies the track's
+            // approximation bound against our OWN dual lower bound (the tightest
+            // available). Both sides lifted to original units via the kernel
+            // delta. Armed only for the flat top-level solve (see `abort_armed`).
+            if self.abort_armed.load(Ordering::Relaxed) {
+                if let Some((a, b)) = self.approx_target {
+                    let delta = self.param_reduction.load(Ordering::Relaxed);
+                    let lb_orig = best_lb.ceil().max(0.0) as usize + delta;
+                    let k_orig = best_components + delta;
+                    if lb_orig > 0 && k_orig <= (a * lb_orig as f64).floor() as usize + b {
+                        self.terminate.store(true, Ordering::Relaxed);
+                    }
+                }
+            }
             // Primal-stall convergence: the greedy primal has plateaued (the LB
             // may still trickle up, but the incumbent isn't moving). Hand off to
             // the local search. Keys on the PRIMAL, not the bound, so it fires
@@ -1177,6 +1278,24 @@ impl LagrangianSolver {
             }
         }
 
+        // Freeze the lower-track early-abort target for the primal-improvement
+        // phases. The subgradient's dual bound is final now, so any reduced
+        // forest reaching `t_orig - delta` components satisfies the track bound
+        // once expanded. `improve_packing`/`lns_improve` watch `abort_k_reduced`
+        // and stop the instant they hit it (claims the speed bonus).
+        if self.abort_armed.load(Ordering::Relaxed) {
+            if let Some((a, b)) = self.approx_target {
+                let delta = self.param_reduction.load(Ordering::Relaxed);
+                let lb_orig = best_lb.ceil().max(0.0) as usize + delta;
+                let t_orig = (a * lb_orig as f64).floor() as usize + b;
+                self.abort_k_reduced
+                    .store(t_orig.saturating_sub(delta), Ordering::Relaxed);
+                if best_components <= t_orig.saturating_sub(delta) {
+                    self.terminate.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+
         // ---- Primal improvement loop (iterated local search over the pool) ----
         // The subgradient has converged; now relentlessly re-select a better
         // node-disjoint packing over the columns it generated (the pool already
@@ -1207,6 +1326,13 @@ impl LagrangianSolver {
                 pool.len(),
                 start.elapsed().as_secs_f64()
             );
+        }
+        // Publish the top-level reduced dual bound so `solve` can expose a tight
+        // lower bound. Only depth 0 covers the whole reduced instance; nested
+        // cluster solves (depth ≥ 1) bound only their slice.
+        if depth == 0 {
+            self.reduced_dual_lb
+                .store(best_lb.ceil().max(0.0) as usize, Ordering::Relaxed);
         }
         (best_forest, proved)
     }
@@ -2217,12 +2343,22 @@ impl LagrangianSolver {
                 best_savings = savings;
                 best_in_sel.copy_from_slice(&in_sel);
                 stalls = 0;
+                let k_reduced = nl - best_savings as usize;
                 if trace {
                     eprintln!(
                         "[lagr][ls] improved k={} t={:.1}s",
-                        nl - best_savings as usize,
+                        k_reduced,
                         start.elapsed().as_secs_f64()
                     );
+                }
+                // Lower-track early-abort: this packing already clears the track
+                // bound (target frozen from the final dual). Stop now for the
+                // speed bonus rather than perturbing to the deadline. The MAX
+                // sentinel means "no target" — never abort then.
+                let target = self.abort_k_reduced.load(Ordering::Relaxed);
+                if target != usize::MAX && k_reduced <= target {
+                    self.terminate.store(true, Ordering::Relaxed);
+                    break;
                 }
             } else {
                 stalls += 1;
@@ -2455,6 +2591,13 @@ impl LagrangianSolver {
                         sub_sol.len(),
                         start.elapsed().as_secs_f64()
                     );
+                }
+                // Lower-track early-abort: spliced incumbent now clears the bound.
+                // MAX sentinel ⇒ no target; never abort then.
+                let target = self.abort_k_reduced.load(Ordering::Relaxed);
+                if target != usize::MAX && incumbent.len() <= target {
+                    self.terminate.store(true, Ordering::Relaxed);
+                    break;
                 }
             } else {
                 invalid += 1;

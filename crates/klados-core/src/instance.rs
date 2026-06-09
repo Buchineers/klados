@@ -20,6 +20,10 @@ pub struct Instance {
     /// The kernelization pipeline merges these with any caller-supplied
     /// protected_labels when constructing KernelizeConfig.
     pub protected_labels: Vec<u32>,
+    /// Approximation parameters `(a, b)` from a `#a` line, if present.
+    /// A solution of size `k` is accepted iff `k <= floor(a * opt) + b`.
+    /// Only set on the Lower-bound track; `None` means exact is required.
+    pub approx: Option<(f64, usize)>,
 }
 
 impl Instance {
@@ -31,6 +35,7 @@ impl Instance {
             num_leaves,
             name: None,
             protected_labels: Vec::new(),
+            approx: None,
         }
     }
 
@@ -48,7 +53,9 @@ impl Instance {
             .iter()
             .map(|t| Tree::from_cursor(t.top_down(), num_leaves))
             .collect();
-        Ok(Self::new(trees, num_leaves))
+        let mut inst = Self::new(trees, num_leaves);
+        inst.approx = pace.approx;
+        Ok(inst)
     }
 
     /// Read a PACE instance from a file path.
