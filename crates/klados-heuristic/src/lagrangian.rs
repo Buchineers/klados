@@ -1496,25 +1496,17 @@ impl LagrangianSolver {
     /// solves the cluster with the anytime cascade instead). The pricer now polls
     /// the shared `term` flag, so a SIGTERM aborts the inner DP promptly.
     fn solve_cluster_exact(&self, sub: &Instance, deadline: Instant) -> Option<Vec<Tree>> {
-        let term = Arc::new(AtomicBool::new(false));
-        let capped = Arc::new(AtomicBool::new(false));
-        let term_w = Arc::clone(&term);
-        let capped_w = Arc::clone(&capped);
-        let global = Arc::clone(&self.terminate);
-        let wd = std::thread::spawn(move || {
-            while !term_w.load(Ordering::Relaxed) {
-                if global.load(Ordering::Relaxed) || Instant::now() >= deadline {
-                    capped_w.store(true, Ordering::Relaxed);
-                    term_w.store(true, Ordering::Relaxed);
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        });
-        let res = klados_exact::bp::bp_solve_capped(sub, &term);
-        term.store(true, Ordering::Relaxed);
-        let _ = wd.join();
-        if capped.load(Ordering::Relaxed) {
+        // B&P runs on this thread and polls the deadline cooperatively, so a fast
+        // region solve returns immediately. Previously a watchdog thread flipped a
+        // flag on a 20ms `sleep` poll and the `join()` after each solve blocked
+        // this thread until that watchdog woke — wasting up to ~20ms idle per
+        // region. With thousands of small LNS region solves that idle dominated
+        // the LNS phase's wall-clock and dropped CPU utilisation.
+        let res = klados_exact::bp::bp_solve_capped_until(sub, &self.terminate, Some(deadline));
+        // Discard a result produced by hitting the cap or a global SIGTERM: that's
+        // B&P's graceful-abort forest, not a proven optimum. (Preserves the prior
+        // `capped → None` semantics; the LNS caller only splices proven optima.)
+        if self.terminate.load(Ordering::Relaxed) || Instant::now() >= deadline {
             return None;
         }
         res
@@ -2156,7 +2148,7 @@ impl LagrangianSolver {
         // Perturbation rounds without improvement before the ILS is declared
         // converged. Generous so quality isn't lost, but bounded so the search
         // terminates without a deadline.
-        const LS_STALL_LIMIT: usize = 400;
+        const LS_STALL_LIMIT: usize = 250;
         let timed_out =
             |s: &Self| s.terminate.load(Ordering::Relaxed) || deadline.is_some_and(|d| Instant::now() >= d);
 
@@ -2437,7 +2429,6 @@ impl LagrangianSolver {
         let trees = &reduced.trees;
         let n = reduced.num_leaves;
         let nl = n as usize;
-        let t1 = &trees[0];
         let region_max: usize = std::env::var("KLADOS_LNS_MAX")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -2459,8 +2450,11 @@ impl LagrangianSolver {
             }
         }
 
-        let internal: Vec<NodeId> = (0..t1.num_nodes() as u32).filter(|&v| !t1.is_leaf(v)).collect();
-        if internal.is_empty() {
+        let internals: Vec<Vec<NodeId>> = trees
+            .iter()
+            .map(|t| (0..t.num_nodes() as u32).filter(|&v| !t.is_leaf(v)).collect())
+            .collect();
+        if internals.iter().all(|v| v.is_empty()) {
             return incumbent;
         }
         let mut rng: u64 = 0xD1B5_4A32_D192_ED03;
@@ -2473,16 +2467,25 @@ impl LagrangianSolver {
             rng ^= rng << 13;
             rng ^= rng >> 7;
             rng ^= rng << 17;
-            let v = internal[(rng as usize) % internal.len()];
+            let ti = (rng as usize) % trees.len();
+            let tree_ref = &trees[ti];
+            let int_nodes = &internals[ti];
+            if int_nodes.is_empty() {
+                continue;
+            }
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let v = int_nodes[(rng as usize) % int_nodes.len()];
 
-            // Leaves under v in T₁.
+            // Leaves under v in the selected tree.
             let mut region: Vec<u32> = Vec::new();
             let mut stack = vec![v];
             while let Some(u) = stack.pop() {
-                if t1.is_leaf(u) {
-                    region.push(t1.label[u as usize]);
+                if tree_ref.is_leaf(u) {
+                    region.push(tree_ref.label[u as usize]);
                 } else {
-                    let (l, r) = t1.children_pair(u);
+                    let (l, r) = tree_ref.children_pair(u);
                     stack.push(l);
                     stack.push(r);
                 }
@@ -3464,7 +3467,7 @@ struct Window {
 /// Split T₀ into leaf groups, each a subtree with ≤ `max_leaves` leaves.
 /// Each group's leaves form a connected subtree in T₀, so any agreement
 /// component fully inside the group is findable by the restricted DP.
-fn split_t0_windows(tree: &Tree, max_leaves: usize) -> Vec<Vec<u32>> {
+pub(crate) fn split_t0_windows(tree: &Tree, max_leaves: usize) -> Vec<Vec<u32>> {
     let nn = tree.num_nodes();
     let mut cnt = vec![0u32; nn];
     for v in tree.post_order_vec() {
@@ -3507,7 +3510,7 @@ fn split_t0_windows(tree: &Tree, max_leaves: usize) -> Vec<Vec<u32>> {
 
 /// Map each node of `restricted` to its image node in `orig` (the LCA in
 /// `orig` of the kept leaves beneath it). `rev[r_label] = orig label`.
-fn node_images(restricted: &Tree, orig: &Tree, rev: &[u32]) -> Vec<u32> {
+pub(crate) fn node_images(restricted: &Tree, orig: &Tree, rev: &[u32]) -> Vec<u32> {
     let mut img = vec![NONE; restricted.num_nodes()];
     for r_node in restricted.post_order_vec() {
         if restricted.is_leaf(r_node) {
@@ -3846,7 +3849,7 @@ fn greedy_pack(
 /// components largest-first while they remain valid agreement components AND
 /// node-disjoint from those already kept; explode any offender into singletons.
 /// Returns `(repaired_forest, num_components_exploded)`.
-fn repair_forest(forest: Vec<Tree>, trees: &[Tree], n: u32) -> (Vec<Tree>, usize) {
+pub(crate) fn repair_forest(forest: Vec<Tree>, trees: &[Tree], n: u32) -> (Vec<Tree>, usize) {
     let comp_leaves: Vec<Vec<u32>> = forest.iter().map(|c| c.leaves().collect()).collect();
     let mut order: Vec<usize> = (0..forest.len()).collect();
     order.sort_unstable_by_key(|&i| std::cmp::Reverse(comp_leaves[i].len()));

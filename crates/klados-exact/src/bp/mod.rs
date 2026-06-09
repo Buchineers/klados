@@ -49,6 +49,47 @@ use crate::whidden_cluster::try_whidden_decomp_2tree;
 
 const LOG_TARGET: &str = "klados::bp";
 
+/// Cooperative cancellation for a B&P solve: a shared termination flag plus an
+/// optional wall-clock deadline. B&P is single-threaded, so it polls
+/// [`Cancel::is_cancelled`] at its existing abort points (node loop, CG-round
+/// boundaries) instead of relying on a watchdog thread to flip a flag — a fast
+/// capped solve returns immediately rather than blocking on a poll interval.
+#[derive(Clone)]
+pub struct Cancel {
+    flag: Arc<AtomicBool>,
+    deadline: Option<Instant>,
+}
+
+impl Cancel {
+    /// Flag-only cancellation (no deadline). Equivalent to the old bare
+    /// `Arc<AtomicBool>` behaviour.
+    pub fn new(flag: Arc<AtomicBool>) -> Self {
+        Self {
+            flag,
+            deadline: None,
+        }
+    }
+
+    /// Cancellation on either the flag or an optional wall-clock deadline.
+    pub fn with_deadline(flag: Arc<AtomicBool>, deadline: Option<Instant>) -> Self {
+        Self { flag, deadline }
+    }
+
+    /// True once the flag is set or the deadline has passed.
+    #[inline]
+    pub fn is_cancelled(&self) -> bool {
+        self.flag.load(Ordering::Acquire) || self.deadline.is_some_and(|d| Instant::now() >= d)
+    }
+
+    /// The underlying termination flag, for code paths that still take a bare
+    /// `&AtomicBool` (e.g. the pricer / Whidden decomposition). Those honour
+    /// the flag directly; the deadline is enforced by the surrounding B&P loop.
+    #[inline]
+    pub fn flag(&self) -> &Arc<AtomicBool> {
+        &self.flag
+    }
+}
+
 /// Minimum leaves for which Whidden strict cluster decomp is worth trying.
 /// Below this, the pipeline's generic cluster_reduction handles things fine
 /// and Whidden's overhead isn't justified.
@@ -162,7 +203,8 @@ impl ExactSolver for BpSolver {
         let t_total = Instant::now();
         let cfg = self.config.clone();
         let memo = Rc::new(RefCell::new(SubinstanceMemo::default()));
-        let mut components = solve_recursive_memo(instance, &cfg, &memo, &self.terminated)?;
+        let cancel = Cancel::new(Arc::clone(&self.terminated));
+        let mut components = solve_recursive_memo(instance, &cfg, &memo, &cancel)?;
 
         // Post-validate: if Whidden decomp assembled invalid results
         // (subproblems aborted), fall back to Chen 2-approximation.
@@ -212,36 +254,46 @@ impl ExactSolver for BpSolver {
 pub(crate) fn solve_subinstance(
     instance: &Instance,
     cfg: &BpConfig,
-    terminate: &Arc<AtomicBool>,
+    cancel: &Cancel,
 ) -> Option<Vec<Tree>> {
     let memo = Rc::new(RefCell::new(SubinstanceMemo::default()));
-    solve_recursive_memo(instance, cfg, &memo, terminate)
+    solve_recursive_memo(instance, cfg, &memo, cancel)
 }
 
 /// Solve a 2-tree sub-instance exactly under an external termination flag.
 ///
 /// This is used by callers outside `klados-exact` that want to cap an exact
-/// cluster/core solve with a watchdog. It returns only validated agreement
-/// forests; `None` means the solve was cut short or failed validation.
+/// cluster/core solve. It returns only validated agreement forests; `None`
+/// means the solve was cut short or failed validation.
 pub fn bp_solve_capped(instance: &Instance, terminate: &Arc<AtomicBool>) -> Option<Vec<Tree>> {
+    bp_solve_capped_until(instance, terminate, None)
+}
+
+/// Like [`bp_solve_capped`], but also bounded by an optional wall-clock
+/// `deadline` that B&P polls cooperatively (no watchdog thread). When the
+/// deadline trips mid-solve B&P returns its graceful-abort forest; the caller
+/// is responsible for discarding it (a capped solve is not a proven optimum).
+pub fn bp_solve_capped_until(
+    instance: &Instance,
+    terminate: &Arc<AtomicBool>,
+    deadline: Option<Instant>,
+) -> Option<Vec<Tree>> {
     if instance.num_trees() != 2 || instance.num_leaves < 2 {
         return None;
     }
     let cfg = BpConfig::default();
-    let comps = solve_subinstance(instance, &cfg, terminate)?;
+    let cancel = Cancel::with_deadline(Arc::clone(terminate), deadline);
+    let comps = solve_subinstance(instance, &cfg, &cancel)?;
     if !validate_agreement_forest(instance, &comps).is_ok() {
         return None;
     }
     Some(comps)
 }
 
-fn solve_recursive(
-    instance: &Instance,
-    cfg: &BpConfig,
-    terminate: &Arc<AtomicBool>,
-) -> Option<Vec<Tree>> {
+#[allow(dead_code)]
+fn solve_recursive(instance: &Instance, cfg: &BpConfig, cancel: &Cancel) -> Option<Vec<Tree>> {
     let memo = Rc::new(RefCell::new(SubinstanceMemo::default()));
-    solve_recursive_memo(instance, cfg, &memo, terminate)
+    solve_recursive_memo(instance, cfg, &memo, cancel)
 }
 
 /// Recursive solve: tries decomposition strategies in effectiveness order,
@@ -261,7 +313,7 @@ fn solve_recursive_memo(
     instance: &Instance,
     cfg: &BpConfig,
     memo: &Rc<RefCell<SubinstanceMemo>>,
-    terminate: &Arc<AtomicBool>,
+    cancel: &Cancel,
 ) -> Option<Vec<Tree>> {
     if instance.trees.is_empty() {
         return None;
@@ -273,7 +325,7 @@ fn solve_recursive_memo(
         return Some(instance.trees[0..1].to_vec());
     }
 
-    if terminate.load(Ordering::Acquire) {
+    if cancel.is_cancelled() {
         let forest: Vec<Tree> = (1..=instance.num_leaves)
             .map(|l| klados_core::Tree::singleton(l, instance.num_leaves))
             .collect();
@@ -366,8 +418,8 @@ fn solve_recursive_memo(
         let cfg_inner = cfg.clone();
         let memo_inner = Rc::clone(memo);
         let reduced_components =
-            solver::solve_inner_with_subsolver(reduced, terminate, &mut |sub| {
-                solve_recursive_memo(sub, &cfg_inner, &memo_inner, terminate)
+            solver::solve_inner_with_subsolver(reduced, cancel, &mut |sub| {
+                solve_recursive_memo(sub, &cfg_inner, &memo_inner, cancel)
             })?;
         if let Some(view) = memo_view.as_ref() {
             store_cached_solution(&mut memo.borrow_mut(), view, &reduced_components);
@@ -386,8 +438,8 @@ fn solve_recursive_memo(
         let memo_inner = Rc::clone(memo);
         if let Some(comps) = try_whidden_decomp_2tree(
             reduced,
-            &mut |sub| solve_recursive_memo(sub, &cfg_inner, &memo_inner, terminate),
-            terminate,
+            &mut |sub| solve_recursive_memo(sub, &cfg_inner, &memo_inner, cancel),
+            cancel.flag(),
         ) {
             trace!(
                 target: LOG_TARGET,
@@ -415,7 +467,7 @@ fn solve_recursive_memo(
     let inner_cfg = cfg.clone();
     let reduced_num_leaves = reduced.num_leaves;
     let memo_pipeline = Rc::clone(memo);
-    let t = Arc::clone(terminate);
+    let t = cancel.clone();
     let reduced_components = solve_with_pipeline(
         reduced,
         &pipeline_cfg,
@@ -430,7 +482,7 @@ fn solve_recursive_memo(
                 if let Some(comps) = try_whidden_decomp_2tree(
                     sub,
                     &mut |s| solve_recursive_memo(s, &cfg2, &memo2, &t),
-                    &t,
+                    t.flag(),
                 ) {
                     return Some(comps);
                 }

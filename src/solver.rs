@@ -37,6 +37,8 @@ pub enum SolverChoice {
     Agglomerative,
     #[value(name = "lagrangian")]
     Lagrangian,
+    #[value(name = "divebp")]
+    DiveBp,
     #[value(name = "overlay-exchange")]
     OverlayExchange,
     #[value(name = "root-pool")]
@@ -53,7 +55,7 @@ impl SolverChoice {
     pub fn kind(&self) -> SolverKind {
         use SolverChoice::*;
         match self {
-            GreedyPartition | Agglomerative | Lagrangian | OverlayExchange | RootPool => {
+            GreedyPartition | Agglomerative | Lagrangian | DiveBp | OverlayExchange | RootPool => {
                 SolverKind::Heuristic
             }
             RootCorridor | Corridor => SolverKind::Exact,
@@ -79,6 +81,7 @@ impl SolverChoice {
             GreedyPartition => "Greedy partition heuristic with union-add-one refinement",
             Agglomerative => "Agglomerative clustering heuristic",
             Lagrangian => "Dual-guided set-packing (Lagrangian column generation, anytime)",
+            DiveBp => "Diving branch-and-price (exact LP duals + Ryan–Foster branching, anytime)",
             OverlayExchange => "Incumbent-overlay replacement prototype",
             RootPool => "Root column generation + integer pool cover prototype",
             RootCorridor => "Certified root-corridor probe with exact B&P fallback",
@@ -119,6 +122,10 @@ impl SolverChoice {
             Lagrangian => &[
                 ("KLADOS_HEUR_TIME_MS", "wall-time budget in ms (default 290000)"),
                 ("KLADOS_LAGR_TRACE", "print per-iteration diagnostics"),
+            ],
+            DiveBp => &[
+                ("KLADOS_HEUR_TIME_MS", "wall-time budget in ms (default: SIGTERM-driven)"),
+                ("KLADOS_DIVEBP_TRACE", "print per-node diagnostics"),
             ],
             OverlayExchange => &[
                 ("KLADOS_OVERLAY_MAX_H", "maximum incumbent neighborhood size"),
@@ -183,6 +190,9 @@ impl SolverChoice {
             }
             SolverChoice::Lagrangian => {
                 from_heuristic(klados_heuristic::lagrangian::LagrangianSolver::new())
+            }
+            SolverChoice::DiveBp => {
+                from_heuristic(klados_heuristic::dive_bp::DiveBpSolver::new())
             }
             SolverChoice::Lower => Box::new(LowerWrapper),
         }
@@ -348,12 +358,17 @@ fn spawn_emit_watchdog(terminated: Arc<AtomicBool>) {
         let Some(forest) = solver.snapshot() else {
             return;
         };
-        // We have an incumbent: emit it (unless the normal path beat us) and
-        // force-exit so a still-unwinding `solve` can't blow the grace window.
+        // We have an incumbent. If `solve` has not already claimed the emit it
+        // is still running (a slow unwind) — emit the live incumbent and
+        // force-exit so it can't blow the grace window. If the normal path HAS
+        // claimed the emit, it has returned and is writing the forest right
+        // now; we must NOT force-exit, or `process::exit` could truncate that
+        // write mid-stream and produce a malformed (unparseable) forest. In
+        // that case let the process exit normally through `main`.
         if !EMITTED.swap(true, Ordering::SeqCst) {
             emit_forest(&forest);
+            std::process::exit(0);
         }
-        std::process::exit(0);
     });
 }
 

@@ -1,6 +1,7 @@
 //! klados-heuristic: Heuristic FPT solvers for Maximum Agreement Forest
 
 pub mod agglomerative;
+pub mod dive_bp;
 pub mod lagrangian;
 pub mod max_sat;
 pub mod partition;
@@ -8,6 +9,7 @@ pub mod partition;
 use klados_core::{Instance, SolverStats, Tree};
 
 use crate::agglomerative::AgglomerativeSolver;
+use crate::dive_bp::DiveBpSolver;
 use crate::lagrangian::LagrangianSolver;
 use crate::max_sat::MaxSatSolver;
 use crate::partition::PartitionHeuristicSolver;
@@ -57,6 +59,7 @@ pub fn solver_by_name(name: &str) -> Option<Box<dyn HeuristicSolver>> {
         }
         "agglomerative" => Some(Box::new(AgglomerativeSolver::new())),
         "lagrangian" => Some(Box::new(LagrangianSolver::new())),
+        "divebp" => Some(Box::new(DiveBpSolver::new())),
         // Keep the legacy path addressable explicitly without advertising it.
         "maxsat" => Some(Box::new(MaxSatSolver::new())),
         _ => None,
