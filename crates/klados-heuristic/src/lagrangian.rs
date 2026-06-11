@@ -683,14 +683,7 @@ impl LagrangianSolver {
                 let img: Vec<Vec<u32>> = (0..2)
                     .map(|ti| node_images(&inst.trees[ti], &trees[ti], &rev))
                     .collect();
-                let scratch_w = PricerScratch::new(&inst.trees);
-                windows.push(Window {
-                    inst,
-                    rev,
-                    img,
-                    scratch: scratch_w,
-                    seen: ColumnSet::new(),
-                });
+                windows.push(Window::new(inst, rev, img));
             }
             if trace {
                 let sizes: Vec<usize> =
@@ -802,6 +795,33 @@ impl LagrangianSolver {
         // carve a tail from. KLADOS_LAGR_NO_LS disables it.
         let ls_on = !std::env::var("KLADOS_LAGR_NO_LS").is_ok();
 
+        // Env-gated per-center profiling of the hot loop (KLADOS_LAGR_PROFILE).
+        let profile = std::env::var("KLADOS_LAGR_PROFILE").is_ok();
+        let (mut t_price, mut t_add, mut t_score, mut t_sg, mut t_primal) = (
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+
+        // Adaptive windowed re-pricing: skip a window's dense DP when its mapped
+        // duals moved by ≤ `reprice_eps` (L∞) since it was last priced, unless it
+        // has been stale for `reprice_maxstale` iterations (round-robin floor so
+        // no window starves). The subgradient moves slowly, so most windows are
+        // stable per iteration — this removes the redundant re-pricing that is
+        // ~83% of the giant budget, WITHOUT shrinking windows (no column loss).
+        let reprice_eps = std::env::var("KLADOS_LAGR_REPRICE_EPS")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.05);
+        let reprice_maxstale = std::env::var("KLADOS_LAGR_REPRICE_MAXSTALE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(10);
+        let mut win_priced_total = 0usize;
+        let mut win_skipped_total = 0usize;
+
         loop {
             if self.terminate.load(Ordering::Relaxed)
                 || deadline.is_some_and(|d| Instant::now() >= d)
@@ -811,6 +831,7 @@ impl LagrangianSolver {
             iter += 1;
 
             // ---- Price at current duals (drain banked reserve first) ----
+            let tp = Instant::now();
             let mut new_cols: Vec<Vec<u32>> = Vec::new();
             if windows.is_empty() {
                 // Global pricing: the dense DP fits.
@@ -845,6 +866,39 @@ impl LagrangianSolver {
                         break;
                     }
                     let rn = w.inst.num_leaves as usize;
+
+                    // ---- Adaptive skip: re-price only if the window's mapped
+                    //      duals moved (L∞ > eps) since the last price, or the
+                    //      round-robin staleness cap is hit. The O(rn+nodes)
+                    //      check is cheap vs the O(rn²) DP it guards. ----
+                    let mut reprice = w.stale >= reprice_maxstale;
+                    if !reprice {
+                        for rl in 1..=rn {
+                            if (alpha[w.rev[rl] as usize] - w.last_a[rl]).abs() > reprice_eps {
+                                reprice = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !reprice {
+                        'beta: for ti in 0..2 {
+                            let imgti = &w.img[ti];
+                            for (node, &lb) in w.last_b[ti].iter().enumerate() {
+                                let o = imgti[node];
+                                let cur = if o != NONE { beta[ti][o as usize] } else { 0.0 };
+                                if (cur - lb).abs() > reprice_eps {
+                                    reprice = true;
+                                    break 'beta;
+                                }
+                            }
+                        }
+                    }
+                    if !reprice {
+                        w.stale += 1;
+                        win_skipped_total += 1;
+                        continue;
+                    }
+
                     let mut a_r = vec![0.0f64; rn + 1];
                     for rl in 1..=rn {
                         a_r[rl] = alpha[w.rev[rl] as usize];
@@ -893,14 +947,26 @@ impl LagrangianSolver {
                         w.seen.insert(rl_labels.clone());
                         new_cols.push(rl_labels.iter().map(|&rl| w.rev[rl as usize]).collect());
                     }
+                    // Record the duals just priced at; reset staleness.
+                    w.last_a = a_r;
+                    w.last_b = b_r;
+                    w.stale = 0;
+                    win_priced_total += 1;
                 }
             }
+            if profile {
+                t_price += tp.elapsed();
+            }
+            let t_add0 = Instant::now();
             let mut added = 0usize;
             for c in new_cols {
                 if add_block(c, &mut pool, &mut seen) {
                     added += 1;
                     pool_cells += block_cells(pool.last().unwrap());
                 }
+            }
+            if profile {
+                t_add += t_add0.elapsed();
             }
             if pool.len() > POOL_HARD_CAP || pool_cells > POOL_CELL_BUDGET {
                 prune_pool(
@@ -997,9 +1063,14 @@ impl LagrangianSolver {
             // Score every block once per round (against the current duals) and
             // reuse it for both the subgradient and the packing — avoids the
             // O(P·log P) score re-evaluation that dominated each round at scale.
+            let t_sc0 = Instant::now();
             let scores: Vec<f64> = pool.iter().map(|b| block_score(b, &alpha, &beta)).collect();
+            if profile {
+                t_score += t_sc0.elapsed();
+            }
 
             // ---- Dual multiplier update (subgradient, or volume) over the pool ----
+            let t_sg0 = Instant::now();
             let lb = if volume {
                 self.volume_step(
                     trees,
@@ -1048,10 +1119,15 @@ impl LagrangianSolver {
                 }
             }
 
+            if profile {
+                t_sg += t_sg0.elapsed();
+            }
+
             // ---- Dual-guided primal ----
             // Volume: pack the stable per-column averaged estimate x̄ (the
             // running fractional solution). Subgradient: the instantaneous
             // reduced-cost scores. Both greedy, node-disjoint.
+            let t_pr0 = Instant::now();
             let primal_scores: &[f64] = if volume { &xbar } else { &scores };
             let improved = self.try_primal(
                 trees,
@@ -1062,6 +1138,9 @@ impl LagrangianSolver {
                 &mut best_components,
                 &mut best_sel,
             );
+            if profile {
+                t_primal += t_pr0.elapsed();
+            }
             // ---- Lower-bound track early-abort ----
             // Stop the instant the current forest already satisfies the track's
             // approximation bound against our OWN dual lower bound (the tightest
@@ -1174,6 +1253,22 @@ impl LagrangianSolver {
                     );
                 }
             }
+        }
+
+        if profile {
+            let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+            eprintln!(
+                "{ind}[lagr][profile] iters={} pool={} | price={:.0}ms add={:.0}ms score={:.0}ms sg={:.0}ms primal={:.0}ms | win_priced={} win_skipped={}",
+                iter,
+                pool.len(),
+                ms(t_price),
+                ms(t_add),
+                ms(t_score),
+                ms(t_sg),
+                ms(t_primal),
+                win_priced_total,
+                win_skipped_total,
+            );
         }
 
         // ---- Branching-lite (prototype, gated by KLADOS_LAGR_BRANCH) ----
@@ -2715,14 +2810,7 @@ impl LagrangianSolver {
                 let img: Vec<Vec<u32>> = (0..2)
                     .map(|ti| node_images(&inst.trees[ti], &trees[ti], &rev))
                     .collect();
-                let scratch_w = PricerScratch::new(&inst.trees);
-                windows.push(Window {
-                    inst,
-                    rev,
-                    img,
-                    scratch: scratch_w,
-                    seen: ColumnSet::new(),
-                });
+                windows.push(Window::new(inst, rev, img));
             }
         }
         // The RMP LP bound is a valid global lower bound only when pricing is
@@ -3459,12 +3547,96 @@ struct Window {
     img: Vec<Vec<u32>>,
     scratch: PricerScratch,
     seen: ColumnSet,
+    /// Mapped duals at the last DP run, for adaptive re-pricing: a window is
+    /// re-priced only when its mapped α/β moved materially since (or after a
+    /// round-robin staleness cap). The dense pair-DP is 83% of the giant
+    /// budget and re-pricing a window whose duals barely changed yields no new
+    /// columns — pure waste. `last_a[r_label]`, `last_b[ti][r_node]`.
+    last_a: Vec<f64>,
+    last_b: Vec<Vec<f64>>,
+    /// Iterations since this window was last priced (round-robin floor).
+    stale: usize,
 }
 
-/// Split T₀ into leaf groups, each a subtree with ≤ `max_leaves` leaves.
-/// Each group's leaves form a connected subtree in T₀, so any agreement
-/// component fully inside the group is findable by the restricted DP.
+impl Window {
+    fn new(inst: Instance, rev: Vec<u32>, img: Vec<Vec<u32>>) -> Self {
+        let rn = inst.num_leaves as usize;
+        // NEG_INFINITY + stale=MAX force a price on the first visit.
+        let last_a = vec![f64::NEG_INFINITY; rn + 1];
+        let last_b: Vec<Vec<f64>> = inst
+            .trees
+            .iter()
+            .map(|t| vec![f64::NEG_INFINITY; t.num_nodes()])
+            .collect();
+        let scratch = PricerScratch::new(&inst.trees);
+        Window {
+            inst,
+            rev,
+            img,
+            scratch,
+            seen: ColumnSet::new(),
+            last_a,
+            last_b,
+            stale: usize::MAX,
+        }
+    }
+}
+
+/// Split T₀ into leaf groups, each a connected subtree region with ≤
+/// `max_leaves` leaves, so any agreement component fully inside the group is
+/// findable by the restricted DP.
+///
+/// Default is BOTTOM-UP packing: post-order, carry each subtree's still-open
+/// leaves upward and only close a window when two children together would
+/// exceed the cap (closing the larger, carrying the smaller on). This yields
+/// ~⌈n/max⌉ near-full windows REGARDLESS of tree balance. The old TOP-DOWN
+/// greedy (emit every maximal ≤max subtree) shatters unbalanced trees into many
+/// tiny windows (measured: ~137 avg-66-leaf windows on a 9k-leaf core), wasting
+/// per-iteration overhead and dropping cross-spine columns the DP never prices.
+/// `KLADOS_LAGR_TOPDOWN_WINDOWS` restores the old behaviour for A/B testing.
 fn split_t0_windows(tree: &Tree, max_leaves: usize) -> Vec<Vec<u32>> {
+    if std::env::var("KLADOS_LAGR_TOPDOWN_WINDOWS").is_ok() {
+        return split_t0_windows_topdown(tree, max_leaves);
+    }
+    let max = max_leaves.max(2);
+    let mut windows: Vec<Vec<u32>> = Vec::new();
+    // `open[node]` = leaves in `node`'s subtree not yet assigned to a window.
+    let mut open: Vec<Vec<u32>> = vec![Vec::new(); tree.num_nodes()];
+    for v in tree.post_order_vec() {
+        if tree.is_leaf(v) {
+            let lbl = tree.label[v as usize];
+            if lbl > 0 {
+                open[v as usize] = vec![lbl];
+            }
+            continue;
+        }
+        let (l, r) = tree.children_pair(v);
+        let lo = std::mem::take(&mut open[l as usize]);
+        let ro = std::mem::take(&mut open[r as usize]);
+        if lo.len() + ro.len() <= max {
+            // Keep both subtrees open; let the region grow toward the cap.
+            let mut merged = lo;
+            merged.extend(ro);
+            open[v as usize] = merged;
+        } else {
+            // Closing both would exceed the cap: emit the larger as a window
+            // (a connected region), carry the smaller up to keep packing.
+            let (keep, close) = if lo.len() >= ro.len() { (ro, lo) } else { (lo, ro) };
+            if close.len() >= 2 {
+                windows.push(close);
+            }
+            open[v as usize] = keep;
+        }
+    }
+    let root_open = std::mem::take(&mut open[tree.root as usize]);
+    if root_open.len() >= 2 {
+        windows.push(root_open);
+    }
+    windows
+}
+
+/// Legacy top-down windowing (fragments unbalanced trees); kept for A/B.
+fn split_t0_windows_topdown(tree: &Tree, max_leaves: usize) -> Vec<Vec<u32>> {
     let nn = tree.num_nodes();
     let mut cnt = vec![0u32; nn];
     for v in tree.post_order_vec() {
