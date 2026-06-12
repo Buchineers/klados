@@ -39,6 +39,7 @@ pub use anchor_cache::{AnchorCache, AnchorEntry, CacheResult};
 pub use scratch::{PairDpTable, PricerScratch};
 
 use klados_core::Tree;
+use std::time::Instant;
 
 use crate::bp::column::{AfColumn, ColumnSet};
 use crate::bp::search::Branchings;
@@ -56,6 +57,19 @@ pub struct PricingContext<'a> {
     /// flag lets a SIGTERM abort it promptly. Callers without a real flag pass
     /// [`NEVER_TERMINATE`].
     pub terminate: &'a core::sync::atomic::AtomicBool,
+    /// Optional wall-clock deadline. This is checked by pricing loops that can
+    /// run for a long time so capped exact solves do not wait until pricing
+    /// returns before noticing that their budget expired.
+    pub deadline: Option<Instant>,
+}
+
+impl<'a> PricingContext<'a> {
+    #[inline]
+    pub fn is_cancelled(&self) -> bool {
+        self.terminate
+            .load(core::sync::atomic::Ordering::Relaxed)
+            || self.deadline.is_some_and(|d| Instant::now() >= d)
+    }
 }
 
 /// Never-set cancellation flag for pricing callers that don't supply their own.

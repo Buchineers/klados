@@ -8,7 +8,7 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use fixedbitset::FixedBitSet;
@@ -317,9 +317,9 @@ fn use_rcvf_shortcuts(reduced: &Instance, trees: &[Tree]) -> bool {
 /// Caller must guarantee `m ≥ 2` and `n ≥ 2` (the pipeline's
 /// `trivial_solution` short-circuit handles the trivial cases).
 pub fn solve_inner(reduced: &Instance, terminate: &Arc<AtomicBool>) -> Option<Vec<Tree>> {
-    let t = terminate;
-    solve_inner_with_subsolver(reduced, terminate, &mut |sub| {
-        crate::bp::solve_subinstance(sub, &crate::bp::BpConfig::default(), t)
+    let cancel = crate::bp::Cancel::new(Arc::clone(terminate));
+    solve_inner_with_subsolver(reduced, &cancel, &mut |sub| {
+        crate::bp::solve_subinstance(sub, &crate::bp::BpConfig::default(), &cancel)
     })
 }
 
@@ -327,7 +327,7 @@ pub fn solve_inner(reduced: &Instance, terminate: &Arc<AtomicBool>) -> Option<Ve
 /// provide the same subproblem solver/memo to primal heuristics.
 pub fn solve_inner_with_subsolver<F>(
     reduced: &Instance,
-    terminate: &Arc<AtomicBool>,
+    cancel: &crate::bp::Cancel,
     solve_sub: &mut F,
 ) -> Option<Vec<Tree>>
 where
@@ -509,7 +509,7 @@ where
         }
 
         // Graceful abort: return best incumbent (or all-singletons as fallback).
-        if terminate.load(Ordering::Acquire) {
+        if cancel.is_cancelled() {
             let components = match state.incumbent() {
                 Some(inc) => reconstruct_components(inc, state.columns(), reduced),
                 None => {
@@ -536,7 +536,7 @@ where
             allow_bound_prune,
             allow_rcvf,
             chen_lb,
-            terminate.as_ref(),
+            cancel,
         );
         match outcome {
             NodeOutcome::Pruned => {}
@@ -620,7 +620,7 @@ fn solve_node<P: Pricer, S: BranchSelector>(
     allow_bound_prune: bool,
     allow_rcvf: bool,
     chen_lb: usize,
-    terminate: &AtomicBool,
+    cancel: &crate::bp::Cancel,
 ) -> NodeOutcome {
     tel.nodes_explored += 1;
 
@@ -664,7 +664,7 @@ fn solve_node<P: Pricer, S: BranchSelector>(
 
         // Abort check between CG rounds so signal doesn't get stuck
         // waiting for a long pricing phase to complete.
-        if terminate.load(Ordering::Acquire) {
+        if cancel.is_cancelled() {
             trace!(target: LOG_TARGET, "cg abort at iter {}", tel.cg_iters);
             return NodeOutcome::Pruned;
         }
@@ -696,7 +696,8 @@ fn solve_node<P: Pricer, S: BranchSelector>(
                 columns: state.columns(),
                 seen: state.seen(),
                 branchings,
-                terminate: terminate,
+                terminate: cancel.flag(),
+                deadline: cancel.deadline(),
             },
             scratch,
         );
@@ -1330,7 +1331,7 @@ fn probe_root_obstruction_impl(
     let exact = crate::bp::solve_subinstance(
         &core,
         &crate::bp::BpConfig::default(),
-        &Arc::new(AtomicBool::new(false)),
+        &crate::bp::Cancel::new(Arc::new(AtomicBool::new(false))),
     );
     match exact {
         Some(forest) => info!(

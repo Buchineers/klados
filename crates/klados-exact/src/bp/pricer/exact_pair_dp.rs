@@ -87,10 +87,22 @@ impl ExactPairDpCache {
         }
     }
 
+    /// Whether this cache can serve a `(n0, n1, num_leaves)` problem.
+    ///
+    /// A max-sized cache may be reused for smaller windows, but all DP indexing
+    /// must use the cache's allocated stride (`self.stride()`), not the current
+    /// problem's `n1`. Reconstruction follows stored child pointers, so mixing
+    /// strides can read stale cells from an older window and turn their pointers
+    /// into wild indices.
     pub(crate) fn fits(&self, n0: usize, n1: usize, num_leaves: usize) -> bool {
-        self.t0_active.len() == n0
-            && self.t1_active.len() == n1
-            && self.active_labels.len() == num_leaves + 1
+        self.t0_active.len() >= n0
+            && self.t1_active.len() >= n1
+            && self.active_labels.len() >= num_leaves + 1
+    }
+
+    #[inline]
+    fn stride(&self) -> usize {
+        self.t1_active.len()
     }
 }
 
@@ -155,6 +167,9 @@ fn price_exact_pair_dp(
         .unwrap_or_else(|| ExactPairDpCache::new(n0, n1, nl));
     let candidates = collect_positive_columns(ctx, &mut cache);
     scratch.exact_dp_cache = Some(cache);
+    if ctx.is_cancelled() {
+        return PricingResult::Improving;
+    }
 
     if candidates.is_empty() {
         return PricingResult::Converged;
@@ -305,7 +320,9 @@ fn collect_candidates_above(
     let t1 = &ctx.trees[ref_tree_idx];
     let n0 = t0.num_nodes();
     let n1 = t1.num_nodes();
-    let idx = |u: usize, v: usize| -> usize { u * n1 + v };
+    debug_assert!(cache.fits(n0, n1, ctx.num_leaves));
+    let stride = cache.stride();
+    let idx = |u: usize, v: usize| -> usize { u * stride + v };
     let is_forbidden =
         |u: u32, v: u32| -> bool { forbidden_anchors.iter().any(|&(fu, fv)| fu == u && fv == v) };
 
@@ -368,12 +385,14 @@ fn collect_candidates_above(
     best_l0.fill((NEG_INF, 0u32));
     best_r0.fill((NEG_INF, 0u32));
 
+    let mut cancelled = false;
     for &u in &t0_post {
         // Cooperative cancellation: this O(n0·n1) DP is the longest
         // uninterruptible step in the solver; bail promptly on SIGTERM. The
         // partial result is discarded by the caller on termination, so leaving
         // the DP incomplete is safe.
-        if ctx.terminate.load(core::sync::atomic::Ordering::Relaxed) {
+        if ctx.is_cancelled() {
+            cancelled = true;
             break;
         }
         let u_idx = u as usize;
@@ -546,27 +565,41 @@ fn collect_candidates_above(
             };
         }
     }
+    if cancelled {
+        return PairDpOutput {
+            candidates: Vec::new(),
+            max_allowed_closed: NEG_INF,
+        };
+    }
 
     let mut results = Vec::new();
     let mut max_allowed_closed = NEG_INF;
-    for u in 0..n0 {
-        if t0.is_leaf(u as u32) {
+    for &u in &t0_post {
+        if t0.is_leaf(u) {
             continue;
         }
-        for v in 0..n1 {
-            if t1.is_leaf(v as u32) {
+        for &v in &t1_post {
+            if t1.is_leaf(v) {
                 continue;
             }
-            if is_forbidden(u as u32, v as u32) {
+            if is_forbidden(u, v) {
                 continue;
             }
-            let score = dp_closed[idx(u, v)].score;
+            let score = dp_closed[idx(u as usize, v as usize)].score;
             if score > max_allowed_closed {
                 max_allowed_closed = score;
             }
             if score > threshold {
                 let mut labels = Vec::new();
-                extract_closed(u as u32, v as u32, t0, dp_closed, dp_open, n1, &mut labels);
+                extract_closed(
+                    u,
+                    v,
+                    t0,
+                    dp_closed,
+                    dp_open,
+                    stride,
+                    &mut labels,
+                );
                 labels.sort_unstable();
                 labels.dedup();
                 if labels.len() >= 2 {
