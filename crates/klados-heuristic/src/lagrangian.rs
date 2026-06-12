@@ -541,6 +541,9 @@ impl LagrangianSolver {
             <= CELL_CAP_SAFE;
         let force_lp = std::env::var("KLADOS_LAGR_LP").is_ok();
         let no_rmp = std::env::var("KLADOS_NO_RMP").is_ok();
+        // Columns the (capped) RMP tier priced; fed to the subgradient pool below
+        // so its CG warm-starts instead of rediscovering them from Chen.
+        let mut rmp_seed_labels: Vec<Vec<u32>> = Vec::new();
         if (global_fits || force_lp) && !no_rmp {
             // Cap the RMP attempt so the subgradient ALWAYS gets the bulk of the
             // budget. Proving happens fast or not at all (n=60, pub049 prove in
@@ -563,10 +566,12 @@ impl LagrangianSolver {
                 };
                 Some(start + dur)
             };
-            let (rmp_forest, rmp_proved) = self.solve_rmp(reduced, rmp_deadline, trace, start);
+            let (rmp_forest, rmp_proved, rmp_pool) =
+                self.solve_rmp(reduced, rmp_deadline, trace, start);
             if force_lp || rmp_proved {
                 return (rmp_forest, rmp_proved);
             }
+            rmp_seed_labels = rmp_pool;
             if trace {
                 eprintln!(
                     "{ind}[lagr] RMP did not certify (gap) — handing off to subgradient at {:.1}s",
@@ -640,10 +645,23 @@ impl LagrangianSolver {
                 }
             }
         }
+        // Warm-start with the columns the RMP tier already priced (avoids the
+        // subgradient rediscovering them from cold via column generation).
+        // `KLADOS_LAGR_NO_RMP_WARM` disables it (for A/B measurement).
+        let rmp_warm = if std::env::var("KLADOS_LAGR_NO_RMP_WARM").is_err() {
+            let n_warm = rmp_seed_labels.len();
+            for labels in std::mem::take(&mut rmp_seed_labels) {
+                add_block(labels, &mut pool, &mut seen);
+            }
+            n_warm
+        } else {
+            0
+        };
         if trace {
             eprintln!(
-                "{ind}[lagr] seeded pool={} ({:.0}ms)",
+                "{ind}[lagr] seeded pool={} (rmp_warm={}) ({:.0}ms)",
                 pool.len(),
+                rmp_warm,
                 start.elapsed().as_secs_f64() * 1000.0
             );
         }
@@ -2722,13 +2740,17 @@ impl LagrangianSolver {
     /// separates node `≤1` rows, prices at those duals, and extracts an
     /// integral primal (MIP at convergence, greedy interim — both validated
     /// node-disjoint). This converges in B&P-class iteration counts.
+    /// Returns `(best_forest, proved, pool_labels)`. `pool_labels` are the
+    /// multi-leaf columns the RMP tier generated; the subgradient fallback seeds
+    /// its pool with them so its column generation does not start cold and
+    /// rediscover what the (capped) RMP tier already priced.
     fn solve_rmp(
         &self,
         reduced: &Instance,
         deadline: Option<Instant>,
         trace: bool,
         start: Instant,
-    ) -> (Vec<Tree>, bool) {
+    ) -> (Vec<Tree>, bool, Vec<Vec<u32>>) {
         let trees = &reduced.trees;
         let n = reduced.num_leaves;
         let nl = n as usize;
@@ -3058,7 +3080,14 @@ impl LagrangianSolver {
                 break;
             }
         }
-        (best_forest, proved)
+        // Hand the multi-leaf columns to the caller so the subgradient fallback
+        // can warm-start its pool instead of rediscovering them.
+        let pool_labels: Vec<Vec<u32>> = pool
+            .iter()
+            .filter(|c| c.labels().len() >= 2)
+            .map(|c| c.labels().to_vec())
+            .collect();
+        (best_forest, proved, pool_labels)
     }
 
     /// Run column generation to convergence under `branchings`, reusing the
