@@ -27,6 +27,7 @@ use klados_core::af_validator::validate_agreement_forest;
 use klados_core::tree::{NONE, NodeId, Tree};
 use klados_core::{Instance, SolverStats};
 use klados_exact::bp::column::{AfColumn, ColumnBuilder, ColumnSet, is_valid_af_component};
+use klados_exact::bp::pricer::exact_pair_dp::ExactPairDpCache;
 use klados_exact::bp::pricer::{
     dispatch_by_m, ExactPairDpPricer, MafPricer, Pricer, PricerScratch, PricingContext,
     PricingResult,
@@ -821,6 +822,13 @@ impl LagrangianSolver {
             .unwrap_or(10);
         let mut win_priced_total = 0usize;
         let mut win_skipped_total = 0usize;
+        // Windows are priced SEQUENTIALLY, so one DP table suffices for all of
+        // them: this single max-sized cache is swapped into each window's
+        // scratch around its price call, instead of every window holding its own
+        // ~(2W)²·32-byte table. On giants (bottom-up packing → big windows) this
+        // cuts the DP-cache footprint from ~Σ(2Wᵢ)² to one ~(2·maxW)² table
+        // (e.g. ~1.2 GB → ~0.15 GB), which is the dominant giant RAM consumer.
+        let mut shared_dp_cache: Option<ExactPairDpCache> = None;
 
         loop {
             if self.terminate.load(Ordering::Relaxed)
@@ -844,6 +852,7 @@ impl LagrangianSolver {
                     seen: &seen,
                     branchings: &branchings,
                     terminate: self.terminate.as_ref(),
+                    deadline: None,
                 };
                 for col in scratch.drain_reserve(&ctx, 64) {
                     new_cols.push(col.labels().to_vec());
@@ -918,6 +927,9 @@ impl LagrangianSolver {
                             }
                         }
                     }
+                    // Lend the single shared DP table to this window for the
+                    // price, then take it back (windows priced sequentially).
+                    std::mem::swap(&mut w.scratch.exact_dp_cache, &mut shared_dp_cache);
                     let got: Vec<Vec<u32>> = {
                         let ctx = PricingContext {
                             trees: &w.inst.trees,
@@ -928,6 +940,7 @@ impl LagrangianSolver {
                             seen: &w.seen,
                             branchings: &branchings,
                             terminate: self.terminate.as_ref(),
+                            deadline: None,
                         };
                         let mut g = Vec::new();
                         for col in w.scratch.drain_reserve(&ctx, 64) {
@@ -943,6 +956,7 @@ impl LagrangianSolver {
                         }
                         g
                     };
+                    std::mem::swap(&mut w.scratch.exact_dp_cache, &mut shared_dp_cache);
                     for rl_labels in got {
                         w.seen.insert(rl_labels.clone());
                         new_cols.push(rl_labels.iter().map(|&rl| w.rev[rl as usize]).collect());
@@ -1332,6 +1346,7 @@ impl LagrangianSolver {
                         seen: &seen,
                         branchings: &br,
                         terminate: self.terminate.as_ref(),
+                        deadline: None,
                     };
                     let mut got: Vec<Vec<u32>> = Vec::new();
                     if let PricingResult::Found(cols) = pricer.price(&ctx, &mut scratch) {
@@ -1591,25 +1606,14 @@ impl LagrangianSolver {
     /// solves the cluster with the anytime cascade instead). The pricer now polls
     /// the shared `term` flag, so a SIGTERM aborts the inner DP promptly.
     fn solve_cluster_exact(&self, sub: &Instance, deadline: Instant) -> Option<Vec<Tree>> {
-        let term = Arc::new(AtomicBool::new(false));
-        let capped = Arc::new(AtomicBool::new(false));
-        let term_w = Arc::clone(&term);
-        let capped_w = Arc::clone(&capped);
-        let global = Arc::clone(&self.terminate);
-        let wd = std::thread::spawn(move || {
-            while !term_w.load(Ordering::Relaxed) {
-                if global.load(Ordering::Relaxed) || Instant::now() >= deadline {
-                    capped_w.store(true, Ordering::Relaxed);
-                    term_w.store(true, Ordering::Relaxed);
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        });
-        let res = klados_exact::bp::bp_solve_capped(sub, &term);
-        term.store(true, Ordering::Relaxed);
-        let _ = wd.join();
-        if capped.load(Ordering::Relaxed) {
+        // The exact B&P polls the deadline itself (no watchdog thread): the old
+        // watchdog slept on a poll and was `join()`ed after each probe, idling
+        // the main thread up to one poll interval per cluster probe — on
+        // decomp-heavy instances that idled a large fraction of the budget.
+        let res = klados_exact::bp::bp_solve_capped_until(sub, &self.terminate, Some(deadline));
+        // A capped/cancelled solve is NOT a proven optimum (a time-capped B&P
+        // returns a near-Chen incumbent the caller must not trust); discard it.
+        if self.terminate.load(Ordering::Relaxed) || Instant::now() >= deadline {
             return None;
         }
         res
@@ -1670,6 +1674,7 @@ impl LagrangianSolver {
                     seen,
                     branchings,
                     terminate: self.terminate.as_ref(),
+                    deadline: None,
                 };
                 for col in scratch.drain_reserve(&ctx, 64) {
                     newc.push(col.labels().to_vec());
@@ -1945,6 +1950,7 @@ impl LagrangianSolver {
                 seen,
                 branchings: &branchings,
                 terminate: self.terminate.as_ref(),
+                deadline: None,
             };
             for col in scratch.drain_reserve(&ctx, 64) {
                 newc.push(col.labels().to_vec());
@@ -2871,6 +2877,7 @@ impl LagrangianSolver {
                     seen: &seen,
                     branchings: &branchings,
                     terminate: self.terminate.as_ref(),
+                    deadline: None,
                 };
                 let mut new_cols: Vec<AfColumn> = scratch.drain_reserve(&ctx, 64);
                 if let PricingResult::Found(cols) = pricer.price(&ctx, &mut scratch) {
@@ -2924,6 +2931,7 @@ impl LagrangianSolver {
                             seen: &w.seen,
                             branchings: &branchings,
                             terminate: self.terminate.as_ref(),
+                            deadline: None,
                         };
                         let mut g = Vec::new();
                         for col in w.scratch.drain_reserve(&ctx, 64) {
@@ -3101,6 +3109,7 @@ impl LagrangianSolver {
                     seen,
                     branchings,
                     terminate: self.terminate.as_ref(),
+                    deadline: None,
                 };
                 let mut new_cols: Vec<AfColumn> = scratch.drain_reserve(&ctx, 64);
                 let r = pricer.price(&ctx, scratch);
