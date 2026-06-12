@@ -540,6 +540,9 @@ impl LagrangianSolver {
             <= CELL_CAP_SAFE;
         let force_lp = std::env::var("KLADOS_LAGR_LP").is_ok();
         let no_rmp = std::env::var("KLADOS_NO_RMP").is_ok();
+        // Columns the (capped) RMP tier priced; fed to the subgradient pool below
+        // so its CG warm-starts instead of rediscovering them from Chen.
+        let mut rmp_seed_labels: Vec<Vec<u32>> = Vec::new();
         if (global_fits || force_lp) && !no_rmp {
             // Cap the RMP attempt so the subgradient ALWAYS gets the bulk of the
             // budget. Proving happens fast or not at all (n=60, pub049 prove in
@@ -562,10 +565,12 @@ impl LagrangianSolver {
                 };
                 Some(start + dur)
             };
-            let (rmp_forest, rmp_proved) = self.solve_rmp(reduced, rmp_deadline, trace, start);
+            let (rmp_forest, rmp_proved, rmp_pool) =
+                self.solve_rmp(reduced, rmp_deadline, trace, start);
             if force_lp || rmp_proved {
                 return (rmp_forest, rmp_proved);
             }
+            rmp_seed_labels = rmp_pool;
             if trace {
                 eprintln!(
                     "{ind}[lagr] RMP did not certify (gap) — handing off to subgradient at {:.1}s",
@@ -639,10 +644,23 @@ impl LagrangianSolver {
                 }
             }
         }
+        // Warm-start with the columns the RMP tier already priced (avoids the
+        // subgradient rediscovering them from cold via column generation).
+        // `KLADOS_LAGR_NO_RMP_WARM` disables it (for A/B measurement).
+        let rmp_warm = if std::env::var("KLADOS_LAGR_NO_RMP_WARM").is_err() {
+            let n_warm = rmp_seed_labels.len();
+            for labels in std::mem::take(&mut rmp_seed_labels) {
+                add_block(labels, &mut pool, &mut seen);
+            }
+            n_warm
+        } else {
+            0
+        };
         if trace {
             eprintln!(
-                "{ind}[lagr] seeded pool={} ({:.0}ms)",
+                "{ind}[lagr] seeded pool={} (rmp_warm={}) ({:.0}ms)",
                 pool.len(),
+                rmp_warm,
                 start.elapsed().as_secs_f64() * 1000.0
             );
         }
@@ -690,6 +708,8 @@ impl LagrangianSolver {
                     img,
                     scratch: scratch_w,
                     seen: ColumnSet::new(),
+                    quiet: 0,
+                    skip_left: 0,
                 });
             }
             if trace {
@@ -838,11 +858,24 @@ impl LagrangianSolver {
             } else {
                 // Windowed pricing: restrict to each T₀ subtree, map α/β,
                 // run the DP, lift columns back to original labels.
+                // Cap on the per-window pricing backoff (max iterations skipped
+                // between re-prices of a quiet window). Env-tunable; 0 disables.
+                let backoff_cap: u16 = std::env::var("KLADOS_LAGR_WINDOW_BACKOFF")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(8);
                 for w in windows.iter_mut() {
                     if self.terminate.load(Ordering::Relaxed)
                         || deadline.is_some_and(|d| Instant::now() >= d)
                     {
                         break;
+                    }
+                    // Skip a window currently in backoff (it recently found no new
+                    // column at drifting duals). It is re-priced once the skip
+                    // window elapses, so no column is lost permanently.
+                    if w.skip_left > 0 {
+                        w.skip_left -= 1;
+                        continue;
                     }
                     let rn = w.inst.num_leaves as usize;
                     let mut a_r = vec![0.0f64; rn + 1];
@@ -889,6 +922,15 @@ impl LagrangianSolver {
                         }
                         g
                     };
+                    // Update backoff: a window that found nothing new is re-priced
+                    // exponentially less often (capped); one that found a column
+                    // resets to eager pricing.
+                    if got.is_empty() {
+                        w.quiet = (w.quiet + 1).min(backoff_cap);
+                        w.skip_left = w.quiet;
+                    } else {
+                        w.quiet = 0;
+                    }
                     for rl_labels in got {
                         w.seen.insert(rl_labels.clone());
                         new_cols.push(rl_labels.iter().map(|&rl| w.rev[rl as usize]).collect());
@@ -2624,13 +2666,17 @@ impl LagrangianSolver {
     /// separates node `≤1` rows, prices at those duals, and extracts an
     /// integral primal (MIP at convergence, greedy interim — both validated
     /// node-disjoint). This converges in B&P-class iteration counts.
+    /// Returns `(best_forest, proved, pool_labels)`. `pool_labels` are the
+    /// multi-leaf columns the RMP tier generated; the subgradient fallback seeds
+    /// its pool with them so its column generation does not start cold and
+    /// rediscover what the (capped) RMP tier already priced.
     fn solve_rmp(
         &self,
         reduced: &Instance,
         deadline: Option<Instant>,
         trace: bool,
         start: Instant,
-    ) -> (Vec<Tree>, bool) {
+    ) -> (Vec<Tree>, bool, Vec<Vec<u32>>) {
         let trees = &reduced.trees;
         let n = reduced.num_leaves;
         let nl = n as usize;
@@ -2725,6 +2771,8 @@ impl LagrangianSolver {
                     img,
                     scratch: scratch_w,
                     seen: ColumnSet::new(),
+                    quiet: 0,
+                    skip_left: 0,
                 });
             }
         }
@@ -2965,7 +3013,14 @@ impl LagrangianSolver {
                 break;
             }
         }
-        (best_forest, proved)
+        // Hand the multi-leaf columns to the caller so the subgradient fallback
+        // can warm-start its pool instead of rediscovering them.
+        let pool_labels: Vec<Vec<u32>> = pool
+            .iter()
+            .filter(|c| c.labels().len() >= 2)
+            .map(|c| c.labels().to_vec())
+            .collect();
+        (best_forest, proved, pool_labels)
     }
 
     /// Run column generation to convergence under `branchings`, reusing the
@@ -3462,6 +3517,14 @@ struct Window {
     img: Vec<Vec<u32>>,
     scratch: PricerScratch,
     seen: ColumnSet,
+    /// Pricing backoff: consecutive iterations this window priced with no new
+    /// column, and how many upcoming iterations to skip it. A window that has
+    /// gone quiet (its local DP keeps finding nothing new at the drifting duals)
+    /// is re-priced exponentially less often, capped — most windows converge in
+    /// a few iterations, so this cuts the dominant per-iteration DP cost on
+    /// giants while still re-checking each window periodically.
+    quiet: u16,
+    skip_left: u16,
 }
 
 /// Split T₀ into leaf groups, each a subtree with ≤ `max_leaves` leaves.
