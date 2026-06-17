@@ -52,33 +52,16 @@ pub fn chen_pair_bounds(t1: &Tree, t2: &Tree) -> (usize, usize) {
 }
 
 #[derive(Clone, Debug)]
+#[derive(Default)]
 pub struct ChenRsprConfig {
     /// Enable jar-dummy leaf attachment.
     pub jar_dummy: bool,
-    /// Print bound details.
-    pub bounds: bool,
-    /// Trace k-search.
-    pub trace_k: bool,
     /// Disable recursive lower bound.
     pub no_recursive_lb: bool,
     /// Enable forced-cut pre-branch rules.
     pub use_forced: bool,
-    /// Trace stopper classifications.
-    pub trace_stoppers: bool,
 }
 
-impl Default for ChenRsprConfig {
-    fn default() -> Self {
-        Self {
-            jar_dummy: false,
-            bounds: false,
-            trace_k: false,
-            no_recursive_lb: false,
-            use_forced: false,
-            trace_stoppers: false,
-        }
-    }
-}
 
 pub struct ChenRsprSolver {
     stats: SolverStats,
@@ -442,14 +425,13 @@ fn build_branches(
         {
             let mut branches = Vec::with_capacity(2);
             let d_ac = d_f_cut_nodes(tf, T2, t2_x1, t2_x2).unwrap_or_default();
-            if !d_ac.is_empty() {
-                if !d_ac.iter().any(|&n| tf.protected[n as usize]) {
+            if !d_ac.is_empty()
+                && !d_ac.iter().any(|&n| tf.protected[n as usize]) {
                     branches.push(BranchCut::Many {
                         nodes: d_ac,
                         locks_after: Vec::new(),
                     });
                 }
-            }
             if lca == tf.parent[T2][t2_x1 as usize] {
                 let x2_sib = tf.sibling(T2, t2_x2);
                 if x2_sib != NONE && !tf.is_leaf(T2, x2_sib) {
@@ -502,14 +484,12 @@ fn build_branches(
             && tf.parent[T2][x2_parent as usize] != NONE
             && (tf.sibling(T2, x1_parent) == f2x || tf.sibling(T2, x2_parent) == f2x)
             && d_cut.len() == 2
-        {
-            if !d_cut.iter().any(|&n| tf.protected[n as usize]) {
+            && !d_cut.iter().any(|&n| tf.protected[n as usize]) {
                 return vec![BranchCut::Many {
                     nodes: d_cut,
                     locks_after: Vec::new(),
                 }];
             }
-        }
     }
 
     let x1_unprotected = !tf.protected[t2_x1 as usize];
@@ -617,14 +597,13 @@ fn build_branches(
     } else {
         Vec::new()
     };
-    if !d_cut.is_empty() {
-        if !d_cut.iter().any(|&n| tf.protected[n as usize]) {
+    if !d_cut.is_empty()
+        && !d_cut.iter().any(|&n| tf.protected[n as usize]) {
             branches.push(BranchCut::Many {
                 nodes: d_cut,
                 locks_after: singleton_lock.clone(),
             });
         }
-    }
     if x2_unprotected {
         branches.push(BranchCut::One {
             node: t2_x2,
@@ -984,10 +963,7 @@ struct ChenAppState {
 impl ChenAppState {
     fn from_twin(tf: &TwinForest) -> Self {
         let n = tf.num_leaves;
-        let mut node_repr_t1 = vec![0 as Label; tf.num_nodes[T1]];
-        for v in 0..tf.num_nodes[T1] {
-            node_repr_t1[v] = tf.label[T1][v];
-        }
+        let node_repr_t1 = tf.label[T1][..tf.num_nodes[T1]].to_vec();
         let mut state = Self {
             parent: tf.parent.clone(),
             orig_parent: [tf.orig_parent.clone(), tf.orig_t2_parent.clone()],
@@ -1240,11 +1216,10 @@ impl ChenAppState {
         }
         let lc = self.left[T1][node as usize];
         let rc = self.right[T1][node as usize];
-        if lc != NONE && rc != NONE && self.is_leaf(T1, lc) && self.is_leaf(T1, rc) {
-            if let Some(cut) = self.optimal_cut_for_cherry(node, lc, rc) {
+        if lc != NONE && rc != NONE && self.is_leaf(T1, lc) && self.is_leaf(T1, rc)
+            && let Some(cut) = self.optimal_cut_for_cherry(node, lc, rc) {
                 return Some(cut);
             }
-        }
         self.find_optimal_cut_under(lc)
             .or_else(|| self.find_optimal_cut_under(rc))
     }
@@ -2572,11 +2547,10 @@ fn find_reference_optimal_cut_under(tf: &TwinForest, node: NodeId) -> Option<Nod
         return None;
     }
 
-    if rc != NONE && tf.is_leaf(T1, lc) && tf.is_leaf(T1, rc) {
-        if let Some(cut) = reference_optimal_cut_for_t1_cherry(tf, node, lc, rc) {
+    if rc != NONE && tf.is_leaf(T1, lc) && tf.is_leaf(T1, rc)
+        && let Some(cut) = reference_optimal_cut_for_t1_cherry(tf, node, lc, rc) {
             return Some(cut);
         }
-    }
 
     if let Some(cut) = find_reference_optimal_cut_under(tf, lc) {
         return Some(cut);
@@ -2599,8 +2573,8 @@ fn reference_optimal_cut_for_t1_cherry(
         return None;
     }
 
-    if let Some(t1_parent_sibling) = sibling_node(tf, T1, t1_parent) {
-        if tf.is_leaf(T1, t1_parent_sibling) {
+    if let Some(t1_parent_sibling) = sibling_node(tf, T1, t1_parent)
+        && tf.is_leaf(T1, t1_parent_sibling) {
             let t2_third = tf.twin[T1][t1_parent_sibling as usize];
             if t2_third != NONE {
                 let t2_third_parent = tf.parent[T2][t2_third as usize];
@@ -2612,7 +2586,6 @@ fn reference_optimal_cut_for_t1_cherry(
                 }
             }
         }
-    }
 
     let t2_left_parent = tf.parent[T2][t2_left as usize];
     let t2_right_parent = tf.parent[T2][t2_right as usize];

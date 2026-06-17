@@ -8,7 +8,7 @@ use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.len() < 2 || args.len() % 2 != 0 {
+    if args.len() < 2 || !args.len().is_multiple_of(2) {
         eprintln!("usage: gap_experiment <best_known> <file> [<best_known> <file> ...]");
         std::process::exit(2);
     }

@@ -2,6 +2,8 @@
 //!
 //! κλάδος (klados) - Ancient Greek for "branch"
 
+#![allow(clippy::too_many_arguments)]
+
 mod commands;
 
 use clap::{Parser, Subcommand, ValueEnum};

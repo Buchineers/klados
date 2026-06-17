@@ -18,6 +18,19 @@ pub struct RedBlueResult {
     pub dual_lb: usize,
 }
 
+/// Dump the active components of `partition` at debug level. Self-guarded on the
+/// log level so the per-component `Vec` collection is skipped entirely when debug
+/// logging is off — this runs on the bounds hot path (once per tree-pair).
+fn debug_dump_components(partition: &Partition) {
+    if !log::log_enabled!(log::Level::Debug) {
+        return;
+    }
+    for cid in partition.active_component_ids() {
+        let members: Vec<usize> = partition.members[cid as usize].ones().collect();
+        debug!("[RB]   comp {}: {:?}", cid, members);
+    }
+}
+
 pub fn red_blue_approx_detailed(t1: &Tree, t2: &Tree) -> RedBlueResult {
     let n = t1.num_leaves;
     if n <= 1 {
@@ -40,10 +53,7 @@ pub fn red_blue_approx_detailed(t1: &Tree, t2: &Tree) -> RedBlueResult {
             "[RB] Partition has {} components",
             partition.count_components()
         );
-        for cid in partition.active_component_ids() {
-            let members: Vec<usize> = partition.members[cid as usize].ones().collect();
-            debug!("[RB]   comp {}: {:?}", cid, members);
-        }
+        debug_dump_components(&partition);
 
         let u = match find_lowest_roi(&td1, &td2, &partition) {
             Some(u) => u,
@@ -67,7 +77,7 @@ pub fn red_blue_approx_detailed(t1: &Tree, t2: &Tree) -> RedBlueResult {
             }
         }
 
-        {
+        if log::log_enabled!(log::Level::Debug) {
             let reds: Vec<usize> = red.ones().collect();
             let blues: Vec<usize> = blue.ones().collect();
             let whites: Vec<usize> = white.ones().collect();
@@ -84,30 +94,21 @@ pub fn red_blue_approx_detailed(t1: &Tree, t2: &Tree) -> RedBlueResult {
             "[RB] After Make-RUB-compatible: {} components",
             partition.count_components()
         );
-        for cid in partition.active_component_ids() {
-            let members: Vec<usize> = partition.members[cid as usize].ones().collect();
-            debug!("[RB]   comp {}: {:?}", cid, members);
-        }
+        debug_dump_components(&partition);
 
         y_decrements += make_splittable(&td2, &mut partition, red, blue, &white);
         debug!(
             "[RB] After Make-Splittable: {} components",
             partition.count_components()
         );
-        for cid in partition.active_component_ids() {
-            let members: Vec<usize> = partition.members[cid as usize].ones().collect();
-            debug!("[RB]   comp {}: {:?}", cid, members);
-        }
+        debug_dump_components(&partition);
 
         y_decrements += split_procedure(&td1, &td2, &mut partition, red, blue, &white);
         debug!(
             "[RB] After Split: {} components",
             partition.count_components()
         );
-        for cid in partition.active_component_ids() {
-            let members: Vec<usize> = partition.members[cid as usize].ones().collect();
-            debug!("[RB]   comp {}: {:?}", cid, members);
-        }
+        debug_dump_components(&partition);
 
         if let Some(pair) = find_merge_pair(&td1, &td2, &partition, red, blue, &original_comp) {
             debug!("[RB] Find-Merge-Pair found: ({}, {})", pair.0, pair.1);
@@ -142,10 +143,7 @@ pub fn red_blue_approx_detailed(t1: &Tree, t2: &Tree) -> RedBlueResult {
         nc.saturating_sub(1),
         dual_lb,
     );
-    for cid in partition.active_component_ids() {
-        let members: Vec<usize> = partition.members[cid as usize].ones().collect();
-        debug!("[RB]   comp {}: {:?}", cid, members);
-    }
+    debug_dump_components(&partition);
     let ub = if nc == 0 { 0 } else { nc - 1 };
     RedBlueResult { ub, dual_lb }
 }
@@ -171,10 +169,7 @@ pub fn red_blue_approx(t1: &Tree, t2: &Tree) -> usize {
             "[RB] Partition has {} components",
             partition.count_components()
         );
-        for cid in partition.active_component_ids() {
-            let members: Vec<usize> = partition.members[cid as usize].ones().collect();
-            debug!("[RB]   comp {}: {:?}", cid, members);
-        }
+        debug_dump_components(&partition);
 
         let u = match find_lowest_roi(&td1, &td2, &partition) {
             Some(u) => u,
@@ -195,7 +190,7 @@ pub fn red_blue_approx(t1: &Tree, t2: &Tree) -> usize {
             }
         }
 
-        {
+        if log::log_enabled!(log::Level::Debug) {
             let reds: Vec<usize> = red.ones().collect();
             let blues: Vec<usize> = blue.ones().collect();
             let whites: Vec<usize> = white.ones().collect();
@@ -212,30 +207,21 @@ pub fn red_blue_approx(t1: &Tree, t2: &Tree) -> usize {
             "[RB] After Make-RUB-compatible: {} components",
             partition.count_components()
         );
-        for cid in partition.active_component_ids() {
-            let members: Vec<usize> = partition.members[cid as usize].ones().collect();
-            debug!("[RB]   comp {}: {:?}", cid, members);
-        }
+        debug_dump_components(&partition);
 
         let _ = make_splittable(&td2, &mut partition, red, blue, &white);
         debug!(
             "[RB] After Make-Splittable: {} components",
             partition.count_components()
         );
-        for cid in partition.active_component_ids() {
-            let members: Vec<usize> = partition.members[cid as usize].ones().collect();
-            debug!("[RB]   comp {}: {:?}", cid, members);
-        }
+        debug_dump_components(&partition);
 
         let _ = split_procedure(&td1, &td2, &mut partition, red, blue, &white);
         debug!(
             "[RB] After Split: {} components",
             partition.count_components()
         );
-        for cid in partition.active_component_ids() {
-            let members: Vec<usize> = partition.members[cid as usize].ones().collect();
-            debug!("[RB]   comp {}: {:?}", cid, members);
-        }
+        debug_dump_components(&partition);
 
         if let Some(pair) = find_merge_pair(&td1, &td2, &partition, red, blue, &original_comp) {
             debug!("[RB] Find-Merge-Pair found: ({}, {})", pair.0, pair.1);
@@ -259,10 +245,7 @@ pub fn red_blue_approx(t1: &Tree, t2: &Tree) -> usize {
         nc,
         nc.saturating_sub(1)
     );
-    for cid in partition.active_component_ids() {
-        let members: Vec<usize> = partition.members[cid as usize].ones().collect();
-        debug!("[RB]   comp {}: {:?}", cid, members);
-    }
+    debug_dump_components(&partition);
     if nc == 0 { 0 } else { nc - 1 }
 }
 

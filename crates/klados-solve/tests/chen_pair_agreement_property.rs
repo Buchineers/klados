@@ -1,12 +1,12 @@
 //! Property tests for `chen_pair_agreement`.
 //!
 //! For random small 2-tree instances, assert that:
-//!   1. The returned leaf-sets form a valid agreement forest of (T1, T2).
-//!   2. The reported `lower` and `upper` bracket the true rSPR distance:
-//!         lower <= OPT_cuts <= upper <= 2 * lower
-//!   3. The leaf-sets correspond to a partition with `upper + 1` components
-//!      (or fewer — padding may happen but should not introduce extras
-//!      beyond what the AF requires).
+//! 1. The returned leaf-sets form a valid agreement forest of (T1, T2).
+//! 2. The reported `lower` and `upper` bracket the true rSPR distance:
+//!    lower <= OPT_cuts <= upper <= 2 * lower
+//! 3. The leaf-sets correspond to a partition with `upper + 1` components
+//!    (or fewer — padding may happen but should not introduce extras
+//!    beyond what the AF requires).
 
 use fixedbitset::FixedBitSet;
 use klados_core::Instance;

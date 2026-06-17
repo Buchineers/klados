@@ -14,7 +14,7 @@
 //!   - Each instance runs in < 50ms via brute force + B&P; full battery < 30s
 
 use klados_core::Instance;
-use klados_core::af_validator::{AfValidation, validate_agreement_forest};
+use klados_core::af_validator::validate_agreement_forest;
 use klados_core::brute_maf::brute_force_maf;
 use klados_core::tree::{Label, NONE, NodeId, Tree};
 use klados_solve::{RunConfig, Solver};

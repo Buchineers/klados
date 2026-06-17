@@ -310,7 +310,7 @@ impl<'a, 'c> LazyKBest<'a, 'c> {
     fn run_forward_dp(input: &LazyKBestInput, cache: &mut LazyKBestCache) {
         let t0 = input.t0;
         let t1 = input.t1;
-        let n0 = t0.num_nodes();
+        let _n0 = t0.num_nodes();
         let n1 = t1.num_nodes();
 
         for c in cache.dp_closed.iter_mut() {
@@ -519,7 +519,7 @@ impl<'a, 'c> LazyKBest<'a, 'c> {
 
     /// Return the next column with score `≥ self.input.threshold`, or
     /// `None` once the shell is exhausted.
-    pub fn next(&mut self) -> Option<CorridorColumn> {
+    pub fn next_column(&mut self) -> Option<CorridorColumn> {
         loop {
             let entry = self.heap.pop()?;
             if entry.score < self.input.threshold - PRICING_EPS {
@@ -962,7 +962,7 @@ mod tests {
             &mut lazy_cache,
         );
         let mut lazy_keys: Vec<(Vec<u32>, f64)> = Vec::new();
-        while let Some(col) = lazy.next() {
+        while let Some(col) = lazy.next_column() {
             lazy_keys.push((col.labels, col.score));
         }
         lazy_keys.sort_by(|a, b| a.0.cmp(&b.0));

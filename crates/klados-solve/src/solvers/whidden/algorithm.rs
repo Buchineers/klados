@@ -204,7 +204,7 @@ struct TTEntry {
     required_k_min: i16,
 }
 
-struct TranspositionTable {
+pub(super) struct TranspositionTable {
     entries: Vec<TTEntry>,
     mask: usize,
 }
@@ -262,7 +262,7 @@ struct BoundEntry {
     approx2_lb: i16, // -1 = not cached
 }
 
-struct BoundCache {
+pub(super) struct BoundCache {
     entries: Vec<BoundEntry>,
     mask: usize,
 }
@@ -335,7 +335,7 @@ impl BoundCache {
 
 /// Propagated bound info from parent to child.
 #[derive(Clone, Copy)]
-struct ParentBounds {
+pub(super) struct ParentBounds {
     val3: i32,       // parent's val3 (-1 = unknown)
     approx2_lb: i32, // parent's approx_2_lb (-1 = unknown)
 }
@@ -544,7 +544,7 @@ fn bb_inner(
     // SPLIT diagnostic — gated on `-v` (verbose), sampled every 50 nodes to
     // keep cost bounded.
     {
-        if stats.nodes_explored % 50 == 0 && log::log_enabled!(log::Level::Debug) {
+        if stats.nodes_explored.is_multiple_of(50) && log::log_enabled!(log::Level::Debug) {
             split_diag_check(tf, rule_stats);
         }
     }
@@ -947,11 +947,10 @@ fn find_any_pair(tf: &TwinForest, node: NodeId, config: &BBConfig) -> PairResult
         return PairResult::NoPairs;
     }
 
-    if rc != NONE && tf.is_leaf(T1, lc) && tf.is_leaf(T1, rc) {
-        if let Some(result) = classify_pair(tf, node, lc, rc, config) {
+    if rc != NONE && tf.is_leaf(T1, lc) && tf.is_leaf(T1, rc)
+        && let Some(result) = classify_pair(tf, node, lc, rc, config) {
             return result;
         }
-    }
 
     if lc != NONE {
         let r = find_any_pair(tf, lc, config);
@@ -988,8 +987,8 @@ fn find_preferred_pair(
         return PairResult::NoPairs;
     }
 
-    if rc != NONE && tf.is_leaf(T1, lc) && tf.is_leaf(T1, rc) {
-        if let Some(result) = classify_pair(tf, node, lc, rc, config) {
+    if rc != NONE && tf.is_leaf(T1, lc) && tf.is_leaf(T1, rc)
+        && let Some(result) = classify_pair(tf, node, lc, rc, config) {
             match &result {
                 PairResult::Case2 { .. } => return result,
                 PairResult::Case3 {
@@ -1027,7 +1026,6 @@ fn find_preferred_pair(
                 _ => {}
             }
         }
-    }
 
     if lc != NONE {
         let r = find_preferred_pair(tf, lc, config, rule_stats, fallback, best_depth);
@@ -1133,20 +1131,18 @@ fn classify_pair(
                     if t2_l != NONE {
                         // Subcase 1: path_length 4 (balanced)
                         // T2_c.parent.parent == T2_l
-                        if t2_c_parent != NONE && tf.parent[T2][t2_c_parent as usize] == t2_l {
-                            if tf.sibling(T2, t2_l) == t2_s {
+                        if t2_c_parent != NONE && tf.parent[T2][t2_c_parent as usize] == t2_l
+                            && tf.sibling(T2, t2_l) == t2_s {
                                 cut_b_only = true;
                             }
-                        }
                         // Subcase 2: path_length 5
                         // T2_c.parent == T2_l.parent
                         if !cut_b_only {
                             let t2_l2 = tf.parent[T2][t2_l as usize];
-                            if t2_l2 != NONE && t2_c_parent == t2_l2 {
-                                if tf.sibling(T2, t2_l2) == t2_s {
+                            if t2_l2 != NONE && t2_c_parent == t2_l2
+                                && tf.sibling(T2, t2_l2) == t2_s {
                                     cut_b_only = true;
                                 }
-                            }
                         }
                     }
                 }
@@ -1223,7 +1219,7 @@ fn find_root(tf: &TwinForest, ti: usize, mut node: NodeId) -> NodeId {
 }
 
 #[derive(Clone)]
-struct ComponentShape {
+pub(super) struct ComponentShape {
     t2_root: NodeId,
     leafset: FixedBitSet,
     homeomorphic: bool,
@@ -1481,7 +1477,7 @@ fn find_edge_with_descendant_leafset(
         let lc = tf.left[ti][node as usize];
         if lc != NONE {
             let left = dfs(tf, ti, lc, target, cap, found);
-            if *found == None && &left == target {
+            if found.is_none() && &left == target {
                 *found = Some(lc);
             }
             out.union_with(&left);
@@ -1489,7 +1485,7 @@ fn find_edge_with_descendant_leafset(
         let rc = tf.right[ti][node as usize];
         if rc != NONE {
             let right = dfs(tf, ti, rc, target, cap, found);
-            if *found == None && &right == target {
+            if found.is_none() && &right == target {
                 *found = Some(rc);
             }
             out.union_with(&right);
@@ -2474,12 +2470,10 @@ fn apply_decompose(
         // others get 0 (= drop). Also build the reverse map (new → orig).
         let mut label_map: Vec<klados_core::tree::Label> =
             vec![0; tf.num_leaves as usize + 1];
-        let mut label_to_orig: Vec<klados_core::tree::Label> = vec![0; (count + 1) as usize];
-        let mut new_label: u32 = 1;
-        for old_lbl in leafset.ones() {
+        let mut label_to_orig: Vec<klados_core::tree::Label> = vec![0; count + 1];
+        for (new_label, old_lbl) in (1u32..).zip(leafset.ones()) {
             label_map[old_lbl] = new_label as klados_core::tree::Label;
             label_to_orig[new_label as usize] = old_lbl as klados_core::tree::Label;
-            new_label += 1;
         }
         let new_num_leaves = count as u32;
         let sub_t1 = t1_orig.relabel(&label_map, new_num_leaves);

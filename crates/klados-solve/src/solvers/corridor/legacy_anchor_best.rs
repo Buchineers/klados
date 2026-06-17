@@ -41,7 +41,7 @@
 //!   exists yet for the multi-tree case — that's a routing decision
 //!   on instance class, not a failure fallback.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use log::debug;
 
@@ -145,7 +145,7 @@ impl CorridorSolver {
             klados_core::kernelize::KernelizeResult {
                 instance: instance.clone(),
                 stats: Default::default(),
-                reverse_map: (0..=instance.num_leaves).map(|i| i as u32).collect(),
+                reverse_map: (0..=instance.num_leaves).collect(),
                 collapses_original: vec![],
                 param_reduction: 0,
                 trace: vec![],
@@ -164,7 +164,7 @@ impl CorridorSolver {
         if reduced.num_leaves >= 20 {
             let mut sub_failed = false;
             let mut solve_sub = |sub: &Instance| {
-                let mut inner = CorridorSolver {
+                let inner = CorridorSolver {
                     stats: SolverStats::default(),
                     config: self.config.clone(),
                 };
@@ -179,8 +179,8 @@ impl CorridorSolver {
                 reduced,
                 &mut solve_sub,
                 &crate::decomp::whidden_cluster::NEVER_TERMINATE,
-            ) {
-                if !sub_failed {
+            )
+                && !sub_failed {
                     let expanded = expand_solution(
                         forest,
                         &kern,
@@ -191,7 +191,6 @@ impl CorridorSolver {
                     self.stats.lower_bound = expanded.len();
                     return Some(expanded);
                 }
-            }
         }
 
         let reduced_forest = self.solve_m2_core(reduced)?;
@@ -248,7 +247,6 @@ impl CorridorSolver {
         // ── Outer loop: CG → corridor → MIP → γ-shrink ─────────────
         let mut outer = 0usize;
         let mut total_cg_iters = 0usize;
-        let mut total_cuts = 0usize;
         let mut total_corridor_added = 0usize;
 
         loop {
@@ -272,7 +270,7 @@ impl CorridorSolver {
             // Phase 1: standard CG (rc < 0 columns only) — runs to
             // convergence with no internal time limit; the safety bound
             // on iter count just catches a runaway pricer.
-            let (lp_obj, lp_converged, cg_iters, cuts) = run_cg(
+            let (lp_obj, lp_converged, cg_iters, _cuts) = run_cg(
                 trees,
                 n,
                 &mut rmp,
@@ -284,7 +282,6 @@ impl CorridorSolver {
                 self.config.max_cg_iters,
             )?;
             total_cg_iters += cg_iters;
-            total_cuts += cuts;
 
             if !lp_converged {
                 debug!(
@@ -296,13 +293,11 @@ impl CorridorSolver {
 
             // Update incumbent via LP rounding before computing γ —
             // a tighter U gives a smaller corridor.
-            if let Some(lp_sol) = solve_lp(&mut rmp) {
-                if let Some(rounded) = lp_round(&columns, &lp_sol.column_values, n) {
-                    if rounded.len() < best_cols.len() {
+            if let Some(lp_sol) = solve_lp(&mut rmp)
+                && let Some(rounded) = lp_round(&columns, &lp_sol.column_values, n)
+                    && rounded.len() < best_cols.len() {
                         best_cols = rounded;
                     }
-                }
-            }
 
             let upper = best_cols.len();
             let lb = (lp_obj - 1.0e-6).ceil() as usize;
@@ -410,13 +405,12 @@ impl CorridorSolver {
                 let mut newly_added = 0usize;
                 for (_score, labels, anchor0, anchor1) in candidates {
                     forbidden_anchors.push((anchor0, anchor1));
-                    if seen.insert(labels.clone()) {
-                        if let Some(col) = builder.try_build(labels, trees) {
+                    if seen.insert(labels.clone())
+                        && let Some(col) = builder.try_build(labels, trees) {
                             rmp.add_column(&col);
                             columns.push(col);
                             newly_added += 1;
                         }
-                    }
                 }
                 total_corridor_added += newly_added;
                 debug!(
@@ -438,25 +432,23 @@ impl CorridorSolver {
                     // integer solution. (Caveat: still incomplete vs
                     // top-K-per-anchor; documented limitation.)
                     let mip = solve_mip_to_optimality(&mut rmp, &columns, n);
-                    if let Some(labels) = mip {
-                        if labels.len() < best_cols.len() {
+                    if let Some(labels) = mip
+                        && labels.len() < best_cols.len() {
                             best_cols = labels;
                             improved_this_outer = true;
                         }
-                    }
                     break;
                 }
 
                 // Run MIP after each enrichment batch. If it improves
                 // U we restart from outer (γ shrinks → tighter corridor).
                 let mip = solve_mip_to_optimality(&mut rmp, &columns, n);
-                if let Some(labels) = mip {
-                    if labels.len() < best_cols.len() {
+                if let Some(labels) = mip
+                    && labels.len() < best_cols.len() {
                         best_cols = labels;
                         improved_this_outer = true;
                         break;
                     }
-                }
             }
 
             if improved_this_outer {

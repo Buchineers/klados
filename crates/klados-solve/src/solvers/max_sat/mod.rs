@@ -373,13 +373,12 @@ impl MaxSatSolver {
 fn parse_solution(output: &str) -> std::collections::HashSet<usize> {
     let mut true_vars = std::collections::HashSet::new();
     for line in output.lines() {
-        if line.starts_with("v ") {
-            for lit in line[2..].split_whitespace() {
-                if let Ok(var) = lit.parse::<isize>() {
-                    if var > 0 {
+        if let Some(rest) = line.strip_prefix("v ") {
+            for lit in rest.split_whitespace() {
+                if let Ok(var) = lit.parse::<isize>()
+                    && var > 0 {
                         true_vars.insert((var - 1) as usize);
                     }
-                }
             }
         }
     }
@@ -401,11 +400,10 @@ fn extract_induced_subtree(tree: &Tree, labels: &[Label]) -> Tree {
         label_set: &std::collections::HashSet<Label>,
     ) -> Option<Vec<Label>> {
         if tree.is_leaf(node) {
-            if let Some(label) = tree.leaf_label(node) {
-                if label_set.contains(&label) {
+            if let Some(label) = tree.leaf_label(node)
+                && label_set.contains(&label) {
                     return Some(vec![label]);
                 }
-            }
             return None;
         }
 

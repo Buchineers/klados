@@ -295,7 +295,7 @@ impl LeafPairDpPricer {
         for v in self.label_to_active_idx.iter_mut() {
             *v = u32::MAX;
         }
-        let mut activate = |me: &mut Self, label: u32| {
+        let activate = |me: &mut Self, label: u32| {
             if me.active_mask.contains(label as usize) {
                 return;
             }
@@ -325,7 +325,7 @@ impl LeafPairDpPricer {
 
     /// Rebuild per-pair LCA / side-child tables (expensive — O(p²·m)).
     /// Only called when the active label set changes.
-    fn rebuild_pair_tables(&mut self, trees: &[Tree]) {
+    fn rebuild_pair_tables(&mut self, _trees: &[Tree]) {
         let p = self.active_labels.len();
         let pair_count = p * p;
         for ti in 0..self.num_trees {
@@ -487,8 +487,7 @@ impl LeafPairDpPricer {
     /// The leaf-pair DP decomposes `s(a, b) = -root_penalty + solve_side(a, b)
     /// + solve_side(b, a)`. On each side, the optimum is either "leaf-only"
     /// (just `a` alone, scored `α[a] − pair_singleton_penalty`) or some
-    /// extension `c` (`solve_pair(a, c) − pen(a, c)`). The "leaf-only"
-    /// alternative is always a valid competing column at this anchor.
+    /// extension `c` (`solve_pair(a, c) − pen(a, c)`), and the "leaf-only" alternative is always a valid competing column at this anchor.
     ///
     /// This is *not* the true second-best gap and must not be used as a
     /// sound skip/optimality certificate. It is retained only as a cheap
@@ -1162,8 +1161,8 @@ impl Pricer for LeafPairDpPricer {
         }
 
         // Optional anchor-cache stats logging.
-        if anchor_cache_enabled(scratch) {
-            if let Some(cache) = scratch.anchor_cache.as_ref() {
+        if anchor_cache_enabled(scratch)
+            && let Some(cache) = scratch.anchor_cache.as_ref() {
                 let avg_gap = if cache.gap_positive_refreshes > 0 {
                     cache.gap_sum / cache.gap_positive_refreshes as f64
                 } else {
@@ -1177,7 +1176,6 @@ impl Pricer for LeafPairDpPricer {
                     cache.gap_zero_refreshes, avg_gap,
                 );
             }
-        }
 
         if !result.found.is_empty() {
             // Sort by RC descending, cap at 128 to prevent RMP flooding

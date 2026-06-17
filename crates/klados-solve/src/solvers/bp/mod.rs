@@ -387,7 +387,7 @@ fn solve_recursive_memo(
         klados_core::kernelize::KernelizeResult {
             instance: instance.clone(),
             stats: Default::default(),
-            reverse_map: (0..=instance.num_leaves).map(|i| i as u32).collect(),
+            reverse_map: (0..=instance.num_leaves).collect(),
             collapses_original: vec![],
             param_reduction: 0,
             trace: vec![],
@@ -631,7 +631,7 @@ fn ir_search(t0: &Tree, t1: &Tree, n: usize, color: &[u32], classes: usize, st: 
             labeled_tree_signature(&r0, r0.root),
             labeled_tree_signature(&r1, r1.root)
         );
-        if st.best_key.as_ref().map_or(true, |bk| key < *bk) {
+        if st.best_key.as_ref().is_none_or(|bk| key < *bk) {
             st.best_key = Some(key);
             st.best_l2c = l2c;
             st.best_c2l = c2l;
@@ -859,6 +859,34 @@ fn make_leafset(labels: &[u32], num_leaves: u32) -> FixedBitSet {
     bits
 }
 
+/// Convert Chen leaf-sets to agreement forest trees.
+fn leafsets_to_trees(leafsets: &[Vec<u32>], instance: &Instance) -> Vec<Tree> {
+    let t1 = &instance.trees[0];
+    let n = instance.num_leaves;
+    leafsets
+        .iter()
+        .map(|labels| {
+            if labels.len() == 1 {
+                Tree::singleton(labels[0], n)
+            } else {
+                let mut bitset = fixedbitset::FixedBitSet::with_capacity(n as usize + 1);
+                for &l in labels {
+                    bitset.insert(l as usize);
+                }
+                Tree::component_from_leafset(&bitset, t1, n)
+            }
+        })
+        .collect()
+}
+
+
+// ── entry point ─────────────────────────────────────────────────────────────
+use crate::{RunConfig, Solver, Track};
+
+pub fn main() {
+    crate::run(BpSolver::new(), RunConfig { track: Track::Exact, specific: BpConfig::default(), ..Default::default() });
+}
+
 #[cfg(test)]
 mod canon_tests {
     use super::*;
@@ -987,32 +1015,4 @@ mod canon_tests {
     fn canon_invariant_caterpillar() {
         check_invariant("(1,(2,(3,(4,(5,6)))))", "(((((1,6),2),5),3),4)", 6);
     }
-}
-
-/// Convert Chen leaf-sets to agreement forest trees.
-fn leafsets_to_trees(leafsets: &[Vec<u32>], instance: &Instance) -> Vec<Tree> {
-    let t1 = &instance.trees[0];
-    let n = instance.num_leaves;
-    leafsets
-        .iter()
-        .map(|labels| {
-            if labels.len() == 1 {
-                Tree::singleton(labels[0], n)
-            } else {
-                let mut bitset = fixedbitset::FixedBitSet::with_capacity(n as usize + 1);
-                for &l in labels {
-                    bitset.insert(l as usize);
-                }
-                Tree::component_from_leafset(&bitset, t1, n)
-            }
-        })
-        .collect()
-}
-
-
-// ── entry point ─────────────────────────────────────────────────────────────
-use crate::{RunConfig, Solver, Track};
-
-pub fn main() {
-    crate::run(BpSolver::new(), RunConfig { track: Track::Exact, specific: BpConfig::default(), ..Default::default() });
 }

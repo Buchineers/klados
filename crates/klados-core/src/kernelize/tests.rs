@@ -258,7 +258,7 @@ fn pipeline_preserves_protected_labels() {
 
     // Verify that the protected label 2 survives as a representative in the
     // reverse map (meaning it wasn't removed from the instance).
-    let prot_label_present = result.reverse_map.iter().any(|&orig| orig == 2);
+    let prot_label_present = result.reverse_map.contains(&2);
     assert!(
         prot_label_present,
         "protected label 2 should appear in the reverse map"

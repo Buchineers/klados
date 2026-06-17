@@ -322,22 +322,16 @@ fn component_nodes_for_instance(
 ) -> Option<Vec<Vec<FixedBitSet>>> {
     let mut out = Vec::with_capacity(leafsets.len());
     for leafset in leafsets {
-        let Some(reference_signature) = induced_tree_signature(&instance.trees[0], leafset) else {
-            return None;
-        };
+        let reference_signature = induced_tree_signature(&instance.trees[0], leafset)?;
 
         let mut component = Vec::with_capacity(instance.num_trees());
         for tree in &instance.trees {
-            let Some(signature) = induced_tree_signature(tree, leafset) else {
-                return None;
-            };
+            let signature = induced_tree_signature(tree, leafset)?;
             if signature != reference_signature {
                 return None;
             }
 
-            let Some(nodes) = covered_internal_nodes_for_leafset(tree, leafset) else {
-                return None;
-            };
+            let nodes = covered_internal_nodes_for_leafset(tree, leafset)?;
             let mut bitset = FixedBitSet::with_capacity(tree.num_nodes());
             for node in nodes {
                 bitset.insert(node);

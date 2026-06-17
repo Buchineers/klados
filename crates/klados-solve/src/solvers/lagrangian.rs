@@ -319,10 +319,11 @@ impl LagrangianSolver {
         self.abort_armed.store(false, Ordering::Relaxed);
         self.stats.lower_bound = 0;
 
-        // Publish a trivial-but-valid baseline immediately (original labels), so
-        // a SIGTERM arriving before the real solve has a complete forest still
-        // emits something non-zero. The Chen 2-approx is O(n) and far better
-        // than singletons (which would score 0: k=n).
+        // Compute the Chen 2-approx forest up front (original labels): it is O(n)
+        // and drives the lower-bound-track fast path below. It is no longer
+        // *published* as an early SIGTERM baseline — the harness is single-threaded
+        // and the SIGTERM handler only flips the stop flag, so `solve()` must (and
+        // does) notice it and return its best forest promptly on its own.
         {
             let (chen_lb_dist, _up, sets) =
                 chen_pair_agreement(&instance.trees[0], &instance.trees[1]);
@@ -611,7 +612,7 @@ impl LagrangianSolver {
         // ---- Pool + dedup ----
         let mut pool: Vec<Block> = Vec::new();
         let mut seen = ColumnSet::new();
-        let mut add_block =
+        let add_block =
             |labels: Vec<u32>, pool: &mut Vec<Block>, seen: &mut ColumnSet| -> bool {
                 let mut l = labels;
                 l.sort_unstable();
@@ -1019,27 +1020,25 @@ impl LagrangianSolver {
             }
 
             // ---- Hybrid dual refresh: overwrite α/β with exact LP duals ----
-            if hybrid && iter % refresh_every == 0 {
+            if hybrid && iter.is_multiple_of(refresh_every) {
                 // Sync the warm RMP with any blocks not yet in it (singletons
                 // first, for leaf-row =1 feasibility). Pruned blocks already in
                 // the RMP stay there — extra columns only sharpen the duals.
                 let need_init = h_rmp.is_none();
                 if need_init {
                     for l in 1..=n {
-                        if h_in_rmp.insert(vec![l]) {
-                            if let Some(c) = h_builder.try_build(vec![l], trees) {
+                        if h_in_rmp.insert(vec![l])
+                            && let Some(c) = h_builder.try_build(vec![l], trees) {
                                 h_afpool.push(c);
                             }
-                        }
                     }
                 }
                 let mut fresh: Vec<AfColumn> = Vec::new();
                 for b in &pool {
-                    if b.labels.len() >= 2 && h_in_rmp.insert(b.labels.clone()) {
-                        if let Some(c) = h_builder.try_build(b.labels.clone(), trees) {
+                    if b.labels.len() >= 2 && h_in_rmp.insert(b.labels.clone())
+                        && let Some(c) = h_builder.try_build(b.labels.clone(), trees) {
                             fresh.push(c);
                         }
-                    }
                 }
                 if need_init {
                     h_afpool.extend(fresh);
@@ -1174,8 +1173,8 @@ impl LagrangianSolver {
             // approximation bound against our OWN dual lower bound (the tightest
             // available). Both sides lifted to original units via the kernel
             // delta. Armed only for the flat top-level solve (see `abort_armed`).
-            if self.abort_armed.load(Ordering::Relaxed) {
-                if let Some((a, b)) = self.approx_target {
+            if self.abort_armed.load(Ordering::Relaxed)
+                && let Some((a, b)) = self.approx_target {
                     let delta = self.param_reduction.load(Ordering::Relaxed);
                     let lb_orig = best_lb.ceil().max(0.0) as usize + delta;
                     let k_orig = best_components + delta;
@@ -1183,7 +1182,6 @@ impl LagrangianSolver {
                         self.terminate.store(true, Ordering::Relaxed);
                     }
                 }
-            }
             // Primal-stall convergence: the greedy primal has plateaued (the LB
             // may still trickle up, but the incumbent isn't moving). Hand off to
             // the local search. Keys on the PRIMAL, not the bound, so it fires
@@ -1203,7 +1201,7 @@ impl LagrangianSolver {
                 break;
             }
 
-            if iter <= 5 || iter % 25 == 0 || improved {
+            if iter <= 5 || iter.is_multiple_of(25) || improved {
                 debug!(
                     "{ind}[lagr] iter={} pool={} +{} lb={:.1} lambda={:.4} best={} gap={:.1}% t={:.1}s",
                     iter,
@@ -1395,8 +1393,8 @@ impl LagrangianSolver {
         // forest reaching `t_orig - delta` components satisfies the track bound
         // once expanded. `improve_packing`/`lns_improve` watch `abort_k_reduced`
         // and stop the instant they hit it (claims the speed bonus).
-        if self.abort_armed.load(Ordering::Relaxed) {
-            if let Some((a, b)) = self.approx_target {
+        if self.abort_armed.load(Ordering::Relaxed)
+            && let Some((a, b)) = self.approx_target {
                 let delta = self.param_reduction.load(Ordering::Relaxed);
                 let lb_orig = best_lb.ceil().max(0.0) as usize + delta;
                 let t_orig = (a * lb_orig as f64).floor() as usize + b;
@@ -1406,7 +1404,6 @@ impl LagrangianSolver {
                     self.terminate.store(true, Ordering::Relaxed);
                 }
             }
-        }
 
         // ---- Primal improvement loop (iterated local search over the pool) ----
         // The subgradient has converged; now relentlessly re-select a better
@@ -1603,7 +1600,6 @@ impl LagrangianSolver {
     /// the columns the constraints demand (the "gap columns" the flat dual never
     /// generates). Returns the best packing found here: (#components, selected
     /// column indices, best Lagrangian bound).
-    #[allow(clippy::too_many_arguments)]
     fn subgradient_slice(
         &self,
         trees: &[Tree],
@@ -1611,7 +1607,7 @@ impl LagrangianSolver {
         nl: usize,
         pool: &mut Vec<Block>,
         seen: &mut ColumnSet,
-        alpha: &mut Vec<f64>,
+        alpha: &mut [f64],
         beta: &mut Vec<Vec<f64>>,
         branchings: &Branchings,
         pricer: &mut ExactPairDpPricer,
@@ -1633,7 +1629,7 @@ impl LagrangianSolver {
             // duals it has negative reduced cost and is never generated, which
             // starves the must-link branch. The boost is for pricing only; the
             // subgradient step and scoring use the real duals.
-            let mut price_alpha = alpha.clone();
+            let mut price_alpha = alpha.to_vec();
             for pair in branchings.must_link() {
                 if (pair.a as usize) <= nl {
                     price_alpha[pair.a as usize] = price_alpha[pair.a as usize].max(2.0);
@@ -1668,12 +1664,11 @@ impl LagrangianSolver {
                 let mut l = c;
                 l.sort_unstable();
                 l.dedup();
-                if l.len() >= 2 && !seen.contains(&l) && is_valid_af_component(&l, trees) {
-                    if let Some(b) = make_block(trees, l.clone()) {
+                if l.len() >= 2 && !seen.contains(&l) && is_valid_af_component(&l, trees)
+                    && let Some(b) = make_block(trees, l.clone()) {
                         seen.insert(l);
                         pool.push(b);
                     }
-                }
             }
             scores = pool.iter().map(|b| block_score(b, alpha, beta)).collect();
             let lb = self.subgradient_step(trees, nl, pool, &scores, alpha, beta, lambda, ub);
@@ -1877,7 +1872,6 @@ impl LagrangianSolver {
     /// no branching), bank columns into the pool, take a subgradient step, then
     /// FREEZE the duals of already-covered leaves at 0 so the residual dual
     /// re-approximates only what's left to cover. Returns the Lagrangian bound.
-    #[allow(clippy::too_many_arguments)]
     fn dive_sg_iter(
         &self,
         trees: &[Tree],
@@ -1919,12 +1913,11 @@ impl LagrangianSolver {
             let mut l = c;
             l.sort_unstable();
             l.dedup();
-            if l.len() >= 2 && !seen.contains(&l) && is_valid_af_component(&l, trees) {
-                if let Some(b) = make_block(trees, l.clone()) {
+            if l.len() >= 2 && !seen.contains(&l) && is_valid_af_component(&l, trees)
+                && let Some(b) = make_block(trees, l.clone()) {
                     seen.insert(l);
                     pool.push(b);
                 }
-            }
         }
         let scores: Vec<f64> = pool.iter().map(|b| block_score(b, alpha, beta)).collect();
         let lb = self.subgradient_step(trees, nl, pool, &scores, alpha, beta, lambda, ub);
@@ -2132,7 +2125,6 @@ impl LagrangianSolver {
     /// (restore best, eject a few random columns) to escape the local optimum.
     /// Always-valid, anytime (keeps the best), O(pool) memory. Returns the best
     /// node-disjoint selection found by the deadline.
-    #[allow(clippy::too_many_arguments)]
     fn improve_packing(
         &self,
         pool: &[Block],
@@ -2669,7 +2661,7 @@ impl LagrangianSolver {
                 pool.push(c);
             }
         }
-        let mut add_labels = |labels: Vec<u32>,
+        let add_labels = |labels: Vec<u32>,
                               pool: &mut Vec<AfColumn>,
                               seen: &mut ColumnSet,
                               builder: &mut ColumnBuilder| {
@@ -2883,14 +2875,13 @@ impl LagrangianSolver {
                 .iter()
                 .map(|c| c.pricing_score(&sol.leaf_duals, &sol.node_duals))
                 .collect();
-            if let Some((forest, comps)) = greedy_pack_af(&pool, &scores, trees, n, self.flat_terminal.load(Ordering::Relaxed)) {
-                if comps < best_components {
+            if let Some((forest, comps)) = greedy_pack_af(&pool, &scores, trees, n, self.flat_terminal.load(Ordering::Relaxed))
+                && comps < best_components {
                     best_components = comps;
                     best_forest = forest;
                 }
-            }
 
-            if iter <= 5 || iter % 10 == 0 || added == 0 {
+            if iter <= 5 || iter.is_multiple_of(10) || added == 0 {
                 debug!(
                     "[lagr][rmp] iter={} cols={} +{} lp={:.2} best={} gap={:.1}% t={:.1}s",
                     iter,
@@ -2918,18 +2909,13 @@ impl LagrangianSolver {
                     && gap > 0
                     && gap <= MIP_GAP_LIMIT
                     && !self.terminate.load(Ordering::Relaxed)
-                {
-                    if let Ok(Some(mip)) = rmp.solve_mip_with_time_limit(0.5) {
-                        if let Some((forest, comps)) =
+                    && let Ok(Some(mip)) = rmp.solve_mip_with_time_limit(0.5)
+                        && let Some((forest, comps)) =
                             forest_from_lp(&pool, &mip.column_values, trees, n, self.flat_terminal.load(Ordering::Relaxed))
-                        {
-                            if comps < best_components {
+                            && comps < best_components {
                                 best_components = comps;
                                 best_forest = forest;
                             }
-                        }
-                    }
-                }
                 // Global pricing with a complete pool ⇒ sol.objective is a valid
                 // LB. best ≤ ⌈lb⌉ certifies optimality. Windowed never certifies.
                 proved = global && best_components <= lb;
@@ -2949,7 +2935,7 @@ impl LagrangianSolver {
                 // constraint-aware MafPricer, certified LP-bound prune) to close
                 // it, keeping the best incumbent and stopping at the deadline.
                 if global && !proved && self.config.bnb {
-                    let (bf, bc, bnb_proved) = self.bnb_anytime(
+                    let (bf, _bc, bnb_proved) = self.bnb_anytime(
                         trees,
                         n,
                         &mut rmp,
@@ -2962,7 +2948,6 @@ impl LagrangianSolver {
                         start,
                     );
                     best_forest = bf;
-                    best_components = bc;
                     if bnb_proved {
                         proved = true;
                     }
@@ -2988,7 +2973,6 @@ impl LagrangianSolver {
     /// on deadline/terminate or LP error. Uses the composite `MafPricer` (with
     /// the constraint-aware leaf-pair fallback) so constrained nodes price
     /// exactly, exactly like bp.
-    #[allow(clippy::too_many_arguments)]
     fn price_node(
         &self,
         rmp: &mut Rmp,
@@ -3060,7 +3044,6 @@ impl LagrangianSolver {
     /// Returns `(best_forest, best_components, proved)`; `proved` is true only if
     /// the tree was fully explored (every leaf integral or pruned by a valid
     /// bound) — i.e. the incumbent is the optimum.
-    #[allow(clippy::too_many_arguments)]
     fn bnb_anytime(
         &self,
         trees: &[Tree],
@@ -3117,8 +3100,8 @@ impl LagrangianSolver {
             }
 
             // Incumbent from this node's LP support.
-            if let Some((forest, comps)) = forest_from_lp(pool, &sol.column_values, trees, n, self.flat_terminal.load(Ordering::Relaxed)) {
-                if comps < best_components {
+            if let Some((forest, comps)) = forest_from_lp(pool, &sol.column_values, trees, n, self.flat_terminal.load(Ordering::Relaxed))
+                && comps < best_components {
                     best_components = comps;
                     best_forest = forest;
                     debug!(
@@ -3129,7 +3112,6 @@ impl LagrangianSolver {
                         start.elapsed().as_secs_f64()
                     );
                 }
-            }
             nodes += 1;
 
             // Branch on the most-fractional leaf-pair. Pass the certified LP
@@ -3163,7 +3145,6 @@ impl LagrangianSolver {
 
     /// Dual-guided greedy node-disjoint packing. Returns true if it improved
     /// the incumbent (and updates it).
-    #[allow(clippy::too_many_arguments)]
     fn try_primal(
         &self,
         trees: &[Tree],
@@ -3312,7 +3293,6 @@ impl LagrangianSolver {
     /// solutions (the "primal estimate"), not the instantaneous one — this
     /// damps the zigzag and converges to the LP dual in far fewer iterations.
     /// `v_cov`/`v_use` persist across calls; `avg_a` is the averaging weight.
-    #[allow(clippy::too_many_arguments)]
     /// One volume-algorithm iteration (Barahona–Anbil). Maintains a stability
     /// centre (`center_*`, the best-bound dual point), a per-column primal
     /// estimate `xbar` (running average of the subproblem solutions), and
@@ -3321,7 +3301,6 @@ impl LagrangianSolver {
     /// `xbar` — a far smoother direction than the instantaneous subgradient.
     /// Returns the centre's bound (monotone non-decreasing). The caller packs
     /// the primal from `xbar`, not from the thrashing instantaneous scores.
-    #[allow(clippy::too_many_arguments)]
     fn volume_step(
         &self,
         trees: &[Tree],
@@ -3754,14 +3733,14 @@ fn greedy_pack_af(
         let cov = pool[idx].coverage();
         for (t, nodes) in cov.iter_per_tree().enumerate() {
             for &v in nodes {
-                if used[t].contains(v as usize) {
+                if used[t].contains(v) {
                     continue 'cand;
                 }
             }
         }
         for (t, nodes) in cov.iter_per_tree().enumerate() {
             for &v in nodes {
-                used[t].insert(v as usize);
+                used[t].insert(v);
             }
         }
         let mut bs = FixedBitSet::with_capacity(n as usize + 1);
@@ -3803,10 +3782,10 @@ fn forest_from_lp(
         let cov = pool[ci].coverage();
         for (t, nodes) in cov.iter_per_tree().enumerate() {
             for &v in nodes {
-                if used[t].contains(v as usize) {
+                if used[t].contains(v) {
                     return None; // node conflict ⇒ not a valid AF
                 }
-                used[t].insert(v as usize);
+                used[t].insert(v);
             }
         }
         let mut bs = FixedBitSet::with_capacity(n as usize + 1);

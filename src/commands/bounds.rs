@@ -151,9 +151,9 @@ fn run_single(
                 "  LB={}  UB={}  UB/LB={}  {:.1}ms",
                 r.lower, r.upper, lb_ub_gap, r.ms
             );
-            if let Some(scores) = scores {
-                if let Some(name) = &instance.name {
-                    if let Some(&opt) = scores.get(&name.to_uppercase()) {
+            if let Some(scores) = scores
+                && let Some(name) = &instance.name
+                    && let Some(&opt) = scores.get(&name.to_uppercase()) {
                         let gap = if opt > 0 {
                             r.upper as f64 / opt as f64
                         } else {
@@ -167,8 +167,6 @@ fn run_single(
                             if ok { "✓" } else { "✗ VIOLATION" }
                         );
                     }
-                }
-            }
         }
     }
     Ok(())
@@ -213,7 +211,7 @@ fn run_batch(
         })
         .collect();
     eprintln!(
-        "{:>64} {:>3} {:>5}  {:>5} | {} | {} | {}",
+        "{:>64} {:>3} {:>5}  {:>5} | {} | {} | ok",
         "DIGEST",
         "m",
         "n",
@@ -222,8 +220,7 @@ fn run_batch(
             .map(|s| format!("{} {:<5} {:<5} {:<5} {:<5}", s, "LB", "UB", "gap", "ms"))
             .collect::<Vec<_>>()
             .join(" | "),
-        if algos.len() > 1 { "best-gap" } else { "" },
-        "ok"
+        if algos.len() > 1 { "best-gap" } else { "" }
     );
     eprintln!("{}", "-".repeat(180));
 
@@ -350,7 +347,7 @@ fn run_batch(
             ts.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
             let avg_t = ts.iter().sum::<f64>() / n as f64;
             let (min_t, max_t) = (ts[0], ts[n - 1]);
-            let med_t = if n % 2 == 0 {
+            let med_t = if n.is_multiple_of(2) {
                 (ts[n / 2 - 1] + ts[n / 2]) / 2.0
             } else {
                 ts[n / 2]

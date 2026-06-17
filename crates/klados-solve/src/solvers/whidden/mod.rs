@@ -40,6 +40,10 @@ struct SplitDiagPrinter {
 }
 impl Drop for SplitDiagPrinter {
     fn drop(&mut self) {
+        // Diagnostic only — skip the float/percentage math when debug logging is off.
+        if !log::log_enabled!(log::Level::Debug) {
+            return;
+        }
         let rs = unsafe { &*self.stats_ptr };
         let n = rs.split_diag_nodes.max(1);
         let avg_blocks = rs.split_diag_disjoint_blocks_sum as f64

@@ -14,7 +14,7 @@ use std::time::Instant;
 use fixedbitset::FixedBitSet;
 use klados_core::af_validator::validate_agreement_forest;
 use klados_core::lower_bound::{
-    best_randomized_partition, greedy_multi_tree_partition, greedy_multi_tree_ub_seeded,
+    best_randomized_partition,
     pairwise_refine_ub,
 };
 use klados_core::{Instance, Tree};
@@ -387,7 +387,7 @@ where
                 continue; // singletons already in pool
             }
             let column = seed_builder.build_unchecked(labels, trees);
-            if let Some(_) = state.add_column(column) {
+            if state.add_column(column).is_some() {
                 rmp.add_column(state.columns().last().unwrap());
                 chen_added += 1;
             }
@@ -411,8 +411,8 @@ where
     // bp-multi's behavior; this was the missing primal heuristic that
     // explains the recurring "LP=optimum but support fractional" gap.
     let relaxed_incumbent_enabled = cfg.experimental.relaxed_incumbent;
-    if relaxed_incumbent_enabled && trees.len() == 2 && reduced.num_leaves >= 20 {
-        if let Some(incumbent_forest) = try_whidden_relaxed_incumbent_2tree(reduced, solve_sub, false) {
+    if relaxed_incumbent_enabled && trees.len() == 2 && reduced.num_leaves >= 20
+        && let Some(incumbent_forest) = try_whidden_relaxed_incumbent_2tree(reduced, solve_sub, false) {
             install_incumbent(
                 &mut state,
                 &mut rmp,
@@ -421,7 +421,6 @@ where
                 incumbent_forest,
             );
         }
-    }
 
     let mut scratch = PricerScratch::new(trees);
     scratch.m2_batch = cfg.m2_batch;
@@ -998,8 +997,8 @@ fn solve_node<P: Pricer, S: BranchSelector>(
     // rounding generally returns ub = optimum + 1 — it doesn't recover the
     // missing integer optimum. A diving / MIP-on-pool heuristic would be
     // stronger but is deferred.
-    if let Some(inc) = try_round_primal(state, &lp.column_values) {
-        if inc.k < state.best_ub() {
+    if let Some(inc) = try_round_primal(state, &lp.column_values)
+        && inc.k < state.best_ub() {
             let updated = state.update_incumbent(inc);
             if updated {
                 tel.incumbent_updates += 1;
@@ -1015,7 +1014,6 @@ fn solve_node<P: Pricer, S: BranchSelector>(
                 }
             }
         }
-    }
 
     // MIP-on-pool primal heuristic. Disabled by default; enable via
     // `BpExperimental.mip_heuristic`. Fires when the LP objective is at an
@@ -1588,7 +1586,7 @@ fn solve_region_support_mip(
             .iter()
             .map(|&old_label| old_to_new[old_label as usize])
             .collect::<Vec<_>>();
-        if labels.iter().any(|&label| label == 0) {
+        if labels.contains(&0) {
             rejected += 1;
             continue;
         }
@@ -1674,11 +1672,10 @@ fn maybe_log_bridge_footprint(
         if q < touched_hist.len() {
             touched_hist[q] += 1;
         }
-        if q == 1 {
-            if let Some(rid) = touched.ones().next() {
+        if q == 1
+            && let Some(rid) = touched.ones().next() {
                 local_component_counts[rid] += 1;
             }
-        }
         if q > 1 {
             bridge_columns += 1;
             bridge_savings += q - 1;

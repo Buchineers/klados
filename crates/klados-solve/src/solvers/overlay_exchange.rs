@@ -223,14 +223,13 @@ impl OverlayExchangeSolver {
         let outside = outside_masks(instance, comps, &open_set);
 
         // Zero-split/coarsening fast path: all opened leaves become one block.
-        if let Some(col) = builder.try_build(labels.clone(), &instance.trees) {
-            if coverage_disjoint(&outside, col.coverage()) {
+        if let Some(col) = builder.try_build(labels.clone(), &instance.trees)
+            && coverage_disjoint(&outside, col.coverage()) {
                 return Some(Replacement {
                     open: open.to_vec(),
                     blocks: vec![labels],
                 });
             }
-        }
 
         if labels.len() > self.config.local_leaf_cap {
             return None;
@@ -295,12 +294,11 @@ impl<'a, 'b> LocalGen<'a, 'b> {
                     cur.pop();
                     return;
                 }
-                if let Some(col) = self.builder.try_build(cur.clone(), &self.instance.trees) {
-                    if coverage_disjoint(self.outside, col.coverage()) {
+                if let Some(col) = self.builder.try_build(cur.clone(), &self.instance.trees)
+                    && coverage_disjoint(self.outside, col.coverage()) {
                         self.out.push(ocomp_from_col(self.instance, col));
                         self.enumerate(i + 1, cur);
                     }
-                }
             } else {
                 self.enumerate(i + 1, cur);
             }
@@ -326,7 +324,7 @@ impl<'a> LocalSearch<'a> {
         mut candidates: Vec<OComp>,
         target: usize,
     ) -> Self {
-        candidates.sort_by(|a, b| b.labels.len().cmp(&a.labels.len()));
+        candidates.sort_by_key(|c| std::cmp::Reverse(c.labels.len()));
         let mut by_leaf = vec![Vec::new(); n + 1];
         for (i, c) in candidates.iter().enumerate() {
             for &l in &c.labels {

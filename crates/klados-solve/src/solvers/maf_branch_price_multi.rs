@@ -170,8 +170,8 @@ impl Dp2TreeCache {
         let mut dp_open = Vec::new();
         let mut t0_active = Vec::new();
         let mut t1_active = Vec::new();
-        let mut t0_post_order = Vec::new();
-        let mut t1_post_order = Vec::new();
+        let t0_post_order = Vec::new();
+        let t1_post_order = Vec::new();
         let mut max_score_under = Vec::new();
 
         if trees.len() == 2 {
@@ -226,13 +226,13 @@ impl<'a> ExactPricer2Tree<'a> {
             if !blocked_leaves[i] && alpha[i] > 1.0e-12 {
                 active_labels[i] = true;
 
-                let mut curr = trees[0].label_to_node[i] as u32;
+                let mut curr = trees[0].label_to_node[i];
                 while curr != klados_core::NONE && !cache.t0_active[curr as usize] {
                     cache.t0_active[curr as usize] = true;
                     curr = trees[0].parent[curr as usize];
                 }
 
-                let mut curr = trees[1].label_to_node[i] as u32;
+                let mut curr = trees[1].label_to_node[i];
                 while curr != klados_core::NONE && !cache.t1_active[curr as usize] {
                     cache.t1_active[curr as usize] = true;
                     curr = trees[1].parent[curr as usize];
@@ -841,8 +841,8 @@ fn solve_branch_price_multi_cached(
     // previously-prototyped batch/relaxed join variants remain opt-in inside
     // whidden_cluster because a valid AF from those variants is not by itself
     // an optimality certificate.
-    if reduced.num_trees() == 2 && reduced.num_leaves >= WHIDDEN_DECOMP_MIN_LEAVES {
-        if let Some(solution) =
+    if reduced.num_trees() == 2 && reduced.num_leaves >= WHIDDEN_DECOMP_MIN_LEAVES
+        && let Some(solution) =
             crate::decomp::whidden_cluster::try_whidden_decomp_2tree(
                 reduced,
                 &mut |subinstance| {
@@ -871,10 +871,9 @@ fn solve_branch_price_multi_cached(
             );
             return Some(components);
         }
-    }
 
-    if RSPR_CLUSTER_DECOMP_EXPERIMENTAL && reduced.num_leaves >= RSPR_CLUSTER_MIN_LEAVES {
-        if let Some(solution) =
+    if RSPR_CLUSTER_DECOMP_EXPERIMENTAL && reduced.num_leaves >= RSPR_CLUSTER_MIN_LEAVES
+        && let Some(solution) =
             cluster_decomposition::try_rspr_cluster_decomposition(reduced, &mut |subinstance| {
                 solve_branch_price_multi_cached(subinstance, &mut SolverStats::default(), memo)
             })
@@ -898,7 +897,6 @@ fn solve_branch_price_multi_cached(
             );
             return Some(components);
         }
-    }
 
     let cluster_result = cluster_reduction::try_cluster_reduction(reduced, &mut |subinstance| {
         solve_branch_price_multi_cached(subinstance, &mut SolverStats::default(), memo)
@@ -1014,8 +1012,7 @@ fn solve_branch_price_multi_cached(
             crate::decomp::whidden_cluster::try_whidden_relaxed_incumbent_2tree(reduced, &mut |sub| {
                 solve_branch_price_multi_cached(sub, &mut SolverStats::default(), memo)
             }, false)
-        {
-            if incumbent.len() < best_ub {
+            && incumbent.len() < best_ub {
                 let mut values = vec![0.0; columns.len()];
                 let mut ok = true;
                 let mut added = 0usize;
@@ -1054,7 +1051,6 @@ fn solve_branch_price_multi_cached(
                     );
                 }
             }
-        }
     }
 
     let mut state = BpState {
@@ -1438,7 +1434,7 @@ fn solve_bp_node(
             Err(_) => return NodeResult::Pruned,
         };
         state.t_lp_solve += t_solve.elapsed().as_secs_f64();
-        if num_leaves > 500 && state.cg_iterations_total % 50 == 0 {
+        if num_leaves > 500 && state.cg_iterations_total.is_multiple_of(50) {
             info!(
                 "[bp-multi] CG iter {} cols={} obj={:.4} (lp_solve={:.1}ms)",
                 state.cg_iterations_total,
@@ -2791,9 +2787,8 @@ impl PersistentRmp {
             let labels = &columns[ci].labels;
             let (desired_lo, desired_hi) = if self.fixed_one_mark[ci] == epoch {
                 (1.0, 1.0)
-            } else if self.fixed_zero_mark[ci] == epoch {
-                (0.0, 0.0)
-            } else if labels.iter().any(|&l| blocked_leaves[l as usize])
+            } else if self.fixed_zero_mark[ci] == epoch
+                || labels.iter().any(|&l| blocked_leaves[l as usize])
                 || !labels_satisfy_pair_constraints(labels, must_link_pairs, cannot_link_pairs)
             {
                 (0.0, 0.0)
