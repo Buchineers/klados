@@ -63,12 +63,9 @@ use super::{Pricer, PricerScratch, PricingContext, PricingResult, adaptive_m2_ba
 const PRICING_EPS: f64 = 1.0e-8;
 const NEG_INF: f64 = f64::NEG_INFINITY;
 
-/// Read the `KLADOS_BP_USE_ANCHOR_CACHE` env var once and cache the
-/// result. Cached-positive reuse is opt-in via this flag.
-fn anchor_cache_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("KLADOS_BP_USE_ANCHOR_CACHE").is_ok())
+/// Returns true if anchor cache is enabled via config.
+fn anchor_cache_enabled(scratch: &PricerScratch) -> bool {
+    scratch.use_anchor_cache
 }
 /// Sentinel in `memo_side_split` meaning "leaf-only side, no extension chosen".
 const SPLIT_LEAF_ONLY: u32 = u32::MAX - 1;
@@ -814,7 +811,7 @@ impl LeafPairDpPricer {
         let mut global_max: f64 = NEG_INF;
 
         let cache_active =
-            anchor_cache_enabled() && ctx.trees.len() == 2 && scratch.anchor_cache.is_some();
+            anchor_cache_enabled(scratch) && ctx.trees.len() == 2 && scratch.anchor_cache.is_some();
 
         let scan = order.len().min(trial_limit);
         // `completed` ⇒ every pair in `order` had its `solve_pair` evaluated;
@@ -1053,10 +1050,10 @@ impl Pricer for LeafPairDpPricer {
         self.reset_memos();
 
         // --- Anchor cache (cached-positive reuse) ---
-        // Gated by env var. Lazy-init; allocate label-pair storage once.
+        // Gated by `BpConfig.use_anchor_cache`. Lazy-init; allocate label-pair storage once.
         // Indexing is by leaf label, so structural data is invariant
         // across active-label-set changes.
-        if anchor_cache_enabled() && ctx.trees.len() == 2 {
+        if anchor_cache_enabled(scratch) && ctx.trees.len() == 2 {
             if scratch.anchor_cache.is_none() {
                 scratch.anchor_cache = Some(super::anchor_cache::AnchorCache::new(self.num_leaves));
             }
@@ -1132,7 +1129,7 @@ impl Pricer for LeafPairDpPricer {
             return PricingResult::Converged;
         }
         let target = if ctx.trees.len() == 2 {
-            self.max_per_call.min(adaptive_m2_batch_size(ctx))
+            self.max_per_call.min(adaptive_m2_batch_size(ctx, scratch.m2_batch))
         } else {
             self.max_per_call
         };
@@ -1165,7 +1162,7 @@ impl Pricer for LeafPairDpPricer {
         }
 
         // Optional anchor-cache stats logging.
-        if anchor_cache_enabled() {
+        if anchor_cache_enabled(scratch) {
             if let Some(cache) = scratch.anchor_cache.as_ref() {
                 let avg_gap = if cache.gap_positive_refreshes > 0 {
                     cache.gap_sum / cache.gap_positive_refreshes as f64

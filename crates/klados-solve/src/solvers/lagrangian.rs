@@ -38,6 +38,7 @@ use crate::solvers::bp::search::{
 };
 use crate::solvers::chen_rspr::chen_pair_agreement;
 use crate::decomp::whidden_cluster::try_whidden_decomp_2tree;
+use log::debug;
 
 
 const POOL_HARD_CAP: usize = 120_000;
@@ -78,11 +79,6 @@ const DECOMP_TRY_MAX_LEAVES: u32 = 4_000;
 /// instance has a hard core and hand off to the flat engine. Well-decomposing
 /// instances prove well within this; hard ones forfeit only this much.
 const DECOMP_ATTEMPT: Duration = Duration::from_secs(25);
-/// Cluster router: irreducible clusters at or below this many leaves are PROBED
-/// with the exact B&P solver (used only if it proves optimal in the cap); larger
-/// ones, and probes that don't finish, go to the anytime cascade.
-/// Tunable via KLADOS_DECOMP_EXACT.
-const EXACT_THRESHOLD_DEFAULT: u32 = 600;
 /// Only attempt the certifying MIP when the incumbent is within this many
 /// components of the LP bound (a wide gap won't close and risks a HiGHS
 /// time-limit overrun that blows the SIGTERM grace window).
@@ -91,9 +87,6 @@ const MIP_GAP_LIMIT: usize = 4;
 /// Safe ceiling on the anchor DP's dense `n₀·n₁` table (kept under the
 /// pricer's own ~64M-cell cap). Above this we price in tree-local windows.
 const CELL_CAP_SAFE: u64 = 60_000_000;
-/// Max leaves per T₀-subtree pricing window. `(2·W)² ≤ CELL_CAP_SAFE` so each
-/// window's restricted DP fits; per-window cache ≈ 32·(2W)² bytes.
-const WINDOW_MAX_LEAVES: usize = 1_200;
 
 /// A validated agreement-forest column with its per-tree V-set internal nodes.
 struct Block {
@@ -151,7 +144,90 @@ fn block_score(b: &Block, alpha: &[f64], beta: &[Vec<f64>]) -> f64 {
     leaf_gain - node_pen
 }
 
+#[derive(Clone, Debug)]
+pub struct LagrangianConfig {
+    pub whole_bp: bool,
+    pub bp_cap_ms: u64,
+    pub no_decomp: bool,
+    pub lns_on: bool,
+    pub lbnb: bool,
+    pub dive: bool,
+    pub force_lp: bool,
+    pub no_rmp: bool,
+    pub rmp_cap_ms: u64,
+    pub no_rmp_warm: bool,
+    /// Max leaves per T₀-subtree pricing window. `(2·W)² ≤ CELL_CAP_SAFE` so each
+    /// window's restricted DP fits; per-window cache ≈ 32·(2W)² bytes.
+    pub window_max: usize,
+    pub volume: bool,
+    pub volume_a: f64,
+    pub hybrid: bool,
+    pub refresh_every: usize,
+    pub no_ls: bool,
+    pub profile: bool,
+    pub reprice_eps: f64,
+    pub reprice_maxstale: usize,
+    pub hybrid_blend: f64,
+    pub stall_thresh: usize,
+    pub branch: bool,
+    pub plan_ms: u64,
+    /// Cluster router: irreducible clusters at or below this many leaves are
+    /// probed with the exact B&P solver (used only if it proves optimal in the
+    /// cap); larger ones, and probes that don't finish, go to the anytime cascade.
+    pub decomp_exact: usize,
+    pub decomp_exact_cap_ms: u64,
+    pub lbnb_root_ms: u64,
+    pub lbnb_node_ms: u64,
+    pub dive_reopt: usize,
+    pub dive_warmup: f64,
+    pub lns_max: usize,
+    pub lns_cap_ms: u64,
+    pub bnb: bool,
+    pub topdown_windows: bool,
+}
+
+impl Default for LagrangianConfig {
+    fn default() -> Self {
+        Self {
+            whole_bp: false,
+            bp_cap_ms: 0,
+            no_decomp: false,
+            lns_on: true,
+            lbnb: false,
+            dive: false,
+            force_lp: false,
+            no_rmp: false,
+            rmp_cap_ms: 15_000,
+            no_rmp_warm: false,
+            window_max: 1_200,
+            volume: false,
+            volume_a: 0.1,
+            hybrid: false,
+            refresh_every: 15,
+            no_ls: false,
+            profile: false,
+            reprice_eps: 0.05,
+            reprice_maxstale: 10,
+            hybrid_blend: 1.0,
+            stall_thresh: 20,
+            branch: false,
+            plan_ms: 290_000,
+            decomp_exact: 600,
+            decomp_exact_cap_ms: 10_000,
+            lbnb_root_ms: 20_000,
+            lbnb_node_ms: 2_500,
+            dive_reopt: 3,
+            dive_warmup: 0.4,
+            lns_max: 250,
+            lns_cap_ms: 2_000,
+            bnb: false,
+            topdown_windows: false,
+        }
+    }
+}
+
 pub struct LagrangianSolver {
+    config: LagrangianConfig,
     terminate: Arc<AtomicBool>,
     stats: SolverStats,
     /// True while the current solve is the flat top-level (depth 0), whose
@@ -197,6 +273,7 @@ pub struct LagrangianSolver {
 impl LagrangianSolver {
     pub fn new() -> Self {
         Self {
+            config: LagrangianConfig::default(),
             terminate: Arc::new(AtomicBool::new(false)),
             stats: SolverStats::default(),
             flat_terminal: AtomicBool::new(false),
@@ -237,7 +314,6 @@ impl LagrangianSolver {
 
         let start = Instant::now();
         let budget = self.budget_override;
-        let trace = std::env::var("KLADOS_LAGR_TRACE").is_ok();
         self.reduced_dual_lb.store(0, Ordering::Relaxed);
         self.abort_k_reduced.store(usize::MAX, Ordering::Relaxed);
         self.abort_armed.store(false, Ordering::Relaxed);
@@ -278,14 +354,12 @@ impl LagrangianSolver {
         self.param_reduction
             .store(kern.param_reduction, Ordering::Relaxed);
         let reduced = &kern.instance;
-        if trace {
-            eprintln!(
-                "[lagr] kernelize {} -> {} leaves ({:.0}ms)",
-                orig_n,
-                reduced.num_leaves,
-                start.elapsed().as_secs_f64() * 1000.0
-            );
-        }
+        debug!(
+            "[lagr] kernelize {} -> {} leaves ({:.0}ms)",
+            orig_n,
+            reduced.num_leaves,
+            start.elapsed().as_secs_f64() * 1000.0
+        );
         if reduced.num_leaves <= 1 {
             let reduced_forest = if reduced.num_leaves == 0 {
                 Vec::new()
@@ -313,37 +387,35 @@ impl LagrangianSolver {
         // the cap — a timed-out garbage incumbent is never used. On timeout we
         // fall through to the anytime cascade. This is decomposition delivering
         // the right way (inside B&P), not the lossy external split.
-        // DISABLED BY DEFAULT (opt-in via KLADOS_LAGR_WHOLE_BP). Measured data
+        // DISABLED BY DEFAULT (opt-in via `LagrangianConfig.whole_bp`). Measured data
         // shows the whole-instance B&P gamble HURTS: it can burn up to half the
         // budget getting stuck on an instance whose difficulty we can't predict,
         // then hands the Lagrangian a fraction of the time (n4465: default 3012
         // vs pure-Lagrangian 2955). B&P now runs only where it can't get stuck —
         // the bounded per-cluster probe inside the decomposition cascade.
-        if std::env::var("KLADOS_LAGR_WHOLE_BP").is_ok()
+        if self.config.whole_bp
             && reduced.num_trees() == 2
             && reduced.num_leaves <= BP_TRY_MAX_LEAVES
         {
-            let bp_cap = std::env::var("KLADOS_BP_CAP_MS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-                .map(Duration::from_millis)
-                .unwrap_or_else(|| match budget {
+            let bp_cap = if self.config.bp_cap_ms > 0 {
+                Duration::from_millis(self.config.bp_cap_ms)
+            } else {
+                match budget {
                     Some(b) => b.mul_f64(0.5).min(Duration::from_secs(90)),
                     None => Duration::from_secs(90),
-                });
+                }
+            };
             let bp_deadline = match deadline {
                 Some(d) => (start + bp_cap).min(d),
                 None => start + bp_cap,
             };
             if let Some(reduced_forest) = self.solve_cluster_exact(reduced, bp_deadline) {
-                if trace {
-                    eprintln!(
-                        "[lagr] B&P solved n={} k={} (OPTIMAL) in {:.1}s",
-                        reduced.num_leaves,
-                        reduced_forest.len(),
-                        start.elapsed().as_secs_f64()
-                    );
-                }
+                debug!(
+                    "[lagr] B&P solved n={} k={} (OPTIMAL) in {:.1}s",
+                    reduced.num_leaves,
+                    reduced_forest.len(),
+                    start.elapsed().as_secs_f64()
+                );
                 let expanded = klados_core::kernelize::expand_solution_unindexed(
                     reduced_forest,
                     &kern,
@@ -354,12 +426,10 @@ impl LagrangianSolver {
                 self.stats.upper_bound = Some(expanded.len());
                 return Some(expanded);
             }
-            if trace {
-                eprintln!(
-                    "[lagr] B&P did not finish in {:.0}s cap — anytime cascade",
-                    bp_cap.as_secs_f64()
-                );
-            }
+            debug!(
+                "[lagr] B&P did not finish in {:.0}s cap — anytime cascade",
+                bp_cap.as_secs_f64()
+            );
         }
 
         // ---- Phase 1: construct a complete forest — decomposition router ----
@@ -379,7 +449,7 @@ impl LagrangianSolver {
         // hand the whole reduced core to the flat engine for the rest of the
         // time. Giants skip the attempt outright (decomposition can't help and
         // its recombination would waste the budget).
-        let no_decomp = std::env::var("KLADOS_LAGR_NO_DECOMP").is_ok();
+        let no_decomp = self.config.no_decomp;
         let try_decomp = !no_decomp
             && reduced.num_trees() == 2
             && reduced.num_leaves >= DECOMP_MIN_LEAVES
@@ -390,11 +460,11 @@ impl LagrangianSolver {
                 let attempt = budget
                     .map(|b| b.min(DECOMP_ATTEMPT))
                     .unwrap_or(DECOMP_ATTEMPT);
-                let (forest, p) = self.solve_decomposed(reduced, Some(attempt), start, trace);
+                let (forest, p) = self.solve_decomposed(reduced, Some(attempt), start);
                 if p {
                     proven = Some((forest, true)); // certified optimal — done
-                } else if trace {
-                    eprintln!(
+                } else {
+                    debug!(
                         "[lagr] decomp attempt did not prove (hard core) — flat engine, t={:.1}s",
                         start.elapsed().as_secs_f64()
                     );
@@ -405,27 +475,25 @@ impl LagrangianSolver {
                 // the LNS that follows) is the only place a forest describes the
                 // whole instance, so it is the only place the abort may fire.
                 self.abort_armed.store(true, Ordering::Relaxed);
-                self.solve_reduced_core(reduced, deadline, start, trace, 0)
+                self.solve_reduced_core(reduced, deadline, start, 0)
             })
         };
-        if trace {
-            eprintln!(
-                "[lagr] construction done: k={} proved={} t={:.1}s",
-                reduced_forest.len(),
-                proved,
-                start.elapsed().as_secs_f64()
-            );
-        }
+        debug!(
+            "[lagr] construction done: k={} proved={} t={:.1}s",
+            reduced_forest.len(),
+            proved,
+            start.elapsed().as_secs_f64()
+        );
         // ---- Phase 2: refine until proven optimal or SIGTERM ----
         // If construction PROVED the optimum there is nothing to improve — stop.
         // Otherwise the optimum is unproven (LP↔IP gap on the hard cores): spend
         // EVERY remaining second re-solving incumbent regions exactly (LNS) and
         // splicing back any that shrink — monotone, never worsens the forest.
-        // Default ON (KLADOS_LAGR_NO_LNS disables). Runs until deadline/SIGTERM.
-        let lns_on = std::env::var("KLADOS_LAGR_NO_LNS").is_err();
+        // Default ON (`LagrangianConfig.lns_on = false` disables). Runs until deadline/SIGTERM.
+        let lns_on = self.config.lns_on;
         if lns_on && !proved && reduced.num_trees() == 2 && !self.terminate.load(Ordering::Relaxed)
         {
-            reduced_forest = self.lns_improve(reduced, reduced_forest, deadline, start, trace);
+            reduced_forest = self.lns_improve(reduced, reduced_forest, deadline, start);
         }
         let reduced_len = reduced_forest.len();
         let expanded = klados_core::kernelize::expand_solution_unindexed(
@@ -458,7 +526,6 @@ impl LagrangianSolver {
         reduced: &Instance,
         deadline: Option<Instant>,
         start: Instant,
-        trace: bool,
         depth: usize,
     ) -> (Vec<Tree>, bool) {
         let trees = &reduced.trees;
@@ -486,14 +553,14 @@ impl LagrangianSolver {
         // NOT the LP. The flat subgradient plateaus at the LP↔integer gap because
         // the unconstrained pricer never emits the columns the integer optimum
         // needs; branching on a contended leaf-pair forces them, anytime.
-        if std::env::var("KLADOS_LAGR_LBNB").is_ok() {
-            return (self.solve_lagrangian_bnb(reduced, deadline, start, trace), false);
+        if self.config.lbnb {
+            return (self.solve_lagrangian_bnb(reduced, deadline, start), false);
         }
         // Lagrangian dive: warm the dual, then commit the best column and let
         // the dual re-approximate on the residual, repeatedly — a direct descent
         // that subdivides the solution space and is anytime by construction.
-        if std::env::var("KLADOS_LAGR_DIVE").is_ok() {
-            return (self.solve_lagrangian_dive(reduced, deadline, start, trace), false);
+        if self.config.dive {
+            return (self.solve_lagrangian_dive(reduced, deadline, start), false);
         }
 
         // ---- Tier cascade ----
@@ -506,8 +573,8 @@ impl LagrangianSolver {
         let global_fits = (reduced.trees[0].num_nodes() as u64)
             * (reduced.trees[1].num_nodes() as u64)
             <= CELL_CAP_SAFE;
-        let force_lp = std::env::var("KLADOS_LAGR_LP").is_ok();
-        let no_rmp = std::env::var("KLADOS_NO_RMP").is_ok();
+        let force_lp = self.config.force_lp;
+        let no_rmp = self.config.no_rmp;
         // Columns the (capped) RMP tier priced; fed to the subgradient pool below
         // so its CG warm-starts instead of rediscovering them from Chen.
         let mut rmp_seed_labels: Vec<Vec<u32>> = Vec::new();
@@ -517,13 +584,9 @@ impl LagrangianSolver {
             // <1s); a small-but-gappy instance can otherwise run CG for the whole
             // window, starving the subgradient (which wins the primal on gap
             // instances) AND risking the SIGTERM grace. So: cap at a modest
-            // absolute ceiling, and at ≤¼ of a known budget. KLADOS_LAGR_LP
+            // absolute ceiling, and at ≤¼ of a known budget. `LagrangianConfig.force_lp`
             // forces the full budget (the standalone RMP-engine path, testing).
-            let cap_ceiling = std::env::var("KLADOS_RMP_CAP_MS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-                .map(Duration::from_millis)
-                .unwrap_or_else(|| Duration::from_secs(15));
+            let cap_ceiling = Duration::from_millis(self.config.rmp_cap_ms);
             let rmp_deadline = if force_lp {
                 deadline
             } else {
@@ -534,17 +597,15 @@ impl LagrangianSolver {
                 Some(start + dur)
             };
             let (rmp_forest, rmp_proved, rmp_pool) =
-                self.solve_rmp(reduced, rmp_deadline, trace, start);
+                self.solve_rmp(reduced, rmp_deadline, start);
             if force_lp || rmp_proved {
                 return (rmp_forest, rmp_proved);
             }
             rmp_seed_labels = rmp_pool;
-            if trace {
-                eprintln!(
-                    "{ind}[lagr] RMP did not certify (gap) — handing off to subgradient at {:.1}s",
-                    start.elapsed().as_secs_f64()
-                );
-            }
+            debug!(
+                "{ind}[lagr] RMP did not certify (gap) — handing off to subgradient at {:.1}s",
+                start.elapsed().as_secs_f64()
+            );
         }
 
         // ---- Pool + dedup ----
@@ -583,14 +644,12 @@ impl LagrangianSolver {
         for s in &chen_sets {
             add_block(s.clone(), &mut pool, &mut seen);
         }
-        if trace {
-            eprintln!(
-                "{ind}[lagr] n={} chen incumbent={} ({:.0}ms)",
-                n,
-                best_components,
-                start.elapsed().as_secs_f64() * 1000.0
-            );
-        }
+        debug!(
+            "{ind}[lagr] n={} chen incumbent={} ({:.0}ms)",
+            n,
+            best_components,
+            start.elapsed().as_secs_f64() * 1000.0
+        );
 
         // ---- Seed pool with a few overlapping greedy partitions ----
         let num_seeds: u64 = if n <= 2_000 {
@@ -614,8 +673,8 @@ impl LagrangianSolver {
         }
         // Warm-start with the columns the RMP tier already priced (avoids the
         // subgradient rediscovering them from cold via column generation).
-        // `KLADOS_LAGR_NO_RMP_WARM` disables it (for A/B measurement).
-        let rmp_warm = if std::env::var("KLADOS_LAGR_NO_RMP_WARM").is_err() {
+        // `LagrangianConfig.no_rmp_warm` disables it (for A/B measurement).
+        let rmp_warm = if !self.config.no_rmp_warm {
             let n_warm = rmp_seed_labels.len();
             for labels in std::mem::take(&mut rmp_seed_labels) {
                 add_block(labels, &mut pool, &mut seen);
@@ -624,14 +683,12 @@ impl LagrangianSolver {
         } else {
             0
         };
-        if trace {
-            eprintln!(
-                "{ind}[lagr] seeded pool={} (rmp_warm={}) ({:.0}ms)",
-                pool.len(),
-                rmp_warm,
-                start.elapsed().as_secs_f64() * 1000.0
-            );
-        }
+        debug!(
+            "{ind}[lagr] seeded pool={} (rmp_warm={}) ({:.0}ms)",
+            pool.len(),
+            rmp_warm,
+            start.elapsed().as_secs_f64() * 1000.0
+        );
 
         // ---- Multipliers: α per leaf (free), β per node per tree (≥0) ----
         let mut alpha = vec![0.0f64; nl + 1];
@@ -648,13 +705,10 @@ impl LagrangianSolver {
         // ---- R2: windowed pricing when the global DP table is too large ----
         let global_fits =
             (trees[0].num_nodes() as u64) * (trees[1].num_nodes() as u64) <= CELL_CAP_SAFE;
-        let window_max = std::env::var("KLADOS_LAGR_WINDOW")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(WINDOW_MAX_LEAVES);
+        let window_max = self.config.window_max;
         let mut windows: Vec<Window> = Vec::new();
         if !global_fits {
-            for leaves in split_t0_windows(&trees[0], window_max) {
+            for leaves in split_t0_windows(&trees[0], window_max, self.config.topdown_windows) {
                 if self.terminate.load(Ordering::Relaxed) {
                     break;
                 }
@@ -671,28 +725,26 @@ impl LagrangianSolver {
                     .collect();
                 windows.push(Window::new(inst, rev, img));
             }
-            if trace {
-                let sizes: Vec<usize> =
-                    windows.iter().map(|w| w.inst.num_leaves as usize).collect();
-                let (mn, mx) = (
-                    sizes.iter().copied().min().unwrap_or(0),
-                    sizes.iter().copied().max().unwrap_or(0),
-                );
-                let avg = if sizes.is_empty() {
-                    0
-                } else {
-                    sizes.iter().sum::<usize>() / sizes.len()
-                };
-                eprintln!(
-                    "{ind}[lagr] windowed pricing: {} windows (cap={}, leaves min/avg/max={}/{}/{}) ({:.0}ms)",
-                    windows.len(),
-                    window_max,
-                    mn,
-                    avg,
-                    mx,
-                    start.elapsed().as_secs_f64() * 1000.0
-                );
-            }
+            let sizes: Vec<usize> =
+                windows.iter().map(|w| w.inst.num_leaves as usize).collect();
+            let (mn, mx) = (
+                sizes.iter().copied().min().unwrap_or(0),
+                sizes.iter().copied().max().unwrap_or(0),
+            );
+            let avg = if sizes.is_empty() {
+                0
+            } else {
+                sizes.iter().sum::<usize>() / sizes.len()
+            };
+            debug!(
+                "{ind}[lagr] windowed pricing: {} windows (cap={}, leaves min/avg/max={}/{}/{}) ({:.0}ms)",
+                windows.len(),
+                window_max,
+                mn,
+                avg,
+                mx,
+                start.elapsed().as_secs_f64() * 1000.0
+            );
         }
 
         // The Lagrangian L is a valid global lower bound only when pricing is
@@ -725,11 +777,8 @@ impl LagrangianSolver {
         // drives a smooth descent direction, and serious/null step control.
         // The primal is then rounded from `x̄` (stable) rather than the
         // thrashing instantaneous reduced-cost scores.
-        let volume = std::env::var("KLADOS_LAGR_VOLUME").is_ok();
-        let avg_a = std::env::var("KLADOS_LAGR_VOLUME_A")
-            .ok()
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(0.1);
+        let volume = self.config.volume;
+        let avg_a = self.config.volume_a;
         let mut xbar: Vec<f64> = Vec::new(); // per-column averaged selection
         let mut xbar_sing = vec![0.0f64; nl + 1]; // per-leaf averaged singleton selection
         let mut center_alpha: Vec<f64> = alpha.clone();
@@ -744,12 +793,8 @@ impl LagrangianSolver {
         // Periodically solve the exact LP over the current pool and overwrite
         // α/β with the LP duals: the pricer + greedy then aim at the true LP
         // optimum while the subgradient keeps diversifying around it.
-        let hybrid = std::env::var("KLADOS_LAGR_HYBRID").is_ok();
-        let refresh_every = std::env::var("KLADOS_LAGR_REFRESH")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(15)
-            .max(1);
+        let hybrid = self.config.hybrid;
+        let refresh_every = self.config.refresh_every.max(1);
         let mut h_builder = ColumnBuilder::new(trees);
         let mut h_afpool: Vec<AfColumn> = Vec::new();
         let mut h_in_rmp = ColumnSet::new();
@@ -772,17 +817,17 @@ impl LagrangianSolver {
         // Reserve a tail of the budget for the primal improvement loop: the
         // subgradient generates the columns; the local search then relentlessly
         // re-selects a better packing over the same pool. ON by default
-        // (KLADOS_LAGR_LS=frac to tune, KLADOS_LAGR_NO_LS to disable) — it helps
+        // (`LagrangianConfig.no_ls = true` disables) — it helps
         // the hard fallback cores (n4465: 2910→2829) and never hurts (it only
         // refines the subgradient's own plateaued incumbent).
         // Local search runs AFTER the subgradient converges (stall-based), not
         // on a reserved time fraction — so it works with no deadline (the
         // default, SIGTERM-driven) instead of needing a hardcoded horizon to
-        // carve a tail from. KLADOS_LAGR_NO_LS disables it.
-        let ls_on = !std::env::var("KLADOS_LAGR_NO_LS").is_ok();
+        // carve a tail from. `LagrangianConfig.no_ls` disables it.
+        let ls_on = !self.config.no_ls;
 
-        // Env-gated per-center profiling of the hot loop (KLADOS_LAGR_PROFILE).
-        let profile = std::env::var("KLADOS_LAGR_PROFILE").is_ok();
+        // Config-gated per-center profiling of the hot loop.
+        let profile = self.config.profile;
         let (mut t_price, mut t_add, mut t_score, mut t_sg, mut t_primal) = (
             Duration::ZERO,
             Duration::ZERO,
@@ -797,14 +842,8 @@ impl LagrangianSolver {
         // no window starves). The subgradient moves slowly, so most windows are
         // stable per iteration — this removes the redundant re-pricing that is
         // ~83% of the giant budget, WITHOUT shrinking windows (no column loss).
-        let reprice_eps = std::env::var("KLADOS_LAGR_REPRICE_EPS")
-            .ok()
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(0.05);
-        let reprice_maxstale = std::env::var("KLADOS_LAGR_REPRICE_MAXSTALE")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(10);
+        let reprice_eps = self.config.reprice_eps;
+        let reprice_maxstale = self.config.reprice_maxstale;
         let mut win_priced_total = 0usize;
         let mut win_skipped_total = 0usize;
         // Windows are priced SEQUENTIALLY, so one DP table suffices for all of
@@ -1029,11 +1068,7 @@ impl LagrangianSolver {
                         }
                         // Pull the subgradient's dual center toward the LP duals.
                         // blend=1 → full snap; <1 keeps some subgradient drift.
-                        let blend = std::env::var("KLADOS_LAGR_HYBRID_BLEND")
-                            .ok()
-                            .and_then(|s| s.parse::<f64>().ok())
-                            .unwrap_or(1.0)
-                            .clamp(0.0, 1.0);
+                        let blend = self.config.hybrid_blend.clamp(0.0, 1.0);
                         let na = alpha.len().min(sol.leaf_duals.len());
                         for l in 0..na {
                             alpha[l] = (1.0 - blend) * alpha[l] + blend * sol.leaf_duals[l];
@@ -1045,16 +1080,14 @@ impl LagrangianSolver {
                                     (1.0 - blend) * beta[ti][nd] + blend * sol.node_duals[ti][nd];
                             }
                         }
-                        if trace {
-                            eprintln!(
-                                "{ind}[lagr][hybrid] refresh iter={} rmp_cols={} lp={:.2} best={} t={:.1}s",
-                                iter,
-                                h_afpool.len(),
-                                sol.objective,
-                                best_components,
-                                start.elapsed().as_secs_f64()
-                            );
-                        }
+                        debug!(
+                            "{ind}[lagr][hybrid] refresh iter={} rmp_cols={} lp={:.2} best={} t={:.1}s",
+                            iter,
+                            h_afpool.len(),
+                            sol.objective,
+                            best_components,
+                            start.elapsed().as_secs_f64()
+                        );
                     }
                 }
             }
@@ -1108,11 +1141,7 @@ impl LagrangianSolver {
                 // Volume adapts its own step via serious/null counters; only the
                 // plain subgradient uses the stall-halving rule here.
                 stall += 1;
-                let stall_thresh = std::env::var("KLADOS_LAGR_STALL")
-                    .ok()
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(20);
-                if stall >= stall_thresh {
+                if stall >= self.config.stall_thresh {
                     lambda *= 0.5;
                     stall = 0;
                 }
@@ -1167,17 +1196,15 @@ impl LagrangianSolver {
                 since_primal_improve += 1;
             }
             if iter >= PRIMAL_WARMUP && since_primal_improve >= PRIMAL_STALL_LIMIT {
-                if trace {
-                    eprintln!(
-                        "{ind}[lagr] primal converged at iter={} (best={}, {} stalled iters)",
-                        iter, best_components, since_primal_improve
-                    );
-                }
+                debug!(
+                    "{ind}[lagr] primal converged at iter={} (best={}, {} stalled iters)",
+                    iter, best_components, since_primal_improve
+                );
                 break;
             }
 
-            if trace && (iter <= 5 || iter % 25 == 0 || improved) {
-                eprintln!(
+            if iter <= 5 || iter % 25 == 0 || improved {
+                debug!(
                     "{ind}[lagr] iter={} pool={} +{} lb={:.1} lambda={:.4} best={} gap={:.1}% t={:.1}s",
                     iter,
                     pool.len(),
@@ -1199,12 +1226,10 @@ impl LagrangianSolver {
             // incumbent meets it. (OPT ≥ ⌈lb⌉ and best ≥ OPT, so best ≤ ⌈lb⌉
             // ⇒ best = OPT.) Windowed pricing never certifies.
             if global && added == 0 && best_components <= lb.ceil() as usize {
-                if trace {
-                    eprintln!(
-                        "{ind}[lagr] PROVED optimal at iter={}: best={} lb={:.2}",
-                        iter, best_components, lb
-                    );
-                }
+                debug!(
+                    "{ind}[lagr] PROVED optimal at iter={}: best={} lb={:.2}",
+                    iter, best_components, lb
+                );
                 proved = true;
                 break;
             }
@@ -1232,12 +1257,10 @@ impl LagrangianSolver {
                 }
                 best_at_reenergise = best_components;
                 if reenergise_dry >= REENERGISE_DRY_LIMIT {
-                    if trace {
-                        eprintln!(
-                            "{ind}[lagr] subgradient converged at iter={} (best={}, {} dry re-energises)",
-                            iter, best_components, reenergise_dry
-                        );
-                    }
+                    debug!(
+                        "{ind}[lagr] subgradient converged at iter={} (best={}, {} dry re-energises)",
+                        iter, best_components, reenergise_dry
+                    );
                     break;
                 }
                 lambda = 1.0;
@@ -1245,18 +1268,16 @@ impl LagrangianSolver {
                     *a = 0.5 * *a + 0.5;
                 }
                 no_new = 0;
-                if trace {
-                    eprintln!(
-                        "{ind}[lagr] re-energise at iter={} (unproven, best={})",
-                        iter, best_components
-                    );
-                }
+                debug!(
+                    "{ind}[lagr] re-energise at iter={} (unproven, best={})",
+                    iter, best_components
+                );
             }
         }
 
         if profile {
             let ms = |d: Duration| d.as_secs_f64() * 1000.0;
-            eprintln!(
+            debug!(
                 "{ind}[lagr][profile] iters={} pool={} | price={:.0}ms add={:.0}ms score={:.0}ms sg={:.0}ms primal={:.0}ms | win_priced={} win_skipped={}",
                 iter,
                 pool.len(),
@@ -1270,13 +1291,13 @@ impl LagrangianSolver {
             );
         }
 
-        // ---- Branching-lite (prototype, gated by KLADOS_LAGR_BRANCH) ----
+        // ---- Branching-lite (prototype, gated by `LagrangianConfig.branch`) ----
         // When the bound can't prove the incumbent (LP↔IP integrality gap), the
         // unconstrained pricer never generates the columns the optimum needs.
         // Branch on contended leaf-pairs: force {a,b} together (must-link),
         // RE-PRICE under that constraint so the anchor DP emits {a,b}-together
         // columns (the gap columns), then re-pack. Keep any improvement.
-        if global && !proved && std::env::var("KLADOS_LAGR_BRANCH").is_ok() {
+        if global && !proved && self.config.branch {
             // Incumbent leaf → component map.
             let mut comp_of = vec![usize::MAX; nl + 1];
             for (ci, comp) in best_forest.iter().enumerate() {
@@ -1355,22 +1376,18 @@ impl LagrangianSolver {
                 if comps < best_components {
                     best_components = comps;
                     best_forest = build_forest(&pool, &sel, trees, n, unindexed);
-                    if trace {
-                        eprintln!(
-                            "{ind}[lagr] branch must-link({},{}) improved: best={}",
-                            a, b, comps
-                        );
-                    }
+                    debug!(
+                        "{ind}[lagr] branch must-link({},{}) improved: best={}",
+                        a, b, comps
+                    );
                 }
             }
-            if trace {
-                eprintln!(
-                    "{ind}[lagr] branching-lite: tried {} pairs, best={} pool={}",
-                    n_pairs,
-                    best_components,
-                    pool.len()
-                );
-            }
+            debug!(
+                "{ind}[lagr] branching-lite: tried {} pairs, best={} pool={}",
+                n_pairs,
+                best_components,
+                pool.len()
+            );
         }
 
         // Freeze the lower-track early-abort target for the primal-improvement
@@ -1402,7 +1419,7 @@ impl LagrangianSolver {
             // iterations), not a final-dual greedy — the local search refines
             // the strongest packing found, not a one-shot one.
             let sel1 =
-                self.improve_packing(&pool, trees, n, &scores, &best_sel, deadline, start, trace);
+                self.improve_packing(&pool, trees, n, &scores, &best_sel, deadline, start);
             let savings1: usize = sel1.iter().map(|&i| pool[i].labels.len() - 1).sum();
             let k1 = nl - savings1;
             if k1 < best_components {
@@ -1411,17 +1428,15 @@ impl LagrangianSolver {
             }
         }
 
-        if trace {
-            eprintln!(
-                "{ind}[lagr] DONE reduced_n={} reduced_best={} lb={:.1} iters={} pool={} t={:.1}s",
-                n,
-                best_components,
-                best_lb,
-                iter,
-                pool.len(),
-                start.elapsed().as_secs_f64()
-            );
-        }
+        debug!(
+            "{ind}[lagr] DONE reduced_n={} reduced_best={} lb={:.1} iters={} pool={} t={:.1}s",
+            n,
+            best_components,
+            best_lb,
+            iter,
+            pool.len(),
+            start.elapsed().as_secs_f64()
+        );
         // Publish the top-level reduced dual bound so `solve` can expose a tight
         // lower bound. Only depth 0 covers the whole reduced instance; nested
         // cluster solves (depth ≥ 1) bound only their slice.
@@ -1443,24 +1458,18 @@ impl LagrangianSolver {
         reduced: &Instance,
         budget: Option<Duration>,
         start: Instant,
-        trace: bool,
     ) -> (Vec<Tree>, bool) {
         // No internal time horizon by default: the solver is SIGTERM-driven and
         // each cluster runs to its own convergence/stall. A budget is supplied
         // only when `cfg.budget` is set (the run-track wall limit, or the
         // lower-track racer), in which case it is sliced across clusters by
-        // leaf-share. (KLADOS_PLAN_MS likewise forces a horizon for experiments.)
-        let plan_deadline: Option<Instant> = budget.map(|b| start + b).or_else(|| {
-            std::env::var("KLADOS_PLAN_MS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .map(|ms| start + Duration::from_millis(ms))
-        });
+        // leaf-share.
+        let plan_deadline: Option<Instant> = budget.map(|b| start + b);
         let remaining = Cell::new(reduced.num_leaves as u64);
         // Tracks whether any cluster finished UNproven (gap or time-capped). The
         // whole instance is proven optimal only if every cluster is.
         let unproved = Cell::new(false);
-        let forest = self.solve_cluster(reduced, &remaining, plan_deadline, trace, 0, &unproved);
+        let forest = self.solve_cluster(reduced, &remaining, plan_deadline, 0, &unproved);
         (forest, !unproved.get())
     }
 
@@ -1473,7 +1482,6 @@ impl LagrangianSolver {
         sub: &Instance,
         remaining: &Cell<u64>,
         plan_deadline: Option<Instant>,
-        trace: bool,
         depth: usize,
         unproved: &Cell<bool>,
     ) -> Vec<Tree> {
@@ -1509,14 +1517,12 @@ impl LagrangianSolver {
         {
             unproved.set(true);
             let now = Instant::now();
-            return self.solve_reduced_core(sub, Some(now), now, trace, depth).0;
+            return self.solve_reduced_core(sub, Some(now), now, depth).0;
         }
         if sub.num_trees() == 2 && sub.num_leaves >= DECOMP_MIN_LEAVES {
-            if trace {
-                eprintln!("{ind}[lagr][decomp] split n={}", sub.num_leaves);
-            }
+            debug!("{ind}[lagr][decomp] split n={}", sub.num_leaves);
             let mut cb = |s: &Instance| -> Option<Vec<Tree>> {
-                Some(self.solve_cluster(s, remaining, plan_deadline, trace, depth + 1, unproved))
+                Some(self.solve_cluster(s, remaining, plan_deadline, depth + 1, unproved))
             };
             if let Some(forest) = try_whidden_decomp_2tree(sub, &mut cb, &self.terminate) {
                 return forest;
@@ -1540,45 +1546,33 @@ impl LagrangianSolver {
         // capped B&P returns garbage, so solve_cluster_exact returns None unless
         // it truly finished. The cap is a bounded *attempt*, not a phase
         // timeout — it caps wasted effort on a cluster exact B&P can't crack.
-        let exact_threshold = std::env::var("KLADOS_DECOMP_EXACT")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(EXACT_THRESHOLD_DEFAULT);
+        let exact_threshold = self.config.decomp_exact as u32;
         if sub.num_leaves <= exact_threshold && !self.terminate.load(Ordering::Relaxed) {
-            let exact_cap = Duration::from_millis(
-                std::env::var("KLADOS_DECOMP_EXACT_CAP_MS")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(10_000),
-            );
+            let exact_cap = Duration::from_millis(self.config.decomp_exact_cap_ms);
             let probe = match slice_end {
                 Some(se) => (Instant::now() + exact_cap).min(se),
                 None => Instant::now() + exact_cap,
             };
             if let Some(forest) = self.solve_cluster_exact(sub, probe) {
-                if trace {
-                    eprintln!(
-                        "{ind}[lagr][decomp] exact n={} k={} (optimal)",
-                        sub.num_leaves,
-                        forest.len()
-                    );
-                }
+                debug!(
+                    "{ind}[lagr][decomp] exact n={} k={} (optimal)",
+                    sub.num_leaves,
+                    forest.len()
+                );
                 return forest;
             }
         }
-        if trace {
-            let slice_s = slice_end
-                .map(|se| se.saturating_duration_since(Instant::now()).as_secs_f64());
-            eprintln!(
-                "{ind}[lagr][decomp] cascade n={} slice={}",
-                sub.num_leaves,
-                match slice_s {
-                    Some(s) => format!("{s:.1}s"),
-                    None => "converge".to_string(),
-                }
-            );
-        }
-        let (forest, proved) = self.solve_reduced_core(sub, slice_end, Instant::now(), trace, depth);
+        let slice_s = slice_end
+            .map(|se| se.saturating_duration_since(Instant::now()).as_secs_f64());
+        debug!(
+            "{ind}[lagr][decomp] cascade n={} slice={}",
+            sub.num_leaves,
+            match slice_s {
+                Some(s) => format!("{s:.1}s"),
+                None => "converge".to_string(),
+            }
+        );
+        let (forest, proved) = self.solve_reduced_core(sub, slice_end, Instant::now(), depth);
         if !proved {
             unproved.set(true);
         }
@@ -1722,7 +1716,6 @@ impl LagrangianSolver {
         reduced: &Instance,
         deadline: Option<Instant>,
         start: Instant,
-        trace: bool,
     ) -> Vec<Tree> {
         let trees = &reduced.trees;
         let n = reduced.num_leaves;
@@ -1774,23 +1767,9 @@ impl LagrangianSolver {
         let alpha0: Vec<f64> = (0..=nl).map(|i| if i == 0 { 0.0 } else { 1.0 }).collect();
         let beta0: Vec<Vec<f64>> = trees.iter().map(|t| vec![0.0f64; t.num_nodes()]).collect();
 
-        let plan_deadline = deadline.unwrap_or_else(|| {
-            start
-                + Duration::from_millis(
-                    std::env::var("KLADOS_PLAN_MS")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(290_000),
-                )
-        });
-        let root_ms = std::env::var("KLADOS_LBNB_ROOT_MS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(20_000);
-        let node_ms = std::env::var("KLADOS_LBNB_NODE_MS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(2_500);
+        let plan_deadline = deadline.unwrap_or(start + Duration::from_millis(self.config.plan_ms));
+        let root_ms = self.config.lbnb_root_ms;
+        let node_ms = self.config.lbnb_node_ms;
 
         // DFS stack: (branchings, warm duals). Children warm-start from the
         // parent's converged α/β.
@@ -1821,15 +1800,13 @@ impl LagrangianSolver {
             if k < global_best_k {
                 global_best_k = k;
                 global_best_forest = build_forest(&pool, &sel, trees, n, false);
-                if trace {
-                    eprintln!(
-                        "[lagr][lbnb] node={} depth={} k={} (best) t={:.1}s",
-                        nodes,
-                        br.depth(),
-                        global_best_k,
-                        start.elapsed().as_secs_f64()
-                    );
-                }
+                debug!(
+                    "[lagr][lbnb] node={} depth={} k={} (best) t={:.1}s",
+                    nodes,
+                    br.depth(),
+                    global_best_k,
+                    start.elapsed().as_secs_f64()
+                );
             }
             // The gap columns this branch generated are valid GLOBALLY (a column
             // is a valid AF component regardless of branchings). Pack the
@@ -1844,14 +1821,12 @@ impl LagrangianSolver {
                 if uk < global_best_k {
                     global_best_k = uk;
                     global_best_forest = build_forest(&pool, &usel, trees, n, false);
-                    if trace {
-                        eprintln!(
-                            "[lagr][lbnb] node={} (unconstrained pack) k={} t={:.1}s",
-                            nodes,
-                            global_best_k,
-                            start.elapsed().as_secs_f64()
-                        );
-                    }
+                    debug!(
+                        "[lagr][lbnb] node={} (unconstrained pack) k={} t={:.1}s",
+                        nodes,
+                        global_best_k,
+                        start.elapsed().as_secs_f64()
+                    );
                 }
             }
             nodes += 1;
@@ -1862,26 +1837,22 @@ impl LagrangianSolver {
             // the same sum isn't a valid node bound, so we don't prune there
             // (anytime keeps the best regardless).
             if br.depth() == 0 && (lb - 1e-6).ceil() as usize >= global_best_k {
-                if trace {
-                    eprintln!("[lagr][lbnb] root certified: k={} lb={:.1}", global_best_k, lb);
-                }
+                debug!("[lagr][lbnb] root certified: k={} lb={:.1}", global_best_k, lb);
                 break;
             }
 
             // Branch on the most-contended pair the node's incumbent splits.
             let bp = pick_branch_pair(&pool, &sel, &alpha, &beta, nl, &br);
-            if trace {
-                eprintln!(
-                    "[lagr][lbnb]   node={} depth={} k={} lb={:.1} pool {}→{} pair={:?}",
-                    nodes - 1,
-                    br.depth(),
-                    k,
-                    lb,
-                    pool_before,
-                    pool.len(),
-                    bp.map(|p| (p.a, p.b))
-                );
-            }
+            debug!(
+                "[lagr][lbnb]   node={} depth={} k={} lb={:.1} pool {}→{} pair={:?}",
+                nodes - 1,
+                br.depth(),
+                k,
+                lb,
+                pool_before,
+                pool.len(),
+                bp.map(|p| (p.a, p.b))
+            );
             if let Some(pair) = bp {
                 let (left, right) = br.split_on(pair);
                 if !right.is_inconsistent() {
@@ -1892,15 +1863,13 @@ impl LagrangianSolver {
                 }
             }
         }
-        if trace {
-            eprintln!(
-                "[lagr][lbnb] done nodes={} k={} pool={} t={:.1}s",
-                nodes,
-                global_best_k,
-                pool.len(),
-                start.elapsed().as_secs_f64()
-            );
-        }
+        debug!(
+            "[lagr][lbnb] done nodes={} k={} pool={} t={:.1}s",
+            nodes,
+            global_best_k,
+            pool.len(),
+            start.elapsed().as_secs_f64()
+        );
         global_best_forest
     }
 
@@ -1977,7 +1946,6 @@ impl LagrangianSolver {
         reduced: &Instance,
         deadline: Option<Instant>,
         start: Instant,
-        trace: bool,
     ) -> Vec<Tree> {
         let trees = &reduced.trees;
         let n = reduced.num_leaves;
@@ -2029,24 +1997,10 @@ impl LagrangianSolver {
         let mut alpha: Vec<f64> = (0..=nl).map(|i| if i == 0 { 0.0 } else { 1.0 }).collect();
         let mut beta: Vec<Vec<f64>> = trees.iter().map(|t| vec![0.0f64; t.num_nodes()]).collect();
 
-        let plan_deadline = deadline.unwrap_or_else(|| {
-            start
-                + Duration::from_millis(
-                    std::env::var("KLADOS_PLAN_MS")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(290_000),
-                )
-        });
-        let reopt_iters: usize = std::env::var("KLADOS_DIVE_REOPT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(3);
+        let plan_deadline = deadline.unwrap_or(start + Duration::from_millis(self.config.plan_ms));
+        let reopt_iters: usize = self.config.dive_reopt;
         // Warm-up gets a fraction of the budget; the dive uses the rest.
-        let warmup_frac: f64 = std::env::var("KLADOS_DIVE_WARMUP")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0.4);
+        let warmup_frac: f64 = self.config.dive_warmup;
 
         let empty = FixedBitSet::with_capacity(nl + 1);
         let total = plan_deadline.saturating_duration_since(Instant::now());
@@ -2078,14 +2032,12 @@ impl LagrangianSolver {
                 best_forest = build_forest(&pool, &sel, trees, n, false);
             }
         }
-        if trace {
-            eprintln!(
-                "[lagr][dive] warm-up done: greedy_best={} pool={} t={:.1}s",
-                best_k,
-                pool.len(),
-                start.elapsed().as_secs_f64()
-            );
-        }
+        debug!(
+            "[lagr][dive] warm-up done: greedy_best={} pool={} t={:.1}s",
+            best_k,
+            pool.len(),
+            start.elapsed().as_secs_f64()
+        );
 
         // ---- Dive: commit best-fitting column, re-approximate the residual ----
         let mut committed: Vec<usize> = Vec::new();
@@ -2149,29 +2101,25 @@ impl LagrangianSolver {
                     if k < best_k {
                         best_k = k;
                         best_forest = build_forest(&pool, &committed, trees, n, false);
-                        if trace {
-                            eprintln!(
-                                "[lagr][dive] commit #{} k={} covered={}/{} t={:.1}s",
-                                committed.len(),
-                                best_k,
-                                covered.count_ones(..),
-                                nl,
-                                start.elapsed().as_secs_f64()
-                            );
-                        }
+                        debug!(
+                            "[lagr][dive] commit #{} k={} covered={}/{} t={:.1}s",
+                            committed.len(),
+                            best_k,
+                            covered.count_ones(..),
+                            nl,
+                            start.elapsed().as_secs_f64()
+                        );
                     }
                 }
                 None => break, // nothing improving still fits
             }
         }
-        if trace {
-            eprintln!(
-                "[lagr][dive] done committed={} k={} t={:.1}s",
-                committed.len(),
-                best_k,
-                start.elapsed().as_secs_f64()
-            );
-        }
+        debug!(
+            "[lagr][dive] done committed={} k={} t={:.1}s",
+            committed.len(),
+            best_k,
+            start.elapsed().as_secs_f64()
+        );
         best_forest
     }
 
@@ -2194,7 +2142,6 @@ impl LagrangianSolver {
         init_sel: &[usize],
         deadline: Option<Instant>,
         start: Instant,
-        trace: bool,
     ) -> Vec<usize> {
         let nl = n as usize;
         let ncol = pool.len();
@@ -2430,13 +2377,11 @@ impl LagrangianSolver {
                 best_in_sel.copy_from_slice(&in_sel);
                 stalls = 0;
                 let k_reduced = nl - best_savings as usize;
-                if trace {
-                    eprintln!(
-                        "[lagr][ls] improved k={} t={:.1}s",
-                        k_reduced,
-                        start.elapsed().as_secs_f64()
-                    );
-                }
+                debug!(
+                    "[lagr][ls] improved k={} t={:.1}s",
+                    k_reduced,
+                    start.elapsed().as_secs_f64()
+                );
                 // Lower-track early-abort: this packing already clears the track
                 // bound (target frozen from the final dual). Stop now for the
                 // speed bonus rather than perturbing to the deadline. The MAX
@@ -2518,22 +2463,13 @@ impl LagrangianSolver {
         mut incumbent: Vec<Tree>,
         deadline: Option<Instant>,
         start: Instant,
-        trace: bool,
     ) -> Vec<Tree> {
         let trees = &reduced.trees;
         let n = reduced.num_leaves;
         let nl = n as usize;
         let t1 = &trees[0];
-        let region_max: usize = std::env::var("KLADOS_LNS_MAX")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(250);
-        let cap = Duration::from_millis(
-            std::env::var("KLADOS_LNS_CAP_MS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(2_000),
-        );
+        let region_max: usize = self.config.lns_max;
+        let cap = Duration::from_millis(self.config.lns_cap_ms);
 
         // leaf → incumbent component index
         let mut comp_of = vec![usize::MAX; nl + 1];
@@ -2668,16 +2604,14 @@ impl LagrangianSolver {
                         }
                     }
                 }
-                if trace {
-                    eprintln!(
-                        "[lagr][lns] accept k={} (region={} comps {}→{}) t={:.1}s",
-                        incumbent.len(),
-                        m,
-                        touched.len(),
-                        sub_sol.len(),
-                        start.elapsed().as_secs_f64()
-                    );
-                }
+                debug!(
+                    "[lagr][lns] accept k={} (region={} comps {}→{}) t={:.1}s",
+                    incumbent.len(),
+                    m,
+                    touched.len(),
+                    sub_sol.len(),
+                    start.elapsed().as_secs_f64()
+                );
                 // Lower-track early-abort: spliced incumbent now clears the bound.
                 // MAX sentinel ⇒ no target; never abort then.
                 let target = self.abort_k_reduced.load(Ordering::Relaxed);
@@ -2689,16 +2623,14 @@ impl LagrangianSolver {
                 invalid += 1;
             }
         }
-        if trace {
-            eprintln!(
-                "[lagr][lns] done tries={} accepts={} invalid={} k={} t={:.1}s",
-                tries,
-                accepts,
-                invalid,
-                incumbent.len(),
-                start.elapsed().as_secs_f64()
-            );
-        }
+        debug!(
+            "[lagr][lns] done tries={} accepts={} invalid={} k={} t={:.1}s",
+            tries,
+            accepts,
+            invalid,
+            incumbent.len(),
+            start.elapsed().as_secs_f64()
+        );
         incumbent
     }
 
@@ -2715,7 +2647,6 @@ impl LagrangianSolver {
         &self,
         reduced: &Instance,
         deadline: Option<Instant>,
-        trace: bool,
         start: Instant,
     ) -> (Vec<Tree>, bool, Vec<Vec<u32>>) {
         let trees = &reduced.trees;
@@ -2784,13 +2715,10 @@ impl LagrangianSolver {
         // reduced labels and rebuilt against the full trees.
         let global_fits =
             (trees[0].num_nodes() as u64) * (trees[1].num_nodes() as u64) <= CELL_CAP_SAFE;
-        let window_max = std::env::var("KLADOS_LAGR_WINDOW")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(WINDOW_MAX_LEAVES);
+        let window_max = self.config.window_max;
         let mut windows: Vec<Window> = Vec::new();
         if !global_fits {
-            for leaves in split_t0_windows(&trees[0], window_max) {
+            for leaves in split_t0_windows(&trees[0], window_max, self.config.topdown_windows) {
                 if self.terminate.load(Ordering::Relaxed) {
                     break;
                 }
@@ -2812,20 +2740,18 @@ impl LagrangianSolver {
         // global (the DP sees the whole column space). Windowed pricing is
         // local, so its converged objective is not an optimality certificate.
         let global = windows.is_empty();
-        if trace {
-            eprintln!(
-                "[lagr][rmp] n={} chen={} pool={} pricing={} ({:.0}ms)",
-                n,
-                best_components,
-                pool.len(),
-                if global {
-                    "global".to_string()
-                } else {
-                    format!("windowed({})", windows.len())
-                },
-                start.elapsed().as_secs_f64() * 1000.0
-            );
-        }
+        debug!(
+            "[lagr][rmp] n={} chen={} pool={} pricing={} ({:.0}ms)",
+            n,
+            best_components,
+            pool.len(),
+            if global {
+                "global".to_string()
+            } else {
+                format!("windowed({})", windows.len())
+            },
+            start.elapsed().as_secs_f64() * 1000.0
+        );
 
         let mut iter = 0usize;
         loop {
@@ -2964,8 +2890,8 @@ impl LagrangianSolver {
                 }
             }
 
-            if trace && (iter <= 5 || iter % 10 == 0 || added == 0) {
-                eprintln!(
+            if iter <= 5 || iter % 10 == 0 || added == 0 {
+                debug!(
                     "[lagr][rmp] iter={} cols={} +{} lp={:.2} best={} gap={:.1}% t={:.1}s",
                     iter,
                     pool.len(),
@@ -3007,24 +2933,22 @@ impl LagrangianSolver {
                 // Global pricing with a complete pool ⇒ sol.objective is a valid
                 // LB. best ≤ ⌈lb⌉ certifies optimality. Windowed never certifies.
                 proved = global && best_components <= lb;
-                if trace {
-                    let status = if !global {
-                        "(windowed)"
-                    } else if proved {
-                        "PROVED"
-                    } else {
-                        "(gap)"
-                    };
-                    eprintln!(
-                        "[lagr][rmp] CG converged iter={} lp={:.3} best={} {}",
-                        iter, sol.objective, best_components, status
-                    );
-                }
+                let status = if !global {
+                    "(windowed)"
+                } else if proved {
+                    "PROVED"
+                } else {
+                    "(gap)"
+                };
+                debug!(
+                    "[lagr][rmp] CG converged iter={} lp={:.3} best={} {}",
+                    iter, sol.objective, best_components, status
+                );
                 // Anytime branch-and-price: the root LP converged with an
                 // integrality gap. Branch (B&P-parity: most-fractional pair,
                 // constraint-aware MafPricer, certified LP-bound prune) to close
                 // it, keeping the best incumbent and stopping at the deadline.
-                if global && !proved && std::env::var("KLADOS_LAGR_BNB").is_ok() {
+                if global && !proved && self.config.bnb {
                     let (bf, bc, bnb_proved) = self.bnb_anytime(
                         trees,
                         n,
@@ -3036,7 +2960,6 @@ impl LagrangianSolver {
                         best_components,
                         deadline,
                         start,
-                        trace,
                     );
                     best_forest = bf;
                     best_components = bc;
@@ -3150,7 +3073,6 @@ impl LagrangianSolver {
         mut best_components: usize,
         deadline: Option<Instant>,
         start: Instant,
-        trace: bool,
     ) -> (Vec<Tree>, usize, bool) {
         let nl = n as usize;
         let mut pricer = dispatch_by_m(trees);
@@ -3199,15 +3121,13 @@ impl LagrangianSolver {
                 if comps < best_components {
                     best_components = comps;
                     best_forest = forest;
-                    if trace {
-                        eprintln!(
-                            "[lagr][bnb] node={} incumbent={} lp={:.2} t={:.1}s",
-                            nodes,
-                            best_components,
-                            lp,
-                            start.elapsed().as_secs_f64()
-                        );
-                    }
+                    debug!(
+                        "[lagr][bnb] node={} incumbent={} lp={:.2} t={:.1}s",
+                        nodes,
+                        best_components,
+                        lp,
+                        start.elapsed().as_secs_f64()
+                    );
                 }
             }
             nodes += 1;
@@ -3231,15 +3151,13 @@ impl LagrangianSolver {
         }
 
         let proved = !hit_deadline;
-        if trace {
-            eprintln!(
-                "[lagr][bnb] done nodes={} best={} proved={} t={:.1}s",
-                nodes,
-                best_components,
-                proved,
-                start.elapsed().as_secs_f64()
-            );
-        }
+        debug!(
+            "[lagr][bnb] done nodes={} best={} proved={} t={:.1}s",
+            nodes,
+            best_components,
+            proved,
+            start.elapsed().as_secs_f64()
+        );
         (best_forest, best_components, proved)
     }
 
@@ -3598,9 +3516,9 @@ impl Window {
 /// greedy (emit every maximal ≤max subtree) shatters unbalanced trees into many
 /// tiny windows (measured: ~137 avg-66-leaf windows on a 9k-leaf core), wasting
 /// per-iteration overhead and dropping cross-spine columns the DP never prices.
-/// `KLADOS_LAGR_TOPDOWN_WINDOWS` restores the old behaviour for A/B testing.
-fn split_t0_windows(tree: &Tree, max_leaves: usize) -> Vec<Vec<u32>> {
-    if std::env::var("KLADOS_LAGR_TOPDOWN_WINDOWS").is_ok() {
+/// `LagrangianConfig.topdown_windows` restores the old behaviour for A/B testing.
+fn split_t0_windows(tree: &Tree, max_leaves: usize, topdown: bool) -> Vec<Vec<u32>> {
+    if topdown {
         return split_t0_windows_topdown(tree, max_leaves);
     }
     let max = max_leaves.max(2);
@@ -4137,11 +4055,10 @@ impl Default for LagrangianSolver {
 use crate::{RunConfig, Solver, Track};
 
 impl Solver for LagrangianSolver {
-    type Config = ();
+    type Config = LagrangianConfig;
     const SUPPORTED_TRACKS: &'static [Track] = &[Track::Heuristic];
-    const OPTIONS: &'static [(&'static str, &'static str)] =
-        &[("KLADOS_LAGR_TRACE", "print per-iteration diagnostics")];
     fn solve(&mut self, inst: &Instance, cfg: &RunConfig<Self::Config>) -> Option<Vec<Tree>> {
+        self.config = cfg.specific.clone();
         LagrangianSolver::solve(self, inst)
     }
     fn stats(&self) -> &SolverStats {
@@ -4154,5 +4071,5 @@ impl Solver for LagrangianSolver {
 }
 
 pub fn main() {
-    crate::run(LagrangianSolver::new(), RunConfig { track: Track::Heuristic, ..Default::default() });
+    crate::run(LagrangianSolver::new(), RunConfig { track: Track::Heuristic, specific: LagrangianConfig::default(), ..Default::default() });
 }

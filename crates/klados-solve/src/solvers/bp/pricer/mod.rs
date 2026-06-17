@@ -102,13 +102,9 @@ pub trait Pricer {
 /// The rewrite had grown to 64-column batches everywhere, which tends to
 /// flood the RMP with weaker columns and makes the LP/search loop much larger
 /// on the hard decomposed heuristic subinstances.
-pub(crate) fn adaptive_m2_batch_size(ctx: &PricingContext) -> usize {
-    if let Ok(raw) = std::env::var("KLADOS_BP_M2_BATCH") {
-        if let Ok(n) = raw.parse::<usize>() {
-            if n > 0 {
-                return n;
-            }
-        }
+pub(crate) fn adaptive_m2_batch_size(ctx: &PricingContext, m2_batch_override: usize) -> usize {
+    if m2_batch_override > 0 {
+        return m2_batch_override;
     }
 
     let active = ctx.alpha.iter().skip(1).filter(|&&a| a > 1.0e-12).count();

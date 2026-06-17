@@ -17,6 +17,7 @@ use klados_core::lower_bound::{
     greedy_multi_tree_partition, greedy_multi_tree_ub_seeded, pairwise_refine_ub,
 };
 use klados_core::{Instance, SolverStats, Tree};
+use log::{error, info};
 
 struct LocalBounds {
     best_partition: Option<Vec<usize>>,
@@ -750,7 +751,7 @@ fn solve_branch_price_multi(instance: &Instance, stats: &mut SolverStats) -> Opt
     let mut memo = ExactSubinstanceMemo::default();
     let result = solve_branch_price_multi_cached(instance, stats, &mut memo);
     if memo.hits > 0 || memo.stores > 0 || memo.skipped_ambiguous > 0 {
-        eprintln!(
+        info!(
             "[bp-multi] memo: hits={} stores={} entries={} skipped_ambiguous={}",
             memo.hits,
             memo.stores,
@@ -775,7 +776,7 @@ fn solve_branch_price_multi_cached(
     let kern = kernelize::kernelize_best(instance, &config);
     let reduced = &kern.instance;
 
-    eprintln!(
+    info!(
         "[bp-multi] kernelized {} -> {} leaves (m={})",
         instance.num_leaves,
         reduced.num_leaves,
@@ -862,7 +863,7 @@ fn solve_branch_price_multi_cached(
                 instance.reference_tree(),
                 instance.num_leaves,
             );
-            eprintln!(
+            info!(
                 "[bp-multi] optimal: {} components (whidden strict cluster decomp, n={}), {:.1}ms total",
                 components.len(),
                 reduced.num_leaves,
@@ -890,7 +891,7 @@ fn solve_branch_price_multi_cached(
                 instance.reference_tree(),
                 instance.num_leaves,
             );
-            eprintln!(
+            info!(
                 "[bp-multi] optimal: {} components (rspr cluster decomp), {:.1}ms total",
                 components.len(),
                 t_total.elapsed().as_secs_f64() * 1000.0,
@@ -917,7 +918,7 @@ fn solve_branch_price_multi_cached(
                 instance.reference_tree(),
                 instance.num_leaves,
             );
-            eprintln!(
+            info!(
                 "[bp-multi] optimal: {} components (cluster decomp), {:.1}ms total",
                 components.len(),
                 t_total.elapsed().as_secs_f64() * 1000.0,
@@ -995,7 +996,7 @@ fn solve_branch_price_multi_cached(
             }
             chen_columns_added += 1;
         }
-        eprintln!(
+        info!(
             "[bp-multi] chen seed: {} columns in {:.1}ms",
             chen_columns_added,
             chen_t0.elapsed().as_secs_f64() * 1000.0,
@@ -1012,7 +1013,7 @@ fn solve_branch_price_multi_cached(
         if let Some(incumbent) =
             crate::decomp::whidden_cluster::try_whidden_relaxed_incumbent_2tree(reduced, &mut |sub| {
                 solve_branch_price_multi_cached(sub, &mut SolverStats::default(), memo)
-            })
+            }, false)
         {
             if incumbent.len() < best_ub {
                 let mut values = vec![0.0; columns.len()];
@@ -1045,7 +1046,7 @@ fn solve_branch_price_multi_cached(
                 if ok {
                     best_ub = incumbent.len();
                     best_solution = Some(values);
-                    eprintln!(
+                    info!(
                         "[bp-multi] relaxed whidden incumbent: {} components, {} cols added, {:.1}ms",
                         best_ub,
                         added,
@@ -1089,7 +1090,7 @@ fn solve_branch_price_multi_cached(
     let mut rmp = match PersistentRmp::new(&state.columns, trees, n) {
         Ok(rmp) => rmp,
         Err(err) => {
-            eprintln!("[bp-multi] failed to build persistent RMP: {}", err);
+            error!("[bp-multi] failed to build persistent RMP: {}", err);
             return None;
         }
     };
@@ -1108,7 +1109,7 @@ fn solve_branch_price_multi_cached(
         match result {
             NodeResult::Integral(obj, values) => {
                 if obj < state.best_ub {
-                    eprintln!(
+                    info!(
                         "[bp-multi] new incumbent: {} components (depth={}, nodes={})",
                         obj, node.depth, state.nodes_explored,
                     );
@@ -1173,7 +1174,7 @@ fn solve_branch_price_multi_cached(
     stats.upper_bound = Some(components.len());
     stats.lower_bound = components.len();
     let total_ms = t_total.elapsed().as_secs_f64() * 1000.0;
-    eprintln!(
+    info!(
         "[bp-multi] optimal: {} components, {} B&B nodes, {} CG iters, {} cols, {:.1}ms total",
         components.len(),
         state.nodes_explored,
@@ -1181,7 +1182,7 @@ fn solve_branch_price_multi_cached(
         state.columns_added,
         total_ms,
     );
-    eprintln!(
+    info!(
         "[bp-multi] timings ms: pricer_new={:.1} pricer_solve={:.1} collect={:.1} apply_bounds={:.1} lp_solve={:.1} add_col={:.1} cuts={:.1} cuts_added={}",
         state.t_pricer_new * 1000.0,
         state.t_pricer_solve * 1000.0,
@@ -1438,7 +1439,7 @@ fn solve_bp_node(
         };
         state.t_lp_solve += t_solve.elapsed().as_secs_f64();
         if num_leaves > 500 && state.cg_iterations_total % 50 == 0 {
-            eprintln!(
+            info!(
                 "[bp-multi] CG iter {} cols={} obj={:.4} (lp_solve={:.1}ms)",
                 state.cg_iterations_total,
                 state.columns.len(),

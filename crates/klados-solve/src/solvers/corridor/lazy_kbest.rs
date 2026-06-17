@@ -284,8 +284,7 @@ pub struct LazyKBest<'a, 'c> {
     heap: BinaryHeap<RootEntry>,
     /// Per-anchor hard cap on within-anchor alts. Many `(v_l, v_r)`
     /// tuples collapse to the same labelset under `reconstruct_open`,
-    /// so unbounded expansion wastes effort. Configurable via
-    /// `KLADOS_LAZY_KBEST_ANCHOR_K`.
+    /// so unbounded expansion wastes effort.
     max_alt: u32,
 }
 
@@ -297,10 +296,9 @@ impl<'a, 'c> LazyKBest<'a, 'c> {
     pub fn new(input: LazyKBestInput<'a>, cache: &'c mut LazyKBestCache) -> Self {
         Self::run_forward_dp(&input, cache);
         let heap = Self::seed_heap(&input, cache);
-        let max_alt = std::env::var("KLADOS_LAZY_KBEST_ANCHOR_K")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(8);
+        // Anchor-alternatives cap for this experimental enumerator
+        // (only the equivalence test constructs this).
+        let max_alt = 8;
         Self {
             input,
             cache,

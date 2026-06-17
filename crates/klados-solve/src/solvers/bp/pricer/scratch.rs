@@ -59,12 +59,17 @@ pub struct PricerScratch {
     /// call; allocated lazily.
     pub topk_dp_cache: Option<crate::solvers::corridor::topk_m2::TopKDpCache>,
     /// Cached-positive reuse for the leaf-pair-DP pricer (m=2). Gated by
-    /// `KLADOS_BP_USE_ANCHOR_CACHE=1` at the pricer level. Lives here so it
+    /// `BpConfig.use_anchor_cache` at the pricer level. Lives here so it
     /// persists across CG iterations within a B&P node and is dropped when
     /// the scratch is reset between nodes.
     pub anchor_cache: Option<super::anchor_cache::AnchorCache>,
     pub column_reserve: Vec<AfColumn>,
     pub pricing_stats: PricingStats,
+    // --- BpConfig fields threaded through scratch ---
+    pub m2_batch: usize,
+    pub m2_exact_dp_cells: usize,
+    pub m2_exact_reserve_cap: usize,
+    pub use_anchor_cache: bool,
 }
 
 impl PricerScratch {
@@ -78,6 +83,10 @@ impl PricerScratch {
             anchor_cache: None,
             column_reserve: Vec::new(),
             pricing_stats: PricingStats::default(),
+            m2_batch: 0,
+            m2_exact_dp_cells: 0,
+            m2_exact_reserve_cap: 0,
+            use_anchor_cache: false,
         }
     }
 

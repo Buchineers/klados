@@ -31,20 +31,20 @@ rustsat-cadical = "0.7"
 
 # CLI (for main binary)
 clap = { version = "4.5", features = ["derive"] }
+env_logger = "0.11"
 
 [dependencies]
 klados-core = { workspace = true }
 klados-solve = { workspace = true }
 pace26io = { workspace = true }
 clap = { workspace = true }
+env_logger = { workspace = true }
 fixedbitset = { workspace = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 signal-hook = "0.4.3"
 indicatif = "0.18.4"
 highs = { workspace = true }
-log = "0.4"
-env_logger = "0.11"
 
 [[bin]]
 name = "klados"

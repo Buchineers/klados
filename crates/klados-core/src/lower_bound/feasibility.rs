@@ -2,6 +2,7 @@
 
 use crate::tree::{Label, NodeId};
 use fixedbitset::FixedBitSet;
+use log::debug;
 
 use super::partition::Partition;
 use super::tree_data::TreeData;
@@ -146,7 +147,6 @@ pub fn is_rub_feasible_impl(
     partition: &Partition,
     red: &FixedBitSet,
     blue: &FixedBitSet,
-    trace: bool,
 ) -> bool {
     let n = partition.n as usize;
     let rub = {
@@ -163,10 +163,10 @@ pub fn is_rub_feasible_impl(
             kw.insert(w);
             test_set.intersect_with(&kw);
             if test_set.count_ones(..) >= 3 && !is_set_compatible(td1, td2, &test_set) {
-                if trace {
+                if log::log_enabled!(log::Level::Debug) {
                     let set_members: Vec<usize> = test_set.ones().collect();
                     let comp_members: Vec<usize> = comp.ones().collect();
-                    eprintln!(
+                    debug!(
                         "[RB-FEA]     FAIL: comp {:?} with w={}: set {:?} not compatible",
                         comp_members, w, set_members
                     );
@@ -177,9 +177,7 @@ pub fn is_rub_feasible_impl(
     }
 
     if partition_overlaps_in_v2(td2, partition) {
-        if trace {
-            eprintln!("[RB-FEA]     FAIL: partition overlaps in V2");
-        }
+        debug!("[RB-FEA]     FAIL: partition overlaps in V2");
         return false;
     }
 
@@ -210,12 +208,10 @@ pub fn is_rub_feasible_impl(
                     break;
                 }
                 if cover[cur as usize] != u32::MAX && cover[cur as usize] != cid {
-                    if trace {
-                        eprintln!(
-                            "[RB-FEA]     FAIL: overlap in V1[RUB] at node {} (comp {} and comp {})",
-                            cur, cover[cur as usize], cid
-                        );
-                    }
+                    debug!(
+                        "[RB-FEA]     FAIL: overlap in V1[RUB] at node {} (comp {} and comp {})",
+                        cur, cover[cur as usize], cid
+                    );
                     return false;
                 }
                 cover[cur as usize] = cid;

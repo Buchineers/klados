@@ -71,7 +71,7 @@ impl Pricer for MafPricer {
 
         // Fast path: drain the reserve (columns banked by an earlier DP pass,
         // re-scored against the current duals).
-        let reserve = scratch.drain_reserve(ctx, adaptive_m2_batch_size(ctx));
+        let reserve = scratch.drain_reserve(ctx, adaptive_m2_batch_size(ctx, scratch.m2_batch));
         if !reserve.is_empty() {
             return PricingResult::Found(reserve);
         }

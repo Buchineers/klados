@@ -43,10 +43,11 @@
 
 use std::time::{Duration, Instant};
 
+use log::debug;
+
 use klados_core::af_validator::{AfValidation, validate_agreement_forest};
 use klados_core::kernelize::{expand_solution, kernelize_best};
 use klados_core::{Instance, SolverStats, Tree};
-use log::info;
 
 use crate::{RunConfig, Solver, Track};
 use crate::solvers::bp::BpSolver;
@@ -61,27 +62,46 @@ use crate::decomp::whidden_cluster::try_whidden_decomp_2tree;
 
 const PRICING_EPS: f64 = 1.0e-8;
 
-pub struct CorridorSolver {
-    stats: SolverStats,
+/// Tuning knobs for [`CorridorSolver`].
+#[derive(Clone, Debug)]
+pub struct CorridorConfig {
     /// Bound on root-CG iterations *per outer iter* — a runaway CG would
     /// indicate a pricer bug, not a hard problem. Default is loose.
-    max_cg_iters: usize,
+    pub max_cg_iters: usize,
     /// Bound on outer (γ-shrink) iterations. Each outer iter must either
     /// shrink γ via an improving MIP or exhaust the corridor; the bound
     /// is therefore at most `initial_γ` in practice. Default is loose.
-    max_outer_iters: usize,
-    seed_budget: usize,
-    trace: bool,
+    pub max_outer_iters: usize,
+    /// Primal-seed budget for randomized cherry partitions.
+    pub seed_budget: usize,
+    /// Skip kernelization.
+    pub no_kernel: bool,
+    /// Corridor enumeration width: `<=1` = legacy anchor-best, `>1` = top-K DP.
+    pub topk: usize,
+}
+
+impl Default for CorridorConfig {
+    fn default() -> Self {
+        Self {
+            max_cg_iters: 4096,
+            max_outer_iters: 64,
+            seed_budget: 200,
+            no_kernel: false,
+            topk: 1,
+        }
+    }
+}
+
+pub struct CorridorSolver {
+    stats: SolverStats,
+    config: CorridorConfig,
 }
 
 impl CorridorSolver {
     pub fn new() -> Self {
         Self {
             stats: SolverStats::default(),
-            max_cg_iters: env_usize("KLADOS_CORRIDOR_MAX_CG", 4096),
-            max_outer_iters: env_usize("KLADOS_CORRIDOR_MAX_OUTER", 64),
-            seed_budget: env_usize("KLADOS_CORRIDOR_SEEDS", 200),
-            trace: std::env::var("KLADOS_CORRIDOR_TRACE").is_ok(),
+            config: CorridorConfig::default(),
         }
     }
 }
@@ -93,16 +113,11 @@ impl Default for CorridorSolver {
 }
 
 impl Solver for CorridorSolver {
-    type Config = ();
+    type Config = CorridorConfig;
     const SUPPORTED_TRACKS: &'static [Track] = &[Track::Exact];
-    const OPTIONS: &'static [(&'static str, &'static str)] = &[
-        ("KLADOS_CORRIDOR_MAX_CG", "safety bound on root CG iters per outer iter"),
-        ("KLADOS_CORRIDOR_MAX_OUTER", "safety bound on outer γ-shrink iterations"),
-        ("KLADOS_CORRIDOR_SEEDS", "primal-seed budget for randomized cherry partitions"),
-        ("KLADOS_CORRIDOR_TRACE", "print per-iteration diagnostics"),
-    ];
 
-    fn solve(&mut self, instance: &Instance, _cfg: &RunConfig<Self::Config>) -> Option<Vec<Tree>> {
+    fn solve(&mut self, instance: &Instance, cfg: &RunConfig<Self::Config>) -> Option<Vec<Tree>> {
+        self.config = cfg.specific.clone();
         // m≥3 is not yet supported by the corridor enumerator. Route to
         // B&P as a separate algorithm — this is not a fallback, it's a
         // routing decision: the corridor algorithm is undefined for m≥3
@@ -124,7 +139,7 @@ impl Solver for CorridorSolver {
 impl CorridorSolver {
     fn solve_m2(&mut self, instance: &Instance) -> Option<Vec<Tree>> {
         // Standard kernelization first.
-        let kern = if std::env::var("KLADOS_CORRIDOR_NO_KERNEL").is_err() {
+        let kern = if !self.config.no_kernel {
             kernelize_best(instance, &Default::default())
         } else {
             klados_core::kernelize::KernelizeResult {
@@ -151,10 +166,7 @@ impl CorridorSolver {
             let mut solve_sub = |sub: &Instance| {
                 let mut inner = CorridorSolver {
                     stats: SolverStats::default(),
-                    max_cg_iters: self.max_cg_iters,
-                    max_outer_iters: self.max_outer_iters,
-                    seed_budget: self.seed_budget,
-                    trace: self.trace,
+                    config: self.config.clone(),
                 };
                 if let Some(comps) = inner.solve_m2_core(sub) {
                     Some(comps)
@@ -221,7 +233,7 @@ impl CorridorSolver {
         let mut best_cols: Vec<Vec<u32>> = (1..=n as u32).map(|l| vec![l]).collect();
         seed_columns_and_incumbent(
             instance,
-            self.seed_budget,
+            self.config.seed_budget,
             &mut builder,
             &mut columns,
             &mut seen,
@@ -244,17 +256,15 @@ impl CorridorSolver {
             // shrinks γ via an improving MIP or exhausts the corridor,
             // so the bound is essentially the initial γ; the cap here
             // just catches infinite loops from a bug.
-            if outer >= self.max_outer_iters {
-                if self.trace {
-                    eprintln!(
-                        "[corridor] outer-cap n={} k={} cols={} outer={} ms={:.0}",
-                        n,
-                        best_cols.len(),
-                        columns.len(),
-                        outer,
-                        started.elapsed().as_secs_f64() * 1000.0,
-                    );
-                }
+            if outer >= self.config.max_outer_iters {
+                debug!(
+                    "[corridor] outer-cap n={} k={} cols={} outer={} ms={:.0}",
+                    n,
+                    best_cols.len(),
+                    columns.len(),
+                    outer,
+                    started.elapsed().as_secs_f64() * 1000.0,
+                );
                 return assemble_forest(instance, &best_cols);
             }
             outer += 1;
@@ -271,18 +281,16 @@ impl CorridorSolver {
                 &mut pricer,
                 &mut scratch,
                 &branchings,
-                self.max_cg_iters,
+                self.config.max_cg_iters,
             )?;
             total_cg_iters += cg_iters;
             total_cuts += cuts;
 
             if !lp_converged {
-                if self.trace {
-                    eprintln!(
-                        "[corridor] cg-not-converged outer={} lp={:.4} cg_iters={}",
-                        outer, lp_obj, cg_iters,
-                    );
-                }
+                debug!(
+                    "[corridor] cg-not-converged outer={} lp={:.4} cg_iters={}",
+                    outer, lp_obj, cg_iters,
+                );
                 return assemble_forest(instance, &best_cols);
             }
 
@@ -300,19 +308,17 @@ impl CorridorSolver {
             let lb = (lp_obj - 1.0e-6).ceil() as usize;
             if lb >= upper {
                 // Certified optimal: LP lower bound matches incumbent.
-                if self.trace {
-                    eprintln!(
-                        "[corridor] certified-lp-bound n={} k={} lp={:.4} lb={} outer={} cg={} corridor_added={} ms={:.0}",
-                        n,
-                        upper,
-                        lp_obj,
-                        lb,
-                        outer,
-                        total_cg_iters,
-                        total_corridor_added,
-                        started.elapsed().as_secs_f64() * 1000.0,
-                    );
-                }
+                debug!(
+                    "[corridor] certified-lp-bound n={} k={} lp={:.4} lb={} outer={} cg={} corridor_added={} ms={:.0}",
+                    n,
+                    upper,
+                    lp_obj,
+                    lb,
+                    outer,
+                    total_cg_iters,
+                    total_corridor_added,
+                    started.elapsed().as_secs_f64() * 1000.0,
+                );
                 return assemble_forest(instance, &best_cols);
             }
 
@@ -357,12 +363,9 @@ impl CorridorSolver {
                 };
                 // Corridor enumeration: either anchor-best (legacy
                 // behaviour, K=1) or top-K threshold DP. The choice is
-                // controlled by `KLADOS_CORRIDOR_TOPK` so we can A/B
+                // controlled by `CorridorConfig.topk` so we can A/B
                 // test the new oracle.
-                let topk = std::env::var("KLADOS_CORRIDOR_TOPK")
-                    .ok()
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(1);
+                let topk = self.config.topk;
                 let candidates: Vec<(f64, Vec<u32>, u32, u32)> = if topk <= 1 {
                     let corridor =
                         collect_corridor_candidates(&ctx, &mut cache, gamma, &forbidden_anchors);
@@ -416,19 +419,17 @@ impl CorridorSolver {
                     }
                 }
                 total_corridor_added += newly_added;
-                if self.trace {
-                    eprintln!(
-                        "[corridor] outer={} pass={} lp={:.4} U={} γ={:.3} new={} pool={} forbidden={}",
-                        outer,
-                        inner_pass,
-                        lp_obj,
-                        upper,
-                        gamma,
-                        newly_added,
-                        columns.len(),
-                        forbidden_anchors.len(),
-                    );
-                }
+                debug!(
+                    "[corridor] outer={} pass={} lp={:.4} U={} γ={:.3} new={} pool={} forbidden={}",
+                    outer,
+                    inner_pass,
+                    lp_obj,
+                    upper,
+                    gamma,
+                    newly_added,
+                    columns.len(),
+                    forbidden_anchors.len(),
+                );
 
                 if newly_added == 0 {
                     // Corridor exhausted under anchor-cut enumeration.
@@ -466,16 +467,14 @@ impl CorridorSolver {
             // this γ examined) and no MIP improvement found. Under the
             // anchor-best enumeration this is the best we can certify;
             // returning the current best forest.
-            if self.trace {
-                eprintln!(
-                    "[corridor] corridor-exhausted n={} k={} γ={:.3} corridor_total={} pool={}",
-                    n,
-                    best_cols.len(),
-                    gamma,
-                    total_corridor_added,
-                    columns.len(),
-                );
-            }
+            debug!(
+                "[corridor] corridor-exhausted n={} k={} γ={:.3} corridor_total={} pool={}",
+                n,
+                best_cols.len(),
+                gamma,
+                total_corridor_added,
+                columns.len(),
+            );
             return assemble_forest(instance, &best_cols);
         }
     }
@@ -691,20 +690,6 @@ fn integral_solution(columns: &[AfColumn], values: &[f64], n: usize) -> Option<V
         return None;
     }
     Some(out)
-}
-
-fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
-
-fn env_f64(name: &str, default: f64) -> f64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
 }
 
 #[allow(dead_code)]

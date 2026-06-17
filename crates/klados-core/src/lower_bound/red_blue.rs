@@ -2,6 +2,7 @@
 
 use crate::tree::{Label, NONE, NodeId, Tree};
 use fixedbitset::FixedBitSet;
+use log::debug;
 
 use super::feasibility::{
     find_lowest_roi, is_rub_feasible_impl, is_set_compatible, is_triple_compatible, mark_v_set,
@@ -23,39 +24,31 @@ pub fn red_blue_approx_detailed(t1: &Tree, t2: &Tree) -> RedBlueResult {
         return RedBlueResult { ub: 0, dual_lb: 0 };
     }
 
-    let trace = std::env::var("RED_BLUE_TRACE").is_ok();
-
     let td1 = TreeData::build(t1);
     let td2 = TreeData::build(t2);
     let mut partition = Partition::new_single(n);
     let mut pairslist: Vec<(Label, Label)> = Vec::new();
     let mut y_decrements: usize = 0;
 
-    if trace {
-        eprintln!("[RB] Starting red_blue_approx_detailed with {} leaves", n);
-        eprintln!("[RB] T1 root={}, T2 root={}", t1.root, t2.root);
-    }
+    debug!("[RB] Starting red_blue_approx_detailed with {} leaves", n);
+    debug!("[RB] T1 root={}, T2 root={}", t1.root, t2.root);
 
     let max_iterations = 4 * n as usize;
     for iter in 0..max_iterations {
-        if trace {
-            eprintln!("[RB] === Iteration {} ===", iter);
-            eprintln!(
-                "[RB] Partition has {} components",
-                partition.count_components()
-            );
-            for cid in partition.active_component_ids() {
-                let members: Vec<usize> = partition.members[cid as usize].ones().collect();
-                eprintln!("[RB]   comp {}: {:?}", cid, members);
-            }
+        debug!("[RB] === Iteration {} ===", iter);
+        debug!(
+            "[RB] Partition has {} components",
+            partition.count_components()
+        );
+        for cid in partition.active_component_ids() {
+            let members: Vec<usize> = partition.members[cid as usize].ones().collect();
+            debug!("[RB]   comp {}: {:?}", cid, members);
         }
 
         let u = match find_lowest_roi(&td1, &td2, &partition) {
             Some(u) => u,
             None => {
-                if trace {
-                    eprintln!("[RB] No ROI found — partition is feasible");
-                }
+                debug!("[RB] No ROI found — partition is feasible");
                 break;
             }
         };
@@ -74,61 +67,53 @@ pub fn red_blue_approx_detailed(t1: &Tree, t2: &Tree) -> RedBlueResult {
             }
         }
 
-        if trace {
+        {
             let reds: Vec<usize> = red.ones().collect();
             let blues: Vec<usize> = blue.ones().collect();
             let whites: Vec<usize> = white.ones().collect();
-            eprintln!("[RB] ROI: u={} (u_l={}, u_r={})", u, u_l, u_r);
-            eprintln!("[RB] Red (L(u_r)): {:?}", reds);
-            eprintln!("[RB] Blue (L(u_l)): {:?}", blues);
-            eprintln!("[RB] White: {:?}", whites);
+            debug!("[RB] ROI: u={} (u_l={}, u_r={})", u, u_l, u_r);
+            debug!("[RB] Red (L(u_r)): {:?}", reds);
+            debug!("[RB] Blue (L(u_l)): {:?}", blues);
+            debug!("[RB] White: {:?}", whites);
         }
 
         let original_comp = partition.comp.clone();
 
         y_decrements += make_rub_compatible(&td1, &td2, &mut partition, red, blue);
-        if trace {
-            eprintln!(
-                "[RB] After Make-RUB-compatible: {} components",
-                partition.count_components()
-            );
-            for cid in partition.active_component_ids() {
-                let members: Vec<usize> = partition.members[cid as usize].ones().collect();
-                eprintln!("[RB]   comp {}: {:?}", cid, members);
-            }
+        debug!(
+            "[RB] After Make-RUB-compatible: {} components",
+            partition.count_components()
+        );
+        for cid in partition.active_component_ids() {
+            let members: Vec<usize> = partition.members[cid as usize].ones().collect();
+            debug!("[RB]   comp {}: {:?}", cid, members);
         }
 
         y_decrements += make_splittable(&td2, &mut partition, red, blue, &white);
-        if trace {
-            eprintln!(
-                "[RB] After Make-Splittable: {} components",
-                partition.count_components()
-            );
-            for cid in partition.active_component_ids() {
-                let members: Vec<usize> = partition.members[cid as usize].ones().collect();
-                eprintln!("[RB]   comp {}: {:?}", cid, members);
-            }
+        debug!(
+            "[RB] After Make-Splittable: {} components",
+            partition.count_components()
+        );
+        for cid in partition.active_component_ids() {
+            let members: Vec<usize> = partition.members[cid as usize].ones().collect();
+            debug!("[RB]   comp {}: {:?}", cid, members);
         }
 
         y_decrements += split_procedure(&td1, &td2, &mut partition, red, blue, &white);
-        if trace {
-            eprintln!(
-                "[RB] After Split: {} components",
-                partition.count_components()
-            );
-            for cid in partition.active_component_ids() {
-                let members: Vec<usize> = partition.members[cid as usize].ones().collect();
-                eprintln!("[RB]   comp {}: {:?}", cid, members);
-            }
+        debug!(
+            "[RB] After Split: {} components",
+            partition.count_components()
+        );
+        for cid in partition.active_component_ids() {
+            let members: Vec<usize> = partition.members[cid as usize].ones().collect();
+            debug!("[RB]   comp {}: {:?}", cid, members);
         }
 
         if let Some(pair) = find_merge_pair(&td1, &td2, &partition, red, blue, &original_comp) {
-            if trace {
-                eprintln!("[RB] Find-Merge-Pair found: ({}, {})", pair.0, pair.1);
-            }
+            debug!("[RB] Find-Merge-Pair found: ({}, {})", pair.0, pair.1);
             pairslist.push(pair);
-        } else if trace {
-            eprintln!("[RB] Find-Merge-Pair: no pair found");
+        } else {
+            debug!("[RB] Find-Merge-Pair: no pair found");
         }
     }
 
@@ -138,34 +123,28 @@ pub fn red_blue_approx_detailed(t1: &Tree, t2: &Tree) -> RedBlueResult {
         .saturating_sub(1)
         .saturating_sub(y_decrements);
 
-    if trace {
-        eprintln!("[RB] === Merge-Components: {} pairs ===", pairslist.len());
-        eprintln!(
-            "[RB] Dual: |P_before_merge|={}, y_decrements={}, D={}",
-            p_before_merge, y_decrements, dual_lb
-        );
-    }
+    debug!("[RB] === Merge-Components: {} pairs ===", pairslist.len());
+    debug!(
+        "[RB] Dual: |P_before_merge|={}, y_decrements={}, D={}",
+        p_before_merge, y_decrements, dual_lb
+    );
     for &(x1, x2) in pairslist.iter() {
         let c1 = partition.component_of(x1);
         let c2 = partition.component_of(x2);
-        if trace {
-            eprintln!("[RB] Merge: x1={}, x2={}, c1={}, c2={}", x1, x2, c1, c2);
-        }
+        debug!("[RB] Merge: x1={}, x2={}, c1={}, c2={}", x1, x2, c1, c2);
         partition.merge(c1, c2);
     }
 
     let nc = partition.count_components();
-    if trace {
-        eprintln!(
-            "[RB] Final: {} components (UB={}, dual_LB={})",
-            nc,
-            nc.saturating_sub(1),
-            dual_lb,
-        );
-        for cid in partition.active_component_ids() {
-            let members: Vec<usize> = partition.members[cid as usize].ones().collect();
-            eprintln!("[RB]   comp {}: {:?}", cid, members);
-        }
+    debug!(
+        "[RB] Final: {} components (UB={}, dual_LB={})",
+        nc,
+        nc.saturating_sub(1),
+        dual_lb,
+    );
+    for cid in partition.active_component_ids() {
+        let members: Vec<usize> = partition.members[cid as usize].ones().collect();
+        debug!("[RB]   comp {}: {:?}", cid, members);
     }
     let ub = if nc == 0 { 0 } else { nc - 1 };
     RedBlueResult { ub, dual_lb }
@@ -177,38 +156,30 @@ pub fn red_blue_approx(t1: &Tree, t2: &Tree) -> usize {
         return 0;
     }
 
-    let trace = std::env::var("RED_BLUE_TRACE").is_ok();
-
     let td1 = TreeData::build(t1);
     let td2 = TreeData::build(t2);
     let mut partition = Partition::new_single(n);
     let mut pairslist: Vec<(Label, Label)> = Vec::new();
 
-    if trace {
-        eprintln!("[RB] Starting red_blue_approx with {} leaves", n);
-        eprintln!("[RB] T1 root={}, T2 root={}", t1.root, t2.root);
-    }
+    debug!("[RB] Starting red_blue_approx with {} leaves", n);
+    debug!("[RB] T1 root={}, T2 root={}", t1.root, t2.root);
 
     let max_iterations = 4 * n as usize;
     for iter in 0..max_iterations {
-        if trace {
-            eprintln!("[RB] === Iteration {} ===", iter);
-            eprintln!(
-                "[RB] Partition has {} components",
-                partition.count_components()
-            );
-            for cid in partition.active_component_ids() {
-                let members: Vec<usize> = partition.members[cid as usize].ones().collect();
-                eprintln!("[RB]   comp {}: {:?}", cid, members);
-            }
+        debug!("[RB] === Iteration {} ===", iter);
+        debug!(
+            "[RB] Partition has {} components",
+            partition.count_components()
+        );
+        for cid in partition.active_component_ids() {
+            let members: Vec<usize> = partition.members[cid as usize].ones().collect();
+            debug!("[RB]   comp {}: {:?}", cid, members);
         }
 
         let u = match find_lowest_roi(&td1, &td2, &partition) {
             Some(u) => u,
             None => {
-                if trace {
-                    eprintln!("[RB] No ROI found — partition is feasible");
-                }
+                debug!("[RB] No ROI found — partition is feasible");
                 break;
             }
         };
@@ -224,87 +195,73 @@ pub fn red_blue_approx(t1: &Tree, t2: &Tree) -> usize {
             }
         }
 
-        if trace {
+        {
             let reds: Vec<usize> = red.ones().collect();
             let blues: Vec<usize> = blue.ones().collect();
             let whites: Vec<usize> = white.ones().collect();
-            eprintln!("[RB] ROI: u={} (u_l={}, u_r={})", u, u_l, u_r);
-            eprintln!("[RB] Red (L(u_r)): {:?}", reds);
-            eprintln!("[RB] Blue (L(u_l)): {:?}", blues);
-            eprintln!("[RB] White: {:?}", whites);
+            debug!("[RB] ROI: u={} (u_l={}, u_r={})", u, u_l, u_r);
+            debug!("[RB] Red (L(u_r)): {:?}", reds);
+            debug!("[RB] Blue (L(u_l)): {:?}", blues);
+            debug!("[RB] White: {:?}", whites);
         }
 
         let original_comp = partition.comp.clone();
 
         let _ = make_rub_compatible(&td1, &td2, &mut partition, red, blue);
-        if trace {
-            eprintln!(
-                "[RB] After Make-RUB-compatible: {} components",
-                partition.count_components()
-            );
-            for cid in partition.active_component_ids() {
-                let members: Vec<usize> = partition.members[cid as usize].ones().collect();
-                eprintln!("[RB]   comp {}: {:?}", cid, members);
-            }
+        debug!(
+            "[RB] After Make-RUB-compatible: {} components",
+            partition.count_components()
+        );
+        for cid in partition.active_component_ids() {
+            let members: Vec<usize> = partition.members[cid as usize].ones().collect();
+            debug!("[RB]   comp {}: {:?}", cid, members);
         }
 
         let _ = make_splittable(&td2, &mut partition, red, blue, &white);
-        if trace {
-            eprintln!(
-                "[RB] After Make-Splittable: {} components",
-                partition.count_components()
-            );
-            for cid in partition.active_component_ids() {
-                let members: Vec<usize> = partition.members[cid as usize].ones().collect();
-                eprintln!("[RB]   comp {}: {:?}", cid, members);
-            }
+        debug!(
+            "[RB] After Make-Splittable: {} components",
+            partition.count_components()
+        );
+        for cid in partition.active_component_ids() {
+            let members: Vec<usize> = partition.members[cid as usize].ones().collect();
+            debug!("[RB]   comp {}: {:?}", cid, members);
         }
 
         let _ = split_procedure(&td1, &td2, &mut partition, red, blue, &white);
-        if trace {
-            eprintln!(
-                "[RB] After Split: {} components",
-                partition.count_components()
-            );
-            for cid in partition.active_component_ids() {
-                let members: Vec<usize> = partition.members[cid as usize].ones().collect();
-                eprintln!("[RB]   comp {}: {:?}", cid, members);
-            }
+        debug!(
+            "[RB] After Split: {} components",
+            partition.count_components()
+        );
+        for cid in partition.active_component_ids() {
+            let members: Vec<usize> = partition.members[cid as usize].ones().collect();
+            debug!("[RB]   comp {}: {:?}", cid, members);
         }
 
         if let Some(pair) = find_merge_pair(&td1, &td2, &partition, red, blue, &original_comp) {
-            if trace {
-                eprintln!("[RB] Find-Merge-Pair found: ({}, {})", pair.0, pair.1);
-            }
+            debug!("[RB] Find-Merge-Pair found: ({}, {})", pair.0, pair.1);
             pairslist.push(pair);
-        } else if trace {
-            eprintln!("[RB] Find-Merge-Pair: no pair found");
+        } else {
+            debug!("[RB] Find-Merge-Pair: no pair found");
         }
     }
 
-    if trace {
-        eprintln!("[RB] === Merge-Components: {} pairs ===", pairslist.len());
-    }
+    debug!("[RB] === Merge-Components: {} pairs ===", pairslist.len());
     for &(x1, x2) in pairslist.iter() {
         let c1 = partition.component_of(x1);
         let c2 = partition.component_of(x2);
-        if trace {
-            eprintln!("[RB] Merge: x1={}, x2={}, c1={}, c2={}", x1, x2, c1, c2);
-        }
+        debug!("[RB] Merge: x1={}, x2={}, c1={}, c2={}", x1, x2, c1, c2);
         partition.merge(c1, c2);
     }
 
     let nc = partition.count_components();
-    if trace {
-        eprintln!(
-            "[RB] Final: {} components (cost={})",
-            nc,
-            nc.saturating_sub(1)
-        );
-        for cid in partition.active_component_ids() {
-            let members: Vec<usize> = partition.members[cid as usize].ones().collect();
-            eprintln!("[RB]   comp {}: {:?}", cid, members);
-        }
+    debug!(
+        "[RB] Final: {} components (cost={})",
+        nc,
+        nc.saturating_sub(1)
+    );
+    for cid in partition.active_component_ids() {
+        let members: Vec<usize> = partition.members[cid as usize].ones().collect();
+        debug!("[RB]   comp {}: {:?}", cid, members);
     }
     if nc == 0 { 0 } else { nc - 1 }
 }
@@ -661,17 +618,14 @@ fn find_merge_pair(
     blue: &FixedBitSet,
     original_comp: &[u32],
 ) -> Option<(Label, Label)> {
-    let trace = std::env::var("RED_BLUE_TRACE").is_ok();
     let mut rub = red.clone();
     rub.union_with(blue);
     let rub_labels: Vec<usize> = rub.ones().collect();
 
-    if trace {
-        eprintln!(
-            "[RB-FMP] Searching for merge pair among R∪B labels: {:?}",
-            rub_labels
-        );
-    }
+    debug!(
+        "[RB-FMP] Searching for merge pair among R∪B labels: {:?}",
+        rub_labels
+    );
 
     for i in 0..rub_labels.len() {
         for j in (i + 1)..rub_labels.len() {
@@ -679,28 +633,24 @@ fn find_merge_pair(
             let x2 = rub_labels[j] as Label;
 
             if original_comp[x1 as usize] != original_comp[x2 as usize] {
-                if trace {
-                    eprintln!(
-                        "[RB-FMP]   ({},{}) skipped: different original component",
-                        x1, x2
-                    );
-                }
+                debug!(
+                    "[RB-FMP]   ({},{}) skipped: different original component",
+                    x1, x2
+                );
                 continue;
             }
 
             let c1 = partition.component_of(x1);
             let c2 = partition.component_of(x2);
             if c1 == c2 {
-                if trace {
-                    eprintln!("[RB-FMP]   ({},{}) skipped: same component now", x1, x2);
-                }
+                debug!("[RB-FMP]   ({},{}) skipped: same component now", x1, x2);
                 continue;
             }
 
-            if trace {
+            if log::log_enabled!(log::Level::Debug) {
                 let m1: Vec<usize> = partition.members[c1 as usize].ones().collect();
                 let m2: Vec<usize> = partition.members[c2 as usize].ones().collect();
-                eprintln!(
+                debug!(
                     "[RB-FMP]   Checking ({},{}) : comps {:?} and {:?}",
                     x1, x2, m1, m2
                 );
@@ -713,17 +663,15 @@ fn find_merge_pair(
             };
             test.merge(c1, c2);
 
-            let feasible = is_rub_feasible_impl(td1, td2, &test, red, blue, trace);
+            let feasible = is_rub_feasible_impl(td1, td2, &test, red, blue);
             if feasible {
-                if trace {
-                    eprintln!(
-                        "[RB-FMP]   ({},{}) is R∪B-feasible! Returning pair.",
-                        x1, x2
-                    );
-                }
+                debug!(
+                    "[RB-FMP]   ({},{}) is R∪B-feasible! Returning pair.",
+                    x1, x2
+                );
                 return Some((x1, x2));
-            } else if trace {
-                eprintln!("[RB-FMP]   ({},{}) is NOT R∪B-feasible", x1, x2);
+            } else {
+                debug!("[RB-FMP]   ({},{}) is NOT R∪B-feasible", x1, x2);
             }
         }
     }

@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use klados_core::kernelize::{self, KernelizeConfig};
 use klados_core::lower_bound::maf_bounds;
 use klados_core::{Instance, Label, SolverStats, Tree};
+use log::info;
 
 use crate::solvers::max_sat::max_sat_problem::{ClauseKind, Lit, MaxSatProblem, VarId};
 
@@ -32,7 +33,7 @@ impl MaxSatSolver {
     }
 
     pub fn solve(&mut self, instance: &Instance) -> Option<Vec<Tree>> {
-        println!("c Start solve");
+        info!("c Start solve");
         if instance.trees.is_empty() {
             return None;
         }
@@ -59,7 +60,7 @@ impl MaxSatSolver {
         let k = bounds.upper.max(1);
         let m = reduced.num_trees();
 
-        println!(
+        info!(
             "c Kernelized: {}→{} leaves, LB={}, UB={}",
             instance.num_leaves, n, bounds.lower, k
         );
@@ -68,7 +69,7 @@ impl MaxSatSolver {
 
         // Variables
 
-        println!("c Creating variables");
+        info!("c Creating variables");
         let mut l = vec![vec![VarId(0); n]; k];
         for i in 0..k {
             for j in 0..n {
@@ -111,7 +112,7 @@ impl MaxSatSolver {
         //Clauses
 
         //  H1a
-        println!("c H1");
+        info!("c H1");
         for j in 0..n {
             let mut lits: Vec<Lit> = Vec::with_capacity(k);
 
@@ -138,7 +139,7 @@ impl MaxSatSolver {
         }
 
         //  H2
-        println!("c H2");
+        info!("c H2");
         for q in 0..m {
             for v in 0..num_nodes {
                 for i in 0..k - 1 {
@@ -156,7 +157,7 @@ impl MaxSatSolver {
         }
 
         //  H3
-        println!("c H3");
+        info!("c H3");
         for q in 0..m {
             let tree = &reduced.trees[q];
             for i in 0..k {
@@ -212,7 +213,7 @@ impl MaxSatSolver {
         }
 
         //  H4
-        println!("c H4");
+        info!("c H4");
         for a in 0..n {
             for b in a + 1..n {
                 for c in b + 1..n {
@@ -265,7 +266,7 @@ impl MaxSatSolver {
         }
 
         //  H5
-        println!("c H5");
+        info!("c H5");
         for i in 0..k {
             for j in 0..n {
                 msp.add_clause(&[l[i][j].neg(), u[i].pos()], ClauseKind::Hard);
@@ -273,23 +274,23 @@ impl MaxSatSolver {
         }
 
         //  S1
-        println!("c S1");
+        info!("c S1");
         for i in 0..k {
             msp.add_clause(&[u[i].neg()], ClauseKind::Soft { weight: 1.0 });
         }
 
         //  O1
-        println!("c O1");
+        info!("c O1");
         for i in 0..k - 1 {
             msp.add_clause(&[u[i + 1].neg(), u[i].pos()], ClauseKind::Hard);
         }
 
         //  O2
-        println!("c O2");
+        info!("c O2");
         msp.add_clause(&[l[0][0].pos()], ClauseKind::Hard);
 
         //  O3
-        println!("c O3");
+        info!("c O3");
         for i in 0..k - 1 {
             for j in 0..n {
                 let mut lits: Vec<Lit> = Vec::new();
@@ -304,13 +305,13 @@ impl MaxSatSolver {
             }
         }
 
-        println!("c Building DIMACS");
+        info!("c Building DIMACS");
 
         let mut dimacs = Vec::new();
         msp.write_dimacs(&mut Cursor::new(&mut dimacs))
             .expect("Failed to write DIMACS");
 
-        println!("c Starting open-wbo");
+        info!("c Starting open-wbo");
 
         let mut child = Command::new(SOLVER_PATH)
             .args(SOLVER_ARGS)

@@ -111,7 +111,6 @@ pub fn run(
     algos: &[BoundsAlgo],
     list: Option<&Path>,
     scores_file: Option<&Path>,
-    verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let scores = if let Some(path) = scores_file {
         Some(load_scores(path)?)
@@ -120,9 +119,9 @@ pub fn run(
     };
 
     if let Some(list_file) = list {
-        run_batch(algos, list_file, scores.as_ref(), verbose)
+        run_batch(algos, list_file, scores.as_ref())
     } else {
-        run_single(algos, scores.as_ref(), verbose)
+        run_single(algos, scores.as_ref())
     }
 }
 
@@ -131,7 +130,6 @@ pub fn run(
 fn run_single(
     algos: &[BoundsAlgo],
     scores: Option<&HashMap<String, usize>>,
-    verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let instance = Instance::from_stdin()?;
     let n = instance.num_leaves;
@@ -189,7 +187,6 @@ fn run_batch(
     algos: &[BoundsAlgo],
     list_file: &Path,
     scores: Option<&HashMap<String, usize>>,
-    verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (entries, _) = klados_core::parse_list_file(list_file)?;
     let has_scores = scores.is_some();

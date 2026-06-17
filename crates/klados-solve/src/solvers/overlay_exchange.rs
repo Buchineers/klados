@@ -11,29 +11,50 @@
 use fixedbitset::FixedBitSet;
 use klados_core::lower_bound::best_randomized_partition;
 use klados_core::{Instance, SolverStats, Tree};
+use log::{debug, info};
 
 use crate::solvers::bp::column::{AfColumn, ColumnBuilder};
 
+/// Tuning knobs for [`OverlayExchangeSolver`].
+#[derive(Clone, Debug)]
+pub struct OverlayConfig {
+    /// Maximum incumbent neighborhood size.
+    pub max_h: usize,
+    /// Maximum improvement rounds.
+    pub max_rounds: usize,
+    /// Skip split neighborhoods above this many leaves.
+    pub local_leaf_cap: usize,
+    /// Neighborhood checks per round cap.
+    pub max_neighborhoods: u64,
+    /// Per-neighborhood local candidate generation cap.
+    pub gen_cap: u64,
+    /// Randomized-partition seed budget for the initial upper bound.
+    pub ub_seeds: usize,
+}
+
+impl Default for OverlayConfig {
+    fn default() -> Self {
+        Self {
+            max_h: 4,
+            max_rounds: 100,
+            local_leaf_cap: 24,
+            max_neighborhoods: 200_000,
+            gen_cap: 500_000,
+            ub_seeds: 64,
+        }
+    }
+}
+
 pub struct OverlayExchangeSolver {
     stats: SolverStats,
-    max_h: usize,
-    max_rounds: usize,
-    local_leaf_cap: usize,
-    max_neighborhoods: u64,
-    gen_cap: u64,
-    trace: bool,
+    config: OverlayConfig,
 }
 
 impl OverlayExchangeSolver {
     pub fn new() -> Self {
         Self {
             stats: SolverStats::default(),
-            max_h: env_usize("KLADOS_OVERLAY_MAX_H", 4),
-            max_rounds: env_usize("KLADOS_OVERLAY_MAX_ROUNDS", 100),
-            local_leaf_cap: env_usize("KLADOS_OVERLAY_LOCAL_LEAF_CAP", 24),
-            max_neighborhoods: env_usize("KLADOS_OVERLAY_MAX_NEIGHBORHOODS", 200_000) as u64,
-            gen_cap: env_usize("KLADOS_OVERLAY_GEN_CAP", 500_000) as u64,
-            trace: std::env::var("KLADOS_OVERLAY_TRACE").is_ok(),
+            config: OverlayConfig::default(),
         }
     }
 }
@@ -45,18 +66,11 @@ impl Default for OverlayExchangeSolver {
 }
 
 impl Solver for OverlayExchangeSolver {
-    type Config = ();
+    type Config = OverlayConfig;
     const SUPPORTED_TRACKS: &'static [Track] = &[Track::Heuristic];
-    const OPTIONS: &'static [(&'static str, &'static str)] = &[
-        ("KLADOS_OVERLAY_MAX_H", "maximum incumbent neighborhood size"),
-        ("KLADOS_OVERLAY_MAX_ROUNDS", "maximum improvement rounds"),
-        ("KLADOS_OVERLAY_LOCAL_LEAF_CAP", "skip split neighborhoods above this many leaves"),
-        ("KLADOS_OVERLAY_MAX_NEIGHBORHOODS", "neighborhood checks per round cap"),
-        ("KLADOS_OVERLAY_GEN_CAP", "per-neighborhood local candidate generation cap"),
-        ("KLADOS_OVERLAY_TRACE", "print diagnostics"),
-    ];
 
-    fn solve(&mut self, instance: &Instance, _cfg: &RunConfig<Self::Config>) -> Option<Vec<Tree>> {
+    fn solve(&mut self, instance: &Instance, cfg: &RunConfig<Self::Config>) -> Option<Vec<Tree>> {
+        self.config = cfg.specific.clone();
         let n = instance.num_leaves as usize;
         if n == 0 {
             return Some(Vec::new());
@@ -73,26 +87,26 @@ impl Solver for OverlayExchangeSolver {
             )]);
         }
 
-        let seed_count = env_usize("KLADOS_OVERLAY_UB_SEEDS", 64);
+        let seed_count = self.config.ub_seeds;
         let refs: Vec<usize> = (0..instance.trees.len()).collect();
         let (ub, part) = best_randomized_partition(&instance.trees, &refs, seed_count);
         let mut builder = ColumnBuilder::new(&instance.trees);
         let mut comps = comps_from_partition(instance, &part, &mut builder)?;
-        eprintln!(
+        info!(
             "[overlay] initial ub={} comps={} n={} m={} max_h={} leaf_cap={}",
             ub,
             comps.len(),
             n,
             instance.num_trees(),
-            self.max_h,
-            self.local_leaf_cap,
+            self.config.max_h,
+            self.config.local_leaf_cap,
         );
 
-        for round in 0..self.max_rounds {
+        for round in 0..self.config.max_rounds {
             let before = comps.len();
             let mut improved = false;
             let mut checks = 0u64;
-            for h in 2..=self.max_h.min(comps.len()) {
+            for h in 2..=self.config.max_h.min(comps.len()) {
                 let mut choice = Vec::with_capacity(h);
                 if let Some(rep) = self.find_exchange(
                     instance,
@@ -106,7 +120,7 @@ impl Solver for OverlayExchangeSolver {
                     let opened = rep.open.clone();
                     let new_blocks = rep.blocks.len();
                     apply_replacement_with_builder(instance, &mut comps, rep, &mut builder)?;
-                    eprintln!(
+                    info!(
                         "[overlay] round={} h={} improved {} -> {} opened={:?} new_blocks={}",
                         round,
                         h,
@@ -120,7 +134,7 @@ impl Solver for OverlayExchangeSolver {
                 }
             }
             if !improved {
-                eprintln!(
+                info!(
                     "[overlay] stopped comps={} rounds={} checked={}",
                     comps.len(),
                     round,
@@ -164,12 +178,12 @@ impl OverlayExchangeSolver {
     ) -> Option<Replacement> {
         if choice.len() == h {
             *checks += 1;
-            if *checks > self.max_neighborhoods {
+            if *checks > self.config.max_neighborhoods {
                 return None;
             }
             return self.try_choice(instance, comps, choice, builder);
         }
-        if *checks > self.max_neighborhoods {
+        if *checks > self.config.max_neighborhoods {
             return None;
         }
         let need = h - choice.len();
@@ -180,7 +194,7 @@ impl OverlayExchangeSolver {
                 return Some(r);
             }
             choice.pop();
-            if *checks > self.max_neighborhoods {
+            if *checks > self.config.max_neighborhoods {
                 break;
             }
         }
@@ -218,7 +232,7 @@ impl OverlayExchangeSolver {
             }
         }
 
-        if labels.len() > self.local_leaf_cap {
+        if labels.len() > self.config.local_leaf_cap {
             return None;
         }
         let target_saving = labels.len().saturating_sub(open.len() - 1);
@@ -233,7 +247,7 @@ impl OverlayExchangeSolver {
             labels_universe: &labels,
             out: Vec::new(),
             generated: 0,
-            gen_cap: self.gen_cap,
+            gen_cap: self.config.gen_cap,
             aborted: false,
         };
         let mut cur = Vec::new();
@@ -241,15 +255,13 @@ impl OverlayExchangeSolver {
         if lgen.aborted {
             return None;
         }
-        if self.trace {
-            eprintln!(
-                "[overlay] try open={:?} leaves={} target_saving={} candidates={}",
-                open,
-                labels.len(),
-                target_saving,
-                lgen.out.len(),
-            );
-        }
+        debug!(
+            "[overlay] try open={:?} leaves={} target_saving={} candidates={}",
+            open,
+            labels.len(),
+            target_saving,
+            lgen.out.len(),
+        );
         let mut search = LocalSearch::new(n, instance, labels.clone(), lgen.out, target_saving);
         search.run().map(|blocks| Replacement {
             open: open.to_vec(),
@@ -559,17 +571,16 @@ fn comps_to_trees(instance: &Instance, comps: &[OComp]) -> Vec<Tree> {
         .collect()
 }
 
-fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
-
-
 // ── Unified Solver impl + entry point ───────────────────────────────────────
 use crate::{RunConfig, Solver, Track};
 
 pub fn main() {
-    crate::run(OverlayExchangeSolver::new(), RunConfig { track: Track::Heuristic, ..Default::default() });
+    crate::run(
+        OverlayExchangeSolver::new(),
+        RunConfig {
+            track: Track::Heuristic,
+            specific: OverlayConfig::default(),
+            ..Default::default()
+        },
+    );
 }

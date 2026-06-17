@@ -17,6 +17,7 @@
 use fixedbitset::FixedBitSet;
 use fxhash::FxHashMap;
 use klados_core::tree::{Label, NONE, NodeId};
+use log::debug;
 use klados_core::twin_tree::forest::{T1, T2, TwinForest};
 use klados_core::twin_tree::undo;
 use klados_core::{Instance, SolverStats, Tree};
@@ -50,8 +51,38 @@ pub fn chen_pair_bounds(t1: &Tree, t2: &Tree) -> (usize, usize) {
     (lower, upper)
 }
 
+#[derive(Clone, Debug)]
+pub struct ChenRsprConfig {
+    /// Enable jar-dummy leaf attachment.
+    pub jar_dummy: bool,
+    /// Print bound details.
+    pub bounds: bool,
+    /// Trace k-search.
+    pub trace_k: bool,
+    /// Disable recursive lower bound.
+    pub no_recursive_lb: bool,
+    /// Enable forced-cut pre-branch rules.
+    pub use_forced: bool,
+    /// Trace stopper classifications.
+    pub trace_stoppers: bool,
+}
+
+impl Default for ChenRsprConfig {
+    fn default() -> Self {
+        Self {
+            jar_dummy: false,
+            bounds: false,
+            trace_k: false,
+            no_recursive_lb: false,
+            use_forced: false,
+            trace_stoppers: false,
+        }
+    }
+}
+
 pub struct ChenRsprSolver {
     stats: SolverStats,
+    config: ChenRsprConfig,
 }
 
 impl Default for ChenRsprSolver {
@@ -64,31 +95,25 @@ impl ChenRsprSolver {
     pub fn new() -> Self {
         Self {
             stats: SolverStats::default(),
+            config: ChenRsprConfig::default(),
         }
     }
 }
 
 impl Solver for ChenRsprSolver {
-    type Config = ();
+    type Config = ChenRsprConfig;
     const SUPPORTED_TRACKS: &'static [Track] = &[Track::Exact];
-    const OPTIONS: &'static [(&'static str, &'static str)] = &[
-        ("KLADOS_CHEN_JAR_DUMMY", "enable jar-dummy leaf attachment"),
-        ("KLADOS_CHEN_BOUNDS", "print bound details"),
-        ("KLADOS_CHEN_TRACE_K", "trace k-search"),
-        ("KLADOS_CHEN_NO_RECURSIVE_LB", "disable recursive lower bound"),
-        ("KLADOS_CHEN_USE_FORCED", "enable forced-cut pre-branch rules"),
-        ("KLADOS_CHEN_STOPPERS", "trace stopper classifications"),
-    ];
 
-    fn solve(&mut self, instance: &Instance, _cfg: &RunConfig<Self::Config>) -> Option<Vec<Tree>> {
+    fn solve(&mut self, instance: &Instance, cfg: &RunConfig<Self::Config>) -> Option<Vec<Tree>> {
         if instance.num_trees() != 2 {
-            eprintln!(
+            log::warn!(
                 "[chen-rspr] m={} is not supported by the clean Chen prototype",
                 instance.num_trees()
             );
             return None;
         }
-        solve_chen_rspr(instance, &mut self.stats)
+        self.config = cfg.specific.clone();
+        solve_chen_rspr(instance, &mut self.stats, &self.config)
     }
 
     fn stats(&self) -> &SolverStats {
@@ -126,13 +151,17 @@ fn with_chen_dummy(tree: &Tree, original_num_leaves: u32) -> Tree {
     out
 }
 
-fn solve_chen_rspr(instance: &Instance, stats: &mut SolverStats) -> Option<Vec<Tree>> {
+fn solve_chen_rspr(
+    instance: &Instance,
+    stats: &mut SolverStats,
+    config: &ChenRsprConfig,
+) -> Option<Vec<Tree>> {
     if instance.num_leaves <= 1 {
         return Some(vec![instance.trees[0].clone()]);
     }
 
     let output_n = instance.num_leaves;
-    let use_jar_dummy = std::env::var_os("KLADOS_CHEN_JAR_DUMMY").is_some();
+    let use_jar_dummy = config.jar_dummy;
     let n = if use_jar_dummy {
         output_n + 1
     } else {
@@ -151,18 +180,17 @@ fn solve_chen_rspr(instance: &Instance, stats: &mut SolverStats) -> Option<Vec<T
     let mut um = undo::UndoMachine::new();
     let mut ctx = ChenSearchCtx::default();
 
-    let app2_bounds = chen_app2_bounds_with_options(&tf, true);
+    let app2_bounds =
+        chen_app2_bounds_with_options(&tf, true);
     let app1_bounds = if app2_bounds.lower > n as usize {
         chen_app1_bounds_inner(&tf)
     } else {
         app2_bounds
     };
-    if std::env::var_os("KLADOS_CHEN_BOUNDS").is_some() {
-        eprintln!(
-            "[chen-rspr] app1={}~{} app2={}~{}",
-            app1_bounds.lower, app1_bounds.upper, app2_bounds.lower, app2_bounds.upper
-        );
-    }
+    debug!(
+        "[chen-rspr] app1={}~{} app2={}~{}",
+        app1_bounds.lower, app1_bounds.upper, app2_bounds.lower, app2_bounds.upper
+    );
     let app_bounds = app1_bounds;
     let lb_k = app_bounds.lower.min(n.saturating_sub(1) as usize);
     let ub_k = app_bounds.upper.min(n.saturating_sub(1) as usize);
@@ -173,26 +201,22 @@ fn solve_chen_rspr(instance: &Instance, stats: &mut SolverStats) -> Option<Vec<T
     for k in lb_k..=ub_k {
         let cp = um.checkpoint();
         let before_nodes = stats.nodes_explored;
-        if chen_search(&mut tf, k as i32, &mut um, stats, &mut ctx) {
-            if std::env::var_os("KLADOS_CHEN_TRACE_K").is_some() {
-                eprintln!(
-                    "[chen-rspr] k={} yes nodes={}",
-                    k,
-                    stats.nodes_explored.saturating_sub(before_nodes)
-                );
-            }
+        if chen_search(&mut tf, k as i32, &mut um, stats, &mut ctx, config) {
+            debug!(
+                "[chen-rspr] k={} yes nodes={}",
+                k,
+                stats.nodes_explored.saturating_sub(before_nodes)
+            );
             let solution = extract_components_with_reference(&tf, output_n, &instance.trees[0]);
             stats.lower_bound = solution.len();
             stats.upper_bound = Some(solution.len());
             return Some(solution);
         }
-        if std::env::var_os("KLADOS_CHEN_TRACE_K").is_some() {
-            eprintln!(
-                "[chen-rspr] k={} no nodes={}",
-                k,
-                stats.nodes_explored.saturating_sub(before_nodes)
-            );
-        }
+        debug!(
+            "[chen-rspr] k={} no nodes={}",
+            k,
+            stats.nodes_explored.saturating_sub(before_nodes)
+        );
         um.undo_to(cp, &mut tf);
     }
 
@@ -202,26 +226,22 @@ fn solve_chen_rspr(instance: &Instance, stats: &mut SolverStats) -> Option<Vec<T
     for k in (ub_k + 1)..=n.saturating_sub(1) as usize {
         let cp = um.checkpoint();
         let before_nodes = stats.nodes_explored;
-        if chen_search(&mut tf, k as i32, &mut um, stats, &mut ctx) {
-            if std::env::var_os("KLADOS_CHEN_TRACE_K").is_some() {
-                eprintln!(
-                    "[chen-rspr] k={} yes nodes={}",
-                    k,
-                    stats.nodes_explored.saturating_sub(before_nodes)
-                );
-            }
+        if chen_search(&mut tf, k as i32, &mut um, stats, &mut ctx, config) {
+            debug!(
+                "[chen-rspr] k={} yes nodes={}",
+                k,
+                stats.nodes_explored.saturating_sub(before_nodes)
+            );
             let solution = extract_components_with_reference(&tf, output_n, &instance.trees[0]);
             stats.lower_bound = solution.len();
             stats.upper_bound = Some(solution.len());
             return Some(solution);
         }
-        if std::env::var_os("KLADOS_CHEN_TRACE_K").is_some() {
-            eprintln!(
-                "[chen-rspr] k={} no nodes={}",
-                k,
-                stats.nodes_explored.saturating_sub(before_nodes)
-            );
-        }
+        debug!(
+            "[chen-rspr] k={} no nodes={}",
+            k,
+            stats.nodes_explored.saturating_sub(before_nodes)
+        );
         um.undo_to(cp, &mut tf);
     }
 
@@ -234,11 +254,12 @@ fn chen_search(
     um: &mut undo::UndoMachine,
     stats: &mut SolverStats,
     ctx: &mut ChenSearchCtx,
+    config: &ChenRsprConfig,
 ) -> bool {
     stats.nodes_explored += 1;
 
     // Pre-screen: if the lower bound already says this branch can't succeed, bail out.
-    if std::env::var_os("KLADOS_CHEN_NO_RECURSIVE_LB").is_none() {
+    if !config.no_recursive_lb {
         let lb = chen_lower_bound(tf, ctx);
         if (lb as i32) > k {
             return false;
@@ -266,7 +287,7 @@ fn chen_search(
             continue;
         }
 
-        if std::env::var_os("KLADOS_CHEN_USE_FORCED").is_some() {
+        if config.use_forced {
             if let Some(node) = find_step4_forced_cut(tf) {
                 if tf.protected[node as usize] {
                     return false;
@@ -316,14 +337,13 @@ fn chen_search(
                     apply_branch_cut(tf, &branch, um);
                     branch.apply_locks(tf, um);
                     let remaining = k - cost;
-                    let passes_lower_bound =
-                        if std::env::var_os("KLADOS_CHEN_NO_RECURSIVE_LB").is_some() {
-                            true
-                        } else {
-                            let lb = chen_lower_bound(tf, ctx);
-                            (lb as i32) <= remaining
-                        };
-                    if passes_lower_bound && chen_search(tf, remaining, um, stats, ctx) {
+                    let passes_lower_bound = if config.no_recursive_lb {
+                        true
+                    } else {
+                        let lb = chen_lower_bound(tf, ctx);
+                        (lb as i32) <= remaining
+                    };
+                    if passes_lower_bound && chen_search(tf, remaining, um, stats, ctx, config) {
                         return true;
                     }
                     um.undo_to(cp, tf);
@@ -857,11 +877,13 @@ fn chen_app1_bounds_inner(tf: &TwinForest) -> AppBounds {
     bounds
 }
 
-fn chen_app2_bounds_with_options(tf: &TwinForest, improve_upper: bool) -> AppBounds {
+fn chen_app2_bounds_with_options(
+    tf: &TwinForest,
+    improve_upper: bool,
+) -> AppBounds {
     let mut state = ChenAppState::from_twin(tf);
     let mut bounds = AppBounds::default();
     let mut guard = state.num_nodes[T1] * 8 + state.num_nodes[T2] * 8;
-    let trace_stoppers = std::env::var_os("KLADOS_CHEN_STOPPERS").is_some();
     let mut iter = 0usize;
     while guard > 0 {
         guard -= 1;
@@ -882,12 +904,10 @@ fn chen_app2_bounds_with_options(tf: &TwinForest, improve_upper: bool) -> AppBou
             state.cut_forest2(cut);
             bounds.lower += 1;
             bounds.upper += 1;
-            if trace_stoppers {
-                eprintln!(
-                    "[chen-rspr] app2 iter={} kind=OPT cut={} acc={}~{}",
-                    iter, cut, bounds.lower, bounds.upper
-                );
-            }
+            debug!(
+                "[chen-rspr] app2 iter={} kind=OPT cut={} acc={}~{}",
+                iter, cut, bounds.lower, bounds.upper
+            );
             continue;
         }
 
@@ -908,30 +928,26 @@ fn chen_app2_bounds_with_options(tf: &TwinForest, improve_upper: bool) -> AppBou
             break;
         }
         stopper.cut_stopper(&mut state, &mut bounds);
-        if trace_stoppers {
-            let name = match stopper.stopper {
-                Some(ChenStopper::Disconnected) => "DIS",
-                Some(ChenStopper::Root) => "ROOT",
-                Some(ChenStopper::Close) => "CLOSE",
-                Some(ChenStopper::Overlapping) => "OVER",
-                None => "NONE",
-            };
-            eprintln!(
-                "[chen-rspr] app2 iter={} kind={} acc={}~{}",
-                iter, name, bounds.lower, bounds.upper
-            );
-        }
+        let name = match stopper.stopper {
+            Some(ChenStopper::Disconnected) => "DIS",
+            Some(ChenStopper::Root) => "ROOT",
+            Some(ChenStopper::Close) => "CLOSE",
+            Some(ChenStopper::Overlapping) => "OVER",
+            None => "NONE",
+        };
+        debug!(
+            "[chen-rspr] app2 iter={} kind={} acc={}~{}",
+            iter, name, bounds.lower, bounds.upper
+        );
     }
     if improve_upper {
         let raw_bounds = bounds;
         let improved_upper = improved_upper_from_state(tf, &state);
         bounds.upper = bounds.upper.min(improved_upper);
-        if trace_stoppers {
-            eprintln!(
-                "[chen-rspr] app2 raw={}~{} improved={}~{}",
-                raw_bounds.lower, raw_bounds.upper, bounds.lower, bounds.upper
-            );
-        }
+        debug!(
+            "[chen-rspr] app2 raw={}~{} improved={}~{}",
+            raw_bounds.lower, raw_bounds.upper, bounds.lower, bounds.upper
+        );
     }
     bounds
 }
@@ -3263,5 +3279,12 @@ fn tree_from_original(tf: &TwinForest) -> Tree {
 use crate::{RunConfig, Solver, Track};
 
 pub fn main() {
-    crate::run(ChenRsprSolver::new(), RunConfig { track: Track::Exact, ..Default::default() });
+    crate::run(
+        ChenRsprSolver::new(),
+        RunConfig {
+            track: Track::Exact,
+            specific: ChenRsprConfig::default(),
+            ..Default::default()
+        },
+    );
 }

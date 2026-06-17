@@ -32,19 +32,13 @@ pub use run::run;
 /// The unified solver trait. Every solver implements this; the per-solver
 /// `main()` runs it via [`run`].
 pub trait Solver {
-    /// Solver-specific knobs (was: a pile of `KLADOS_*` env vars).
+    /// Solver-specific knobs.
     type Config: Default;
 
     /// Tracks this solver can run. `run()` refuses any other track (e.g.
     /// `agglomerative` is heuristic-only; `max_sat` can't do the lower-bound
     /// track since it can't tell open-wbo the `#a` budget).
     const SUPPORTED_TRACKS: &'static [Track];
-
-    /// `(env-var, description)` pairs for the `KLADOS_*` knobs this solver still
-    /// reads, surfaced by `klados solve` (no-arg). Transitional: once the
-    /// env→[`Config`](Self::Config) migration lands, the typed config replaces
-    /// this and it goes away. Defaults to none.
-    const OPTIONS: &'static [(&'static str, &'static str)] = &[];
 
     /// Polls its own stop flag + the `cfg.budget` deadline; returns its best
     /// forest per `cfg.track` (exact returns one only if proven optimal).

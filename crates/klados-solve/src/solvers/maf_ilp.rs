@@ -21,6 +21,7 @@ use fixedbitset::FixedBitSet;
 use highs::{Col, HighsModelStatus, RowProblem, Sense};
 use klados_core::tree::{Label, NONE, NodeId, Tree};
 use klados_core::{Instance, SolverStats};
+use log::{error, warn};
 
 /// Triangular index for unordered pair (x, y) with 1 ≤ x < y ≤ n.
 /// Maps to a contiguous range 0..n*(n-1)/2.
@@ -516,7 +517,7 @@ impl Solver for MafIlpSolver {
 
     fn solve(&mut self, instance: &Instance, _cfg: &RunConfig<Self::Config>) -> Option<Vec<Tree>> {
         if instance.num_leaves > self.max_leaves {
-            eprintln!(
+            warn!(
                 "ILP: instance has {} leaves, exceeding limit of {}",
                 instance.num_leaves, self.max_leaves
             );
@@ -534,7 +535,7 @@ impl Solver for MafIlpSolver {
                 Some(components)
             }
             None => {
-                eprintln!("ILP: solver did not find optimal solution");
+                error!("ILP: solver did not find optimal solution");
                 None
             }
         }

@@ -15,6 +15,7 @@ pub use stats::{WhiddenProgressUpdate, WhiddenRuleStats, WhiddenRunStats};
 use std::time::Instant;
 
 use klados_core::{Instance, SolverStats, Tree};
+use log::{debug, warn};
 
 use crate::kernelize::{self, KernelizeConfig};
 
@@ -45,7 +46,7 @@ impl Drop for SplitDiagPrinter {
             / rs.split_diag_disjoint.max(1) as f64;
         let avg_max_block = rs.split_diag_disjoint_max_block_sum as f64
             / rs.split_diag_disjoint.max(1) as f64;
-        eprintln!(
+        debug!(
             "[split-diag] n_input={} sampled={} overlap={} ({:.1}%) disjoint={} ({:.1}%) single={} ({:.1}%) avg_blocks={:.2} avg_max_block={:.1}",
             self.n_input,
             rs.split_diag_nodes,
@@ -62,7 +63,7 @@ impl Drop for SplitDiagPrinter {
         if rs.split_rule_checked > 0 {
             let avg_core_cut = rs.split_rule_core_edges as f64
                 / rs.split_rule_core_cutsets.max(1) as f64;
-            eprintln!(
+            debug!(
                 "[split-rule] checked={} overlap_found={} ({:.1}%) disjoint_found={} ({:.1}%) applied={} core_cutsets={} size1={} ({:.1}%) avg_cut_size={:.2}",
                 rs.split_rule_checked,
                 rs.split_rule_overlap_found,
@@ -180,7 +181,7 @@ impl WhiddenSolver {
         let _decr = SplitDiagDepthDecrement;
         let is_outermost = entry_depth == 0;
         // Diagnostic print runs unconditionally on outermost exit via Drop.
-        let _diag_guard = if is_outermost && std::env::var("KLADOS_WHIDDEN_SPLIT_DIAG").is_ok() {
+        let _diag_guard = if is_outermost {
             Some(SplitDiagPrinter {
                 stats_ptr: &self.rule_stats as *const _,
                 n_input: instance.num_leaves,
@@ -190,7 +191,7 @@ impl WhiddenSolver {
         };
         // Whidden is 2-tree only; fall back to SAT solver for multi-tree instances.
         if instance.num_trees() != 2 {
-            eprintln!("[whidden] m={}, falling back to sat", instance.num_trees());
+            warn!("[whidden] m={}, falling back to sat", instance.num_trees());
             let mut sat = crate::solvers::maf_sat::MafSatSolver::new();
             let result = crate::Solver::solve(&mut sat, instance, &crate::RunConfig::default());
             self.stats = crate::Solver::stats(&sat).clone();
@@ -265,15 +266,10 @@ impl WhiddenSolver {
 }
 
 impl Solver for WhiddenSolver {
-    /// Branch-and-bound knobs ([`BBConfig`]); production defaults set in
-    /// [`main`]. Was: the `KLADOS_WHIDDEN_SPLIT_OR_DECOMPOSE` env read in `new()`.
+    /// Branch-and-bound knobs ([`BBConfig`]); production defaults are set in
+    /// [`main`].
     type Config = BBConfig;
     const SUPPORTED_TRACKS: &'static [Track] = &[Track::Exact];
-    const OPTIONS: &'static [(&'static str, &'static str)] = &[
-        ("KLADOS_WHIDDEN_BATCH_STRICT", "use strict cluster point detection"),
-        ("KLADOS_WHIDDEN_RSPR_GREEDY", "use greedy rSPR decomposition"),
-        ("KLADOS_WHIDDEN_DEBUG", "enable debug output"),
-    ];
 
     fn solve(&mut self, instance: &Instance, cfg: &RunConfig<Self::Config>) -> Option<Vec<Tree>> {
         self.bb_config = cfg.specific.clone();
@@ -290,10 +286,5 @@ impl Solver for WhiddenSolver {
 use crate::{RunConfig, Solver, Track};
 
 pub fn main() {
-    // Gate for the split-or-decompose path. (C3 will turn this into a CLI flag.)
-    let mut specific = BBConfig::default();
-    if std::env::var("KLADOS_WHIDDEN_SPLIT_OR_DECOMPOSE").is_ok() {
-        specific.use_split_or_decompose = true;
-    }
-    crate::run(WhiddenSolver::new(), RunConfig { track: Track::Exact, specific, ..Default::default() });
+    crate::run(WhiddenSolver::new(), RunConfig { track: Track::Exact, specific: BBConfig::default(), ..Default::default() });
 }

@@ -28,6 +28,7 @@ use fixedbitset::FixedBitSet;
 use klados_core::Instance;
 use klados_core::af_validator::validate_agreement_forest;
 use klados_core::tree::{Label, NONE, NodeId, Tree};
+use log::debug;
 
 /// Never-set termination flag for callers that don't supply their own. The
 /// decomposition is then uninterruptible (its prior behaviour). Hot anytime
@@ -70,6 +71,7 @@ where
 pub fn try_whidden_relaxed_incumbent_2tree<F>(
     instance: &Instance,
     solve: &mut F,
+    batch_incumbent: bool,
 ) -> Option<Vec<Tree>>
 where
     F: FnMut(&Instance) -> Option<Vec<Tree>>,
@@ -77,17 +79,10 @@ where
     if let Some(r) = try_rspr_decomp(instance, solve) {
         return Some(r);
     }
-    if env_flag("KLADOS_WHIDDEN_BATCH_INCUMBENT") {
+    if batch_incumbent {
         return try_batch_decomp(instance, solve);
     }
     None
-}
-
-fn env_flag(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|v| {
-        let v = v.trim().to_ascii_lowercase();
-        matches!(v.as_str(), "1" | "true" | "yes" | "on")
-    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -368,7 +363,7 @@ where
     }
 
     if !result.is_empty() && validate_agreement_forest(instance, &result).is_ok() {
-        log::trace!(
+        log::debug!(
             "[whidden] rspr n={}: {} clusters -> {} comps",
             n,
             sel.len(),
@@ -870,19 +865,17 @@ where
     }
     let validation = validate_agreement_forest(instance, &result);
     if !validation.is_ok() {
-        if env_flag("KLADOS_WHIDDEN_DEBUG") {
-            let sizes: Vec<usize> = solved.iter().map(|s| s.leaves.count_ones(..)).collect();
-            eprintln!(
-                "[whidden] batch n={}: validation failed for {} clusters sizes={:?}: {:?}",
-                n,
-                solved.len(),
-                sizes,
-                validation
-            );
-        }
+        let sizes: Vec<usize> = solved.iter().map(|s| s.leaves.count_ones(..)).collect();
+        debug!(
+            "[whidden] batch n={}: validation failed for {} clusters sizes={:?}: {:?}",
+            n,
+            solved.len(),
+            sizes,
+            validation
+        );
         return None;
     }
-    log::trace!(
+    log::debug!(
         "[whidden] batch n={}: {} clusters -> {} comps",
         n,
         solved.len(),
@@ -1136,7 +1129,7 @@ where
         candidate.push(merged);
 
         if validate_agreement_forest(instance, &candidate).is_ok() {
-            log::trace!(
+            log::debug!(
                 "[whidden] decomp n={}: inner={} outer={} (cluster_node={}, anchor_idx={}, {} comps)",
                 n,
                 cluster_size,
@@ -1229,7 +1222,7 @@ where
                     if candidate.len() == expected
                         && validate_agreement_forest(instance, &candidate).is_ok()
                     {
-                        log::trace!(
+                        log::debug!(
                             "[whidden] decomp n={}: inner={} outer={} (cluster_node={}, ρ-fallback, {} comps)",
                             n,
                             cluster_size,
@@ -1261,7 +1254,7 @@ where
                         );
 
                         if validate_agreement_forest(instance, &candidate).is_ok() {
-                            log::trace!(
+                            log::debug!(
                                 "[whidden] decomp n={}: inner={} outer={} (cluster_node={}, ρ-boundary-cut, {} comps)",
                                 n,
                                 cluster_size,
@@ -1278,7 +1271,7 @@ where
     }
 
     // No valid anchor — decomposition fails for this cluster point.
-    log::trace!(
+    log::debug!(
         "[whidden] decomp n={}: inner={} outer={} — no valid anchor among {} inner components",
         n,
         cluster_size,
@@ -1810,7 +1803,7 @@ fn debug_assert_valid_tree(tree: &Tree, name: &str) {
             );
         }
     }
-    log::trace!(
+    log::debug!(
         "[whidden] {} ok: nodes={} leaves={} num_leaves_field={} root={}",
         name,
         tree.parent.len(),

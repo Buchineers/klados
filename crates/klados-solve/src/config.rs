@@ -22,8 +22,6 @@ pub struct RunConfig<C> {
     pub track: Track,
     /// Wall-time budget. `None` means "until SIGTERM".
     pub budget: Option<Duration>,
-    /// Verbose per-solver diagnostics (the former `*_TRACE` knobs).
-    pub trace: bool,
     /// Solver-specific knobs.
     pub specific: C,
 }
