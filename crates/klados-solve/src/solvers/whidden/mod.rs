@@ -94,15 +94,13 @@ impl Default for WhiddenSolver {
 
 impl WhiddenSolver {
     pub fn new() -> Self {
-        let mut bb_config = BBConfig::default();
-        // Env-var gate for the new split-or-decompose path (Day 6+).
-        if std::env::var("KLADOS_WHIDDEN_SPLIT_OR_DECOMPOSE").is_ok() {
-            bb_config.use_split_or_decompose = true;
-        }
+        // bb_config is a default placeholder; the real config arrives via
+        // `Solver::solve`'s `cfg.specific` (set in `main`), or is overridden by
+        // the `with_*` builders for internal sub-solves.
         Self {
             stats: SolverStats::default(),
             rule_stats: WhiddenRuleStats::default(),
-            bb_config,
+            bb_config: BBConfig::default(),
         }
     }
 
@@ -194,8 +192,8 @@ impl WhiddenSolver {
         if instance.num_trees() != 2 {
             eprintln!("[whidden] m={}, falling back to sat", instance.num_trees());
             let mut sat = crate::solvers::maf_sat::MafSatSolver::new();
-            let result = crate::ExactSolver::solve(&mut sat, instance);
-            self.stats = crate::ExactSolver::stats(&sat).clone();
+            let result = crate::Solver::solve(&mut sat, instance, &crate::RunConfig::default());
+            self.stats = crate::Solver::stats(&sat).clone();
             return result;
         }
 
@@ -266,28 +264,36 @@ impl WhiddenSolver {
     }
 }
 
-impl crate::ExactSolver for WhiddenSolver {
-    fn name(&self) -> &'static str {
-        "whidden"
-    }
+impl Solver for WhiddenSolver {
+    /// Branch-and-bound knobs ([`BBConfig`]); production defaults set in
+    /// [`main`]. Was: the `KLADOS_WHIDDEN_SPLIT_OR_DECOMPOSE` env read in `new()`.
+    type Config = BBConfig;
+    const SUPPORTED_TRACKS: &'static [Track] = &[Track::Exact];
+    const OPTIONS: &'static [(&'static str, &'static str)] = &[
+        ("KLADOS_WHIDDEN_BATCH_STRICT", "use strict cluster point detection"),
+        ("KLADOS_WHIDDEN_RSPR_GREEDY", "use greedy rSPR decomposition"),
+        ("KLADOS_WHIDDEN_DEBUG", "enable debug output"),
+    ];
 
-    fn description(&self) -> &'static str {
-        "Whidden 3-way branch-and-bound (2-tree only)"
-    }
-
-    fn options(&self) -> &'static [(&'static str, &'static str)] {
-        &[
-            ("KLADOS_WHIDDEN_BATCH_STRICT", "use strict cluster point detection"),
-            ("KLADOS_WHIDDEN_RSPR_GREEDY", "use greedy rSPR decomposition"),
-            ("KLADOS_WHIDDEN_DEBUG", "enable debug output"),
-        ]
-    }
-
-    fn solve(&mut self, instance: &Instance) -> Option<Vec<Tree>> {
+    fn solve(&mut self, instance: &Instance, cfg: &RunConfig<Self::Config>) -> Option<Vec<Tree>> {
+        self.bb_config = cfg.specific.clone();
         WhiddenSolver::solve(self, instance)
     }
 
     fn stats(&self) -> &SolverStats {
         &self.stats
     }
+}
+
+
+// ── Unified Solver impl + entry point ───────────────────────────────────────
+use crate::{RunConfig, Solver, Track};
+
+pub fn main() {
+    // Gate for the split-or-decompose path. (C3 will turn this into a CLI flag.)
+    let mut specific = BBConfig::default();
+    if std::env::var("KLADOS_WHIDDEN_SPLIT_OR_DECOMPOSE").is_ok() {
+        specific.use_split_or_decompose = true;
+    }
+    crate::run(WhiddenSolver::new(), RunConfig { track: Track::Exact, specific, ..Default::default() });
 }

@@ -7,7 +7,6 @@ use klados_core::kernelize::{self, KernelizeConfig};
 use klados_core::lower_bound::maf_bounds;
 use klados_core::{Instance, Label, SolverStats, Tree};
 
-use crate::HeuristicSolver;
 use crate::solvers::max_sat::max_sat_problem::{ClauseKind, Lit, MaxSatProblem, VarId};
 
 mod max_sat_problem;
@@ -527,15 +526,15 @@ fn build_single_leaf_tree(label: Label) -> Tree {
     Tree::from_cursor(LeafCursor { label }, label)
 }
 
-impl HeuristicSolver for MaxSatSolver {
-    fn name(&self) -> &'static str {
-        "max-sat"
-    }
+// ── Unified Solver impl + entry point ───────────────────────────────────────
+use crate::{RunConfig, Solver, Track};
 
-    fn solve(&mut self, instance: &Instance) -> Option<Vec<Tree>> {
-        MaxSatSolver::solve(self, instance)
+impl Solver for MaxSatSolver {
+    type Config = ();
+    const SUPPORTED_TRACKS: &'static [Track] = &[Track::Exact, Track::Heuristic];
+    fn solve(&mut self, inst: &Instance, _cfg: &RunConfig<Self::Config>) -> Option<Vec<Tree>> {
+        MaxSatSolver::solve(self, inst)
     }
-
     fn stats(&self) -> &SolverStats {
         static EMPTY: SolverStats = SolverStats {
             nodes_explored: 0,
@@ -545,13 +544,24 @@ impl HeuristicSolver for MaxSatSolver {
         };
         &EMPTY
     }
-
-    fn sigterm_handler(&self) {
-        let pid = self.child_pid.load(Ordering::SeqCst);
-        if pid != 0 {
-            unsafe {
-                libc::kill(pid as i32, libc::SIGTERM);
-            }
+    fn sigterm_handler(&self, track: Track) -> Option<Box<dyn Fn() + Send + Sync>> {
+        // Only the heuristic track emits a best-so-far: SIGTERM makes open-wbo
+        // flush its best `v`-line. On exact a killed, unproven result is useless.
+        if track != Track::Heuristic {
+            return None;
         }
+        let pid = self.child_pid.clone();
+        Some(Box::new(move || {
+            let p = pid.load(Ordering::SeqCst);
+            if p != 0 {
+                unsafe {
+                    libc::kill(p as i32, libc::SIGTERM);
+                }
+            }
+        }))
     }
+}
+
+pub fn main() {
+    crate::run(MaxSatSolver::new(), RunConfig { track: Track::Heuristic, ..Default::default() });
 }

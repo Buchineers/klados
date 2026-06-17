@@ -48,7 +48,7 @@ use klados_core::kernelize::{expand_solution, kernelize_best};
 use klados_core::{Instance, SolverStats, Tree};
 use log::info;
 
-use crate::ExactSolver;
+use crate::{RunConfig, Solver, Track};
 use crate::solvers::bp::BpSolver;
 use crate::solvers::bp::column::{AfColumn, ColumnBuilder, ColumnSet};
 use crate::solvers::bp::pricer::exact_pair_dp::{ExactPairDpCache, collect_corridor_candidates};
@@ -92,31 +92,23 @@ impl Default for CorridorSolver {
     }
 }
 
-impl ExactSolver for CorridorSolver {
-    fn name(&self) -> &'static str {
-        "corridor"
-    }
+impl Solver for CorridorSolver {
+    type Config = ();
+    const SUPPORTED_TRACKS: &'static [Track] = &[Track::Exact];
+    const OPTIONS: &'static [(&'static str, &'static str)] = &[
+        ("KLADOS_CORRIDOR_MAX_CG", "safety bound on root CG iters per outer iter"),
+        ("KLADOS_CORRIDOR_MAX_OUTER", "safety bound on outer γ-shrink iterations"),
+        ("KLADOS_CORRIDOR_SEEDS", "primal-seed budget for randomized cherry partitions"),
+        ("KLADOS_CORRIDOR_TRACE", "print per-iteration diagnostics"),
+    ];
 
-    fn description(&self) -> &'static str {
-        "Reduced-cost corridor solver (m=2 native; m≥3 routes to B&P)"
-    }
-
-    fn options(&self) -> &'static [(&'static str, &'static str)] {
-        &[
-            ("KLADOS_CORRIDOR_MAX_CG", "safety bound on root CG iters per outer iter"),
-            ("KLADOS_CORRIDOR_MAX_OUTER", "safety bound on outer γ-shrink iterations"),
-            ("KLADOS_CORRIDOR_SEEDS", "primal-seed budget for randomized cherry partitions"),
-            ("KLADOS_CORRIDOR_TRACE", "print per-iteration diagnostics"),
-        ]
-    }
-
-    fn solve(&mut self, instance: &Instance) -> Option<Vec<Tree>> {
+    fn solve(&mut self, instance: &Instance, _cfg: &RunConfig<Self::Config>) -> Option<Vec<Tree>> {
         // m≥3 is not yet supported by the corridor enumerator. Route to
         // B&P as a separate algorithm — this is not a fallback, it's a
         // routing decision: the corridor algorithm is undefined for m≥3
         // until the threshold-K DSSR enumerator is built.
         if instance.num_trees() >= 3 {
-            return BpSolver::new().solve(instance);
+            return Solver::solve(&mut BpSolver::new(), instance, &RunConfig::default());
         }
         if instance.num_trees() <= 1 || instance.num_leaves <= 1 {
             return Some(instance.trees.clone());

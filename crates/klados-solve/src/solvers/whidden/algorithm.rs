@@ -2497,7 +2497,7 @@ fn apply_decompose(
         }
         let mut sub_solver =
             crate::solvers::whidden::WhiddenSolver::new().with_split_or_decompose(false);
-        let sub_solution = match crate::ExactSolver::solve(&mut sub_solver, &sub_instance) {
+        let sub_solution = match crate::Solver::solve(&mut sub_solver, &sub_instance, &crate::RunConfig::default()) {
             Some(s) => s,
             None => {
                 if std::env::var("KLADOS_WHIDDEN_SOD_TRACE").is_ok() {

@@ -46,31 +46,11 @@ highs = { workspace = true }
 log = "0.4"
 env_logger = "0.11"
 
-[features]
-default = []
-# Build optil.io submission binaries. Use: cargo build --release --features optil
-optil = []
-# Enable SIGTERM-based early termination with best-effort output.
-early-termination = ["klados-solve/early-termination"]
-
 [[bin]]
 name = "klados"
 path = "src/main.rs"
 
-[[bin]]
-name = "klados-exact"
-path = "src/bin/klados-exact.rs"
-required-features = ["optil"]
-
-[[bin]]
-name = "klados-heuristic"
-path = "src/bin/klados-heuristic.rs"
-required-features = ["optil"]
-
-[[bin]]
-name = "klados-lb"
-path = "src/bin/klados-lb.rs"
-required-features = ["optil"]
+# Per-solver binaries (src/bin/klados-<name>.rs) are auto-discovered by Cargo.
 
 [profile.release]
 lto = "fat"

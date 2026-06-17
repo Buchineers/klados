@@ -484,7 +484,7 @@ pub fn solve_lp_relaxation(instance: &Instance) -> Option<f64> {
 }
 
 // ---------------------------------------------------------------------------
-// Public solver struct implementing ExactSolver
+// Public solver struct implementing Solver
 // ---------------------------------------------------------------------------
 
 /// ILP-based exact MAF solver using HiGHS.
@@ -510,20 +510,11 @@ impl MafIlpSolver {
     }
 }
 
-impl crate::ExactSolver for MafIlpSolver {
-    fn name(&self) -> &'static str {
-        "ilp"
-    }
+impl Solver for MafIlpSolver {
+    type Config = ();
+    const SUPPORTED_TRACKS: &'static [Track] = &[Track::Exact];
 
-    fn description(&self) -> &'static str {
-        "Integer Linear Programming via HiGHS (pairwise conflict triple cover)"
-    }
-
-    fn options(&self) -> &'static [(&'static str, &'static str)] {
-        &[]
-    }
-
-    fn solve(&mut self, instance: &Instance) -> Option<Vec<Tree>> {
+    fn solve(&mut self, instance: &Instance, _cfg: &RunConfig<Self::Config>) -> Option<Vec<Tree>> {
         if instance.num_leaves > self.max_leaves {
             eprintln!(
                 "ILP: instance has {} leaves, exceeding limit of {}",
@@ -554,10 +545,18 @@ impl crate::ExactSolver for MafIlpSolver {
     }
 }
 
+
+// ── Unified Solver impl + entry point ───────────────────────────────────────
+use crate::{RunConfig, Solver, Track};
+
+pub fn main() {
+    crate::run(MafIlpSolver::new(), RunConfig { track: Track::Exact, ..Default::default() });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ExactSolver;
+    use crate::{RunConfig, Solver};
 
     /// Manually build tree ((1,2),(3,4)):
     ///       0 (root, node 4)
@@ -732,7 +731,7 @@ mod tests {
         let instance = Instance::new(vec![t1, t2], 4);
 
         let mut solver = MafIlpSolver::new();
-        let result = solver.solve(&instance);
+        let result = Solver::solve(&mut solver, &instance, &RunConfig::default());
         assert!(result.is_some());
         let components = result.unwrap();
         assert_eq!(components.len(), 1);
@@ -748,7 +747,7 @@ mod tests {
         let instance = Instance::new(vec![t1, t2], 4);
 
         let mut solver = MafIlpSolver::new();
-        let result = solver.solve(&instance);
+        let result = Solver::solve(&mut solver, &instance, &RunConfig::default());
         assert!(result.is_some());
         let components = result.unwrap();
         // rSPR distance between ((1,2),(3,4)) and ((1,3),(2,4)) is 2.

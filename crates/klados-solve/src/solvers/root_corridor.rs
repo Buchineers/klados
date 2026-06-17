@@ -16,7 +16,6 @@ use klados_core::kernelize::kernelize_best;
 use klados_core::{Instance, SolverStats, Tree};
 use log::info;
 
-use crate::ExactSolver;
 use crate::solvers::bp::BpSolver;
 use crate::solvers::root_pool::RootPoolSolver;
 
@@ -44,38 +43,18 @@ impl Default for RootCorridorSolver {
     }
 }
 
-impl ExactSolver for RootCorridorSolver {
-    fn name(&self) -> &'static str {
-        "root-corridor"
-    }
+impl Solver for RootCorridorSolver {
+    type Config = ();
+    const SUPPORTED_TRACKS: &'static [Track] = &[Track::Exact];
+    const OPTIONS: &'static [(&'static str, &'static str)] = &[
+        ("KLADOS_ROOT_CORRIDOR_MAX_PROBE_LEAVES", "skip root probe above this leaf count"),
+        ("KLADOS_ROOT_CORRIDOR_MAX_PROBE_2TREE_LEAVES", "also probe 2-tree instances up to this original leaf count"),
+        ("KLADOS_ROOT_CORRIDOR_PROBE_MS", "soft root probe wall budget in milliseconds"),
+        ("KLADOS_ROOT_CORRIDOR_MIP_TIME_LIMIT", "HiGHS pool-MIP time limit per probe pass"),
+        ("KLADOS_ROOT_CORRIDOR_TRACE", "print diagnostics"),
+    ];
 
-    fn description(&self) -> &'static str {
-        "Certified root-LP corridor probe with exact B&P fallback"
-    }
-
-    fn options(&self) -> &'static [(&'static str, &'static str)] {
-        &[
-            (
-                "KLADOS_ROOT_CORRIDOR_MAX_PROBE_LEAVES",
-                "skip root probe above this leaf count",
-            ),
-            (
-                "KLADOS_ROOT_CORRIDOR_MAX_PROBE_2TREE_LEAVES",
-                "also probe 2-tree instances up to this original leaf count",
-            ),
-            (
-                "KLADOS_ROOT_CORRIDOR_PROBE_MS",
-                "soft root probe wall budget in milliseconds",
-            ),
-            (
-                "KLADOS_ROOT_CORRIDOR_MIP_TIME_LIMIT",
-                "HiGHS pool-MIP time limit per probe pass",
-            ),
-            ("KLADOS_ROOT_CORRIDOR_TRACE", "print diagnostics"),
-        ]
-    }
-
-    fn solve(&mut self, instance: &Instance) -> Option<Vec<Tree>> {
+    fn solve(&mut self, instance: &Instance, _cfg: &RunConfig<Self::Config>) -> Option<Vec<Tree>> {
         let n = instance.num_leaves as usize;
 
         // The root probe is useful only if the *kernel* is small enough.  Some
@@ -140,7 +119,7 @@ impl ExactSolver for RootCorridorSolver {
         }
 
         let mut bp = BpSolver::new();
-        let forest = bp.solve(instance)?;
+        let forest = crate::Solver::solve(&mut bp, instance, &crate::RunConfig::default())?;
         self.stats.upper_bound = Some(forest.len());
         self.stats.lower_bound = forest.len();
         Some(forest)
@@ -156,4 +135,12 @@ fn env_usize(name: &str, default: usize) -> usize {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(default)
+}
+
+
+// ── Unified Solver impl + entry point ───────────────────────────────────────
+use crate::{RunConfig, Solver, Track};
+
+pub fn main() {
+    crate::run(RootCorridorSolver::new(), RunConfig { track: Track::Exact, ..Default::default() });
 }

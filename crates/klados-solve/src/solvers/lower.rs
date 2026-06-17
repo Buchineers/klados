@@ -33,15 +33,9 @@ use std::time::{Duration, Instant};
 /// budget, so it is skipped and the whole budget goes to Lagrangian.
 const BP_MAX_LEAVES: u32 = 800;
 
-/// Total per-instance wall budget in seconds. The track caps each instance at
-/// 610 s; the harness exports its limit via `STRIDE_TIMEOUT` (seconds).
-fn wall_secs() -> f64 {
-    std::env::var("STRIDE_TIMEOUT")
-        .ok()
-        .and_then(|s| s.trim().parse::<f64>().ok())
-        .filter(|s| s.is_finite() && *s > 0.0)
-        .unwrap_or(600.0)
-}
+/// Per-instance wall budget when `cfg.budget` is unset. The track caps each
+/// instance at 610 s.
+const DEFAULT_WALL_SECS: f64 = 600.0;
 
 /// `true` iff `forest` is a valid agreement forest AND provably within the track
 /// bound: `|forest| <= floor(a * lb) + b` with `lb` a SOUND lower bound on `k*`.
@@ -53,11 +47,15 @@ fn certifiable(instance: &Instance, forest: &[Tree], a: f64, b: usize, lb: usize
 /// Solve under the Lower-bound track. Returns a forest only when it is provably
 /// within the `#a` bound; returns `None` (emit nothing) otherwise. `approx` is
 /// absent only off-track, where we demand the exact optimum (`a = 1, b = 0`).
-pub fn solve_lower(instance: &Instance) -> Option<Vec<Tree>> {
+///
+/// `budget` is the wall limit (`cfg.budget` ← `STRIDE_TIMEOUT`); the racer
+/// subdivides it (lagrangian then exact `bp`) and leaves a 3 s flush margin.
+pub fn solve_lower(instance: &Instance, budget: Option<Duration>) -> Option<Vec<Tree>> {
     let trace = std::env::var_os("KLADOS_LOWER_TRACE").is_some();
     let (a, b) = instance.approx.unwrap_or((1.0, 0));
     let start = Instant::now();
-    let deadline = start + Duration::from_secs_f64((wall_secs() - 3.0).max(1.0));
+    let wall_secs = budget.map_or(DEFAULT_WALL_SECS, |b| b.as_secs_f64());
+    let deadline = start + Duration::from_secs_f64((wall_secs - 3.0).max(1.0));
 
     // ── Lagrangian (track-aware): seeds Chen, raises a tight dual LB, and
     //    early-aborts the instant its forest clears the bound. ──
@@ -79,7 +77,7 @@ pub fn solve_lower(instance: &Instance) -> Option<Vec<Tree>> {
         let forest = lagr.solve(instance);
         // The dual LB lagrangian exposes is sound (LP weak duality); it is the
         // tightest bound we have, so it certifies the most forests.
-        let lb = crate::HeuristicSolver::stats(&lagr).lower_bound;
+        let lb = crate::Solver::stats(&lagr).lower_bound;
         if let Some(forest) = forest {
             let ok = certifiable(instance, &forest, a, b, lb);
             if trace {
@@ -120,4 +118,35 @@ pub fn solve_lower(instance: &Instance) -> Option<Vec<Tree>> {
         eprintln!("[lower] no certifiable forest within bound -> emit nothing");
     }
     None
+}
+
+
+// ── Unified Solver wrapper + entry point ────────────────────────────────────
+use crate::{RunConfig, Solver, Track};
+use klados_core::SolverStats;
+
+#[derive(Default)]
+pub struct LowerSolver {
+    stats: SolverStats,
+}
+
+impl LowerSolver {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Solver for LowerSolver {
+    type Config = ();
+    const SUPPORTED_TRACKS: &'static [Track] = &[Track::LowerBound];
+    fn solve(&mut self, inst: &Instance, cfg: &RunConfig<()>) -> Option<Vec<Tree>> {
+        solve_lower(inst, cfg.budget)
+    }
+    fn stats(&self) -> &SolverStats {
+        &self.stats
+    }
+}
+
+pub fn main() {
+    crate::run(LowerSolver::new(), RunConfig { track: Track::LowerBound, ..Default::default() });
 }

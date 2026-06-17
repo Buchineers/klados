@@ -1,6 +1,7 @@
-//! The solvers themselves — every module here is a solver. Non-solver
-//! utilities live elsewhere (decomposition primitives in [`crate::decomp`];
-//! kernelization / lower bounds in `klados-core`).
+//! The solvers themselves — every module here implements [`crate::Solver`] and
+//! is enumerated by [`crate::catalog`]. Non-solver utilities live elsewhere
+//! (decomposition primitives in [`crate::decomp`]; kernelization / lower bounds
+//! in `klados-core`).
 
 // ── exact-origin solvers ────────────────────────────────────────────────────
 pub mod bp;

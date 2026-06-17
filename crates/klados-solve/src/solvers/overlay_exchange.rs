@@ -12,7 +12,6 @@ use fixedbitset::FixedBitSet;
 use klados_core::lower_bound::best_randomized_partition;
 use klados_core::{Instance, SolverStats, Tree};
 
-use crate::ExactSolver;
 use crate::solvers::bp::column::{AfColumn, ColumnBuilder};
 
 pub struct OverlayExchangeSolver {
@@ -45,39 +44,19 @@ impl Default for OverlayExchangeSolver {
     }
 }
 
-impl ExactSolver for OverlayExchangeSolver {
-    fn name(&self) -> &'static str {
-        "overlay-exchange"
-    }
+impl Solver for OverlayExchangeSolver {
+    type Config = ();
+    const SUPPORTED_TRACKS: &'static [Track] = &[Track::Heuristic];
+    const OPTIONS: &'static [(&'static str, &'static str)] = &[
+        ("KLADOS_OVERLAY_MAX_H", "maximum incumbent neighborhood size"),
+        ("KLADOS_OVERLAY_MAX_ROUNDS", "maximum improvement rounds"),
+        ("KLADOS_OVERLAY_LOCAL_LEAF_CAP", "skip split neighborhoods above this many leaves"),
+        ("KLADOS_OVERLAY_MAX_NEIGHBORHOODS", "neighborhood checks per round cap"),
+        ("KLADOS_OVERLAY_GEN_CAP", "per-neighborhood local candidate generation cap"),
+        ("KLADOS_OVERLAY_TRACE", "print diagnostics"),
+    ];
 
-    fn description(&self) -> &'static str {
-        "Incumbent-overlay replacement prototype"
-    }
-
-    fn options(&self) -> &'static [(&'static str, &'static str)] {
-        &[
-            (
-                "KLADOS_OVERLAY_MAX_H",
-                "maximum incumbent neighborhood size",
-            ),
-            ("KLADOS_OVERLAY_MAX_ROUNDS", "maximum improvement rounds"),
-            (
-                "KLADOS_OVERLAY_LOCAL_LEAF_CAP",
-                "skip split neighborhoods above this many leaves",
-            ),
-            (
-                "KLADOS_OVERLAY_MAX_NEIGHBORHOODS",
-                "neighborhood checks per round cap",
-            ),
-            (
-                "KLADOS_OVERLAY_GEN_CAP",
-                "per-neighborhood local candidate generation cap",
-            ),
-            ("KLADOS_OVERLAY_TRACE", "print diagnostics"),
-        ]
-    }
-
-    fn solve(&mut self, instance: &Instance) -> Option<Vec<Tree>> {
+    fn solve(&mut self, instance: &Instance, _cfg: &RunConfig<Self::Config>) -> Option<Vec<Tree>> {
         let n = instance.num_leaves as usize;
         if n == 0 {
             return Some(Vec::new());
@@ -585,4 +564,12 @@ fn env_usize(name: &str, default: usize) -> usize {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(default)
+}
+
+
+// ── Unified Solver impl + entry point ───────────────────────────────────────
+use crate::{RunConfig, Solver, Track};
+
+pub fn main() {
+    crate::run(OverlayExchangeSolver::new(), RunConfig { track: Track::Heuristic, ..Default::default() });
 }

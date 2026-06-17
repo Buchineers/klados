@@ -8,7 +8,6 @@ use rustsat::types::{Clause, Lit, TernaryVal, Var};
 use rustsat_cadical::CaDiCaL;
 use std::collections::BTreeMap;
 
-use crate::ExactSolver;
 use crate::cluster_reduction::{self, ClusterReductionResult};
 use crate::kernelize::{self, KernelizeConfig};
 use crate::lower_bound::maf_bounds;
@@ -146,23 +145,15 @@ impl MafSatSolver {
     }
 }
 
-impl ExactSolver for MafSatSolver {
-    fn name(&self) -> &'static str {
-        "sat"
-    }
+impl Solver for MafSatSolver {
+    type Config = ();
+    const SUPPORTED_TRACKS: &'static [Track] = &[Track::Exact];
+    const OPTIONS: &'static [(&'static str, &'static str)] = &[
+        ("KLADOS_MAF_SAT_H4", "H4 mode: full, lazy, seeded-lazy, staged"),
+        ("KLADOS_MAF_SAT_COMPONENT_TRACE", "enable component trace (set to 1)"),
+    ];
 
-    fn description(&self) -> &'static str {
-        "SAT-based encoding via rustsat/cadical with component extraction"
-    }
-
-    fn options(&self) -> &'static [(&'static str, &'static str)] {
-        &[
-            ("KLADOS_MAF_SAT_H4", "H4 mode: full, lazy, seeded-lazy, staged"),
-            ("KLADOS_MAF_SAT_COMPONENT_TRACE", "enable component trace (set to 1)"),
-        ]
-    }
-
-    fn solve(&mut self, instance: &Instance) -> Option<Vec<Tree>> {
+    fn solve(&mut self, instance: &Instance, _cfg: &RunConfig<Self::Config>) -> Option<Vec<Tree>> {
         if instance.trees.is_empty() {
             return None;
         }
@@ -198,23 +189,11 @@ impl MafSatOlverSolver {
     }
 }
 
-impl ExactSolver for MafSatOlverSolver {
-    fn name(&self) -> &'static str {
-        "sat-olver"
-    }
+impl Solver for MafSatOlverSolver {
+    type Config = ();
+    const SUPPORTED_TRACKS: &'static [Track] = &[Track::Exact];
 
-    fn description(&self) -> &'static str {
-        "SAT-based with Olver 2-approx LB for seeding and pruning"
-    }
-
-    fn options(&self) -> &'static [(&'static str, &'static str)] {
-        &[
-            ("KLADOS_MAF_SAT_H4", "H4 mode: full, lazy, seeded-lazy, staged"),
-            ("KLADOS_MAF_SAT_H4_PROMOTE_MS", "promote MaxSAT solution as incumbent"),
-        ]
-    }
-
-    fn solve(&mut self, instance: &Instance) -> Option<Vec<Tree>> {
+    fn solve(&mut self, instance: &Instance, _cfg: &RunConfig<Self::Config>) -> Option<Vec<Tree>> {
         if instance.trees.is_empty() {
             return None;
         }
@@ -2112,7 +2091,6 @@ fn solve_sat_inner_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ExactSolver;
     use klados_core::tree::NONE;
 
     fn make_test_instance() -> Instance {
@@ -2209,7 +2187,7 @@ mod tests {
         let instance = Instance::new(vec![t.clone(), t], 4);
 
         let mut solver = MafSatSolver::new();
-        let result = solver.solve(&instance);
+        let result = crate::Solver::solve(&mut solver, &instance, &crate::RunConfig::default());
         assert!(result.is_some());
         let components = result.unwrap();
         assert_eq!(components.len(), 1);
@@ -2220,7 +2198,7 @@ mod tests {
         let instance = make_test_instance();
 
         let mut solver = MafSatSolver::new();
-        let result = solver.solve(&instance);
+        let result = crate::Solver::solve(&mut solver, &instance, &crate::RunConfig::default());
         assert!(result.is_some());
         let components = result.unwrap();
         assert_eq!(components.len(), 3);
@@ -2267,7 +2245,7 @@ mod tests {
         let instance = Instance::new(vec![t.clone(), t], 4);
 
         let mut solver = MafSatOlverSolver::new();
-        let result = solver.solve(&instance);
+        let result = crate::Solver::solve(&mut solver, &instance, &crate::RunConfig::default());
         assert!(result.is_some());
         let components = result.unwrap();
         assert_eq!(components.len(), 1);
@@ -2278,9 +2256,21 @@ mod tests {
         let instance = make_test_instance();
 
         let mut solver = MafSatOlverSolver::new();
-        let result = solver.solve(&instance);
+        let result = crate::Solver::solve(&mut solver, &instance, &crate::RunConfig::default());
         assert!(result.is_some());
         let components = result.unwrap();
         assert_eq!(components.len(), 3);
     }
+}
+
+
+// ── entry points ────────────────────────────────────────────────────────────
+use crate::{RunConfig, Solver, Track};
+
+pub fn main() {
+    crate::run(MafSatSolver::new(), RunConfig { track: Track::Exact, ..Default::default() });
+}
+
+pub fn olver_main() {
+    crate::run(MafSatOlverSolver::new(), RunConfig { track: Track::Exact, ..Default::default() });
 }

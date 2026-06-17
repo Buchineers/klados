@@ -2126,7 +2126,7 @@ mod tests {
     /// Optimal MAF = 3: {1,2}, {3,4}, {5,6} (exchange 1↔3).
     #[test]
     fn test_common_cluster_point_decomposition() {
-        use crate::ExactSolver;
+        use crate::{RunConfig, Solver};
         use crate::solvers::maf_branch_price_multi::MafBranchPriceMultiSolver;
         use klados_core::af_validator::validate_agreement_forest;
         use klados_core::brute_maf::brute_force_maf;
@@ -2175,7 +2175,7 @@ mod tests {
             &mut |sub| {
                 // Use B&P-Multi directly (without re-decomposition to avoid recursion)
                 // NOTE: won't recurse into Whidden again since we call solve directly
-                solver.solve(sub)
+                crate::Solver::solve(&mut solver, sub, &crate::RunConfig::default())
             },
             &NEVER_TERMINATE,
         );

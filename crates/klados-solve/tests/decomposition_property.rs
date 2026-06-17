@@ -17,7 +17,7 @@ use klados_core::Instance;
 use klados_core::af_validator::{AfValidation, validate_agreement_forest};
 use klados_core::brute_maf::brute_force_maf;
 use klados_core::tree::{Label, NONE, NodeId, Tree};
-use klados_solve::ExactSolver;
+use klados_solve::{RunConfig, Solver};
 
 /// Tiny LCG; we don't need crypto-quality, just reproducible.
 struct Lcg(u64);
@@ -85,7 +85,7 @@ fn run_battery(n: u32, num_pairs: usize, base_seed: u64) {
         let oracle = brute_force_maf(&inst).expect("brute force should run for small n");
 
         let mut solver = klados_solve::solvers::maf_branch_price_multi::MafBranchPriceMultiSolver::new();
-        let solver_result = solver.solve(&inst);
+        let solver_result = solver.solve(&inst, &RunConfig::default());
         let comps = match solver_result {
             Some(c) => c,
             None => {

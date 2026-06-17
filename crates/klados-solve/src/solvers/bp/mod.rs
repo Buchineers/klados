@@ -20,7 +20,7 @@
 //!
 //! ## Solvers
 //!
-//! [`BpSolver`] implements [`crate::ExactSolver`].  By default it enables
+//! [`BpSolver`] implements [`crate::Solver`].  By default it enables
 //! kernelization and cluster reduction.  Set `KLADOS_BP_NO_DECOMP=1` to
 //! disable all decomposition (useful for debugging the core algorithm).
 
@@ -43,7 +43,6 @@ use klados_core::solve_pipeline::{ClusterAlgo, SolveConfig, solve_with_pipeline}
 use klados_core::{Instance, SolverStats, Tree};
 use log::{info, trace};
 
-use crate::ExactSolver;
 use crate::solvers::chen_rspr::chen_pair_agreement;
 use crate::decomp::whidden_cluster::try_whidden_decomp_2tree;
 
@@ -113,7 +112,6 @@ impl BpConfig {
 
 pub struct BpSolver {
     stats: SolverStats,
-    config: BpConfig,
     terminated: Arc<AtomicBool>,
 }
 
@@ -125,45 +123,24 @@ impl Default for BpSolver {
 
 impl BpSolver {
     pub fn new() -> Self {
-        // KLADOS_BP_NO_DECOMP=1 disables all decomposition (Whidden, cluster
-        // reduction, cluster decomposition). Used to expose algorithmic
-        // weaknesses in the core B&P that would otherwise be masked.
-        let config = if std::env::var("KLADOS_BP_NO_DECOMP").is_ok() {
-            BpConfig::no_decomp()
-        } else {
-            BpConfig::default()
-        };
         Self {
             stats: SolverStats::default(),
-            config,
-            terminated: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
-    pub fn with_config(config: BpConfig) -> Self {
-        Self {
-            stats: SolverStats::default(),
-            config,
             terminated: Arc::new(AtomicBool::new(false)),
         }
     }
 }
 
-impl ExactSolver for BpSolver {
-    fn name(&self) -> &'static str {
-        "bp"
-    }
+impl Solver for BpSolver {
+    /// Stage-2 knobs ([`BpConfig`]); the production defaults are set in
+    /// [`main`]. Was: the `KLADOS_BP_NO_DECOMP` env read in `new()`.
+    type Config = BpConfig;
+    const SUPPORTED_TRACKS: &'static [Track] = &[Track::Exact, Track::Heuristic];
 
-    fn description(&self) -> &'static str {
-        "Branch & Price for multi-tree MAF (rewrite, in progress)"
-    }
-
-    fn solve(&mut self, instance: &Instance) -> Option<Vec<Tree>> {
+    fn solve(&mut self, instance: &Instance, cfg: &RunConfig<Self::Config>) -> Option<Vec<Tree>> {
         let t_total = Instant::now();
-        let cfg = self.config.clone();
         let memo = Rc::new(RefCell::new(SubinstanceMemo::default()));
         let cancel = Cancel::new(Arc::clone(&self.terminated));
-        let mut components = solve_recursive_memo(instance, &cfg, &memo, &cancel)?;
+        let mut components = solve_recursive_memo(instance, &cfg.specific, &memo, &cancel)?;
 
         // Post-validate: if Whidden decomp assembled invalid results
         // (subproblems aborted), fall back to Chen 2-approximation.
@@ -201,9 +178,20 @@ impl ExactSolver for BpSolver {
         &self.stats
     }
 
-    #[cfg(feature = "early-termination")]
-    fn sigterm_handler(&self) {
-        self.terminated.store(true, Ordering::SeqCst);
+    fn sigterm_handler(&self, track: Track) -> Option<Box<dyn Fn() + Send + Sync>> {
+        match track {
+            // Exact emits nothing unless proven optimal, so SIGTERM is ignored:
+            // aborting the search could only yield an unproven partial. The
+            // harness SIGKILLs at the hard deadline.
+            Track::Exact => None,
+            // Heuristic: flip the existing stop flag; bp polls it at its cancel
+            // points and returns its best incumbent.
+            Track::Heuristic => {
+                let flag = Arc::clone(&self.terminated);
+                Some(Box::new(move || flag.store(true, Ordering::SeqCst)))
+            }
+            Track::LowerBound => None,
+        }
     }
 }
 
@@ -971,4 +959,20 @@ fn leafsets_to_trees(leafsets: &[Vec<u32>], instance: &Instance) -> Vec<Tree> {
             }
         })
         .collect()
+}
+
+
+// ── entry point ─────────────────────────────────────────────────────────────
+use crate::{RunConfig, Solver, Track};
+
+pub fn main() {
+    // KLADOS_BP_NO_DECOMP=1 disables all decomposition (Whidden, cluster
+    // reduction, cluster decomposition) to expose core-B&P weaknesses that
+    // decomposition would otherwise mask. (C3 will turn this into a CLI flag.)
+    let specific = if std::env::var("KLADOS_BP_NO_DECOMP").is_ok() {
+        BpConfig::no_decomp()
+    } else {
+        BpConfig::default()
+    };
+    crate::run(BpSolver::new(), RunConfig { track: Track::Exact, specific, ..Default::default() });
 }
