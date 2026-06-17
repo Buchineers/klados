@@ -2,6 +2,13 @@
 //!
 //! Provides arena-based tree representation for cache-efficient traversal
 //! during the FPT search.
+//!
+//! Indexed `for i in 0..n` loops over parallel arrays are an intentional
+//! pattern in the numerical kernels; clippy's iterator suggestion there is
+//! churn that hurts readability, so the lint is silenced crate-wide.
+
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::too_many_arguments)]
 
 pub mod af_validator;
 pub mod brute_maf;

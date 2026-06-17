@@ -89,10 +89,10 @@ pub fn maf_bounds(trees: &[Tree], num_leaves: u32) -> MafBounds {
         // Stage 2: sort pairs by cherry_ub desc; run rb only where it can tighten best_lb.
         // For skipped pairs we leave lb_cuts[i][j] = 0 (safe under-approximation of dual_lb,
         // so the additive LB stays valid — possibly weaker, never invalidated).
-        pair_cherry.sort_by(|a, b| b.2.cmp(&a.2));
+        pair_cherry.sort_by_key(|&(_, _, cu)| std::cmp::Reverse(cu));
         for &(i, j, cu) in &pair_cherry {
             // best_ub_pair is only used for m==2, so don't bother updating it here.
-            if cu + 1 <= best_lb {
+            if cu < best_lb {
                 rb_skipped += 1;
                 continue;
             }
@@ -228,7 +228,7 @@ pub fn exact_pairwise_lower_bound(
         }
     }
     // Sort by highest approx LB first — most likely to tighten the bound.
-    pairs.sort_by(|a, b| b.2.cmp(&a.2));
+    pairs.sort_by_key(|&(_, _, lb)| std::cmp::Reverse(lb));
 
     let start = std::time::Instant::now();
 

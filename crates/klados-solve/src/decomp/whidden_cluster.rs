@@ -288,11 +288,9 @@ where
         let csize = leaves.count_ones(..);
         let mut imap = vec![0u32; n + 1];
         let mut ito = vec![0u32; csize + 1];
-        let mut l = 1u32;
-        for leaf in leaves.ones() {
+        for (l, leaf) in (1u32..).zip(leaves.ones()) {
             imap[leaf] = l;
             ito[l as usize] = leaf as u32;
-            l += 1;
         }
         let inner = solve(&Instance::new(
             vec![
@@ -475,11 +473,9 @@ where
         let mut imap = vec![0u32; n + 1];
         let marker_label = csize as u32 + 1;
         let mut ito = vec![0u32; csize + 2];
-        let mut l = 1u32;
-        for leaf in leaves.ones() {
+        for (l, leaf) in (1u32..).zip(leaves.ones()) {
             imap[leaf] = l;
             ito[l as usize] = leaf as u32;
-            l += 1;
         }
         // The marker is deliberately not mapped back to an original label.
         ito[marker_label as usize] = 0;
@@ -588,11 +584,10 @@ where
         }
         let maxp = node_to_p.iter().max().copied().unwrap_or(0);
         let mut out = Tree::with_capacity(src.num_leaves.max(maxp));
-        if src.root != NONE {
-            if let Some(r) = walk(src, node_to_p, clustered, &mut out, src.root) {
+        if src.root != NONE
+            && let Some(r) = walk(src, node_to_p, clustered, &mut out, src.root) {
                 out.root = r;
             }
-        }
         out.compute_metadata();
         out
     }
@@ -742,11 +737,10 @@ where
             .unwrap_or(0)
             .max(p_at.iter().max().copied().unwrap_or(0));
         let mut out = Tree::with_capacity(src.num_leaves.max(maxp));
-        if src.root != NONE {
-            if let Some(r) = walk(src, node_to_p, clustered, &p_at, &mut out, src.root) {
+        if src.root != NONE
+            && let Some(r) = walk(src, node_to_p, clustered, &p_at, &mut out, src.root) {
                 out.root = r;
             }
-        }
         out.compute_metadata();
         out
     }
@@ -931,7 +925,6 @@ where
     let mut candidates: Vec<(NodeId, usize)> =
         collect_rspr_cluster_points(t1, t2, &leaf_sets_t1, &twin_t1_to_t2, &twin_t2_to_t1, n)
             .into_iter()
-            .into_iter()
             .filter(|point| point.kind == RsprClusterPointKind::Strict)
             .filter(|point| point.size >= 2 && point.size <= n - 2)
             .filter(|point| point.t1_round_trip == point.t1_node)
@@ -1019,11 +1012,9 @@ where
     // Build inner sub-instance (no ρ): relabel X to 1..=cluster_size compactly.
     let mut inner_label_map: Vec<Label> = vec![0; instance.num_leaves as usize + 1];
     let mut inner_to_orig: Vec<Label> = vec![0; cluster_size + 1];
-    let mut next: Label = 1;
-    for old_lbl in cluster_leaves.ones() {
+    for (next, old_lbl) in (1u32..).zip(cluster_leaves.ones()) {
         inner_label_map[old_lbl] = next;
         inner_to_orig[next as usize] = old_lbl as Label;
-        next += 1;
     }
     let inner_t1 = t1.relabel(&inner_label_map, cluster_size as u32);
     let inner_t2 = t2.relabel(&inner_label_map, cluster_size as u32);
@@ -1175,8 +1166,8 @@ where
             Instance::new(vec![inner_t1_rho, inner_t2_rho], inner_rho_num_leaves);
         inner_rho_instance.protected_labels = vec![rho_label];
 
-        if let Some(inner_rho_components) = solve(&inner_rho_instance) {
-            if let Some(rho_pos) = inner_rho_components
+        if let Some(inner_rho_components) = solve(&inner_rho_instance)
+            && let Some(rho_pos) = inner_rho_components
                 .iter()
                 .position(|c| component_contains_label(c, rho_label))
             {
@@ -1267,7 +1258,6 @@ where
                     }
                 }
             }
-        }
     }
 
     // No valid anchor — decomposition fails for this cluster point.
@@ -1492,12 +1482,11 @@ fn replace_and_relabel(
         }
     }
 
-    if tree.root != NONE {
-        if let Some(root) = build(tree, target, placeholder, label_map, &mut out, tree.root) {
+    if tree.root != NONE
+        && let Some(root) = build(tree, target, placeholder, label_map, &mut out, tree.root) {
             out.root = root;
             out.parent[root as usize] = NONE;
         }
-    }
     out.compute_metadata();
     out
 }
@@ -1563,12 +1552,11 @@ fn replace_subtree_with_leaf(
         }
     }
 
-    if tree.root != NONE {
-        if let Some(root) = build(tree, target, placeholder, &mut out, tree.root) {
+    if tree.root != NONE
+        && let Some(root) = build(tree, target, placeholder, &mut out, tree.root) {
             out.root = root;
             out.parent[root as usize] = NONE;
         }
-    }
     out.compute_metadata();
     out
 }
@@ -1671,14 +1659,13 @@ fn fuse_at_label(
         }
     }
 
-    if outer_comp.root != NONE {
-        if let Some(root) =
+    if outer_comp.root != NONE
+        && let Some(root) =
             copy_outer_with_splice(outer_comp, inner_comp, p_label, &mut out, outer_comp.root)
         {
             out.root = root;
             out.parent[root as usize] = NONE;
         }
-    }
     out.compute_metadata();
     out
 }
@@ -2119,7 +2106,7 @@ mod tests {
     /// Optimal MAF = 3: {1,2}, {3,4}, {5,6} (exchange 1↔3).
     #[test]
     fn test_common_cluster_point_decomposition() {
-        use crate::{RunConfig, Solver};
+        
         use crate::solvers::maf_branch_price_multi::MafBranchPriceMultiSolver;
         use klados_core::af_validator::validate_agreement_forest;
         use klados_core::brute_maf::brute_force_maf;

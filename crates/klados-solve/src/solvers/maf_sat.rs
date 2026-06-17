@@ -377,9 +377,11 @@ fn extract_components_from_model(
 fn log_component_summary(
     k_bound: usize,
     comps: &[Vec<usize>],
-    _verbose_components: bool,
     label_map_to_original: Option<&[u32]>,
 ) {
+    if !log::log_enabled!(log::Level::Debug) {
+        return;
+    }
     let mut hist: BTreeMap<usize, usize> = BTreeMap::new();
     let mut top_sizes: Vec<usize> = comps.iter().map(|c| c.len()).collect();
     let total_savings: usize = top_sizes.iter().map(|&sz| sz.saturating_sub(1)).sum();
@@ -393,7 +395,7 @@ fn log_component_summary(
         .map(|(size, count)| format!("{}x{}", size, count))
         .collect::<Vec<_>>()
         .join(",");
-    info!(
+    debug!(
         "[cut] k={} component-summary savings={} hist=[{}] top_sizes={:?}",
         k_bound, total_savings, hist_str, top_sizes
     );
@@ -1054,14 +1056,13 @@ fn sat_solve_maf_cut(
                                 }
                                 for q in 0..m {
                                     for &v in &paths[q][a][b] {
-                                        if let Some(dv) = del[q][v as usize] {
-                                            if solver.var_val(dv).unwrap() == TernaryVal::True {
+                                        if let Some(dv) = del[q][v as usize]
+                                            && solver.var_val(dv).unwrap() == TernaryVal::True {
                                                 violated_clauses.push([
                                                     conn[a][b].unwrap().neg_lit(),
                                                     dv.neg_lit(),
                                                 ]);
                                             }
-                                        }
                                     }
                                 }
                             }
@@ -1127,7 +1128,7 @@ fn sat_solve_maf_cut(
                         "[cut] k={} SAT {:.1}ms (cum {:.1}s) comps={} max_size={}",
                         k_bound, solve_ms, cum_s, num_comps, max_sz
                     );
-                    log_component_summary(k_bound, &comps, true, label_map_to_original);
+                    log_component_summary(k_bound, &comps, label_map_to_original);
                     best_components = Some(comps);
 
                     // Phase hints for next k.
@@ -1872,8 +1873,7 @@ fn solve_sat_inner_impl(
     config: &MafSatConfig,
 ) -> Option<Vec<Tree>> {
     let n = instance.num_leaves as usize;
-    let mut profile = SolveProfile::default();
-    profile.n = n;
+    let mut profile = SolveProfile { n, ..Default::default() };
 
     let kern_config = KernelizeConfig {
         protected_labels: preferred_singleton_labels.clone(),
@@ -2073,6 +2073,18 @@ fn solve_sat_inner_impl(
     Some(components)
 }
 
+
+// ── entry points ────────────────────────────────────────────────────────────
+use crate::{RunConfig, Solver, Track};
+
+pub fn main() {
+    crate::run(MafSatSolver::new(), RunConfig { track: Track::Exact, specific: MafSatConfig::default(), ..Default::default() });
+}
+
+pub fn olver_main() {
+    crate::run(MafSatOlverSolver::new(), RunConfig { track: Track::Exact, ..Default::default() });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2248,16 +2260,4 @@ mod tests {
         let components = result.unwrap();
         assert_eq!(components.len(), 3);
     }
-}
-
-
-// ── entry points ────────────────────────────────────────────────────────────
-use crate::{RunConfig, Solver, Track};
-
-pub fn main() {
-    crate::run(MafSatSolver::new(), RunConfig { track: Track::Exact, specific: MafSatConfig::default(), ..Default::default() });
-}
-
-pub fn olver_main() {
-    crate::run(MafSatOlverSolver::new(), RunConfig { track: Track::Exact, ..Default::default() });
 }

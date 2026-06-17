@@ -2582,11 +2582,13 @@ fn clean_dual(value: f64) -> f64 {
     if value.abs() <= 1.0e-9 { 0.0 } else { value }
 }
 
+type AlphaBeta = (Vec<f64>, Vec<Vec<f64>>);
+
 fn solve_stabilized_dual_blocks(
     candidates: &[PartitionBlock],
     trees: &[Tree],
     num_leaves: usize,
-) -> Result<(Vec<f64>, Vec<Vec<f64>>), Box<dyn std::error::Error>> {
+) -> Result<AlphaBeta, Box<dyn std::error::Error>> {
     if candidates.is_empty() {
         return Ok((
             (0..=num_leaves)
@@ -2657,12 +2659,14 @@ fn extract_stabilized_dual_solution(
     (alpha, beta)
 }
 
+type PaperPricedColumn = Option<(f64, Vec<u32>)>;
+
 fn run_rooted_paper_pricer(
     t1: &Tree,
     t2: &Tree,
     alpha: &[f64],
     beta: &[Vec<f64>],
-) -> Result<Option<(f64, Vec<u32>)>, Box<dyn std::error::Error>> {
+) -> Result<PaperPricedColumn, Box<dyn std::error::Error>> {
     const NEG_INF: f64 = -1.0e100;
 
     let n2 = t2.num_nodes();
@@ -2991,7 +2995,7 @@ pub fn run_packing_gap_experiment(instance: &Instance, best_known: usize) -> Gap
     let mut seen: HashSet<Vec<u32>> = HashSet::new();
     let mut pool: Vec<PartitionBlock> = Vec::new();
 
-    let mut push_block =
+    let push_block =
         |labels: Vec<u32>, pool: &mut Vec<PartitionBlock>, seen: &mut HashSet<Vec<u32>>| {
             if labels.len() < 2 {
                 return;

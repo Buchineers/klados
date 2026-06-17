@@ -274,11 +274,10 @@ impl RootPoolSolver {
                 continue;
             }
 
-            if let Some(labels) = round_lp(&columns, &lp.column_values, n) {
-                if labels.len() < best_cols.len() {
+            if let Some(labels) = round_lp(&columns, &lp.column_values, n)
+                && labels.len() < best_cols.len() {
                     best_cols = labels;
                 }
-            }
 
             let result = pricer.price(
                 &PricingContext {
@@ -525,11 +524,10 @@ impl RootPoolSolver {
                     cuts_total += cuts;
                     continue;
                 }
-                if let Some(labels) = integral_solution(&columns, &mip.column_values, n) {
-                    if labels.len() < best_cols.len() {
+                if let Some(labels) = integral_solution(&columns, &mip.column_values, n)
+                    && labels.len() < best_cols.len() {
                         best_cols = labels;
                     }
-                }
                 break;
             }
         }
@@ -650,7 +648,7 @@ fn lazy_audit_shell(
         },
         &mut lazy_cache,
     );
-    while let Some(col) = iter.next() {
+    while let Some(col) = iter.next_column() {
         if !seen.insert(col.labels.clone()) {
             continue;
         }

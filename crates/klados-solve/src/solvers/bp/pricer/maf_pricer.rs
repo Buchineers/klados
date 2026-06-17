@@ -108,12 +108,11 @@ pub fn dispatch_by_m(trees: &[Tree]) -> MafPricer {
 /// Per-call batch size. Larger for big active sets / many trees; capped tight
 /// at branched nodes (matching the legacy generator's behaviour).
 fn adaptive_batch_size_for(m: usize, n: usize) -> usize {
-    let base = if m >= 8 {
+    if m >= 8 {
         64
     } else if n >= 384 {
         32
     } else {
         16
-    };
-    base
+    }
 }

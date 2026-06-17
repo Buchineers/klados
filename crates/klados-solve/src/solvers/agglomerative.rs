@@ -130,14 +130,13 @@ impl TreePrecomp {
             if first_occ[node as usize] == u32::MAX {
                 first_occ[node as usize] = pos;
             }
-            if !returning {
-                if let Some((left, right)) = tree.children(node) {
+            if !returning
+                && let Some((left, right)) = tree.children(node) {
                     stack.push((node, true));
                     stack.push((right, false));
                     stack.push((node, true));
                     stack.push((left, false));
                 }
-            }
         }
 
         let len = euler.len();
@@ -1106,6 +1105,12 @@ fn exact_region_reoptimization_pass(
 pub struct AgglomerativeSolver {
     terminate: Arc<AtomicBool>,
     stats: SolverStats,
+}
+
+impl Default for AgglomerativeSolver {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AgglomerativeSolver {

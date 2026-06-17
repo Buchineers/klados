@@ -166,12 +166,11 @@ impl BranchSelector for StrongBranching {
 
         // Past the depth cap, fall back to most-fractional (the first
         // entry, which is already sorted by closeness to 0.5).
-        if let Some(d) = self.max_depth {
-            if ctx.branchings.depth() >= d {
+        if let Some(d) = self.max_depth
+            && ctx.branchings.depth() >= d {
                 let (l, r) = ctx.branchings.split_on(candidates[0].0);
                 return Some(vec![l, r]);
             }
-        }
 
         let pool = std::cmp::min(self.candidates, candidates.len());
         let mut best: Option<(LeafPair, f64)> = None;
@@ -184,7 +183,7 @@ impl BranchSelector for StrongBranching {
                 (Some(a), None) | (None, Some(a)) => a,
                 (None, None) => f64::NEG_INFINITY,
             };
-            if best.map_or(true, |(_, s)| lp_min > s) {
+            if best.is_none_or(|(_, s)| lp_min > s) {
                 best = Some((pair, lp_min));
             }
         }
@@ -300,7 +299,7 @@ impl BranchSelector for ClusterBranching {
                         continue;
                     }
                     let m_min = mab.min(mac).min(mbc);
-                    if best.map_or(true, |(_, _, _, s)| m_min > s) {
+                    if best.is_none_or(|(_, _, _, s)| m_min > s) {
                         best = Some((a, b, c, m_min));
                     }
                 }

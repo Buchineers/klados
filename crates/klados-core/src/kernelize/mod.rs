@@ -231,19 +231,15 @@ pub fn kernelize(instance: &Instance, config: &KernelizeConfig) -> KernelizeResu
 
                 trace.push(RuleEvent {
                     rule_name: rule.name(),
-                    action: match &trace.last() {
-                        // Re-derive action with original labels for the trace
-                        _ => {
-                            if original_labels.len() == 2 {
-                                ReductionAction::Collapse {
-                                    keep: original_labels[0],
-                                    remove: original_labels[1],
-                                }
-                            } else {
-                                ReductionAction::Delete {
-                                    victim: original_labels[0],
-                                }
-                            }
+                    // Re-derive action with original labels for the trace
+                    action: if original_labels.len() == 2 {
+                        ReductionAction::Collapse {
+                            keep: original_labels[0],
+                            remove: original_labels[1],
+                        }
+                    } else {
+                        ReductionAction::Delete {
+                            victim: original_labels[0],
                         }
                     },
                     original_labels,

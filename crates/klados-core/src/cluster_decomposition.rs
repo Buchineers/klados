@@ -286,11 +286,10 @@ fn find_cluster_points_multi(
     // Remove redundant: skip nodes where ALL children are also cluster points.
     let mut result = Vec::new();
     for &node in &candidates {
-        if let Some((left, right)) = t0.children(node) {
-            if is_cluster_point[left as usize] && is_cluster_point[right as usize] {
+        if let Some((left, right)) = t0.children(node)
+            && is_cluster_point[left as usize] && is_cluster_point[right as usize] {
                 continue;
             }
-        }
         result.push(node);
     }
 
@@ -356,11 +355,9 @@ fn build_sub_instance(
     // label_map[old_label] = new_label
     let mut label_map: Vec<Label> = vec![0; instance.num_leaves as usize + 1];
 
-    let mut new_label: u32 = 1;
-    for old_lbl in leaves.ones() {
+    for (new_label, old_lbl) in (1u32..).zip(leaves.ones()) {
         label_map[old_lbl] = new_label;
         old_labels[new_label as usize] = old_lbl as Label;
-        new_label += 1;
     }
 
     let sub_trees: Vec<Tree> = instance

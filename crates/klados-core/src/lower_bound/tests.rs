@@ -180,21 +180,21 @@ fn test_red_blue_identical() {
 fn test_red_blue_3leaf() {
     let (t1, t2) = make_3leaf_trees();
     let cost = red_blue_approx(&t1, &t2);
-    assert!(cost >= 1 && cost <= 2, "red_blue cost={}", cost);
+    assert!((1..=2).contains(&cost), "red_blue cost={}", cost);
 }
 
 #[test]
 fn test_red_blue_4leaf() {
     let (t1, t2) = make_4leaf_trees();
     let cost = red_blue_approx(&t1, &t2);
-    assert!(cost >= 1 && cost <= 2, "red_blue cost={}", cost);
+    assert!((1..=2).contains(&cost), "red_blue cost={}", cost);
 }
 
 #[test]
 fn test_lower_bound_3leaf() {
     let (t1, t2) = make_3leaf_trees();
     let lb = maf_bounds(&[t1, t2], 3).lower;
-    assert!(lb >= 1 && lb <= 2, "lb={}", lb);
+    assert!((1..=2).contains(&lb), "lb={}", lb);
 }
 
 #[test]

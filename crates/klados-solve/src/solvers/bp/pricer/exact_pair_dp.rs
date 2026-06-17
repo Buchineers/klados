@@ -97,7 +97,7 @@ impl ExactPairDpCache {
     pub(crate) fn fits(&self, n0: usize, n1: usize, num_leaves: usize) -> bool {
         self.t0_active.len() >= n0
             && self.t1_active.len() >= n1
-            && self.active_labels.len() >= num_leaves + 1
+            && self.active_labels.len() > num_leaves
     }
 
     #[inline]
@@ -605,8 +605,8 @@ fn collect_candidates_above(
                     results.push(PairDpCandidate {
                         score,
                         labels,
-                        anchor0: u as u32,
-                        anchor1: v as u32,
+                        anchor0: u,
+                        anchor1: v,
                     });
                 }
             }

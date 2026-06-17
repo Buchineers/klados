@@ -43,8 +43,8 @@ fn find_common_cherry(trees: &[Tree], num_leaves: u32) -> Option<(u32, u32)> {
 
     let ref_tree = &trees[0];
     for node in ref_tree.post_order() {
-        if let Some((l, r)) = ref_tree.children(node) {
-            if ref_tree.is_leaf(l) && ref_tree.is_leaf(r) {
+        if let Some((l, r)) = ref_tree.children(node)
+            && ref_tree.is_leaf(l) && ref_tree.is_leaf(r) {
                 let ll = ref_tree.label[l as usize];
                 let rl = ref_tree.label[r as usize];
                 if ll == 0 || rl == 0 {
@@ -73,7 +73,6 @@ fn find_common_cherry(trees: &[Tree], num_leaves: u32) -> Option<(u32, u32)> {
                     return Some((keep, remove));
                 }
             }
-        }
     }
     None
 }

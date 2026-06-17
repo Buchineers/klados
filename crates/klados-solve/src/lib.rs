@@ -3,6 +3,14 @@
 //! The unified [`Solver`] trait + [`run`] harness are the public surface. Each
 //! solver lives in [`solvers`] and implements [`Solver`] directly; decomposition
 //! primitives that are not solvers live in [`decomp`].
+//!
+//! Indexed `for i in 0..n` loops over parallel arrays are an intentional
+//! pattern in the numerical kernels (pricing, subgradient, B&B); clippy's
+//! iterator suggestion there is churn that hurts readability, so the lint is
+//! silenced crate-wide.
+
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::too_many_arguments)]
 
 pub use klados_core::cluster_reduction;
 // kernelize and lower_bound live in klados-core; re-export for convenience.
