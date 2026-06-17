@@ -1,7 +1,7 @@
 //! Kernelize subcommand — apply reduction rules and report statistics.
 
 use klados_core::Instance;
-use klados_exact::kernelize::{self, KernelizeConfig, VictimStrategy};
+use klados_solve::kernelize::{self, KernelizeConfig, VictimStrategy};
 use pace26io::newick::NewickWriter;
 use std::io::{self, Write};
 use std::time::Instant;

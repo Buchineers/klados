@@ -12,8 +12,7 @@ resolver = "2"
 [workspace.dependencies]
 # Internal crates
 klados-core = { path = "crates/klados-core" }
-klados-exact = { path = "crates/klados-exact" }
-klados-heuristic = { path = "crates/klados-heuristic" }
+klados-solve = { path = "crates/klados-solve" }
 
 # I/O
 pace26io = "0.2"
@@ -35,8 +34,7 @@ clap = { version = "4.5", features = ["derive"] }
 
 [dependencies]
 klados-core = { workspace = true }
-klados-exact = { workspace = true }
-klados-heuristic = { workspace = true }
+klados-solve = { workspace = true }
 pace26io = { workspace = true }
 clap = { workspace = true }
 fixedbitset = { workspace = true }
@@ -53,7 +51,7 @@ default = []
 # Build optil.io submission binaries. Use: cargo build --release --features optil
 optil = []
 # Enable SIGTERM-based early termination with best-effort output.
-early-termination = ["klados-exact/early-termination"]
+early-termination = ["klados-solve/early-termination"]
 
 [[bin]]
 name = "klados"

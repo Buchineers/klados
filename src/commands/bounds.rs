@@ -77,7 +77,7 @@ fn compute(algo: BoundsAlgo, instance: &Instance) -> AlgoResult {
                 return pair_err(algo);
             }
             let (l, u) =
-                klados_exact::chen_rspr::chen_pair_bounds(&instance.trees[0], &instance.trees[1]);
+                klados_solve::solvers::chen_rspr::chen_pair_bounds(&instance.trees[0], &instance.trees[1]);
             (l + 1, u + 1)
         }
         BoundsAlgo::ChenApp1 => {
@@ -85,7 +85,7 @@ fn compute(algo: BoundsAlgo, instance: &Instance) -> AlgoResult {
                 return pair_err(algo);
             }
             let (l, u) =
-                klados_exact::chen_rspr::chen_app1_bounds(&instance.trees[0], &instance.trees[1]);
+                klados_solve::solvers::chen_rspr::chen_app1_bounds(&instance.trees[0], &instance.trees[1]);
             (l + 1, u + 1)
         }
         BoundsAlgo::RedBlue => {
