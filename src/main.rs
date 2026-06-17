@@ -3,13 +3,11 @@
 //! κλάδος (klados) - Ancient Greek for "branch"
 
 mod commands;
-mod solver;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use commands::bounds::BoundsAlgo;
 use klados_core::Instance;
 use klados_core::kernelize::VictimStrategy;
-use solver::SolverChoice;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -26,10 +24,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Solve an instance. Run without arguments to list available solvers.
+    /// Solve an instance (reads from stdin). Run without a name to list solvers.
     Solve {
-        #[arg(value_enum)]
-        solver: Option<SolverChoice>,
+        /// Solver name; omit to list available solvers.
+        solver: Option<String>,
         #[arg(short, long)]
         verbose: bool,
     },
@@ -91,14 +89,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Solve {
             solver,
             verbose: _verbose,
-        } => {
-            if solver.is_none() {
-                solver::list_solvers();
-                return Ok(());
+        } => match solver {
+            None => {
+                for info in klados_solve::catalog() {
+                    println!("{:<22}  {}", info.name, info.description);
+                    for (var, desc) in (info.options)() {
+                        println!("    {var:<38}  {desc}");
+                    }
+                }
             }
-            let instance = Instance::from_stdin()?;
-            solver::solve_and_print(&instance, solver.unwrap())?;
-        }
+            Some(name) => match klados_solve::catalog().iter().find(|i| i.name == name) {
+                Some(info) => (info.run)(),
+                None => {
+                    eprintln!("unknown solver: {name}");
+                    eprintln!("run `klados solve` (no argument) to list available solvers");
+                }
+            },
+        },
 
         Commands::Bounds {
             algos,

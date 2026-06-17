@@ -12,11 +12,9 @@ use fixedbitset::FixedBitSet;
 use klados_core::kernelize::restrict_instance_simple;
 use klados_core::tree::{NONE, NodeId, Tree};
 use klados_core::{Instance, SolverStats};
-use crate::ExactSolver;
 use crate::solvers::maf_sat::MafSatSolver;
 use crate::solvers::whidden::WhiddenSolver;
 
-use crate::HeuristicSolver;
 
 const REGION_REOPT_MAX_LABELS: usize = 96;
 const REGION_REOPT_MAX_ROOTS: usize = 12;
@@ -528,13 +526,13 @@ fn region_components_from_exact(
 fn exact_local_solve(region_instance: &Instance) -> Option<(Vec<Tree>, &'static str)> {
     if region_instance.num_trees() == 2 && region_instance.num_leaves <= WHIDDEN_LOCAL_MAX_LEAVES {
         let mut whidden = WhiddenSolver::new();
-        if let Some(sol) = ExactSolver::solve(&mut whidden, region_instance) {
+        if let Some(sol) = crate::Solver::solve(&mut whidden, region_instance, &crate::RunConfig::default()) {
             return Some((sol, "whidden"));
         }
     }
 
     let mut sat = MafSatSolver::new();
-    ExactSolver::solve(&mut sat, region_instance).map(|sol| (sol, "sat"))
+    crate::Solver::solve(&mut sat, region_instance, &crate::RunConfig::default()).map(|sol| (sol, "sat"))
 }
 
 fn apply_exact_region_if_improves(
@@ -1552,28 +1550,24 @@ impl AgglomerativeSolver {
     }
 }
 
-impl HeuristicSolver for AgglomerativeSolver {
-    fn name(&self) -> &'static str {
-        "agglomerative"
-    }
+// ── Unified Solver impl + entry point ───────────────────────────────────────
+use crate::{RunConfig, Solver, Track};
 
-    fn description(&self) -> &'static str {
-        "Agglomerative clustering heuristic via conflict-graph merging"
+impl Solver for AgglomerativeSolver {
+    type Config = ();
+    const SUPPORTED_TRACKS: &'static [Track] = &[Track::Heuristic];
+    fn solve(&mut self, inst: &Instance, _cfg: &RunConfig<Self::Config>) -> Option<Vec<Tree>> {
+        AgglomerativeSolver::solve(self, inst)
     }
-
-    fn options(&self) -> &'static [(&'static str, &'static str)] {
-        &[]
-    }
-
-    fn solve(&mut self, instance: &Instance) -> Option<Vec<Tree>> {
-        AgglomerativeSolver::solve(self, instance)
-    }
-
     fn stats(&self) -> &SolverStats {
         &self.stats
     }
-
-    fn sigterm_handler(&self) {
-        self.terminate.store(true, Ordering::SeqCst);
+    fn sigterm_handler(&self, _track: Track) -> Option<Box<dyn Fn() + Send + Sync>> {
+        let flag = self.terminate.clone();
+        Some(Box::new(move || flag.store(true, Ordering::Relaxed)))
     }
+}
+
+pub fn main() {
+    crate::run(AgglomerativeSolver::new(), RunConfig { track: Track::Heuristic, ..Default::default() });
 }

@@ -10,7 +10,6 @@ use klados_core::kernelize::{self, KernelizeConfig};
 use klados_core::lower_bound::greedy_multi_tree_partition;
 use klados_core::{Instance, SolverStats, Tree};
 
-use crate::HeuristicSolver;
 
 pub struct PartitionHeuristicSolver {
     terminate_requested: Arc<AtomicBool>,
@@ -2931,34 +2930,6 @@ fn collect_split_labels(
     }
 }
 
-impl HeuristicSolver for PartitionHeuristicSolver {
-    fn name(&self) -> &'static str {
-        self.mode_name()
-    }
-
-    fn description(&self) -> &'static str {
-        "Greedy partition heuristic with union-add-one refinement"
-    }
-
-    fn options(&self) -> &'static [(&'static str, &'static str)] {
-        &[
-            ("KLADOS_HEURISTIC_TEST_MODE", "enable extended search budget (set to 1)"),
-        ]
-    }
-
-    fn solve(&mut self, instance: &Instance) -> Option<Vec<Tree>> {
-        PartitionHeuristicSolver::solve(self, instance)
-    }
-
-    fn stats(&self) -> &SolverStats {
-        &self.stats
-    }
-
-    fn sigterm_handler(&self) {
-        self.terminate_requested.store(true, Ordering::SeqCst);
-    }
-}
-
 // ===========================================================================
 // Dual-guided set-packing GAP EXPERIMENT (design doc §6, de-risking)
 //
@@ -3154,4 +3125,31 @@ pub fn run_packing_gap_experiment(instance: &Instance, best_known: usize) -> Gap
         pool_ip_timed_out,
         timings_ms: timings,
     }
+}
+
+
+// ── Unified Solver impl + entry point ───────────────────────────────────────
+use crate::{RunConfig, Solver, Track};
+
+impl Solver for PartitionHeuristicSolver {
+    type Config = ();
+    const SUPPORTED_TRACKS: &'static [Track] = &[Track::Heuristic];
+    const OPTIONS: &'static [(&'static str, &'static str)] = &[(
+        "KLADOS_HEURISTIC_TEST_MODE",
+        "enable extended search budget (set to 1)",
+    )];
+    fn solve(&mut self, inst: &Instance, _cfg: &RunConfig<Self::Config>) -> Option<Vec<Tree>> {
+        PartitionHeuristicSolver::solve(self, inst)
+    }
+    fn stats(&self) -> &SolverStats {
+        &self.stats
+    }
+    fn sigterm_handler(&self, _track: Track) -> Option<Box<dyn Fn() + Send + Sync>> {
+        let flag = self.terminate_requested.clone();
+        Some(Box::new(move || flag.store(true, Ordering::Relaxed)))
+    }
+}
+
+pub fn main() {
+    crate::run(PartitionHeuristicSolver::greedy_union_add_one(), RunConfig { track: Track::Heuristic, ..Default::default() });
 }

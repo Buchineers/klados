@@ -22,7 +22,6 @@ use klados_core::twin_tree::undo;
 use klados_core::{Instance, SolverStats, Tree};
 use std::collections::HashMap;
 
-use crate::ExactSolver;
 
 /// Compute Chen's 2-approximation bounds for a tree pair.
 ///
@@ -69,27 +68,19 @@ impl ChenRsprSolver {
     }
 }
 
-impl ExactSolver for ChenRsprSolver {
-    fn name(&self) -> &'static str {
-        "chen-rspr"
-    }
+impl Solver for ChenRsprSolver {
+    type Config = ();
+    const SUPPORTED_TRACKS: &'static [Track] = &[Track::Exact];
+    const OPTIONS: &'static [(&'static str, &'static str)] = &[
+        ("KLADOS_CHEN_JAR_DUMMY", "enable jar-dummy leaf attachment"),
+        ("KLADOS_CHEN_BOUNDS", "print bound details"),
+        ("KLADOS_CHEN_TRACE_K", "trace k-search"),
+        ("KLADOS_CHEN_NO_RECURSIVE_LB", "disable recursive lower bound"),
+        ("KLADOS_CHEN_USE_FORCED", "enable forced-cut pre-branch rules"),
+        ("KLADOS_CHEN_STOPPERS", "trace stopper classifications"),
+    ];
 
-    fn description(&self) -> &'static str {
-        "Chen-style rSPR branch-and-bound (2-tree only)"
-    }
-
-    fn options(&self) -> &'static [(&'static str, &'static str)] {
-        &[
-            ("KLADOS_CHEN_JAR_DUMMY", "enable jar-dummy leaf attachment"),
-            ("KLADOS_CHEN_BOUNDS", "print bound details"),
-            ("KLADOS_CHEN_TRACE_K", "trace k-search"),
-            ("KLADOS_CHEN_NO_RECURSIVE_LB", "disable recursive lower bound"),
-            ("KLADOS_CHEN_USE_FORCED", "enable forced-cut pre-branch rules"),
-            ("KLADOS_CHEN_STOPPERS", "trace stopper classifications"),
-        ]
-    }
-
-    fn solve(&mut self, instance: &Instance) -> Option<Vec<Tree>> {
+    fn solve(&mut self, instance: &Instance, _cfg: &RunConfig<Self::Config>) -> Option<Vec<Tree>> {
         if instance.num_trees() != 2 {
             eprintln!(
                 "[chen-rspr] m={} is not supported by the clean Chen prototype",
@@ -3265,4 +3256,12 @@ fn tree_from_original(tf: &TwinForest) -> Tree {
     tree.depth = vec![0; tf.num_nodes[T1]];
     tree.subtree_size = vec![0; tf.num_nodes[T1]];
     tree
+}
+
+
+// ── entry point ─────────────────────────────────────────────────────────────
+use crate::{RunConfig, Solver, Track};
+
+pub fn main() {
+    crate::run(ChenRsprSolver::new(), RunConfig { track: Track::Exact, ..Default::default() });
 }

@@ -33,8 +33,9 @@ pub fn run(instance: &Instance) -> Result<(), Box<dyn std::error::Error>> {
 
     // Step 2: Solve the original instance exactly
     let solve_start = Instant::now();
-    let mut solver = klados_solve::solver_by_name("bp-multi").expect("B&P solver not available");
-    let components = match solver.solve(instance) {
+    let mut solver = klados_solve::solvers::maf_branch_price_multi::MafBranchPriceMultiSolver::new();
+    let cfg = klados_solve::RunConfig::<()>::default();
+    let components = match klados_solve::Solver::solve(&mut solver, instance, &cfg) {
         Some(c) => c,
         None => {
             eprintln!("ERROR: Solver failed to find a solution");

@@ -18,7 +18,7 @@
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fixedbitset::FixedBitSet;
@@ -39,7 +39,6 @@ use crate::solvers::bp::search::{
 use crate::solvers::chen_rspr::chen_pair_agreement;
 use crate::decomp::whidden_cluster::try_whidden_decomp_2tree;
 
-use crate::HeuristicSolver;
 
 const POOL_HARD_CAP: usize = 120_000;
 const POOL_PRUNE_TO: usize = 80_000;
@@ -155,13 +154,6 @@ fn block_score(b: &Block, alpha: &[f64], beta: &[Vec<f64>]) -> f64 {
 pub struct LagrangianSolver {
     terminate: Arc<AtomicBool>,
     stats: SolverStats,
-    /// Best complete forest in ORIGINAL labels, ready to emit. A watcher thread
-    /// emits this the instant SIGTERM arrives, so the response never depends on
-    /// `solve` unwinding (the decomposition recursion can take seconds to
-    /// unwind, which would blow the grace window and score 0). Seeded with a
-    /// trivial-but-valid forest before any heavy work, then replaced as the
-    /// solver improves it.
-    incumbent: Arc<Mutex<Vec<Tree>>>,
     /// True while the current solve is the flat top-level (depth 0), whose
     /// forests are terminal (→ LNS → expand → output) and never fed to
     /// `whidden_cluster` recombination. Set at each `solve_reduced_core` entry.
@@ -170,9 +162,9 @@ pub struct LagrangianSolver {
     /// during-solve forest memory on large flat cores. Cluster solves (depth ≥
     /// 1) leave it false so their pieces stay label-queryable for recombination.
     flat_terminal: AtomicBool,
-    /// Caller-supplied soft budget. Overrides the `KLADOS_HEUR_TIME_MS` env
-    /// fallback. Used by the lower-track racer to bound the anytime cascade so
-    /// it always returns even without a SIGTERM.
+    /// Soft wall-time budget for the anytime cascade, from `cfg.budget` (the
+    /// run-track wall limit) or set directly by the lower-track racer so it
+    /// always returns even without a SIGTERM. `None` ⇒ run until SIGTERM.
     budget_override: Option<Duration>,
     /// Ceil of the dual lower bound from the most recent depth-0 flat solve, in
     /// REDUCED units. `solve` lifts it to original units (adding the kernel
@@ -207,7 +199,6 @@ impl LagrangianSolver {
         Self {
             terminate: Arc::new(AtomicBool::new(false)),
             stats: SolverStats::default(),
-            incumbent: Arc::new(Mutex::new(Vec::new())),
             flat_terminal: AtomicBool::new(false),
             budget_override: None,
             reduced_dual_lb: AtomicUsize::new(0),
@@ -218,8 +209,7 @@ impl LagrangianSolver {
         }
     }
 
-    /// Set a soft wall-time budget for this solve. Takes precedence over the
-    /// `KLADOS_HEUR_TIME_MS` env fallback.
+    /// Set a soft wall-time budget for this solve.
     pub fn set_budget(&mut self, budget: Duration) {
         self.budget_override = Some(budget);
     }
@@ -230,23 +220,6 @@ impl LagrangianSolver {
     /// grinding the full budget after a valid forest is already in hand.
     pub fn set_approx_target(&mut self, a: f64, b: usize) {
         self.approx_target = Some((a, b));
-    }
-
-    /// Replace the ready-to-emit incumbent (original labels). Cheap; called at
-    /// each point the solver has a better complete forest.
-    fn publish(&self, forest: &[Tree]) {
-        if let Ok(mut slot) = self.incumbent.lock() {
-            *slot = forest.to_vec();
-        }
-    }
-
-    /// Optional soft budget. `None` means run until SIGTERM (the real mode);
-    /// `KLADOS_HEUR_TIME_MS` sets a budget only for local testing.
-    fn time_budget() -> Option<Duration> {
-        std::env::var("KLADOS_HEUR_TIME_MS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .map(Duration::from_millis)
     }
 
     pub fn solve(&mut self, instance: &Instance) -> Option<Vec<Tree>> {
@@ -263,7 +236,7 @@ impl LagrangianSolver {
         }
 
         let start = Instant::now();
-        let budget = self.budget_override.or_else(Self::time_budget);
+        let budget = self.budget_override;
         let trace = std::env::var("KLADOS_LAGR_TRACE").is_ok();
         self.reduced_dual_lb.store(0, Ordering::Relaxed);
         self.abort_k_reduced.store(usize::MAX, Ordering::Relaxed);
@@ -279,7 +252,6 @@ impl LagrangianSolver {
                 chen_pair_agreement(&instance.trees[0], &instance.trees[1]);
             let base = forest_from_partition(&sets, &instance.trees, orig_n, true);
             let (base, _) = repair_forest(base, &instance.trees, orig_n);
-            self.publish(&base);
             // Lower-bound track fast path: Chen's own forest may already clear the
             // approximation bound against Chen's (sound) lower bound `lb_dist + 1`.
             // If so there is nothing to do — return it before any heavy work. This
@@ -473,11 +445,6 @@ impl LagrangianSolver {
         } else {
             self.reduced_dual_lb.load(Ordering::Relaxed) + kernel_delta
         };
-        // Publish the final result so a SIGTERM racing the normal emit still
-        // sees the best forest (the watcher emits the incumbent).
-        if expanded.len() < self.snapshot().map_or(usize::MAX, |s| s.len()) {
-            self.publish(&expanded);
-        }
         self.stats.upper_bound = Some(expanded.len());
         Some(expanded)
     }
@@ -1480,9 +1447,9 @@ impl LagrangianSolver {
     ) -> (Vec<Tree>, bool) {
         // No internal time horizon by default: the solver is SIGTERM-driven and
         // each cluster runs to its own convergence/stall. A budget is supplied
-        // ONLY for local testing (KLADOS_HEUR_TIME_MS), in which case it is
-        // sliced across clusters by leaf-share. (KLADOS_PLAN_MS likewise forces
-        // a horizon for experiments.)
+        // only when `cfg.budget` is set (the run-track wall limit, or the
+        // lower-track racer), in which case it is sliced across clusters by
+        // leaf-share. (KLADOS_PLAN_MS likewise forces a horizon for experiments.)
         let plan_deadline: Option<Instant> = budget.map(|b| start + b).or_else(|| {
             std::env::var("KLADOS_PLAN_MS")
                 .ok()
@@ -4166,38 +4133,26 @@ impl Default for LagrangianSolver {
     }
 }
 
-impl HeuristicSolver for LagrangianSolver {
-    fn name(&self) -> &'static str {
-        "lagrangian"
-    }
+// ── Unified Solver impl + entry point ───────────────────────────────────────
+use crate::{RunConfig, Solver, Track};
 
-    fn description(&self) -> &'static str {
-        "Dual-guided set-packing (Lagrangian column generation, anytime)"
+impl Solver for LagrangianSolver {
+    type Config = ();
+    const SUPPORTED_TRACKS: &'static [Track] = &[Track::Heuristic];
+    const OPTIONS: &'static [(&'static str, &'static str)] =
+        &[("KLADOS_LAGR_TRACE", "print per-iteration diagnostics")];
+    fn solve(&mut self, inst: &Instance, cfg: &RunConfig<Self::Config>) -> Option<Vec<Tree>> {
+        LagrangianSolver::solve(self, inst)
     }
-
-    fn options(&self) -> &'static [(&'static str, &'static str)] {
-        &[
-            ("KLADOS_HEUR_TIME_MS", "wall-time budget in ms (default 290000)"),
-            ("KLADOS_LAGR_TRACE", "print per-iteration diagnostics"),
-        ]
-    }
-
-    fn solve(&mut self, instance: &Instance) -> Option<Vec<Tree>> {
-        LagrangianSolver::solve(self, instance)
-    }
-
     fn stats(&self) -> &SolverStats {
         &self.stats
     }
-
-    fn sigterm_handler(&self) {
-        self.terminate.store(true, Ordering::SeqCst);
+    fn sigterm_handler(&self, _track: Track) -> Option<Box<dyn Fn() + Send + Sync>> {
+        let flag = self.terminate.clone();
+        Some(Box::new(move || flag.store(true, Ordering::Relaxed)))
     }
+}
 
-    fn snapshot(&self) -> Option<Vec<Tree>> {
-        match self.incumbent.lock() {
-            Ok(slot) if !slot.is_empty() => Some(slot.clone()),
-            _ => None,
-        }
-    }
+pub fn main() {
+    crate::run(LagrangianSolver::new(), RunConfig { track: Track::Heuristic, ..Default::default() });
 }

@@ -19,7 +19,6 @@ use klados_core::lower_bound::{best_randomized_partition, pairwise_refine_ub};
 use klados_core::{Instance, SolverStats, Tree};
 use log::debug;
 
-use crate::ExactSolver;
 use crate::solvers::bp::column::{AfColumn, ColumnBuilder, ColumnSet};
 use crate::solvers::bp::pricer::exact_pair_dp::collect_corridor_candidates_ref;
 use crate::solvers::bp::pricer::{Pricer, PricerScratch, PricingContext, PricingResult, dispatch_by_m};
@@ -156,36 +155,19 @@ impl Default for RootPoolSolver {
     }
 }
 
-impl ExactSolver for RootPoolSolver {
-    fn name(&self) -> &'static str {
-        "root-pool"
-    }
+impl Solver for RootPoolSolver {
+    type Config = ();
+    const SUPPORTED_TRACKS: &'static [Track] = &[Track::Heuristic];
+    const OPTIONS: &'static [(&'static str, &'static str)] = &[
+        ("KLADOS_ROOT_POOL_MAX_CG", "maximum root column-generation iterations"),
+        ("KLADOS_ROOT_POOL_MAX_MS", "soft root-pool wall budget in milliseconds"),
+        ("KLADOS_ROOT_POOL_MIP_PASSES", "lazy-cut MIP repair passes"),
+        ("KLADOS_ROOT_POOL_MIP_TIME_LIMIT", "HiGHS MIP time limit per pass in seconds"),
+        ("KLADOS_ROOT_POOL_SEEDS", "randomized incumbent seed budget"),
+        ("KLADOS_ROOT_POOL_TRACE", "print diagnostics"),
+    ];
 
-    fn description(&self) -> &'static str {
-        "Root column generation + one integer pool cover heuristic"
-    }
-
-    fn options(&self) -> &'static [(&'static str, &'static str)] {
-        &[
-            (
-                "KLADOS_ROOT_POOL_MAX_CG",
-                "maximum root column-generation iterations",
-            ),
-            (
-                "KLADOS_ROOT_POOL_MAX_MS",
-                "soft root-pool wall budget in milliseconds",
-            ),
-            ("KLADOS_ROOT_POOL_MIP_PASSES", "lazy-cut MIP repair passes"),
-            (
-                "KLADOS_ROOT_POOL_MIP_TIME_LIMIT",
-                "HiGHS MIP time limit per pass in seconds",
-            ),
-            ("KLADOS_ROOT_POOL_SEEDS", "randomized incumbent seed budget"),
-            ("KLADOS_ROOT_POOL_TRACE", "print diagnostics"),
-        ]
-    }
-
-    fn solve(&mut self, instance: &Instance) -> Option<Vec<Tree>> {
+    fn solve(&mut self, instance: &Instance, _cfg: &RunConfig<Self::Config>) -> Option<Vec<Tree>> {
         self.solve_with_outcome(instance).map(|out| out.forest)
     }
 
@@ -1059,4 +1041,12 @@ fn env_f64(name: &str, default: f64) -> f64 {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(default)
+}
+
+
+// ── Unified Solver impl + entry point ───────────────────────────────────────
+use crate::{RunConfig, Solver, Track};
+
+pub fn main() {
+    crate::run(RootPoolSolver::new(), RunConfig { track: Track::Heuristic, ..Default::default() });
 }

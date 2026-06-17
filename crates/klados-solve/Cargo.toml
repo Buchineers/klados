@@ -17,6 +17,3 @@ rustsat-cadical = { workspace = true }
 log = "0.4"
 libc = "0.2"
 signal-hook = "0.4.3"
-
-[features]
-early-termination = []

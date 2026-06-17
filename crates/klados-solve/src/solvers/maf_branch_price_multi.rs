@@ -89,7 +89,6 @@ fn compute_local_bounds(trees: &[Tree], num_leaves: u32) -> LocalBounds {
 
 use klados_core::cluster_decomposition;
 
-use crate::ExactSolver;
 use crate::solvers::chen_rspr::chen_pair_agreement;
 use crate::cluster_reduction::{self, ClusterReductionResult};
 use crate::kernelize::{self, KernelizeConfig};
@@ -549,20 +548,11 @@ impl MafBranchPriceMultiSolver {
     }
 }
 
-impl ExactSolver for MafBranchPriceMultiSolver {
-    fn name(&self) -> &'static str {
-        "bp-multi"
-    }
+impl Solver for MafBranchPriceMultiSolver {
+    type Config = ();
+    const SUPPORTED_TRACKS: &'static [Track] = &[Track::Exact];
 
-    fn description(&self) -> &'static str {
-        "Branch & Price for multi-tree MAF (default exact solver)"
-    }
-
-    fn options(&self) -> &'static [(&'static str, &'static str)] {
-        &[]
-    }
-
-    fn solve(&mut self, instance: &Instance) -> Option<Vec<Tree>> {
+    fn solve(&mut self, instance: &Instance, _cfg: &RunConfig<Self::Config>) -> Option<Vec<Tree>> {
         if instance.trees.is_empty() {
             return None;
         }
@@ -3098,4 +3088,12 @@ fn make_leafset(labels: &[u32], num_leaves: u32) -> FixedBitSet {
 
 fn clean_dual(value: f64) -> f64 {
     if value.abs() <= 1.0e-9 { 0.0 } else { value }
+}
+
+
+// ── Unified Solver impl + entry point ───────────────────────────────────────
+use crate::{RunConfig, Solver, Track};
+
+pub fn main() {
+    crate::run(MafBranchPriceMultiSolver::new(), RunConfig { track: Track::Exact, ..Default::default() });
 }
