@@ -124,7 +124,7 @@ impl Pricer for ExactPairDpPricer {
 
     fn price(&mut self, ctx: &PricingContext, scratch: &mut PricerScratch) -> PricingResult {
         debug_assert_eq!(ctx.trees.len(), 2);
-        price_exact_pair_dp(ctx, scratch, self.max_per_call.min(adaptive_m2_batch_size(ctx)))
+        price_exact_pair_dp(ctx, scratch, self.max_per_call.min(adaptive_m2_batch_size(ctx, scratch.m2_batch)))
     }
 }
 
@@ -133,12 +133,12 @@ impl Pricer for ExactPairDpPricer {
 /// within the 8 GB platform budget while covering every exact-track m=2 core.
 /// Above this the pricer declines (returns `Exhausted`) and the exhaustive
 /// leaf-pair tier behind it provides the sound convergence proof instead.
-pub(crate) fn exact_dp_cell_cap() -> usize {
-    std::env::var("KLADOS_BP_M2_EXACT_DP_CELLS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(64_000_000)
+pub(crate) fn exact_dp_cell_cap(scratch: &PricerScratch) -> usize {
+    if scratch.m2_exact_dp_cells > 0 {
+        scratch.m2_exact_dp_cells
+    } else {
+        64_000_000
+    }
 }
 
 fn price_exact_pair_dp(
@@ -156,7 +156,7 @@ fn price_exact_pair_dp(
     // rather than allocate. Returning `Exhausted` (never `Converged`) keeps
     // this tier sound — it cascades to the exhaustive leaf-pair verifier,
     // which proves convergence without the dense table.
-    if n0.saturating_mul(n1) > exact_dp_cell_cap() {
+    if n0.saturating_mul(n1) > exact_dp_cell_cap(scratch) {
         return PricingResult::Improving;
     }
 
@@ -178,7 +178,7 @@ fn price_exact_pair_dp(
     let mut found = Vec::new();
     let mut blocked_positive = false;
     let mut seen_positive = false;
-    let reserve_cap = exact_reserve_cap(max_per_call);
+    let reserve_cap = exact_reserve_cap(max_per_call, scratch);
     for (_, labels) in candidates {
         let column = scratch.builder.build_unchecked(labels, ctx.trees);
         // `forbids` MUST be checked before `seen`. A column that is both
@@ -223,14 +223,13 @@ fn price_exact_pair_dp(
     }
 }
 
-fn exact_reserve_cap(max_per_call: usize) -> usize {
+fn exact_reserve_cap(max_per_call: usize, scratch: &PricerScratch) -> usize {
     let default_cap = max_per_call.saturating_mul(8).max(max_per_call);
-    std::env::var("KLADOS_BP_M2_EXACT_RESERVE_CAP")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(default_cap)
-        .max(max_per_call)
+    if scratch.m2_exact_reserve_cap > 0 {
+        scratch.m2_exact_reserve_cap.max(max_per_call)
+    } else {
+        default_cap
+    }
 }
 
 pub(crate) fn collect_positive_columns(

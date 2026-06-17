@@ -18,7 +18,7 @@ use klados_core::lower_bound::{
     pairwise_refine_ub,
 };
 use klados_core::{Instance, Tree};
-use log::{debug, info, trace};
+use log::{debug, info};
 
 use crate::solvers::bp::column::{AfColumn, ColumnBuilder};
 use crate::solvers::bp::pricer::{Pricer, PricerScratch, PricingContext, PricingResult, dispatch_by_m};
@@ -61,12 +61,12 @@ fn sampled_reference_indices(m: usize, limit: usize) -> Vec<usize> {
 /// pair, so its component count is ≥ each pairwise MAF. Conservative on the
 /// rSPR-vs-component-count offset (no `+1`) so it can never over-bound.
 /// Cheap: each `chen_pair_bounds` is the fast 2-approx, not red-blue.
-fn chen_lower_bound(trees: &[Tree]) -> usize {
+fn chen_lower_bound(trees: &[Tree], no_chen_lb: bool) -> usize {
     let m = trees.len();
     if m < 2 {
         return 0;
     }
-    if std::env::var("KLADOS_BP_NO_CHEN_LB").is_ok() {
+    if no_chen_lb {
         return 0;
     }
     let mut lb = 0usize;
@@ -79,14 +79,10 @@ fn chen_lower_bound(trees: &[Tree]) -> usize {
     lb
 }
 
-fn maybe_log_core_decomp_potential(reduced: &Instance) {
-    if std::env::var("KLADOS_BP_CORE_DECOMP_ANALYZE").is_err() {
+fn maybe_log_core_decomp_potential(reduced: &Instance, analyze: bool, min_leaves: usize) {
+    if !analyze {
         return;
     }
-    let min_leaves = std::env::var("KLADOS_BP_CORE_DECOMP_MIN")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(150);
     let n = reduced.num_leaves as usize;
     if n < min_leaves || reduced.num_trees() != 2 {
         return;
@@ -94,7 +90,7 @@ fn maybe_log_core_decomp_potential(reduced: &Instance) {
     let Some(p) = analyze_whidden_decomp_potential(reduced) else {
         return;
     };
-    eprintln!(
+    debug!(
         "BP_CORE_DECOMP\tn={}\tstrict={}\trelaxed={}\tstrict_sel={}\tstrict_clustered={}\tstrict_rem={}\tstrict_largest={}\tbalanced_sel={}\tbalanced_clustered={}\tbalanced_rem={}\tbalanced_largest={}\ttop_strict={:?}\ttop_relaxed={:?}",
         n,
         p.strict_points,
@@ -286,8 +282,8 @@ enum NodeOutcome {
 /// before we read the final objective.  Hence `ceil(RMP_obj) ≥ incumbent` is
 /// a sound prune — the integer optimum cannot be lower than the full-master
 /// LP optimum, which itself cannot be lower than `RMP_obj`.
-fn can_prune_by_bound(lb: usize, best_ub: usize) -> bool {
-    if std::env::var("KLADOS_BP_DISABLE_BOUND_PRUNE").is_ok() {
+fn can_prune_by_bound(lb: usize, best_ub: usize, disable_bound_prune: bool) -> bool {
+    if disable_bound_prune {
         return false;
     }
     lb >= best_ub
@@ -302,11 +298,11 @@ fn use_bound_prune_shortcuts(reduced: &Instance, trees: &[Tree]) -> bool {
     true
 }
 
-fn use_rcvf_shortcuts(reduced: &Instance, trees: &[Tree]) -> bool {
-    if std::env::var("KLADOS_BP_NO_RCVF").is_ok() {
+fn use_rcvf_shortcuts(reduced: &Instance, trees: &[Tree], no_rcvf: bool, tiny_rcvf: bool) -> bool {
+    if no_rcvf {
         return false;
     }
-    if std::env::var("KLADOS_BP_TINY_RCVF").is_ok() {
+    if tiny_rcvf {
         return true;
     }
     !is_tiny_two_tree_core(reduced, trees)
@@ -318,8 +314,9 @@ fn use_rcvf_shortcuts(reduced: &Instance, trees: &[Tree]) -> bool {
 /// `trivial_solution` short-circuit handles the trivial cases).
 pub fn solve_inner(reduced: &Instance, terminate: &Arc<AtomicBool>) -> Option<Vec<Tree>> {
     let cancel = crate::solvers::bp::Cancel::new(Arc::clone(terminate));
-    solve_inner_with_subsolver(reduced, &cancel, &mut |sub| {
-        crate::solvers::bp::solve_subinstance(sub, &crate::solvers::bp::BpConfig::default(), &cancel)
+    let cfg = crate::solvers::bp::BpConfig::default();
+    solve_inner_with_subsolver(reduced, &cfg, &cancel, &mut |sub| {
+        crate::solvers::bp::solve_subinstance(sub, &cfg, &cancel)
     })
 }
 
@@ -327,6 +324,7 @@ pub fn solve_inner(reduced: &Instance, terminate: &Arc<AtomicBool>) -> Option<Ve
 /// provide the same subproblem solver/memo to primal heuristics.
 pub fn solve_inner_with_subsolver<F>(
     reduced: &Instance,
+    cfg: &crate::solvers::bp::BpConfig,
     cancel: &crate::solvers::bp::Cancel,
     solve_sub: &mut F,
 ) -> Option<Vec<Tree>>
@@ -344,11 +342,15 @@ where
     if n <= 1 {
         return Some(trees[0..1].to_vec());
     }
-    maybe_log_core_decomp_potential(reduced);
+    maybe_log_core_decomp_potential(
+        reduced,
+        cfg.experimental.core_decomp_analyze,
+        cfg.experimental.core_decomp_min_leaves,
+    );
 
     // Chen pairwise lower bound — a sound combinatorial floor on the
     // component count, valid for every B&B node of this (sub)instance.
-    let chen_lb = chen_lower_bound(trees);
+    let chen_lb = chen_lower_bound(trees, cfg.experimental.no_chen_lb);
 
     // Seed singletons via a temporary builder; the runtime builder lives in
     // PricerScratch so all pricer tiers share it.
@@ -408,10 +410,9 @@ where
     // integer solution and we lose by branching needlessly. Matches
     // bp-multi's behavior; this was the missing primal heuristic that
     // explains the recurring "LP=optimum but support fractional" gap.
-    let relaxed_incumbent_enabled =
-        std::env::var("KLADOS_BP_RELAXED_INCUMBENT").map_or(true, |v| v != "0");
+    let relaxed_incumbent_enabled = cfg.experimental.relaxed_incumbent;
     if relaxed_incumbent_enabled && trees.len() == 2 && reduced.num_leaves >= 20 {
-        if let Some(incumbent_forest) = try_whidden_relaxed_incumbent_2tree(reduced, solve_sub) {
+        if let Some(incumbent_forest) = try_whidden_relaxed_incumbent_2tree(reduced, solve_sub, false) {
             install_incumbent(
                 &mut state,
                 &mut rmp,
@@ -423,6 +424,10 @@ where
     }
 
     let mut scratch = PricerScratch::new(trees);
+    scratch.m2_batch = cfg.m2_batch;
+    scratch.m2_exact_dp_cells = cfg.m2_exact_dp_cells;
+    scratch.m2_exact_reserve_cap = cfg.m2_exact_reserve_cap;
+    scratch.use_anchor_cache = cfg.use_anchor_cache;
     let mut pricer = dispatch_by_m(trees);
     // Tried, all reverted with strong negative results — all three
     // amounted to "branching scheme is the bottleneck", which the data
@@ -459,7 +464,12 @@ where
     let mut stack: Vec<(Branchings, f64)> = vec![(Branchings::default(), f64::NEG_INFINITY)];
     let mut last_progress_log = std::time::Instant::now();
     let allow_bound_prune = use_bound_prune_shortcuts(reduced, trees);
-    let allow_rcvf = use_rcvf_shortcuts(reduced, trees);
+    let allow_rcvf = use_rcvf_shortcuts(
+        reduced,
+        trees,
+        cfg.experimental.no_rcvf,
+        cfg.experimental.tiny_rcvf,
+    );
     while let Some((b, parent_lp_bound)) = stack.pop() {
         // Periodic progress log so we can see telemetry on timeouts, not
         // just on successful completion. Every 5 seconds is rare enough
@@ -503,7 +513,7 @@ where
             0
         };
         // The Chen lower bound is a sound floor independent of the LP.
-        if allow_bound_prune && can_prune_by_bound(inherited_lb.max(chen_lb), state.best_ub()) {
+        if allow_bound_prune && can_prune_by_bound(inherited_lb.max(chen_lb), state.best_ub(), cfg.experimental.disable_bound_prune) {
             tel.bound_prunes += 1;
             continue;
         }
@@ -537,6 +547,7 @@ where
             allow_rcvf,
             chen_lb,
             cancel,
+            cfg,
         );
         match outcome {
             NodeOutcome::Pruned => {}
@@ -558,6 +569,7 @@ where
                         state.incumbent(),
                         state.columns(),
                         root_regions.as_ref(),
+                        cfg.experimental.bridge_probe,
                     );
                     // RCVF replay happens at the top of the next solve_node.
                 }
@@ -621,6 +633,7 @@ fn solve_node<P: Pricer, S: BranchSelector>(
     allow_rcvf: bool,
     chen_lb: usize,
     cancel: &crate::solvers::bp::Cancel,
+    cfg: &crate::solvers::bp::BpConfig,
 ) -> NodeOutcome {
     tel.nodes_explored += 1;
 
@@ -655,7 +668,7 @@ fn solve_node<P: Pricer, S: BranchSelector>(
         let lp = match rmp.solve() {
             Ok(lp) => lp,
             Err(e) => {
-                trace!(target: LOG_TARGET, "node pruned: LP {e}");
+                debug!(target: LOG_TARGET, "node pruned: LP {e}");
                 return NodeOutcome::Pruned;
             }
         };
@@ -665,7 +678,7 @@ fn solve_node<P: Pricer, S: BranchSelector>(
         // Abort check between CG rounds so signal doesn't get stuck
         // waiting for a long pricing phase to complete.
         if cancel.is_cancelled() {
-            trace!(target: LOG_TARGET, "cg abort at iter {}", tel.cg_iters);
+            debug!(target: LOG_TARGET, "cg abort at iter {}", tel.cg_iters);
             return NodeOutcome::Pruned;
         }
 
@@ -678,7 +691,7 @@ fn solve_node<P: Pricer, S: BranchSelector>(
         tel.timings.cut_separation += t0.elapsed();
         if new_cuts > 0 {
             tel.cuts_added += new_cuts;
-            trace!(
+            debug!(
                 target: LOG_TARGET,
                 "cg iter {}: +{} cuts (total rows tightened); re-solving LP",
                 tel.cg_iters, new_cuts,
@@ -719,7 +732,7 @@ fn solve_node<P: Pricer, S: BranchSelector>(
                     }
                 }
                 tel.columns_added += added;
-                trace!(
+                debug!(
                     target: LOG_TARGET,
                     "cg iter={} lp={:.4} lp_ms={:.1} pricer_ms={:.1} cols_found={} added={} seen={} total_cols={}",
                     tel.cg_iters,
@@ -737,7 +750,7 @@ fn solve_node<P: Pricer, S: BranchSelector>(
                 // An improving column provably exists but none was emittable
                 // (all violate branch constraints). The LP is NOT at its true
                 // optimum — bound is uncertified. CG stops; the node branches.
-                trace!(
+                debug!(
                     target: LOG_TARGET,
                     "cg iter={} lp={:.4} IMPROVING (uncertified) pricer_ms={:.1}",
                     tel.cg_iters,
@@ -747,7 +760,7 @@ fn solve_node<P: Pricer, S: BranchSelector>(
                 break lp;
             }
             PricingResult::Converged => {
-                trace!(
+                debug!(
                     target: LOG_TARGET,
                     "cg iter={} lp={:.4} CONVERGED pricer_ms={:.1}",
                     tel.cg_iters,
@@ -771,7 +784,7 @@ fn solve_node<P: Pricer, S: BranchSelector>(
         chen_lb
     };
 
-    if allow_bound_prune && can_prune_by_bound(lb, state.best_ub()) {
+    if allow_bound_prune && can_prune_by_bound(lb, state.best_ub(), cfg.experimental.disable_bound_prune) {
         debug!(
             target: LOG_TARGET,
             "node pruned by bound: lb={} (lp={:.4} chen={}) ub={}",
@@ -830,13 +843,13 @@ fn solve_node<P: Pricer, S: BranchSelector>(
         // LP mass currently paid inside it, then the missing proof object is a
         // global obstruction cut rather than another local branch.
         if root_regions.is_none()
-            && (std::env::var("KLADOS_BP_OBSTRUCTION_PROBE").is_ok()
-                || std::env::var("KLADOS_BP_BRIDGE_PROBE").is_ok()
-                || std::env::var("KLADOS_BP_ROOT_SUPPORT_INCUMBENT").is_ok())
+            && (cfg.experimental.obstruction_probe
+                || cfg.experimental.bridge_probe
+                || cfg.experimental.root_support_incumbent)
         {
             *root_regions = build_root_support_regions(state, &lp);
         }
-        if std::env::var("KLADOS_BP_ROOT_SUPPORT_INCUMBENT").is_ok()
+        if cfg.experimental.root_support_incumbent
             && let Some(regions) = root_regions.as_ref()
         {
             let t0 = Instant::now();
@@ -854,12 +867,13 @@ fn solve_node<P: Pricer, S: BranchSelector>(
                 }
             }
         }
-        maybe_probe_root_obstruction(reduced, state, &lp, root_regions.as_ref());
+        maybe_probe_root_obstruction(reduced, state, &lp, root_regions.as_ref(), &cfg.experimental);
         maybe_log_bridge_footprint(
             "root-incumbent",
             state.incumbent(),
             state.columns(),
             root_regions.as_ref(),
+            cfg.experimental.bridge_probe,
         );
 
         // ── Corridor-enriched B&P (DISABLED by default; ablation only) ─
@@ -879,12 +893,9 @@ fn solve_node<P: Pricer, S: BranchSelector>(
         // exactly the columns it needs; the root-corridor theorem
         // is *informative* about completeness but the upfront-add
         // formulation isn't a shortcut.
-        // Re-enable with `KLADOS_BP_CORRIDOR_ENRICH=1` for further
+        // Re-enable via `BpExperimental.corridor_enrich` for further
         // experimentation.
-        let corridor_enrich = std::env::var("KLADOS_BP_CORRIDOR_ENRICH")
-            .ok()
-            .map(|v| v != "0")
-            .unwrap_or(false);
+        let corridor_enrich = cfg.experimental.corridor_enrich;
         if corridor_enrich && trees.len() == 2 {
             let upper = state.best_ub();
             let lb = (lp.objective - 1.0e-6).ceil() as usize;
@@ -893,10 +904,7 @@ fn solve_node<P: Pricer, S: BranchSelector>(
             if lb < upper {
                 let gamma = (upper as f64) - 1.0 - lp.objective;
                 let threshold = 1.0 - gamma - 1.0e-8;
-                let max_k = std::env::var("KLADOS_BP_CORRIDOR_K")
-                    .ok()
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(1);
+                let max_k = cfg.experimental.corridor_max_k.max(1);
                 let n0 = trees[0].num_nodes();
                 let n1 = trees[1].num_nodes();
                 let mut cache = scratch
@@ -969,7 +977,7 @@ fn solve_node<P: Pricer, S: BranchSelector>(
             branchings.depth(),
         );
         if rcvf_newly_fixed > 0 {
-            trace!(
+            debug!(
                 target: LOG_TARGET,
                 "rcvf subtree (depth={}): fixed {} more (lp={:.4} ub={})",
                 branchings.depth(), rcvf_newly_fixed, lp.objective, state.best_ub(),
@@ -995,13 +1003,13 @@ fn solve_node<P: Pricer, S: BranchSelector>(
             let updated = state.update_incumbent(inc);
             if updated {
                 tel.incumbent_updates += 1;
-                trace!(
+                debug!(
                     target: LOG_TARGET,
                     "primal heuristic improved incumbent: ub={} (cg_iter={})",
                     state.best_ub(), tel.cg_iters,
                 );
 
-                if allow_bound_prune && can_prune_by_bound(lb, state.best_ub()) {
+                if allow_bound_prune && can_prune_by_bound(lb, state.best_ub(), cfg.experimental.disable_bound_prune) {
                     tel.bound_prunes += 1;
                     return NodeOutcome::Pruned;
                 }
@@ -1009,34 +1017,34 @@ fn solve_node<P: Pricer, S: BranchSelector>(
         }
     }
 
-    // MIP-on-pool primal heuristic. Disabled by default; enable with
-    // KLADOS_BP_MIP_HEURISTIC=1. Fires when the LP objective is at an
+    // MIP-on-pool primal heuristic. Disabled by default; enable via
+    // `BpExperimental.mip_heuristic`. Fires when the LP objective is at an
     // integer boundary but the support is fractional — exactly the case
     // where pure branching nudges the LP by ε per node and a MIP solve
     // over the existing pool finds the missing integer combination
     // directly. Time-capped (100ms by default) so the failure mode is
     // bounded.
     let lp_frac = lp.objective.ceil() - lp.objective;
-    if std::env::var("KLADOS_BP_MIP_HEURISTIC").is_ok_and(|v| v != "0")
+    if cfg.experimental.mip_heuristic
         && lb < state.best_ub()
         && lp_frac < 1e-4
     {
-        trace!(target: LOG_TARGET, "Running MIP heuristic on pool of {} columns (lp_obj={:.4})", state.columns().len(), lp.objective);
+        debug!(target: LOG_TARGET, "Running MIP heuristic on pool of {} columns (lp_obj={:.4})", state.columns().len(), lp.objective);
         let mut mip_attempts = 0;
         while mip_attempts < 5 {
             mip_attempts += 1;
-            if let Ok(Some(mip_sol)) = rmp.solve_mip() {
-                trace!(target: LOG_TARGET, "MIP solve {}: obj={:.4}", mip_attempts, mip_sol.objective);
+            if let Ok(Some(mip_sol)) = rmp.solve_mip_with_time_limit(cfg.mip_time_limit) {
+                debug!(target: LOG_TARGET, "MIP solve {}: obj={:.4}", mip_attempts, mip_sol.objective);
                 let new_cuts =
                     rmp.separate_and_add_cuts(state.columns(), &mip_sol.column_values, 0.5);
                 if new_cuts > 0 {
                     tel.cuts_added += new_cuts;
-                    trace!(target: LOG_TARGET, "MIP solution violated {} cuts, looping", new_cuts);
+                    debug!(target: LOG_TARGET, "MIP solution violated {} cuts, looping", new_cuts);
                     continue; // Re-solve MIP with new cuts
                 }
 
                 if let Some(inc) = try_integral(state, &mip_sol.column_values) {
-                    trace!(target: LOG_TARGET, "try_integral found valid incumbent k={}", inc.k);
+                    debug!(target: LOG_TARGET, "try_integral found valid incumbent k={}", inc.k);
                     if inc.k < state.best_ub() {
                         let updated = state.update_incumbent(inc);
                         if updated {
@@ -1047,17 +1055,17 @@ fn solve_node<P: Pricer, S: BranchSelector>(
                                 state.best_ub(), tel.cg_iters, branchings.depth(),
                             );
 
-                            if allow_bound_prune && can_prune_by_bound(lb, state.best_ub()) {
+                            if allow_bound_prune && can_prune_by_bound(lb, state.best_ub(), cfg.experimental.disable_bound_prune) {
                                 tel.bound_prunes += 1;
                                 return NodeOutcome::Pruned;
                             }
                         }
                     }
                 } else {
-                    trace!(target: LOG_TARGET, "try_integral returned None for MIP solution");
+                    debug!(target: LOG_TARGET, "try_integral returned None for MIP solution");
                 }
             } else {
-                trace!(target: LOG_TARGET, "rmp.solve_mip() failed or returned None");
+                debug!(target: LOG_TARGET, "rmp.solve_mip_with_time_limit() failed or returned None");
             }
             break;
         }
@@ -1211,8 +1219,9 @@ fn maybe_probe_root_obstruction(
     state: &SearchState,
     lp: &crate::solvers::bp::rmp::RmpSolution,
     root_regions: Option<&RootSupportRegions>,
+    experimental: &crate::solvers::bp::BpExperimental,
 ) {
-    if std::env::var("KLADOS_BP_OBSTRUCTION_PROBE").is_err() {
+    if !experimental.obstruction_probe {
         return;
     }
 
@@ -1223,7 +1232,7 @@ fn maybe_probe_root_obstruction(
 
     IN_OBSTRUCTION_PROBE.with(|flag| flag.set(true));
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        probe_root_obstruction_impl(reduced, state, lp, root_regions)
+        probe_root_obstruction_impl(reduced, state, lp, root_regions, experimental)
     }));
     IN_OBSTRUCTION_PROBE.with(|flag| flag.set(false));
     if result.is_err() {
@@ -1236,6 +1245,7 @@ fn probe_root_obstruction_impl(
     state: &SearchState,
     lp: &crate::solvers::bp::rmp::RmpSolution,
     root_regions: Option<&RootSupportRegions>,
+    experimental: &crate::solvers::bp::BpExperimental,
 ) {
     let Some(regions) = root_regions else {
         info!(target: LOG_TARGET, "obstruction-probe: empty LP support");
@@ -1266,7 +1276,7 @@ fn probe_root_obstruction_impl(
         );
     }
 
-    if std::env::var("KLADOS_BP_ROOT_SUPPORT_MIP").is_ok() {
+    if experimental.root_support_mip {
         probe_root_support_mip(reduced, state, lp, regions);
     }
 
@@ -1278,8 +1288,8 @@ fn probe_root_obstruction_impl(
         return;
     }
 
-    let want_local_lb = std::env::var("KLADOS_BP_OBSTRUCTION_LOCAL_LB").is_ok();
-    let want_exact_core = std::env::var("KLADOS_BP_OBSTRUCTION_SOLVE_CORE").is_ok();
+    let want_local_lb = experimental.obstruction_local_lb;
+    let want_exact_core = experimental.obstruction_solve_core;
     if !want_local_lb && !want_exact_core {
         return;
     }
@@ -1316,10 +1326,10 @@ fn probe_root_obstruction_impl(
         }
     }
 
-    if std::env::var("KLADOS_BP_REGION_SUPPORT_MIP").is_ok() {
+    if experimental.region_support_mip {
         probe_region_support_mip(reduced, state, largest);
     }
-    if std::env::var("KLADOS_BP_ALL_REGION_SUPPORT_MIP").is_ok() {
+    if experimental.all_region_support_mip {
         probe_all_region_support_mips(reduced, state, regions);
     }
 
@@ -1627,8 +1637,9 @@ fn maybe_log_bridge_footprint(
     incumbent: Option<&Incumbent>,
     columns: &[AfColumn],
     root_regions: Option<&RootSupportRegions>,
+    bridge_probe: bool,
 ) {
-    if std::env::var("KLADOS_BP_BRIDGE_PROBE").is_err() {
+    if !bridge_probe {
         return;
     }
     let (Some(inc), Some(regions)) = (incumbent, root_regions) else {
@@ -1815,7 +1826,7 @@ fn try_integral(state: &SearchState, values: &[f64]) -> Option<Incumbent> {
             continue;
         }
         if (v - 1.0).abs() > 1.0e-6 {
-            trace!(target: LOG_TARGET, "try_integral failed: variable {} is fractional ({})", ci, v);
+            debug!(target: LOG_TARGET, "try_integral failed: variable {} is fractional ({})", ci, v);
             return None;
         }
         let col = &state.columns()[ci];
@@ -1823,7 +1834,7 @@ fn try_integral(state: &SearchState, values: &[f64]) -> Option<Incumbent> {
         for (ti, nodes) in col.coverage().iter_per_tree().enumerate() {
             for &n in nodes {
                 if !covered_nodes[ti].insert(n) {
-                    trace!(target: LOG_TARGET, "try_integral failed: node overlap at tree {}, node {}", ti, n);
+                    debug!(target: LOG_TARGET, "try_integral failed: node overlap at tree {}, node {}", ti, n);
                     return None; // Node constraint violated
                 }
             }
@@ -1832,14 +1843,14 @@ fn try_integral(state: &SearchState, values: &[f64]) -> Option<Incumbent> {
         for &l in col.labels() {
             cover[l as usize] += 1;
             if cover[l as usize] > 1 {
-                trace!(target: LOG_TARGET, "try_integral failed: leaf {} covered multiple times", l);
+                debug!(target: LOG_TARGET, "try_integral failed: leaf {} covered multiple times", l);
                 return None;
             }
         }
         chosen.push(ci);
     }
     if (1..=n).any(|l| cover[l] == 0) {
-        trace!(target: LOG_TARGET, "try_integral failed: some leaves are not covered");
+        debug!(target: LOG_TARGET, "try_integral failed: some leaves are not covered");
         return None;
     }
     let k = chosen.len();

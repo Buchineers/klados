@@ -27,14 +27,52 @@ use crate::solvers::bp::search::Branchings;
 use crate::solvers::chen_rspr::chen_pair_agreement;
 use crate::decomp::whidden_cluster::try_whidden_decomp_2tree;
 
+/// Tuning knobs for [`RootPoolSolver`].
+#[derive(Clone, Debug)]
+pub struct RootPoolConfig {
+    pub max_cg_iters: usize,
+    pub max_wall_ms: u64,
+    pub mip_passes: usize,
+    pub mip_time_limit: f64,
+    pub seed_budget: usize,
+    pub no_kernel: bool,
+    pub probe_ms: u64,
+    pub probe_mip_time_limit: f64,
+    pub dump_core: bool,
+    /// Path to append the core-dump TSV row to.
+    pub core_dump_file: String,
+    pub support_only: bool,
+    pub shell_only: bool,
+    pub enumerate_shell: bool,
+    pub lazy_audit: bool,
+    pub shell_enum_max_passes: usize,
+}
+
+impl Default for RootPoolConfig {
+    fn default() -> Self {
+        Self {
+            max_cg_iters: 256,
+            max_wall_ms: 2000,
+            mip_passes: 8,
+            mip_time_limit: 2.0,
+            seed_budget: 200,
+            no_kernel: false,
+            probe_ms: 1000,
+            probe_mip_time_limit: 0.5,
+            dump_core: false,
+            core_dump_file: "core_dump.tsv".to_string(),
+            support_only: false,
+            shell_only: false,
+            enumerate_shell: false,
+            lazy_audit: false,
+            shell_enum_max_passes: 32,
+        }
+    }
+}
+
 pub struct RootPoolSolver {
     stats: SolverStats,
-    max_cg_iters: usize,
-    max_wall: Duration,
-    mip_passes: usize,
-    mip_time_limit: f64,
-    seed_budget: usize,
-    trace: bool,
+    config: RootPoolConfig,
 }
 
 pub struct RootPoolOutcome {
@@ -48,26 +86,20 @@ impl RootPoolSolver {
     pub fn new() -> Self {
         Self {
             stats: SolverStats::default(),
-            max_cg_iters: env_usize("KLADOS_ROOT_POOL_MAX_CG", 256),
-            max_wall: Duration::from_millis(env_usize("KLADOS_ROOT_POOL_MAX_MS", 2_000) as u64),
-            mip_passes: env_usize("KLADOS_ROOT_POOL_MIP_PASSES", 8),
-            mip_time_limit: env_f64("KLADOS_ROOT_POOL_MIP_TIME_LIMIT", 2.0),
-            seed_budget: env_usize("KLADOS_ROOT_POOL_SEEDS", 200),
-            trace: std::env::var("KLADOS_ROOT_POOL_TRACE").is_ok(),
+            config: RootPoolConfig::default(),
         }
     }
 
     pub(crate) fn for_corridor_probe() -> Self {
         let mut s = Self::new();
-        s.max_wall =
-            Duration::from_millis(env_usize("KLADOS_ROOT_CORRIDOR_PROBE_MS", 1_000) as u64);
-        s.mip_time_limit = env_f64("KLADOS_ROOT_CORRIDOR_MIP_TIME_LIMIT", 0.5);
+        s.config.max_wall_ms = s.config.probe_ms;
+        s.config.mip_time_limit = s.config.probe_mip_time_limit;
         s
     }
 
     pub(crate) fn solve_with_outcome(&mut self, instance: &Instance) -> Option<RootPoolOutcome> {
         let total_started = Instant::now();
-        if std::env::var("KLADOS_ROOT_POOL_NO_KERNEL").is_err()
+        if !self.config.no_kernel
             && instance.num_trees() > 1
             && instance.num_leaves > 2
         {
@@ -156,18 +188,11 @@ impl Default for RootPoolSolver {
 }
 
 impl Solver for RootPoolSolver {
-    type Config = ();
+    type Config = RootPoolConfig;
     const SUPPORTED_TRACKS: &'static [Track] = &[Track::Heuristic];
-    const OPTIONS: &'static [(&'static str, &'static str)] = &[
-        ("KLADOS_ROOT_POOL_MAX_CG", "maximum root column-generation iterations"),
-        ("KLADOS_ROOT_POOL_MAX_MS", "soft root-pool wall budget in milliseconds"),
-        ("KLADOS_ROOT_POOL_MIP_PASSES", "lazy-cut MIP repair passes"),
-        ("KLADOS_ROOT_POOL_MIP_TIME_LIMIT", "HiGHS MIP time limit per pass in seconds"),
-        ("KLADOS_ROOT_POOL_SEEDS", "randomized incumbent seed budget"),
-        ("KLADOS_ROOT_POOL_TRACE", "print diagnostics"),
-    ];
 
-    fn solve(&mut self, instance: &Instance, _cfg: &RunConfig<Self::Config>) -> Option<Vec<Tree>> {
+    fn solve(&mut self, instance: &Instance, cfg: &RunConfig<Self::Config>) -> Option<Vec<Tree>> {
+        self.config = cfg.specific.clone();
         self.solve_with_outcome(instance).map(|out| out.forest)
     }
 
@@ -218,7 +243,7 @@ impl RootPoolSolver {
         let mut best_cols: Vec<Vec<u32>> = (1..=n as u32).map(|l| vec![l]).collect();
         seed_columns_and_incumbent(
             instance,
-            self.seed_budget,
+            self.config.seed_budget,
             &mut builder,
             &mut columns,
             &mut seen,
@@ -235,7 +260,7 @@ impl RootPoolSolver {
         let mut cuts_total = 0usize;
         let mut converged = false;
 
-        while cg_iters < self.max_cg_iters && started.elapsed() < self.max_wall {
+        while cg_iters < self.config.max_cg_iters && started.elapsed() < Duration::from_millis(self.config.max_wall_ms) {
             let lp = match rmp.solve() {
                 Ok(lp) => lp,
                 Err(_) => break,
@@ -301,7 +326,7 @@ impl RootPoolSolver {
         // architecture is worth pursuing. A leaf is "core" if no single
         // support column claims it (max x_c < 1 − eps). Core columns are
         // support columns touching any core leaf.
-        if std::env::var("KLADOS_ROOT_POOL_DUMP_CORE").is_ok()
+        if self.config.dump_core
             && let Some(lp) = final_lp.as_ref()
         {
             let eps = 1.0e-6;
@@ -372,8 +397,7 @@ impl RootPoolSolver {
                 core_col_max_size,
                 core_col_mean_size,
             );
-            let path = std::env::var("KLADOS_CORE_DUMP_FILE")
-                .unwrap_or_else(|_| "core_dump.tsv".to_string());
+            let path = self.config.core_dump_file.clone();
             if let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -388,9 +412,9 @@ impl RootPoolSolver {
         // support of the converged root LP.  This is the zero reduced-cost
         // face exposed by the duals, and on hard m>=3 instances it is often
         // a much smaller, much more relevant MIP than the full root pool.
-        let support_only = std::env::var("KLADOS_ROOT_POOL_SUPPORT_ONLY").is_ok();
-        let shell_only = std::env::var("KLADOS_ROOT_POOL_SHELL_ONLY").is_ok();
-        if std::env::var("KLADOS_ROOT_POOL_ENUMERATE_SHELL").is_ok()
+        let support_only = self.config.support_only;
+        let shell_only = self.config.shell_only;
+        if self.config.enumerate_shell
             && let Some(lp) = final_lp.as_ref()
         {
             let added = expand_shell_anchor_best(
@@ -402,10 +426,9 @@ impl RootPoolSolver {
                 &mut scratch,
                 lp,
                 best_cols.len(),
+                self.config.shell_enum_max_passes,
             );
-            if self.trace {
-                eprintln!("[root-pool] shell-enum added={added}");
-            }
+            debug!("[root-pool] shell-enum added={added}");
         }
 
         // Lazy-audit shell: iterate
@@ -420,9 +443,9 @@ impl RootPoolSolver {
         // Per-pass MIP time limit for the standard solve path; audit can
         // bump this when it enlarges the pool, so the time-per-pass budget
         // tracks the size of the work.
-        let mut downstream_mip_time_limit = self.mip_time_limit;
+        let mut downstream_mip_time_limit = self.config.mip_time_limit;
         if instance.num_trees() == 2
-            && std::env::var("KLADOS_ROOT_POOL_LAZY_AUDIT").is_ok()
+            && self.config.lazy_audit
             && let Some(lp) = final_lp.as_ref()
         {
             let pool_before = columns.len();
@@ -436,22 +459,19 @@ impl RootPoolSolver {
                 &mut scratch,
                 lp,
                 &mut best_cols,
-                self.mip_passes,
-                self.mip_time_limit,
-                self.trace,
+                self.config.mip_passes,
+                self.config.mip_time_limit,
             );
             if added > 0 && pool_before > 0 {
                 // Scale roughly with pool growth, clamped to a sane upper.
                 let factor = (columns.len() as f64 / pool_before as f64).max(1.0);
                 downstream_mip_time_limit =
-                    (self.mip_time_limit * factor).min(self.mip_time_limit * 16.0);
+                    (self.config.mip_time_limit * factor).min(self.config.mip_time_limit * 16.0);
             }
-            if self.trace {
-                eprintln!(
-                    "[root-pool] lazy-audit added={added} mip_tl={:.2}s",
-                    downstream_mip_time_limit,
-                );
-            }
+            debug!(
+                "[root-pool] lazy-audit added={added} mip_tl={:.2}s",
+                downstream_mip_time_limit,
+            );
         }
         if support_only
             && let Some(lp) = final_lp.as_ref()
@@ -460,8 +480,8 @@ impl RootPoolSolver {
                 n,
                 &columns,
                 &lp.column_values,
-                self.mip_passes,
-                self.mip_time_limit,
+                self.config.mip_passes,
+                self.config.mip_time_limit,
             )
             && labels.len() < best_cols.len()
         {
@@ -475,8 +495,8 @@ impl RootPoolSolver {
                 &columns,
                 lp,
                 best_cols.len(),
-                self.mip_passes,
-                self.mip_time_limit,
+                self.config.mip_passes,
+                self.config.mip_time_limit,
             )
             && labels.len() < best_cols.len()
         {
@@ -493,8 +513,8 @@ impl RootPoolSolver {
             // One integer cover over the generated pool.  We keep adding
             // violated node rows and re-solving; this is still a single
             // root-pool solve, not a branch tree.
-            for _ in 0..self.mip_passes {
-                if started.elapsed() >= self.max_wall {
+            for _ in 0..self.config.mip_passes {
+                if started.elapsed() >= Duration::from_millis(self.config.max_wall_ms) {
                     break;
                 }
                 let Ok(Some(mip)) = rmp.solve_mip_with_time_limit(downstream_mip_time_limit) else {
@@ -527,9 +547,9 @@ impl RootPoolSolver {
         }
         self.stats.upper_bound = Some(forest.len());
         let lower_bound = root_lower_bound;
-        if self.trace {
+        {
             let lp_obj = final_lp.as_ref().map(|lp| lp.objective).unwrap_or(0.0);
-            eprintln!(
+            debug!(
                 "[root-pool] n={} m={} k={} cols={} added={} cg={} cuts={} lp={:.3} conv={} ms={:.1}",
                 n,
                 trees.len(),
@@ -550,19 +570,7 @@ impl RootPoolSolver {
                 })
                 .collect::<Vec<_>>()
                 .join(" ");
-            eprintln!("[root-pool] tiers {tiers}");
-        } else {
-            debug!(
-                "root-pool n={} m={} k={} cols={} added={} cg={} cuts={} conv={}",
-                n,
-                trees.len(),
-                forest.len(),
-                columns.len(),
-                added_total,
-                cg_iters,
-                cuts_total,
-                converged,
-            );
+            debug!("[root-pool] tiers {tiers}");
         }
         Some(RootPoolOutcome {
             forest,
@@ -601,7 +609,6 @@ fn lazy_audit_shell(
     _best_cols: &mut Vec<Vec<u32>>,
     _mip_passes: usize,
     _mip_time_limit: f64,
-    trace: bool,
 ) -> usize {
     use crate::solvers::corridor::lazy_kbest::{LazyKBest, LazyKBestCache, LazyKBestInput};
 
@@ -617,12 +624,10 @@ fn lazy_audit_shell(
     let lp_obj = initial_lp.objective;
     let lb = (lp_obj - 1.0e-6).ceil() as usize;
     if lb >= upper {
-        if trace {
-            eprintln!(
-                "[lazy-audit] pre-certified U={} lp={:.4} lb={} (γ < 0)",
-                upper, lp_obj, lb,
-            );
-        }
+        debug!(
+            "[lazy-audit] pre-certified U={} lp={:.4} lb={} (γ < 0)",
+            upper, lp_obj, lb,
+        );
         return 0;
     }
     let gamma = (upper as f64) - 1.0 - lp_obj;
@@ -656,15 +661,13 @@ fn lazy_audit_shell(
         }
     }
     drop(iter);
-    if trace {
-        eprintln!(
-            "[lazy-audit] γ={:.3} U={} new={} pool={}",
-            gamma,
-            upper,
-            added,
-            columns.len(),
-        );
-    }
+    debug!(
+        "[lazy-audit] γ={:.3} U={} new={} pool={}",
+        gamma,
+        upper,
+        added,
+        columns.len(),
+    );
     let _ = n;
     added
 }
@@ -754,6 +757,7 @@ fn expand_shell_anchor_best(
     scratch: &mut PricerScratch,
     lp: &RmpSolution,
     incumbent_k: usize,
+    shell_enum_max_passes: usize,
 ) -> usize {
     let trees = &instance.trees;
     if trees.len() < 3 {
@@ -777,11 +781,10 @@ fn expand_shell_anchor_best(
                 instance.num_leaves as usize,
             )
         });
-    let max_passes = env_usize("KLADOS_ROOT_POOL_SHELL_ENUM_PASSES", 32);
     let mut forbidden = Vec::<(u32, u32)>::new();
     let mut added = 0usize;
 
-    for _ in 0..max_passes {
+    for _ in 0..shell_enum_max_passes {
         let output = {
             let branchings = Branchings::default();
             let ctx = PricingContext {
@@ -1029,24 +1032,9 @@ fn labels_to_trees(instance: &Instance, labels: &[Vec<u32>]) -> Vec<Tree> {
         .collect()
 }
 
-fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
-
-fn env_f64(name: &str, default: f64) -> f64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
-
-
 // ── Unified Solver impl + entry point ───────────────────────────────────────
 use crate::{RunConfig, Solver, Track};
 
 pub fn main() {
-    crate::run(RootPoolSolver::new(), RunConfig { track: Track::Heuristic, ..Default::default() });
+    crate::run(RootPoolSolver::new(), RunConfig { track: Track::Heuristic, specific: RootPoolConfig::default(), ..Default::default() });
 }

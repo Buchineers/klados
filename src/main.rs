@@ -22,6 +22,19 @@ struct Cli {
     command: Commands,
 }
 
+impl Cli {
+    fn verbose(&self) -> bool {
+        match &self.command {
+            Commands::Solve { verbose, .. } => *verbose,
+            Commands::Bounds { .. } => false,
+            Commands::Kernelize { verbose, .. } => *verbose,
+            Commands::KernelizeDiag => false,
+            Commands::ClusterAnalyze => false,
+            Commands::Info => false,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Solve an instance (reads from stdin). Run without a name to list solvers.
@@ -44,8 +57,6 @@ enum Commands {
         /// Known scores JSON for validation.
         #[arg(long, short = 's', value_name = "FILE")]
         scores: Option<PathBuf>,
-        #[arg(short, long)]
-        verbose: bool,
     },
 
     /// Apply kernelization rules.
@@ -79,23 +90,20 @@ enum Commands {
 // ── Main ───────────────────────────────────────────────────────────────────
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
-        .target(env_logger::Target::Stderr)
-        .init();
-
     let cli = Cli::parse();
 
+    let verbose = cli.verbose();
+    let default_level = if verbose { "debug" } else { "info" };
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or(default_level),
+    )
+    .init();
+
     match cli.command {
-        Commands::Solve {
-            solver,
-            verbose: _verbose,
-        } => match solver {
+        Commands::Solve { solver, verbose: _ } => match solver {
             None => {
                 for info in klados_solve::catalog() {
                     println!("{:<22}  {}", info.name, info.description);
-                    for (var, desc) in (info.options)() {
-                        println!("    {var:<38}  {desc}");
-                    }
                 }
             }
             Some(name) => match klados_solve::catalog().iter().find(|i| i.name == name) {
@@ -111,7 +119,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             algos,
             list,
             scores,
-            verbose,
         } => {
             if algos.is_empty() {
                 eprintln!("bounds: specify at least one --algo. Options:");
@@ -120,7 +127,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 return Ok(());
             }
-            commands::bounds::run(&algos, list.as_deref(), scores.as_deref(), verbose)?;
+            commands::bounds::run(&algos, list.as_deref(), scores.as_deref())?;
         }
 
         Commands::Kernelize {

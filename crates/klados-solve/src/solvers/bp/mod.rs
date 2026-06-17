@@ -21,8 +21,8 @@
 //! ## Solvers
 //!
 //! [`BpSolver`] implements [`crate::Solver`].  By default it enables
-//! kernelization and cluster reduction.  Set `KLADOS_BP_NO_DECOMP=1` to
-//! disable all decomposition (useful for debugging the core algorithm).
+//! kernelization and cluster reduction.  Set `BpConfig.cluster_algo = ClusterAlgo::None`
+//! to disable all decomposition (useful for debugging the core algorithm).
 
 pub mod column;
 pub mod pricer;
@@ -41,7 +41,7 @@ use fxhash::FxHashMap;
 use klados_core::af_validator::validate_agreement_forest;
 use klados_core::solve_pipeline::{ClusterAlgo, SolveConfig, solve_with_pipeline};
 use klados_core::{Instance, SolverStats, Tree};
-use log::{info, trace};
+use log::{debug, info};
 
 use crate::solvers::chen_rspr::chen_pair_agreement;
 use crate::decomp::whidden_cluster::try_whidden_decomp_2tree;
@@ -79,6 +79,38 @@ struct CanonicalMemoView {
     canonical_to_label: Vec<u32>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct BpExperimental {
+    pub no_chen_lb: bool,
+    pub core_decomp_analyze: bool,
+    pub core_decomp_min_leaves: usize,
+    pub disable_bound_prune: bool,
+    pub no_rcvf: bool,
+    pub tiny_rcvf: bool,
+    pub relaxed_incumbent: bool,
+    pub obstruction_probe: bool,
+    pub bridge_probe: bool,
+    pub root_support_incumbent: bool,
+    pub corridor_enrich: bool,
+    pub corridor_max_k: usize,
+    pub mip_heuristic: bool,
+    pub root_support_mip: bool,
+    pub obstruction_local_lb: bool,
+    pub obstruction_solve_core: bool,
+    pub region_support_mip: bool,
+    pub all_region_support_mip: bool,
+}
+
+impl BpExperimental {
+    fn defaults() -> Self {
+        Self {
+            relaxed_incumbent: true,
+            core_decomp_min_leaves: 150,
+            ..Default::default()
+        }
+    }
+}
+
 /// Stage-2 configuration. The defaults match what the current pricer can
 /// soundly support: cluster algorithms stay disabled until a sound pricer
 /// (m=2 pair-DP / small-m m-DP) lands, since cluster reduction's stitching
@@ -87,6 +119,12 @@ struct CanonicalMemoView {
 pub struct BpConfig {
     pub kernelize: bool,
     pub cluster_algo: ClusterAlgo,
+    pub mip_time_limit: f64,
+    pub m2_batch: usize,
+    pub m2_exact_dp_cells: usize,
+    pub m2_exact_reserve_cap: usize,
+    pub use_anchor_cache: bool,
+    pub experimental: BpExperimental,
 }
 
 impl Default for BpConfig {
@@ -94,6 +132,12 @@ impl Default for BpConfig {
         Self {
             kernelize: true,
             cluster_algo: ClusterAlgo::ClusterReduction,
+            mip_time_limit: 0.1,
+            m2_batch: 0,
+            m2_exact_dp_cells: 0,
+            m2_exact_reserve_cap: 0,
+            use_anchor_cache: false,
+            experimental: BpExperimental::defaults(),
         }
     }
 }
@@ -106,6 +150,12 @@ impl BpConfig {
         Self {
             kernelize: true,
             cluster_algo: ClusterAlgo::None,
+            mip_time_limit: 0.1,
+            m2_batch: 0,
+            m2_exact_dp_cells: 0,
+            m2_exact_reserve_cap: 0,
+            use_anchor_cache: false,
+            experimental: BpExperimental::defaults(),
         }
     }
 }
@@ -131,8 +181,8 @@ impl BpSolver {
 }
 
 impl Solver for BpSolver {
-    /// Stage-2 knobs ([`BpConfig`]); the production defaults are set in
-    /// [`main`]. Was: the `KLADOS_BP_NO_DECOMP` env read in `new()`.
+    /// Stage-2 knobs ([`BpConfig`]); production defaults are set in
+    /// [`main`].
     type Config = BpConfig;
     const SUPPORTED_TRACKS: &'static [Track] = &[Track::Exact, Track::Heuristic];
 
@@ -367,9 +417,7 @@ fn solve_recursive_memo(
         CANON_NANOS.with(|c| c.set(c.get() + t_canon.elapsed().as_nanos() as u64));
         match canon {
             Some(view) => {
-                if std::env::var("KLADOS_BP_DUMP_MEMO_KEYS").is_ok() {
-                    eprintln!("MEMOKEY\tn={}\tkey={}", reduced.num_leaves, view.key);
-                }
+                debug!("MEMOKEY\tn={}\tkey={}", reduced.num_leaves, view.key);
                 let cached_partition = {
                     let mut memo_ref = memo.borrow_mut();
                     if let Some(cached) = memo_ref.solutions.get(&view.key).cloned() {
@@ -407,7 +455,7 @@ fn solve_recursive_memo(
         let cfg_inner = cfg.clone();
         let memo_inner = Rc::clone(memo);
         let reduced_components =
-            solver::solve_inner_with_subsolver(reduced, cancel, &mut |sub| {
+            solver::solve_inner_with_subsolver(reduced, &cfg_inner, cancel, &mut |sub| {
                 solve_recursive_memo(sub, &cfg_inner, &memo_inner, cancel)
             })?;
         if let Some(view) = memo_view.as_ref() {
@@ -430,7 +478,7 @@ fn solve_recursive_memo(
             &mut |sub| solve_recursive_memo(sub, &cfg_inner, &memo_inner, cancel),
             cancel.flag(),
         ) {
-            trace!(
+            debug!(
                 target: LOG_TARGET,
                 "whidden strict decomp solved: n={} k={}",
                 instance.num_leaves, comps.len(),
@@ -481,7 +529,7 @@ fn solve_recursive_memo(
             } else {
                 let cfg3 = inner_cfg.clone();
                 let memo3 = Rc::clone(&memo_pipeline);
-                solver::solve_inner_with_subsolver(sub, &c, &mut |s| {
+                solver::solve_inner_with_subsolver(sub, &cfg3, &c, &mut |s| {
                     solve_recursive_memo(s, &cfg3, &memo3, &c)
                 })
             }
@@ -966,13 +1014,5 @@ fn leafsets_to_trees(leafsets: &[Vec<u32>], instance: &Instance) -> Vec<Tree> {
 use crate::{RunConfig, Solver, Track};
 
 pub fn main() {
-    // KLADOS_BP_NO_DECOMP=1 disables all decomposition (Whidden, cluster
-    // reduction, cluster decomposition) to expose core-B&P weaknesses that
-    // decomposition would otherwise mask. (C3 will turn this into a CLI flag.)
-    let specific = if std::env::var("KLADOS_BP_NO_DECOMP").is_ok() {
-        BpConfig::no_decomp()
-    } else {
-        BpConfig::default()
-    };
-    crate::run(BpSolver::new(), RunConfig { track: Track::Exact, specific, ..Default::default() });
+    crate::run(BpSolver::new(), RunConfig { track: Track::Exact, specific: BpConfig::default(), ..Default::default() });
 }

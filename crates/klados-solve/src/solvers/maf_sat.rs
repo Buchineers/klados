@@ -7,13 +7,14 @@ use rustsat::solvers::{PhaseLit, Solve, SolveIncremental, SolverResult};
 use rustsat::types::{Clause, Lit, TernaryVal, Var};
 use rustsat_cadical::CaDiCaL;
 use std::collections::BTreeMap;
+use log::{debug, info};
 
 use crate::cluster_reduction::{self, ClusterReductionResult};
 use crate::kernelize::{self, KernelizeConfig};
 use crate::lower_bound::maf_bounds;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum H4Mode {
+pub enum H4Mode {
     Full,
     Lazy,
     SeededLazy,
@@ -21,25 +22,6 @@ enum H4Mode {
 }
 
 impl H4Mode {
-    fn from_env() -> Self {
-        match std::env::var("KLADOS_MAF_SAT_H4") {
-            Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
-                "full" => Self::Full,
-                "lazy" => Self::Lazy,
-                "seeded" | "seeded-lazy" | "seeded_lazy" => Self::SeededLazy,
-                "staged" => Self::Staged,
-                other => {
-                    eprintln!(
-                        "[sat] Unknown KLADOS_MAF_SAT_H4='{}'; expected full|lazy|seeded|staged. Falling back to full.",
-                        other
-                    );
-                    Self::Full
-                }
-            },
-            Err(_) => Self::Full,
-        }
-    }
-
     fn label(self) -> &'static str {
         match self {
             Self::Full => "full",
@@ -51,6 +33,23 @@ impl H4Mode {
 
     fn uses_lazy_cegar(self) -> bool {
         matches!(self, Self::Lazy | Self::SeededLazy | Self::Staged)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct MafSatConfig {
+    /// H4 mode: full, lazy, seeded-lazy, staged.
+    pub h4_mode: H4Mode,
+    /// Staged H4 promotion timeout in ms.
+    pub h4_promote_ms: u64,
+}
+
+impl Default for MafSatConfig {
+    fn default() -> Self {
+        Self {
+            h4_mode: H4Mode::Full,
+            h4_promote_ms: 2_000,
+        }
     }
 }
 
@@ -94,7 +93,7 @@ impl SolveProfile {
     }
 
     fn report(&self) {
-        eprintln!(
+        info!(
             "[profile] n={} n'={} k={} m={} splits={} vars={} clauses={} \
              (H1={} H2={} H3={} H4={} H5={} sym={} sib={} sing={} rspr={}) \
              encode={:.1}ms solve={:.1}ms cegar={:.1}ms \
@@ -129,6 +128,7 @@ impl SolveProfile {
 
 pub struct MafSatSolver {
     stats: SolverStats,
+    config: MafSatConfig,
 }
 
 impl Default for MafSatSolver {
@@ -141,19 +141,17 @@ impl MafSatSolver {
     pub fn new() -> Self {
         Self {
             stats: SolverStats::default(),
+            config: MafSatConfig::default(),
         }
     }
 }
 
 impl Solver for MafSatSolver {
-    type Config = ();
+    type Config = MafSatConfig;
     const SUPPORTED_TRACKS: &'static [Track] = &[Track::Exact];
-    const OPTIONS: &'static [(&'static str, &'static str)] = &[
-        ("KLADOS_MAF_SAT_H4", "H4 mode: full, lazy, seeded-lazy, staged"),
-        ("KLADOS_MAF_SAT_COMPONENT_TRACE", "enable component trace (set to 1)"),
-    ];
 
-    fn solve(&mut self, instance: &Instance, _cfg: &RunConfig<Self::Config>) -> Option<Vec<Tree>> {
+    fn solve(&mut self, instance: &Instance, cfg: &RunConfig<Self::Config>) -> Option<Vec<Tree>> {
+        self.config = cfg.specific.clone();
         if instance.trees.is_empty() {
             return None;
         }
@@ -163,7 +161,7 @@ impl Solver for MafSatSolver {
         if instance.num_leaves <= 1 {
             return Some(instance.trees[0..1].to_vec());
         }
-        solve_sat(instance, &mut self.stats)
+        solve_sat(instance, &mut self.stats, &self.config)
     }
 
     fn stats(&self) -> &SolverStats {
@@ -204,7 +202,7 @@ impl Solver for MafSatOlverSolver {
             return Some(instance.trees[0..1].to_vec());
         }
         if instance.num_trees() != 2 {
-            eprintln!(
+            info!(
                 "[olver] Olver encoding requires exactly 2 trees, got {}",
                 instance.num_trees()
             );
@@ -222,7 +220,7 @@ impl Solver for MafSatOlverSolver {
 /// Used as a callback for pairwise lower bound computation.
 pub(crate) fn solve_pair_sat(instance: &Instance) -> Option<usize> {
     let mut stats = SolverStats::default();
-    solve_sat(instance, &mut stats).map(|trees| trees.len())
+    solve_sat(instance, &mut stats, &MafSatConfig::default()).map(|trees| trees.len())
 }
 
 struct NcaData {
@@ -379,7 +377,7 @@ fn extract_components_from_model(
 fn log_component_summary(
     k_bound: usize,
     comps: &[Vec<usize>],
-    verbose_components: bool,
+    _verbose_components: bool,
     label_map_to_original: Option<&[u32]>,
 ) {
     let mut hist: BTreeMap<usize, usize> = BTreeMap::new();
@@ -395,28 +393,26 @@ fn log_component_summary(
         .map(|(size, count)| format!("{}x{}", size, count))
         .collect::<Vec<_>>()
         .join(",");
-    eprintln!(
+    info!(
         "[cut] k={} component-summary savings={} hist=[{}] top_sizes={:?}",
         k_bound, total_savings, hist_str, top_sizes
     );
-    if verbose_components {
-        let mut nontrivial: Vec<Vec<usize>> = comps
-            .iter()
-            .filter(|comp| comp.len() > 1)
-            .map(|comp| {
-                comp.iter()
-                    .map(|&leaf| {
-                        let reduced_label = (leaf + 1) as u32;
-                        label_map_to_original
-                            .and_then(|map| map.get(reduced_label as usize).copied())
-                            .unwrap_or(reduced_label) as usize
-                    })
-                    .collect()
-            })
-            .collect();
-        nontrivial.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
-        eprintln!("[cut] k={} nontrivial-components={:?}", k_bound, nontrivial);
-    }
+    let mut nontrivial: Vec<Vec<usize>> = comps
+        .iter()
+        .filter(|comp| comp.len() > 1)
+        .map(|comp| {
+            comp.iter()
+                .map(|&leaf| {
+                    let reduced_label = (leaf + 1) as u32;
+                    label_map_to_original
+                        .and_then(|map| map.get(reduced_label as usize).copied())
+                        .unwrap_or(reduced_label) as usize
+                })
+                .collect()
+        })
+        .collect();
+    nontrivial.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    debug!("[cut] k={} nontrivial-components={:?}", k_bound, nontrivial);
 }
 
 fn sorted3(a: usize, b: usize, c: usize) -> (usize, usize, usize) {
@@ -746,7 +742,7 @@ fn sat_solve_maf_cut(
     lb_components: usize,
     profile: &mut SolveProfile,
     use_cegar: bool,
-    h4_mode: H4Mode,
+    config: &MafSatConfig,
     label_map_to_original: Option<&[u32]>,
 ) -> Option<Vec<Tree>> {
     let n = instance.num_leaves as usize;
@@ -755,7 +751,7 @@ fn sat_solve_maf_cut(
     profile.n_reduced = n;
     profile.k = k_max;
     profile.m = m;
-    eprintln!("[cut] H4 mode: {}", h4_mode.label());
+    info!("[cut] H4 mode: {}", config.h4_mode.label());
 
     // Precompute NCA data for H4 incompatible triple detection.
     let nca_data = NcaData::build(instance, n);
@@ -816,7 +812,7 @@ fn sat_solve_maf_cut(
         .collect();
     let conn_count = n * (n - 1) / 2;
 
-    eprintln!(
+    info!(
         "[cut] Variables: {} del + {} conn = {} (path precomp {:.1}ms)",
         del_count,
         conn_count,
@@ -832,17 +828,14 @@ fn sat_solve_maf_cut(
     let mut h4_lazy_rounds = 0usize;
     let mut h4_lazy_triples = 0usize;
     let mut h4_lazy_clauses = 0usize;
-    let staged_promote_ms = std::env::var("KLADOS_MAF_SAT_H4_PROMOTE_MS")
-        .ok()
-        .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(2000.0);
+    let staged_promote_ms = config.h4_promote_ms as f64;
     let mut h4_promoted = false;
-    let mut added_h4_triples = if h4_mode.uses_lazy_cegar() {
+    let mut added_h4_triples = if config.h4_mode.uses_lazy_cegar() {
         FixedBitSet::with_capacity(TripleIndex::capacity(n))
     } else {
         FixedBitSet::new()
     };
-    let triple_index = if h4_mode.uses_lazy_cegar() {
+    let triple_index = if config.h4_mode.uses_lazy_cegar() {
         Some(TripleIndex::new(n))
     } else {
         None
@@ -887,7 +880,7 @@ fn sat_solve_maf_cut(
     //    full: eagerly add all 3 binary clauses per incompatible triple.
     //    lazy: add none upfront and separate violated triples after SAT models.
     //    seeded-lazy: add a cheap local subset upfront based on sibling-pair seeds.
-    match h4_mode {
+    match config.h4_mode {
         H4Mode::Full => {
             for a in 0..n {
                 for b in (a + 1)..n {
@@ -923,7 +916,7 @@ fn sat_solve_maf_cut(
                     }
                 }
             }
-            eprintln!(
+            info!(
                 "[cut] H4 seeded upfront: {} triples -> {} clauses",
                 seeded_triples,
                 seeded_triples * 3
@@ -951,7 +944,7 @@ fn sat_solve_maf_cut(
                     }
                 }
             }
-            eprintln!(
+            info!(
                 "[cut] H4 staged upfront: {} triples -> {} clauses, promote at {:.0}ms",
                 seeded_triples,
                 seeded_triples * 3,
@@ -991,11 +984,11 @@ fn sat_solve_maf_cut(
     profile.encode_ms = path_ms + encode_ms;
     profile.rspr_clauses = rspr_count;
 
-    eprintln!(
+    info!(
         "[cut] Clauses: {} total ({} backward + {} forward + {} H4 + {} rspr) in {:.1}ms",
         total_clauses, backward_count, forward_count, h4_count, rspr_count, encode_ms
     );
-    eprintln!(
+    info!(
         "[cut] Total: {} vars, {} clauses. Totalizer over {} del vars.",
         profile.num_vars, total_clauses, del_0_count
     );
@@ -1019,7 +1012,7 @@ fn sat_solve_maf_cut(
 
             match result {
                 SolverResult::Sat => {
-                    if h4_mode == H4Mode::Staged
+                    if config.h4_mode == H4Mode::Staged
                         && !h4_promoted
                         && t_total_solve.elapsed().as_secs_f64() * 1000.0 >= staged_promote_ms
                     {
@@ -1037,7 +1030,7 @@ fn sat_solve_maf_cut(
                         h4_lazy_triples += added_triples;
                         h4_lazy_clauses += added_clauses;
                         profile.cegar_violations += added_clauses;
-                        eprintln!(
+                        info!(
                             "[cut] k={} H4 promote +{} clauses ({} triples, detect {:.1}ms, cum {:.1}s)",
                             k_bound, added_clauses, added_triples, promote_ms, cum_s
                         );
@@ -1083,7 +1076,7 @@ fn sat_solve_maf_cut(
                         }
                     }
 
-                    if h4_mode.uses_lazy_cegar() && !(h4_mode == H4Mode::Staged && h4_promoted) {
+                    if config.h4_mode.uses_lazy_cegar() && !(config.h4_mode == H4Mode::Staged && h4_promoted) {
                         let comps = extract_components_from_model(&solver, &conn, n);
                         let violated_triples = collect_h4_violated_triples(
                             &comps,
@@ -1111,7 +1104,7 @@ fn sat_solve_maf_cut(
                     let cegar_ms = t_cegar.elapsed().as_secs_f64() * 1000.0;
                     profile.cegar_ms += cegar_ms;
                     if added_backward > 0 || added_h4_now > 0 {
-                        eprintln!(
+                        info!(
                             "[cut] k={} CEGAR +{} backward (total {}) +{} H4 clauses ({} triples, total {}, detect {:.1}ms, cum {:.1}s)",
                             k_bound,
                             added_backward,
@@ -1130,20 +1123,11 @@ fn sat_solve_maf_cut(
                         .unwrap_or_else(|| extract_components_from_model(&solver, &conn, n));
                     let num_comps = comps.len();
                     let max_sz = comps.iter().map(|c| c.len()).max().unwrap_or(0);
-                    eprintln!(
+                    info!(
                         "[cut] k={} SAT {:.1}ms (cum {:.1}s) comps={} max_size={}",
                         k_bound, solve_ms, cum_s, num_comps, max_sz
                     );
-                    if let Ok(trace_mode) = std::env::var("KLADOS_MAF_SAT_COMPONENT_TRACE") {
-                        if trace_mode == "1" || trace_mode.eq_ignore_ascii_case("full") {
-                            log_component_summary(
-                                k_bound,
-                                &comps,
-                                trace_mode.eq_ignore_ascii_case("full"),
-                                label_map_to_original,
-                            );
-                        }
-                    }
+                    log_component_summary(k_bound, &comps, true, label_map_to_original);
                     best_components = Some(comps);
 
                     // Phase hints for next k.
@@ -1175,7 +1159,7 @@ fn sat_solve_maf_cut(
                     break; // Move to next k.
                 }
                 SolverResult::Unsat => {
-                    eprintln!(
+                    info!(
                         "[cut] k={} UNSAT {:.1}ms (cum {:.1}s) — optimal={}",
                         k_bound,
                         solve_ms,
@@ -1196,13 +1180,13 @@ fn sat_solve_maf_cut(
         }
     }
 
-    if h4_mode.uses_lazy_cegar() {
-        eprintln!(
+    if config.h4_mode.uses_lazy_cegar() {
+        info!(
             "[cut] H4 lazy summary: rounds={} triples={} clauses={}{}",
             h4_lazy_rounds,
             h4_lazy_triples,
             h4_lazy_clauses,
-            if h4_mode == H4Mode::Staged && h4_promoted {
+            if config.h4_mode == H4Mode::Staged && h4_promoted {
                 " promoted=true"
             } else {
                 ""
@@ -1375,7 +1359,7 @@ fn sat_solve_maf_olver(
         is_leaf_z[pair_to_idx(a, a)] = true;
     }
 
-    eprintln!(
+    info!(
         "[olver] DAG: {} Z-nodes, {} U1 arcs, {} U2 arcs, {} leaves",
         num_z,
         u1_arcs.len(),
@@ -1726,7 +1710,7 @@ fn sat_solve_maf_olver(
         - leaf_clauses
         - capacity_clauses
         - path_block_clauses;
-    eprintln!(
+    info!(
         "[olver] Clauses: {} total (balance={} conserv={} leaf={} capacity={} pathblock={} root={})",
         clause_count,
         balance_clauses,
@@ -1736,7 +1720,7 @@ fn sat_solve_maf_olver(
         path_block_clauses,
         root_clauses
     );
-    eprintln!(
+    info!(
         "[olver] Total: {} vars, {} component indicators, encode={:.1}ms",
         profile.num_vars,
         component_lits.len(),
@@ -1826,14 +1810,14 @@ fn sat_solve_maf_olver(
 
                 let num_comps = components.len();
                 let max_sz = components.iter().map(|c| c.len()).max().unwrap_or(0);
-                eprintln!(
+                info!(
                     "[olver] k={} SAT {:.1}ms (cum {:.1}s) comps={} max_size={}",
                     comp_bound, solve_ms, cum_s, num_comps, max_sz
                 );
                 best_components = Some(components);
             }
             SolverResult::Unsat => {
-                eprintln!(
+                info!(
                     "[olver] k={} UNSAT {:.1}ms (cum {:.1}s) — optimal={}",
                     comp_bound,
                     solve_ms,
@@ -1862,20 +1846,21 @@ fn sat_solve_maf_olver(
 // Outer pipeline
 // ═══════════════════════════════════════════════════════════════
 
-fn solve_sat(instance: &Instance, stats: &mut SolverStats) -> Option<Vec<Tree>> {
-    solve_sat_inner(instance, stats, vec![])
+fn solve_sat(instance: &Instance, stats: &mut SolverStats, config: &MafSatConfig) -> Option<Vec<Tree>> {
+    solve_sat_inner(instance, stats, vec![], config)
 }
 
 fn solve_sat_inner(
     instance: &Instance,
     stats: &mut SolverStats,
     preferred_singleton_labels: Vec<u32>,
+    config: &MafSatConfig,
 ) -> Option<Vec<Tree>> {
-    solve_sat_inner_impl(instance, stats, preferred_singleton_labels, false, false)
+    solve_sat_inner_impl(instance, stats, preferred_singleton_labels, false, false, config)
 }
 
 fn solve_sat_olver(instance: &Instance, stats: &mut SolverStats) -> Option<Vec<Tree>> {
-    solve_sat_inner_impl(instance, stats, vec![], false, true)
+    solve_sat_inner_impl(instance, stats, vec![], false, true, &MafSatConfig::default())
 }
 
 fn solve_sat_inner_impl(
@@ -1884,11 +1869,11 @@ fn solve_sat_inner_impl(
     preferred_singleton_labels: Vec<u32>,
     skip_cluster_decomp: bool,
     use_olver: bool,
+    config: &MafSatConfig,
 ) -> Option<Vec<Tree>> {
     let n = instance.num_leaves as usize;
     let mut profile = SolveProfile::default();
     profile.n = n;
-    let h4_mode = H4Mode::from_env();
 
     let kern_config = KernelizeConfig {
         protected_labels: preferred_singleton_labels.clone(),
@@ -1903,7 +1888,7 @@ fn solve_sat_inner_impl(
         let total = kern.stats.subtree_removed()
             + kern.stats.chain_removed()
             + kern.stats.chain32_removed();
-        eprintln!(
+        info!(
             "[sat] Kernelized: {} → {} leaves ({} removed: {} subtree, {} chain, {} 3-2)",
             n,
             n_reduced,
@@ -1928,12 +1913,12 @@ fn solve_sat_inner_impl(
         // Try Kelk common-cluster decomposition (works for any m).
         match cluster_reduction::try_cluster_reduction(reduced, &mut |subinstance| {
             let mut sub_stats = SolverStats::default();
-            solve_sat_inner(subinstance, &mut sub_stats, vec![])
+            solve_sat_inner(subinstance, &mut sub_stats, vec![], config)
         })? {
             ClusterReductionResult::NotApplicable => {}
             ClusterReductionResult::Solved(solution) => {
                 profile.cluster_splits += 1;
-                eprintln!(
+                info!(
                     "[sat] Cluster decomposition: {} = {} + {}",
                     n_reduced, solution.cluster_size, solution.rest_size
                 );
@@ -1958,10 +1943,10 @@ fn solve_sat_inner_impl(
             reduced,
             &mut |subinstance| {
                 let mut sub_stats = SolverStats::default();
-                solve_sat_inner(subinstance, &mut sub_stats, vec![])
+                solve_sat_inner(subinstance, &mut sub_stats, vec![], config)
             },
         ) {
-            eprintln!(
+            info!(
                 "[sat] rspr cluster decomposition: {} → {} components",
                 n_reduced,
                 components.len()
@@ -1989,7 +1974,7 @@ fn solve_sat_inner_impl(
     let bounds = maf_bounds(&reduced.trees, reduced.num_leaves);
     let ub_components = bounds.upper;
     let bounds_ms = t_bounds.elapsed().as_secs_f64() * 1000.0;
-    eprintln!(
+    info!(
         "[sat] Greedy bounds: LB={}, UB={} in {:.1}ms (n'={}, m={})",
         bounds.lower,
         ub_components,
@@ -2010,11 +1995,11 @@ fn solve_sat_inner_impl(
             std::time::Duration::from_secs(3),
             &mut |pair| {
                 let mut sub_stats = SolverStats::default();
-                solve_sat_inner(pair, &mut sub_stats, vec![]).map(|trees| trees.len())
+                solve_sat_inner(pair, &mut sub_stats, vec![], config).map(|trees| trees.len())
             },
         );
         let exact_ms = t_exact.elapsed().as_secs_f64() * 1000.0;
-        eprintln!(
+        info!(
             "[sat] Exact pairwise LB: {} (was {}) in {:.1}ms",
             exact_lb, bounds.lower, exact_ms
         );
@@ -2023,7 +2008,7 @@ fn solve_sat_inner_impl(
         bounds.lower
     };
 
-    eprintln!(
+    info!(
         "[sat] Final bounds: LB={}, UB={}, gap={}",
         lb_components,
         ub_components,
@@ -2038,7 +2023,7 @@ fn solve_sat_inner_impl(
                 .find(|&lbl| kern.reverse_map[lbl as usize] == orig_lbl)
                 .map(|lbl| (lbl - 1) as usize);
             if found.is_none() {
-                eprintln!(
+                info!(
                     "[sat] preferred_singleton_label={} not found after kernelization",
                     orig_lbl
                 );
@@ -2053,7 +2038,7 @@ fn solve_sat_inner_impl(
         let min_k_for_ghosts = if n_reduced > g { g + 1 } else { g };
         let lb = lb_components.max(min_k_for_ghosts);
         let ub = (ub_components + g).min(n_reduced);
-        eprintln!(
+        info!(
             "[sat] Ghost adjustment: g={} min_k={} lb={} ub={}",
             g, min_k_for_ghosts, lb, ub
         );
@@ -2076,7 +2061,7 @@ fn solve_sat_inner_impl(
             lb_components,
             &mut profile,
             false, // use_cegar: disabled by default (overhead > benefit on most instances)
-            h4_mode,
+            config,
             Some(&kern.reverse_map),
         )?
     };
@@ -2215,7 +2200,8 @@ mod tests {
             H4Mode::Staged,
         ] {
             let mut profile = SolveProfile::default();
-            let result = sat_solve_maf_cut(&instance, 4, 1, &mut profile, false, mode, None);
+            let config = MafSatConfig { h4_mode: mode, ..MafSatConfig::default() };
+            let result = sat_solve_maf_cut(&instance, 4, 1, &mut profile, false, &config, None);
             assert!(result.is_some(), "mode {:?} returned no solution", mode);
             assert_eq!(result.unwrap().len(), 3, "mode {:?}", mode);
         }
@@ -2233,7 +2219,8 @@ mod tests {
             H4Mode::Staged,
         ] {
             let mut profile = SolveProfile::default();
-            let result = sat_solve_maf_cut(&instance, 4, 1, &mut profile, false, mode, None);
+            let config = MafSatConfig { h4_mode: mode, ..MafSatConfig::default() };
+            let result = sat_solve_maf_cut(&instance, 4, 1, &mut profile, false, &config, None);
             assert!(result.is_some(), "mode {:?} returned no solution", mode);
             assert_eq!(result.unwrap().len(), 1, "mode {:?}", mode);
         }
@@ -2268,7 +2255,7 @@ mod tests {
 use crate::{RunConfig, Solver, Track};
 
 pub fn main() {
-    crate::run(MafSatSolver::new(), RunConfig { track: Track::Exact, ..Default::default() });
+    crate::run(MafSatSolver::new(), RunConfig { track: Track::Exact, specific: MafSatConfig::default(), ..Default::default() });
 }
 
 pub fn olver_main() {

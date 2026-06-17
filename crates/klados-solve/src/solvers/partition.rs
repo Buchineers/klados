@@ -9,11 +9,20 @@ use highs::{Col, ColProblem, HighsModelStatus, Model, Row, RowProblem, Sense};
 use klados_core::kernelize::{self, KernelizeConfig};
 use klados_core::lower_bound::greedy_multi_tree_partition;
 use klados_core::{Instance, SolverStats, Tree};
+use log::{debug, info};
 
+
+/// Tuning knobs for [`PartitionHeuristicSolver`].
+#[derive(Clone, Debug, Default)]
+pub struct PartitionConfig {
+    /// Extended search budget for testing.
+    pub test_mode: bool,
+}
 
 pub struct PartitionHeuristicSolver {
     terminate_requested: Arc<AtomicBool>,
     stats: SolverStats,
+    config: PartitionConfig,
 }
 
 pub(crate) struct PartitionBlock {
@@ -83,6 +92,7 @@ impl PartitionHeuristicSolver {
         Self {
             terminate_requested: Arc::new(AtomicBool::new(false)),
             stats: SolverStats::default(),
+            config: PartitionConfig::default(),
         }
     }
 
@@ -202,7 +212,7 @@ impl PartitionHeuristicSolver {
         let rep_to_all = kernelize::build_rep_to_all(&kern.collapses_original);
         let (pool_soft_limit, pool_hard_limit) =
             candidate_pool_limits(original.num_leaves, &original.trees);
-        let testing_mode = heuristic_testing_mode();
+        let testing_mode = self.config.test_mode;
         let defer_incumbent = !testing_mode;
 
         let mut candidates = Vec::new();
@@ -236,7 +246,7 @@ impl PartitionHeuristicSolver {
                 if candidates.len() > pool_hard_limit {
                     let before = candidates.len();
                     prune_candidate_pool(&mut candidates, None, pool_soft_limit);
-                    eprintln!(
+                    debug!(
                         "[heur:{}] pruned initial candidate pool {} -> {} blocks",
                         self.mode_name(),
                         before,
@@ -273,7 +283,7 @@ impl PartitionHeuristicSolver {
             let before = candidates.len();
             selected = prune_candidate_pool(&mut candidates, Some(&selected), pool_soft_limit)
                 .unwrap_or(selected);
-            eprintln!(
+            debug!(
                 "[heur:{}] pruned selected candidate pool {} -> {} blocks",
                 self.mode_name(),
                 before,
@@ -292,7 +302,7 @@ impl PartitionHeuristicSolver {
                     local_search_merges += merges;
                 }
                 let savings = original.num_leaves as usize - components.len();
-                eprintln!(
+                info!(
                     "[heur:{}] initial greedy incumbent: selected={} savings={} components={} local_merges={}",
                     self.mode_name(),
                     selected.len(),
@@ -312,7 +322,7 @@ impl PartitionHeuristicSolver {
                     local_search_merges += merges;
                 }
                 let savings = original.num_leaves as usize - components.len();
-                eprintln!(
+                info!(
                     "[heur:{}] initial pack selected={} savings={} components={} local_merges={}",
                     self.mode_name(),
                     selected.len(),
@@ -349,7 +359,7 @@ impl PartitionHeuristicSolver {
         let mut exhausted_rounds = 0usize;
         let mut global_pricing_workspace = None::<GlobalPricingWorkspace>;
 
-        eprintln!(
+        info!(
             "[heur:{}] adaptive improvement loop (leaves={}, reduced_leaves={}, rounds={}, patience={}, test_mode={})",
             self.mode_name(),
             original.num_leaves,
@@ -372,7 +382,7 @@ impl PartitionHeuristicSolver {
                 break;
             }
             if testing_mode && round > MAX_ROUNDS {
-                eprintln!(
+                info!(
                     "[heur:{}] stopping adaptive loop on test round cap {}",
                     self.mode_name(),
                     MAX_ROUNDS,
@@ -380,7 +390,7 @@ impl PartitionHeuristicSolver {
                 break;
             }
             if testing_mode && t_improve.elapsed() >= IMPROVEMENT_SOFT_BUDGET {
-                eprintln!(
+                info!(
                     "[heur:{}] stopping adaptive loop on soft budget after {:.1}ms",
                     self.mode_name(),
                     t_improve.elapsed().as_secs_f64() * 1000.0,
@@ -495,7 +505,7 @@ impl PartitionHeuristicSolver {
                 lp_basis_cache.clear();
                 force_lp_refresh = true;
                 global_pricing_workspace = None;
-                eprintln!(
+                debug!(
                     "[heur:{}] pruned adaptive candidate pool {} -> {} blocks",
                     self.mode_name(),
                     before,
@@ -529,7 +539,7 @@ impl PartitionHeuristicSolver {
                 lp_basis_cache.clear();
                 force_lp_refresh = true;
                 global_pricing_workspace = None;
-                eprintln!(
+                debug!(
                     "[heur:{}] pruned diversified candidate pool {} -> {} blocks",
                     self.mode_name(),
                     before,
@@ -603,7 +613,7 @@ impl PartitionHeuristicSolver {
                     incumbent_component_count = components.len();
                     stalled_rounds = 0;
                     low_yield_rounds = 0;
-                    eprintln!(
+                    debug!(
                         "[heur:{}] round {} improved: add_one={} priced_local={} priced_global={} diversified={} lp_basis={} savings={} components={} gain={} local_merges={}",
                         self.mode_name(),
                         round,
@@ -627,7 +637,7 @@ impl PartitionHeuristicSolver {
                     } else {
                         low_yield_rounds = 0;
                     }
-                    eprintln!(
+                    debug!(
                         "[heur:{}] round {} refreshed-no-improve: add_one={} priced_local={} priced_global={} diversified={} lp_basis={} savings={} components={} local_merges={}",
                         self.mode_name(),
                         round,
@@ -647,7 +657,7 @@ impl PartitionHeuristicSolver {
                 } else {
                     0
                 };
-                eprintln!(
+                debug!(
                     "[heur:{}] round {} pool-expanded: add_one={} priced_local={} priced_global={} diversified={} lp_basis={} incumbent_components={} refresh_in={}",
                     self.mode_name(),
                     round,
@@ -669,14 +679,14 @@ impl PartitionHeuristicSolver {
                 search_exhausted = true;
                 exhausted_rounds += 1;
                 if testing_mode {
-                    eprintln!(
+                    info!(
                         "[heur:{}] stopping adaptive loop after exhausted pricing phase at round {}",
                         self.mode_name(),
                         round,
                     );
                     break;
                 } else {
-                    eprintln!(
+                    info!(
                         "[heur:{}] round {} exhausted current search phase; idling until SIGTERM (dry_rounds={})",
                         self.mode_name(),
                         round,
@@ -693,7 +703,7 @@ impl PartitionHeuristicSolver {
             }
 
             if testing_mode && stalled_rounds >= STALL_PATIENCE {
-                eprintln!(
+                info!(
                     "[heur:{}] stopping adaptive loop after {} stalled rounds",
                     self.mode_name(),
                     stalled_rounds,
@@ -709,7 +719,7 @@ impl PartitionHeuristicSolver {
             const FINAL_NODEPACK_TIME_LIMIT_SECS: f64 = 8.0;
             const FINAL_NODEPACK_MAX_CANDIDATES: usize = 3000;
             if candidates.len() > FINAL_NODEPACK_MAX_CANDIDATES {
-                eprintln!(
+                info!(
                     "[heur:{}] finalized incumbent from runtime greedy node-pack over {} candidates: selected={} savings={} components={} local_merges={} (exact fallback skipped: candidate pool too large)",
                     self.mode_name(),
                     candidates.len(),
@@ -745,7 +755,7 @@ impl PartitionHeuristicSolver {
                     selected_savings = exact_savings;
                     incumbent_component_count = exact_components.len();
                     components = exact_components;
-                    eprintln!(
+                    info!(
                         "[heur:{}] finalized incumbent from exact node-pack over {} candidates: selected={} savings={} components={} local_merges={} (time_limit={:.1}s)",
                         self.mode_name(),
                         candidates.len(),
@@ -756,7 +766,7 @@ impl PartitionHeuristicSolver {
                         FINAL_NODEPACK_TIME_LIMIT_SECS,
                     );
                 } else {
-                    eprintln!(
+                    info!(
                         "[heur:{}] finalized incumbent from runtime greedy node-pack over {} candidates: selected={} savings={} components={} local_merges={} (exact fallback kept greedy)",
                         self.mode_name(),
                         candidates.len(),
@@ -767,7 +777,7 @@ impl PartitionHeuristicSolver {
                     );
                 }
             } else {
-                eprintln!(
+                info!(
                     "[heur:{}] finalized incumbent from runtime greedy node-pack over {} candidates: selected={} savings={} components={} local_merges={} (exact fallback unavailable)",
                     self.mode_name(),
                     candidates.len(),
@@ -1515,7 +1525,7 @@ impl PartitionHeuristicSolver {
         let reduced = &kern.instance;
         let kernel_ms = t_kernel.elapsed().as_secs_f64() * 1000.0;
 
-        eprintln!(
+        info!(
             "[heur:{}] kernelized {} -> {} leaves in {:.1}ms (param_reduction={})",
             self.mode_name(),
             instance.num_leaves,
@@ -1556,12 +1566,12 @@ impl PartitionHeuristicSolver {
         let partition_outcome = self.solve_partitions(
             &reduced.trees,
             reduced.num_leaves as usize,
-            heuristic_testing_mode(),
+            self.config.test_mode,
         );
         let partition_ms = t_partition.elapsed().as_secs_f64() * 1000.0;
 
         match partition_outcome.best_meta {
-            Some((ref_idx, seed)) => eprintln!(
+            Some((ref_idx, seed)) => info!(
                 "[heur:{}] reduced partition best={} components in {:.1}ms (ref={}, seed={}, runs={})",
                 self.mode_name(),
                 partition_outcome.best_components,
@@ -1570,7 +1580,7 @@ impl PartitionHeuristicSolver {
                 seed,
                 partition_outcome.total_runs,
             ),
-            None => eprintln!(
+            None => info!(
                 "[heur:{}] reduced partition best={} components in {:.1}ms (runs={})",
                 self.mode_name(),
                 partition_outcome.best_components,
@@ -1584,7 +1594,7 @@ impl PartitionHeuristicSolver {
             match self.build_repaired_components(&partition_outcome.partitions, &kern, instance) {
                 Ok(result) => result,
                 Err(err) => {
-                    eprintln!(
+                    info!(
                         "[heur:{}] repair failed: {}. Falling back to reduced singletons.",
                         self.mode_name(),
                         err
@@ -1607,7 +1617,7 @@ impl PartitionHeuristicSolver {
         let repair_ms = t_repair.elapsed().as_secs_f64() * 1000.0;
 
         self.stats.upper_bound = Some(components.len());
-        eprintln!(
+        info!(
             "[heur:{}] repair kept {}/{} compatible blocks (raw_nontrivial={}, unique_nontrivial={}, generated_add_one={}, generated_priced={}, local_merges={}), savings={}, repair_ms={:.1}",
             self.mode_name(),
             repair.selected_nontrivial_blocks,
@@ -1620,7 +1630,7 @@ impl PartitionHeuristicSolver {
             repair.selected_savings,
             repair_ms,
         );
-        eprintln!(
+        info!(
             "[heur:{}] expanded to {} components in {:.1}ms total",
             self.mode_name(),
             components.len(),
@@ -1773,13 +1783,6 @@ fn make_leafset(labels: &[u32], num_leaves: u32) -> FixedBitSet {
         bits.insert(label as usize);
     }
     bits
-}
-
-fn heuristic_testing_mode() -> bool {
-    matches!(
-        std::env::var("KLADOS_HEURISTIC_TEST_MODE").as_deref(),
-        Ok("1") | Ok("true") | Ok("yes")
-    )
 }
 
 fn candidate_pool_limits(_num_leaves: u32, _trees: &[Tree]) -> (usize, usize) {
@@ -3132,13 +3135,10 @@ pub fn run_packing_gap_experiment(instance: &Instance, best_known: usize) -> Gap
 use crate::{RunConfig, Solver, Track};
 
 impl Solver for PartitionHeuristicSolver {
-    type Config = ();
+    type Config = PartitionConfig;
     const SUPPORTED_TRACKS: &'static [Track] = &[Track::Heuristic];
-    const OPTIONS: &'static [(&'static str, &'static str)] = &[(
-        "KLADOS_HEURISTIC_TEST_MODE",
-        "enable extended search budget (set to 1)",
-    )];
-    fn solve(&mut self, inst: &Instance, _cfg: &RunConfig<Self::Config>) -> Option<Vec<Tree>> {
+    fn solve(&mut self, inst: &Instance, cfg: &RunConfig<Self::Config>) -> Option<Vec<Tree>> {
+        self.config = cfg.specific.clone();
         PartitionHeuristicSolver::solve(self, inst)
     }
     fn stats(&self) -> &SolverStats {

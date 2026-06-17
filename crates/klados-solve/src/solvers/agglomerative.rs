@@ -12,6 +12,7 @@ use fixedbitset::FixedBitSet;
 use klados_core::kernelize::restrict_instance_simple;
 use klados_core::tree::{NONE, NodeId, Tree};
 use klados_core::{Instance, SolverStats};
+use log::info;
 use crate::solvers::maf_sat::MafSatSolver;
 use crate::solvers::whidden::WhiddenSolver;
 
@@ -1133,10 +1134,10 @@ impl AgglomerativeSolver {
         let t1 = &instance.trees[0];
         let t2 = &instance.trees[1];
 
-        eprintln!("[agglo] Building tree precomps for n={}", n);
+        info!("[agglo] Building tree precomps for n={}", n);
         let tp1 = TreePrecomp::build(t1);
         let tp2 = TreePrecomp::build(t2);
-        eprintln!(
+        info!(
             "[agglo] Precomp done in {:.1}ms",
             start.elapsed().as_secs_f64() * 1000.0
         );
@@ -1205,7 +1206,7 @@ impl AgglomerativeSolver {
                 num_components -= 1;
             }
         }
-        eprintln!(
+        info!(
             "[agglo] Phase 1 (common cherries): {} merges, {} components, {:.1}ms",
             cherry_merges,
             num_components,
@@ -1383,7 +1384,7 @@ impl AgglomerativeSolver {
                     }
                 }
 
-                eprintln!(
+                info!(
                     "[agglo] cycle {} rise<={} cand={} attempts={} merges={} comps={} t={:.1}s",
                     cycle,
                     rise_limit,
@@ -1436,7 +1437,7 @@ impl AgglomerativeSolver {
                     no_improve_streak = no_improve_streak.saturating_add(1);
                 }
 
-                eprintln!(
+                info!(
                     "[agglo] cycle {} region-reopt: attempts={} accepted={} rejected={} delta={} best-delta={} whidden={} sat={} no-improve-streak={} comps={} t={:.1}s",
                     cycle,
                     region_stats.attempts,
@@ -1475,7 +1476,7 @@ impl AgglomerativeSolver {
                         plateau_stats_total.best_delta.max(plateau_stats.best_delta);
 
                     let plateau_improved = num_components < plateau_before;
-                    eprintln!(
+                    info!(
                         "[agglo] cycle {} plateau: episodes={} expanded={} deduped={} accepted={} delta={} best-delta={} comps={} t={:.1}s",
                         cycle,
                         plateau_stats.episodes,
@@ -1499,7 +1500,7 @@ impl AgglomerativeSolver {
 
         let total_time = start.elapsed().as_secs_f64();
         let total_merges = cherry_merges + phase2_merges + region_stats_total.merges;
-        eprintln!(
+        info!(
             "[agglo] Final: {} components (score={}) in {:.2}s [{} p1 + {} p2 + {} region-merges = {} merges | region attempts={} accepted={} rejected={} best-delta={} whidden={} sat={} | plateau episodes={} expanded={} deduped={} accepted={} best-delta={}]",
             num_components,
             num_components.saturating_sub(1),

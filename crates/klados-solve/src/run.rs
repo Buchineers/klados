@@ -19,8 +19,13 @@ use crate::{RunConfig, Solver};
 /// (the only environment read in the codebase); otherwise the in-config default
 /// (set by the calling binary) applies.
 pub fn run<S: Solver>(mut solver: S, mut cfg: RunConfig<S::Config>) {
+    let _ = env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("warn"),
+    )
+    .try_init();
+
     if !S::SUPPORTED_TRACKS.contains(&cfg.track) {
-        eprintln!("solver does not support the {:?} track", cfg.track);
+        log::error!("solver does not support the {:?} track", cfg.track);
         return;
     }
 
@@ -50,7 +55,7 @@ pub fn run<S: Solver>(mut solver: S, mut cfg: RunConfig<S::Config>) {
     let inst = match Instance::from_stdin() {
         Ok(i) => i,
         Err(e) => {
-            eprintln!("failed to parse instance: {e}");
+            log::error!("failed to parse instance: {e}");
             return;
         }
     };

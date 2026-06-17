@@ -455,11 +455,7 @@ impl Rmp {
     }
 
     pub fn solve_mip(&mut self) -> Result<Option<RmpSolution>, String> {
-        let mip_time_limit: f64 = std::env::var("KLADOS_BP_MIP_TIME_LIMIT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0.1);
-        self.solve_mip_with_time_limit(mip_time_limit)
+        self.solve_mip_with_time_limit(0.1)
     }
 
     pub fn solve_mip_with_time_limit(

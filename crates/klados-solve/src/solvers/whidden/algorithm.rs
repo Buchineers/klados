@@ -13,6 +13,7 @@ use std::time::Instant;
 use fixedbitset::FixedBitSet;
 use klados_core::tree::{Label, NONE, NodeId, Tree};
 use klados_core::{Instance, SolverStats};
+use log::debug;
 
 use super::stats::{WhiddenProgressUpdate, WhiddenRuleStats};
 use klados_core::lower_bound::{cherry_reduce_ub, red_blue_approx_detailed};
@@ -540,13 +541,10 @@ fn bb_inner(
 ) -> Option<u32> {
     stats.nodes_explored += 1;
 
-    // SPLIT diagnostic — gated env var, sampled every 50 nodes to keep cost
-    // bounded. Reads `KLADOS_WHIDDEN_SPLIT_DIAG` once via a lazy static.
+    // SPLIT diagnostic — gated on `-v` (verbose), sampled every 50 nodes to
+    // keep cost bounded.
     {
-        use std::sync::OnceLock;
-        static ENABLED: OnceLock<bool> = OnceLock::new();
-        let on = *ENABLED.get_or_init(|| std::env::var("KLADOS_WHIDDEN_SPLIT_DIAG").is_ok());
-        if on && stats.nodes_explored % 50 == 0 {
+        if stats.nodes_explored % 50 == 0 && log::log_enabled!(log::Level::Debug) {
             split_diag_check(tf, rule_stats);
         }
     }
@@ -2491,7 +2489,7 @@ fn apply_decompose(
             continue;
         }
         let sub_instance = Instance::new(vec![sub_t1, sub_t2], new_num_leaves);
-        if std::env::var("KLADOS_WHIDDEN_SOD_TRACE").is_ok() {
+        if log::log_enabled!(log::Level::Debug) {
             trace_tree_shape("sub_t1", &sub_instance.trees[0]);
             trace_tree_shape("sub_t2", &sub_instance.trees[1]);
         }
@@ -2500,29 +2498,27 @@ fn apply_decompose(
         let sub_solution = match crate::Solver::solve(&mut sub_solver, &sub_instance, &crate::RunConfig::default()) {
             Some(s) => s,
             None => {
-                if std::env::var("KLADOS_WHIDDEN_SOD_TRACE").is_ok() {
-                    eprintln!(
-                        "[sod-trace] sub-solver returned None: n={} t1_root={} t1_nodes={} t1_num_leaves={} t2_root={} t2_nodes={} t2_num_leaves={}",
-                        new_num_leaves,
-                        sub_instance.trees[0].root,
-                        sub_instance.trees[0].parent.len(),
-                        sub_instance.trees[0].num_leaves,
-                        sub_instance.trees[1].root,
-                        sub_instance.trees[1].parent.len(),
-                        sub_instance.trees[1].num_leaves,
-                    );
-                    // Print labels in each tree for debug
-                    let t1_labels: Vec<u32> = (1..=new_num_leaves)
-                        .filter(|&l| sub_instance.trees[0].label_to_node[l as usize] != NONE)
-                        .collect();
-                    let t2_labels: Vec<u32> = (1..=new_num_leaves)
-                        .filter(|&l| sub_instance.trees[1].label_to_node[l as usize] != NONE)
-                        .collect();
-                    eprintln!(
-                        "[sod-trace] t1_labels={:?} t2_labels={:?}",
-                        t1_labels, t2_labels,
-                    );
-                }
+                debug!(
+                    "[sod-trace] sub-solver returned None: n={} t1_root={} t1_nodes={} t1_num_leaves={} t2_root={} t2_nodes={} t2_num_leaves={}",
+                    new_num_leaves,
+                    sub_instance.trees[0].root,
+                    sub_instance.trees[0].parent.len(),
+                    sub_instance.trees[0].num_leaves,
+                    sub_instance.trees[1].root,
+                    sub_instance.trees[1].parent.len(),
+                    sub_instance.trees[1].num_leaves,
+                );
+                // Print labels in each tree for debug
+                let t1_labels: Vec<u32> = (1..=new_num_leaves)
+                    .filter(|&l| sub_instance.trees[0].label_to_node[l as usize] != NONE)
+                    .collect();
+                let t2_labels: Vec<u32> = (1..=new_num_leaves)
+                    .filter(|&l| sub_instance.trees[1].label_to_node[l as usize] != NONE)
+                    .collect();
+                debug!(
+                    "[sod-trace] t1_labels={:?} t2_labels={:?}",
+                    t1_labels, t2_labels,
+                );
                 return None;
             }
         };
@@ -2561,7 +2557,7 @@ fn trace_tree_shape(name: &str, tree: &Tree) {
     leaves.sort_unstable();
     let expected: Vec<_> = (1..=tree.num_leaves).collect();
     if !bad.is_empty() || leaves != expected {
-        eprintln!(
+        debug!(
             "[sod-trace] {} invalid: root={} num_leaves={} reachable={} leaves={:?} bad={:?}",
             name,
             tree.root,
@@ -2630,7 +2626,7 @@ fn tree_from_t2_subtree(tf: &TwinForest, comp_root: NodeId) -> Tree {
 /// trigger Mestel's SPLIT (overlapping component embeddings in T1) or
 /// DECOMPOSE (disjoint instance with ≥ 2 components).
 ///
-/// Gated by `KLADOS_WHIDDEN_SPLIT_DIAG=1`. Sampled every `SPLIT_DIAG_SAMPLE`
+/// Gated on `-v` (verbose). Sampled every 50
 /// nodes by `nodes_explored` to keep cost bounded — `collect_component_shapes`
 /// is O(n) per call and we don't want to inflate the search by 10×.
 #[inline]

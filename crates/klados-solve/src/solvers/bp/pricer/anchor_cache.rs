@@ -12,7 +12,7 @@
 //! Phase 1 scope: no tree-static precompute; the cache is just label-pair
 //! indexing plus cached column supports.
 //!
-//! Gated by `KLADOS_BP_USE_ANCHOR_CACHE=1`.
+//! Gated by `BpConfig.use_anchor_cache`.
 //!
 //! ## Indexing
 //!

@@ -25,6 +25,7 @@
 
 use klados_core::af_validator::validate_agreement_forest;
 use klados_core::{Instance, Tree};
+use log::debug;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -51,7 +52,6 @@ fn certifiable(instance: &Instance, forest: &[Tree], a: f64, b: usize, lb: usize
 /// `budget` is the wall limit (`cfg.budget` ← `STRIDE_TIMEOUT`); the racer
 /// subdivides it (lagrangian then exact `bp`) and leaves a 3 s flush margin.
 pub fn solve_lower(instance: &Instance, budget: Option<Duration>) -> Option<Vec<Tree>> {
-    let trace = std::env::var_os("KLADOS_LOWER_TRACE").is_some();
     let (a, b) = instance.approx.unwrap_or((1.0, 0));
     let start = Instant::now();
     let wall_secs = budget.map_or(DEFAULT_WALL_SECS, |b| b.as_secs_f64());
@@ -80,13 +80,11 @@ pub fn solve_lower(instance: &Instance, budget: Option<Duration>) -> Option<Vec<
         let lb = crate::Solver::stats(&lagr).lower_bound;
         if let Some(forest) = forest {
             let ok = certifiable(instance, &forest, a, b, lb);
-            if trace {
-                eprintln!(
-                    "[lower] lagrangian: k={} lb={lb} T={} certified={ok}",
-                    forest.len(),
-                    (a * lb as f64).floor() as usize + b,
-                );
-            }
+            debug!(
+                "[lower] lagrangian: k={} lb={lb} T={} certified={ok}",
+                forest.len(),
+                (a * lb as f64).floor() as usize + b,
+            );
             if ok {
                 return Some(forest);
             }
@@ -102,9 +100,7 @@ pub fn solve_lower(instance: &Instance, budget: Option<Duration>) -> Option<Vec<
             std::thread::sleep(remaining);
             tw.store(true, Ordering::Relaxed);
         });
-        if trace {
-            eprintln!("[lower] exact bp (n={}, {:.0}s left)", instance.num_leaves, remaining.as_secs_f64());
-        }
+        debug!("[lower] exact bp (n={}, {:.0}s left)", instance.num_leaves, remaining.as_secs_f64());
         if let Some(forest) = crate::solvers::bp::bp_solve_capped(instance, &terminate) {
             // bp returns the proven optimum; validate defensively before trusting.
             if validate_agreement_forest(instance, &forest).is_ok() {
@@ -114,9 +110,7 @@ pub fn solve_lower(instance: &Instance, budget: Option<Duration>) -> Option<Vec<
     }
 
     // ── Nothing certifiable: emit NOTHING (0 points, never a disqualification). ──
-    if trace {
-        eprintln!("[lower] no certifiable forest within bound -> emit nothing");
-    }
+    debug!("[lower] no certifiable forest within bound -> emit nothing");
     None
 }
 

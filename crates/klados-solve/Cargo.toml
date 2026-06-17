@@ -15,5 +15,6 @@ highs-sys = { workspace = true }
 rustsat = { workspace = true }
 rustsat-cadical = { workspace = true }
 log = "0.4"
+env_logger = "0.11"
 libc = "0.2"
 signal-hook = "0.4.3"
