@@ -782,8 +782,7 @@ dependencies = [
  "highs",
  "indicatif",
  "klados-core",
- "klados-exact",
- "klados-heuristic",
+ "klados-solve",
  "log",
  "pace26io",
  "serde",
@@ -804,7 +803,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "klados-exact"
+name = "klados-solve"
 version = "0.1.0"
 dependencies = [
  "fixedbitset",
@@ -812,22 +811,12 @@ dependencies = [
  "highs",
  "highs-sys",
  "klados-core",
+ "libc",
  "log",
+ "pace26io",
  "rustsat",
  "rustsat-cadical",
-]
-
-[[package]]
-name = "klados-heuristic"
-version = "0.1.0"
-dependencies = [
- "fixedbitset",
- "fxhash",
- "highs",
- "klados-core",
- "klados-exact",
- "libc",
- "pace26io",
+ "signal-hook",
 ]
 
 [[package]]

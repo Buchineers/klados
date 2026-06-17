@@ -7,7 +7,7 @@
 use std::time::Instant;
 
 use klados_core::{Instance, NONE};
-use klados_exact::kernelize::{self, KernelizeConfig};
+use klados_solve::kernelize::{self, KernelizeConfig};
 
 pub fn run(instance: &Instance) -> Result<(), Box<dyn std::error::Error>> {
     let m = instance.num_trees();
@@ -33,7 +33,7 @@ pub fn run(instance: &Instance) -> Result<(), Box<dyn std::error::Error>> {
 
     // Step 2: Solve the original instance exactly
     let solve_start = Instant::now();
-    let mut solver = klados_exact::solver_by_name("bp-multi").expect("B&P solver not available");
+    let mut solver = klados_solve::solver_by_name("bp-multi").expect("B&P solver not available");
     let components = match solver.solve(instance) {
         Some(c) => c,
         None => {

@@ -3,7 +3,6 @@
 //! κλάδος (klados) - Ancient Greek for "branch"
 
 mod commands;
-mod lower;
 mod solver;
 
 use clap::{Parser, Subcommand, ValueEnum};

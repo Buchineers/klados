@@ -156,33 +156,33 @@ impl SolverChoice {
 
     pub fn build(&self) -> Box<dyn AnySolver> {
         match self {
-            SolverChoice::ILP => from_exact(klados_exact::maf_ilp::MafIlpSolver::new()),
-            SolverChoice::Sat => from_exact(klados_exact::maf_sat::MafSatSolver::new()),
+            SolverChoice::ILP => from_exact(klados_solve::solvers::maf_ilp::MafIlpSolver::new()),
+            SolverChoice::Sat => from_exact(klados_solve::solvers::maf_sat::MafSatSolver::new()),
             SolverChoice::MafSatOlver => {
-                from_exact(klados_exact::maf_sat::MafSatOlverSolver::new())
+                from_exact(klados_solve::solvers::maf_sat::MafSatOlverSolver::new())
             }
-            SolverChoice::ChenRspr => from_exact(klados_exact::chen_rspr::ChenRsprSolver::new()),
-            SolverChoice::Whidden => from_exact(klados_exact::whidden::WhiddenSolver::new()),
+            SolverChoice::ChenRspr => from_exact(klados_solve::solvers::chen_rspr::ChenRsprSolver::new()),
+            SolverChoice::Whidden => from_exact(klados_solve::solvers::whidden::WhiddenSolver::new()),
             SolverChoice::BpMulti => {
-                from_exact(klados_exact::maf_branch_price_multi::MafBranchPriceMultiSolver::new())
+                from_exact(klados_solve::solvers::maf_branch_price_multi::MafBranchPriceMultiSolver::new())
             }
-            SolverChoice::Bp => from_exact(klados_exact::bp::BpSolver::new()),
+            SolverChoice::Bp => from_exact(klados_solve::solvers::bp::BpSolver::new()),
             SolverChoice::OverlayExchange => {
-                from_exact(klados_exact::overlay_exchange::OverlayExchangeSolver::new())
+                from_exact(klados_solve::solvers::overlay_exchange::OverlayExchangeSolver::new())
             }
-            SolverChoice::RootPool => from_exact(klados_exact::root_pool::RootPoolSolver::new()),
+            SolverChoice::RootPool => from_exact(klados_solve::solvers::root_pool::RootPoolSolver::new()),
             SolverChoice::RootCorridor => {
-                from_exact(klados_exact::root_corridor::RootCorridorSolver::new())
+                from_exact(klados_solve::solvers::root_corridor::RootCorridorSolver::new())
             }
-            SolverChoice::Corridor => from_exact(klados_exact::corridor::CorridorSolver::new()),
+            SolverChoice::Corridor => from_exact(klados_solve::solvers::corridor::CorridorSolver::new()),
             SolverChoice::GreedyPartition => from_heuristic(
-                klados_heuristic::partition::PartitionHeuristicSolver::greedy_union_add_one(),
+                klados_solve::solvers::partition::PartitionHeuristicSolver::greedy_union_add_one(),
             ),
             SolverChoice::Agglomerative => {
-                from_heuristic(klados_heuristic::agglomerative::AgglomerativeSolver::new())
+                from_heuristic(klados_solve::solvers::agglomerative::AgglomerativeSolver::new())
             }
             SolverChoice::Lagrangian => {
-                from_heuristic(klados_heuristic::lagrangian::LagrangianSolver::new())
+                from_heuristic(klados_solve::solvers::lagrangian::LagrangianSolver::new())
             }
             SolverChoice::Lower => Box::new(LowerWrapper),
         }
@@ -239,8 +239,8 @@ pub trait AnySolver {
     }
 }
 
-struct ExactWrapper(Box<dyn klados_exact::ExactSolver>);
-struct HeuristicWrapper(Box<dyn klados_heuristic::HeuristicSolver>);
+struct ExactWrapper(Box<dyn klados_solve::ExactSolver>);
+struct HeuristicWrapper(Box<dyn klados_solve::HeuristicSolver>);
 
 impl AnySolver for ExactWrapper {
     fn solve(&mut self, instance: &Instance) -> Option<Vec<Tree>> {
@@ -271,16 +271,16 @@ struct LowerWrapper;
 
 impl AnySolver for LowerWrapper {
     fn solve(&mut self, instance: &Instance) -> Option<Vec<Tree>> {
-        crate::lower::solve_lower(instance)
+        klados_solve::solvers::lower::solve_lower(instance)
     }
     fn sigterm_handler(&self) {}
 }
 
-fn from_exact(s: impl klados_exact::ExactSolver + 'static) -> Box<dyn AnySolver> {
+fn from_exact(s: impl klados_solve::ExactSolver + 'static) -> Box<dyn AnySolver> {
     Box::new(ExactWrapper(Box::new(s)))
 }
 
-fn from_heuristic(s: impl klados_heuristic::HeuristicSolver + 'static) -> Box<dyn AnySolver> {
+fn from_heuristic(s: impl klados_solve::HeuristicSolver + 'static) -> Box<dyn AnySolver> {
     Box::new(HeuristicWrapper(Box::new(s)))
 }
 
