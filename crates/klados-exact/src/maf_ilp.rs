@@ -297,7 +297,7 @@ fn solve_ilp(instance: &Instance) -> Option<(Vec<Tree>, SolverStats)> {
     // --- Configure and solve ---
     let mut model = pb.optimise(Sense::Minimise);
     model.make_quiet();
-    model.set_option("threads", 1_i32); // single-threaded for PACE
+    model.set_option("threads", klados_core::highs_threads()); // single-threaded for PACE
     model.set_option("presolve", "on");
 
     let solved = model.solve();
@@ -471,7 +471,7 @@ pub fn solve_lp_relaxation(instance: &Instance) -> Option<f64> {
     // --- Configure and solve ---
     let mut model = pb.optimise(Sense::Minimise);
     model.make_quiet();
-    model.set_option("threads", 1_i32);
+    model.set_option("threads", klados_core::highs_threads());
     model.set_option("presolve", "on");
 
     let solved = model.solve();

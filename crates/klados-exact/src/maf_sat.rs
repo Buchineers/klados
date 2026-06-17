@@ -565,6 +565,1610 @@ fn components_to_trees(components: &[Vec<usize>], ref_tree: &Tree, num_leaves: u
 }
 
 // ═══════════════════════════════════════════════════════════════
+// MaxHS core-guided lower-bound probe (implicit hitting set)
+// ═══════════════════════════════════════════════════════════════
+//
+// Gating measurement for a core-guided / implicit-hitting-set rMAF solver.
+// Uses the exact cut-space agreement encoding (all forward/backward linkage +
+// all H4 incompatible triples; NO cardinality constraint), then builds a lower
+// bound on the number of cuts in reference tree 0 by implicit hitting set:
+//   1. min-cost hitting set IP over discovered cores (HiGHS) -> LB, candidate H
+//   2. SAT under assumptions forcing every tree-0 edge NOT in H to stay uncut:
+//        SAT   => optimal found: cuts = |H|, opt = |H| + 1
+//        UNSAT => failed-assumption core = tree-0 edges that cannot all be uncut
+// #components = #cuts(tree 0) + 1, so comp_lb = lb_cuts + 1 is directly
+// comparable to the known opt. Reports core-size distribution + whether the
+// bound reaches opt. Env: KLADOS_PROBE_BUDGET_S (default 120), KLADOS_PROBE_OPT.
+
+pub fn run_maxhs_lb_probe(instance: &Instance) {
+    let n = instance.num_leaves as usize;
+    let m = instance.num_trees();
+    let budget_s: f64 = std::env::var("KLADOS_PROBE_BUDGET_S")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(120.0);
+    let opt_known: Option<usize> = std::env::var("KLADOS_PROBE_OPT")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    let t0 = std::time::Instant::now();
+
+    let nca = NcaData::build(instance, n);
+
+    // Symmetry detector: two leaves are interchangeable if they have identical
+    // cross-tree LCA-depth profiles. Such pairs induce SAT-formula automorphisms
+    // that CDCL re-explores. Reports how much exploitable symmetry survives
+    // kernelization. Gated by KLADOS_PROBE_SYM.
+    if std::env::var("KLADOS_PROBE_SYM").is_ok() {
+        let mut profiles: Vec<u64> = Vec::with_capacity(n);
+        for a in 0..n {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            use std::hash::{Hash, Hasher};
+            for q in 0..m {
+                let mut row: Vec<u16> = (0..n).filter(|&x| x != a).map(|x| nca.depths[q][a][x]).collect();
+                row.sort_unstable();
+                row.hash(&mut hasher);
+            }
+            profiles.push(hasher.finish());
+        }
+        let mut groups: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+        for &p in &profiles {
+            *groups.entry(p).or_default() += 1;
+        }
+        let symmetric_leaves: usize = groups.values().filter(|&&c| c >= 2).map(|&c| c).sum();
+        let nontrivial_groups = groups.values().filter(|&&c| c >= 2).count();
+        let max_group = groups.values().copied().max().unwrap_or(0);
+        eprintln!(
+            "[symcheck] n={} m={} | distinct_profiles={} | symmetric_leaves={} in {} groups | largest_group={}",
+            n, m, groups.len(), symmetric_leaves, nontrivial_groups, max_group
+        );
+        return;
+    }
+
+    let mut solver = CaDiCaL::default();
+    let mut vm = BasicVarManager::default();
+
+    let num_nodes: Vec<usize> = instance.trees.iter().map(|t| t.num_nodes()).collect();
+    let del: Vec<Vec<Option<Var>>> = (0..m)
+        .map(|q| {
+            let tree = &instance.trees[q];
+            (0..num_nodes[q])
+                .map(|v| {
+                    if v as NodeId == tree.root {
+                        None
+                    } else {
+                        Some(vm.new_var())
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    let conn: Vec<Vec<Option<Var>>> = (0..n)
+        .map(|a| (0..n).map(|b| if b > a { Some(vm.new_var()) } else { None }).collect())
+        .collect();
+
+    // Paths between leaf pairs in every tree.
+    let mut paths: Vec<Vec<Vec<Vec<NodeId>>>> = Vec::with_capacity(m);
+    for q in 0..m {
+        let tree = &instance.trees[q];
+        let mut pq = vec![vec![Vec::new(); n]; n];
+        for a in 0..n {
+            let na = tree.node_by_label((a + 1) as Label);
+            for b in (a + 1)..n {
+                let nb = tree.node_by_label((b + 1) as Label);
+                pq[a][b] = path_nodes(tree, na, nb);
+            }
+        }
+        paths.push(pq);
+    }
+
+    // backward: conn[a][b] -> !del[q][v] for every tree.
+    for q in 0..m {
+        for a in 0..n {
+            for b in (a + 1)..n {
+                for &v in &paths[q][a][b] {
+                    if let Some(dv) = del[q][v as usize] {
+                        add_clause(&mut solver, &[conn[a][b].unwrap().neg_lit(), dv.neg_lit()]);
+                    }
+                }
+            }
+        }
+    }
+    // forward: (no cut on path_q) -> conn[a][b].
+    for q in 0..m {
+        for a in 0..n {
+            for b in (a + 1)..n {
+                let mut clause = vec![conn[a][b].unwrap().pos_lit()];
+                for &v in &paths[q][a][b] {
+                    if let Some(dv) = del[q][v as usize] {
+                        clause.push(dv.pos_lit());
+                    }
+                }
+                add_clause(&mut solver, &clause);
+            }
+        }
+    }
+    // H4: all incompatible triples (exact agreement, eager).
+    let mut h4 = 0usize;
+    for a in 0..n {
+        for b in (a + 1)..n {
+            for c in (b + 1)..n {
+                if nca.is_incompatible(a, b, c) {
+                    add_h4_triple_clauses(&mut solver, &conn, a, b, c);
+                    h4 += 1;
+                }
+            }
+        }
+    }
+
+    // Objective / soft vars = tree-0 cut variables.
+    let cut0: Vec<Var> = del[0].iter().filter_map(|v| *v).collect();
+    let ncut = cut0.len();
+    let mut var_to_idx: fxhash::FxHashMap<Var, usize> = fxhash::FxHashMap::default();
+    for (i, v) in cut0.iter().enumerate() {
+        var_to_idx.insert(*v, i);
+    }
+    eprintln!(
+        "[maxhs-probe] n={} m={} cut0_vars={} h4_triples={} encode={:.1}s budget={:.0}s",
+        n,
+        m,
+        ncut,
+        h4,
+        t0.elapsed().as_secs_f64(),
+        budget_s
+    );
+
+    let mut cores: Vec<Vec<usize>> = Vec::new();
+    let mut core_sizes: Vec<usize> = Vec::new();
+    let mut sat_calls = 0usize;
+    let mut ip_solves = 0usize;
+    let mut sat_ms = 0.0f64;
+    let mut ip_ms = 0.0f64;
+    let mut lb_cuts = 0usize;
+    let mut converged = false;
+
+    loop {
+        // 1. Min-cost hitting set over cores.
+        let (lb, hset) = if cores.is_empty() {
+            (0usize, vec![false; ncut])
+        } else {
+            let ti = std::time::Instant::now();
+            let mut pb = highs::RowProblem::default();
+            let cols: Vec<highs::Col> =
+                (0..ncut).map(|_| pb.add_integer_column(1.0, 0.0..=1.0)).collect();
+            for core in &cores {
+                let coeffs: Vec<(highs::Col, f64)> =
+                    core.iter().map(|&v| (cols[v], 1.0)).collect();
+                pb.add_row(1.0.., &coeffs);
+            }
+            let mut model = pb.optimise(highs::Sense::Minimise);
+            model.set_option("threads", klados_core::highs_threads());
+            let solved = model.solve();
+            ip_ms += ti.elapsed().as_secs_f64() * 1000.0;
+            ip_solves += 1;
+            if solved.status() != highs::HighsModelStatus::Optimal {
+                eprintln!("[maxhs-probe] IP status {:?} — abort", solved.status());
+                break;
+            }
+            let sol = solved.get_solution();
+            let vals = sol.columns();
+            let mut h = vec![false; ncut];
+            let mut cnt = 0usize;
+            for (v, slot) in h.iter_mut().enumerate() {
+                if vals[v] > 0.5 {
+                    *slot = true;
+                    cnt += 1;
+                }
+            }
+            (cnt, h)
+        };
+        lb_cuts = lb;
+
+        // 2. SAT feasibility: force every tree-0 edge outside H to stay uncut.
+        let assumps: Vec<Lit> = (0..ncut)
+            .filter(|&v| !hset[v])
+            .map(|v| cut0[v].neg_lit())
+            .collect();
+        let ts = std::time::Instant::now();
+        let res = solver.solve_assumps(&assumps).unwrap();
+        sat_ms += ts.elapsed().as_secs_f64() * 1000.0;
+        sat_calls += 1;
+
+        match res {
+            SolverResult::Sat => {
+                converged = true;
+                break;
+            }
+            SolverResult::Unsat => {
+                let core_lits = solver.core().unwrap();
+                let mut new_core: Vec<usize> = Vec::new();
+                for l in core_lits {
+                    if let Some(&idx) = var_to_idx.get(&l.var()) {
+                        new_core.push(idx);
+                    }
+                }
+                new_core.sort_unstable();
+                new_core.dedup();
+                if new_core.is_empty() {
+                    eprintln!("[maxhs-probe] empty core (base infeasible) — abort");
+                    break;
+                }
+                // Deletion-based minimization: drop an edge if forcing the rest
+                // uncut is still UNSAT. SAT is cheap here; this yields the true
+                // minimal obstruction size — the quantity that gates IHS.
+                let ts2 = std::time::Instant::now();
+                let mut i = 0;
+                while i < new_core.len() {
+                    let mut trial: Vec<Lit> = Vec::with_capacity(new_core.len() - 1);
+                    for (j, &v) in new_core.iter().enumerate() {
+                        if j != i {
+                            trial.push(cut0[v].neg_lit());
+                        }
+                    }
+                    sat_calls += 1;
+                    if matches!(solver.solve_assumps(&trial).unwrap(), SolverResult::Unsat) {
+                        new_core.remove(i);
+                    } else {
+                        i += 1;
+                    }
+                }
+                sat_ms += ts2.elapsed().as_secs_f64() * 1000.0;
+                core_sizes.push(new_core.len());
+                cores.push(new_core);
+            }
+            SolverResult::Interrupted => {
+                eprintln!("[maxhs-probe] solver interrupted");
+                break;
+            }
+        }
+
+        if t0.elapsed().as_secs_f64() > budget_s {
+            break;
+        }
+    }
+
+    core_sizes.sort_unstable();
+    let (cmin, cmed, cmax, cmean) = if core_sizes.is_empty() {
+        (0, 0, 0, 0.0)
+    } else {
+        let s = core_sizes.len();
+        (
+            core_sizes[0],
+            core_sizes[s / 2],
+            core_sizes[s - 1],
+            core_sizes.iter().sum::<usize>() as f64 / s as f64,
+        )
+    };
+    let comp_lb = lb_cuts + 1;
+    let opt_str = opt_known.map(|o| o.to_string()).unwrap_or_else(|| "?".into());
+    let gap_str = opt_known
+        .map(|o| (o as i64 - comp_lb as i64).to_string())
+        .unwrap_or_else(|| "?".into());
+    eprintln!(
+        "[maxhs-probe] RESULT n={} m={} opt={} | converged={} lb_cuts={} comp_lb={} gap_to_opt={} \
+         | cores={} coresize[min/med/max/mean]={}/{}/{}/{:.1} \
+         | sat_calls={} ip_solves={} sat={:.1}s ip={:.1}s total={:.1}s",
+        n, m, opt_str, converged, lb_cuts, comp_lb, gap_str,
+        cores.len(), cmin, cmed, cmax, cmean,
+        sat_calls, ip_solves, sat_ms / 1000.0, ip_ms / 1000.0, t0.elapsed().as_secs_f64()
+    );
+}
+
+/// Find crossing quadruples (a,a',b,b') in `tree` — one per crossing block-pair
+/// — between distinct blocks of `comps`. Empty iff all blocks are vertex-disjoint.
+/// Witnesses Theorem 1's condition (C): blocks cross iff their Steiner trees
+/// share a node. Returns all crossing pairs found in a single marking pass so a
+/// CEGAR round can separate every current violation at once.
+fn find_crossing_witness(
+    tree: &Tree,
+    comps: &[Vec<usize>],
+    leaf_node: &[NodeId],
+) -> Vec<(usize, usize, usize, usize)> {
+    let mut owner = vec![usize::MAX; tree.num_nodes()];
+    let mut owner_leaf = vec![usize::MAX; tree.num_nodes()];
+    let mut out: Vec<(usize, usize, usize, usize)> = Vec::new();
+    let mut seen_pairs: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+
+    // Partner of `l` in `comp` whose path to `l` passes through `node`.
+    let partner = |comp: &[usize], l: usize, node: NodeId| -> usize {
+        // Prefer a leaf not under `node` (so path l..l2 climbs through node).
+        for &l2 in comp {
+            if l2 != l && !is_ancestor(tree, node, leaf_node[l2]) {
+                return l2;
+            }
+        }
+        // Otherwise node == lca: pick a leaf in a different child subtree of node.
+        let child_of = |mut d: NodeId| -> NodeId {
+            while tree.parent[d as usize] != node {
+                d = tree.parent[d as usize];
+            }
+            d
+        };
+        let cl = child_of(leaf_node[l]);
+        for &l2 in comp {
+            if l2 != l && child_of(leaf_node[l2]) != cl {
+                return l2;
+            }
+        }
+        comp.iter().copied().find(|&x| x != l).unwrap_or(l)
+    };
+
+    for (bid, comp) in comps.iter().enumerate() {
+        if comp.len() < 2 {
+            continue;
+        }
+        let mut lca = leaf_node[comp[0]];
+        for &l in &comp[1..] {
+            lca = tree.nearest_common_ancestor(lca, leaf_node[l]);
+        }
+        for &l in comp {
+            let mut node = leaf_node[l];
+            loop {
+                if owner[node as usize] == usize::MAX {
+                    owner[node as usize] = bid;
+                    owner_leaf[node as usize] = l;
+                } else if owner[node as usize] != bid {
+                    let ob = owner[node as usize];
+                    let key = if bid < ob { (bid, ob) } else { (ob, bid) };
+                    if seen_pairs.insert(key) {
+                        let ol = owner_leaf[node as usize];
+                        let ap = partner(comp, l, node);
+                        let bp = partner(&comps[ob], ol, node);
+                        out.push((l, ap, ol, bp));
+                    }
+                }
+                if node == lca {
+                    break;
+                }
+                node = tree.parent[node as usize];
+            }
+        }
+    }
+    out
+}
+
+/// Merge-encoding refutation probe (Theorem 1). Encodes the partition directly
+/// via x_ab = conn, links it to tree-0 cuts for the cardinality objective, and
+/// enforces cross-tree disjointness through DIRECT width-3 crossing clauses (C)
+/// instead of the cut-encoding's path-diluted backward clauses. Tests a single
+/// block bound K (KLADOS_MERGE_K) and reports SAT/UNSAT + the lazy clause counts,
+/// to falsify the small-core prediction against the cut-encoding's failure.
+pub fn run_merge_probe(instance: &Instance) {
+    let n = instance.num_leaves as usize;
+    let m = instance.num_trees();
+    let budget_s: f64 = std::env::var("KLADOS_PROBE_BUDGET_S")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(120.0);
+    let opt_known: Option<usize> = std::env::var("KLADOS_PROBE_OPT")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    // Block bound to test; default opt-1 (the refutation wall).
+    let k_blocks: usize = std::env::var("KLADOS_MERGE_K")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .or_else(|| opt_known.map(|o| o - 1))
+        .expect("set KLADOS_MERGE_K or KLADOS_PROBE_OPT");
+    let t0 = std::time::Instant::now();
+
+    let nca = NcaData::build(instance, n);
+    let triple_index = TripleIndex::new(n);
+    let leaf_node: Vec<Vec<NodeId>> = (0..m)
+        .map(|q| {
+            let t = &instance.trees[q];
+            (0..n).map(|a| t.node_by_label((a + 1) as Label)).collect()
+        })
+        .collect();
+
+    let mut solver = CaDiCaL::default();
+    let mut vm = BasicVarManager::default();
+
+    // del[0] cut vars (tree 0 only) and x = conn.
+    let t0tree = &instance.trees[0];
+    let del0: Vec<Option<Var>> = (0..t0tree.num_nodes())
+        .map(|v| {
+            if v as NodeId == t0tree.root {
+                None
+            } else {
+                Some(vm.new_var())
+            }
+        })
+        .collect();
+    let x: Vec<Vec<Option<Var>>> = (0..n)
+        .map(|a| (0..n).map(|b| if b > a { Some(vm.new_var()) } else { None }).collect())
+        .collect();
+
+    // Tree-0 paths and linkage: x_ab <=> connected in tree 0 (no del0 cut on path).
+    let mut tree0_link = 0usize;
+    for a in 0..n {
+        for b in (a + 1)..n {
+            let path = path_nodes(t0tree, leaf_node[0][a], leaf_node[0][b]);
+            let mut fwd = vec![x[a][b].unwrap().pos_lit()];
+            for &v in &path {
+                if let Some(dv) = del0[v as usize] {
+                    add_clause(&mut solver, &[x[a][b].unwrap().neg_lit(), dv.neg_lit()]);
+                    fwd.push(dv.pos_lit());
+                    tree0_link += 1;
+                }
+            }
+            add_clause(&mut solver, &fwd);
+        }
+    }
+
+    // Cardinality: <= k_blocks-1 cuts in tree 0  (#blocks = cuts+1).
+    let del0_lits: Vec<Lit> = del0.iter().filter_map(|v| v.map(|x| x.pos_lit())).collect();
+    let mut totalizer = Totalizer::default();
+    for lit in del0_lits {
+        totalizer.extend([lit]);
+    }
+    let cut_bound = k_blocks - 1;
+    totalizer.encode_ub(cut_bound..=cut_bound, &mut solver, &mut vm).unwrap();
+    let assumps = totalizer.enforce_ub(cut_bound).unwrap();
+
+    eprintln!(
+        "[merge] n={} m={} testing K={} blocks (<= {} cuts) | tree0_link={} encode={:.1}s",
+        n, m, k_blocks, cut_bound, tree0_link, t0.elapsed().as_secs_f64()
+    );
+
+    let mut added_h4 = FixedBitSet::with_capacity(TripleIndex::capacity(n));
+    let mut agree_clauses = 0usize;
+    // Agreement obstructions are static and bounded — add them all upfront so
+    // CEGAR rounds only chase crossings (which are partition-dependent).
+    if std::env::var("KLADOS_MERGE_EAGER_AGREE").is_ok() {
+        for a in 0..n {
+            for b in (a + 1)..n {
+                for c in (b + 1)..n {
+                    if nca.is_incompatible(a, b, c) {
+                        add_h4_triple_clauses(&mut solver, &x, a, b, c);
+                        added_h4.insert(triple_index.index(a, b, c));
+                        agree_clauses += 3;
+                    }
+                }
+            }
+        }
+        eprintln!("[merge] eager agreement: {} clauses", agree_clauses);
+    }
+    let mut cross_clauses = 0usize;
+    let mut cross_sizes: Vec<usize> = Vec::new();
+    let mut rounds = 0usize;
+    let mut sat_ms = 0.0f64;
+
+    loop {
+        if t0.elapsed().as_secs_f64() > budget_s {
+            eprintln!(
+                "[merge] RESULT K={} TIMEOUT(>{:.0}s) rounds={} agree_cl={} cross_cl={} (crossing witnesses are width-4 by construction)",
+                k_blocks, budget_s, rounds, agree_clauses, cross_clauses
+            );
+            return;
+        }
+        rounds += 1;
+        let ts = std::time::Instant::now();
+        let res = solver.solve_assumps(&assumps).unwrap();
+        sat_ms += ts.elapsed().as_secs_f64() * 1000.0;
+        match res {
+            SolverResult::Unsat => {
+                let opt_str = opt_known.map(|o| o.to_string()).unwrap_or_else(|| "?".into());
+                eprintln!(
+                    "[merge] RESULT K={} UNSAT -> opt>={} (known opt={}) | rounds={} agree_cl={} cross_cl={} cross_size[min/med/max]={}/{}/{} sat={:.1}s total={:.1}s",
+                    k_blocks, k_blocks + 1, opt_str, rounds, agree_clauses, cross_clauses,
+                    cross_sizes.iter().min().copied().unwrap_or(0),
+                    { let mut v=cross_sizes.clone(); v.sort_unstable(); v.get(v.len()/2).copied().unwrap_or(0) },
+                    cross_sizes.iter().max().copied().unwrap_or(0),
+                    sat_ms / 1000.0, t0.elapsed().as_secs_f64()
+                );
+                return;
+            }
+            SolverResult::Sat => {
+                let comps = extract_components_from_model(&solver, &x, n);
+                // Phase hints: bias the next re-solve toward this model so CEGAR
+                // stays near-feasible instead of wandering to an unrelated
+                // partition that re-exposes a fresh batch of crossings.
+                if std::env::var("KLADOS_MERGE_PHASE").is_ok() {
+                    for a in 0..n {
+                        for b in (a + 1)..n {
+                            let var = x[a][b].unwrap();
+                            if solver.var_val(var).unwrap() == TernaryVal::True {
+                                solver.phase_lit(var.pos_lit()).unwrap();
+                            } else {
+                                solver.phase_lit(var.neg_lit()).unwrap();
+                            }
+                        }
+                    }
+                }
+                // Agreement violations (A).
+                let bad = collect_h4_violated_triples(&comps, &nca, &triple_index, &added_h4);
+                let mut added_any = false;
+                if !bad.is_empty() {
+                    for &(a, b, c) in &bad {
+                        add_h4_triple_clauses(&mut solver, &x, a, b, c);
+                        added_h4.insert(triple_index.index(a, b, c));
+                        agree_clauses += 3;
+                    }
+                    added_any = true;
+                }
+                // Crossing violations (C) for trees 1..m — separate all current
+                // crossing block-pairs per tree in this round.
+                let xl = |i: usize, j: usize| {
+                    let (lo, hi) = if i < j { (i, j) } else { (j, i) };
+                    x[lo][hi].unwrap()
+                };
+                for q in 1..m {
+                    for (a, ap, b, bp) in find_crossing_witness(&instance.trees[q], &comps, &leaf_node[q]) {
+                        // Clause: x_aa' & x_bb' -> x_ab   (=  ¬x_aa' ∨ ¬x_bb' ∨ x_ab)
+                        add_clause(
+                            &mut solver,
+                            &[xl(a, ap).neg_lit(), xl(b, bp).neg_lit(), xl(a, b).pos_lit()],
+                        );
+                        cross_clauses += 1;
+                        cross_sizes.push(4); // witness taxa count
+                        added_any = true;
+                    }
+                }
+                if !added_any {
+                    let opt_str = opt_known.map(|o| o.to_string()).unwrap_or_else(|| "?".into());
+                    eprintln!(
+                        "[merge] RESULT K={} SAT (valid forest with <= {} blocks exists) -> opt<={} (known opt={}) | rounds={} agree_cl={} cross_cl={} total={:.1}s",
+                        k_blocks, k_blocks, k_blocks, opt_str, rounds, agree_clauses, cross_clauses, t0.elapsed().as_secs_f64()
+                    );
+                    return;
+                }
+            }
+            SolverResult::Interrupted => {
+                eprintln!("[merge] interrupted");
+                return;
+            }
+        }
+    }
+}
+
+/// Outcome of the lazy crossing-CEGAR feasibility oracle used by merge-IHS.
+enum OracleResult {
+    /// A model with no agreement/crossing violations exists under the assumptions.
+    Feasible,
+    /// The (incrementally strengthened) theory is UNSAT under the assumptions;
+    /// the last solver call was that UNSAT solve, so `solver.core()` is valid.
+    Infeasible,
+    /// Budget hit or solver interrupted — caller treats as undecided.
+    Interrupted,
+}
+
+/// Run the merge-encoding feasibility oracle to fixpoint under `assumps`:
+/// repeatedly solve, and on SAT separate every current agreement (A) and
+/// crossing (C) violation, re-solving until the model is clean (Feasible) or the
+/// theory turns UNSAT (Infeasible). Shared by the main IHS feasibility test and
+/// by core minimization so reported core sizes reflect the true theory, not a
+/// model with unseparated crossings.
+#[allow(clippy::too_many_arguments)]
+fn merge_oracle(
+    solver: &mut CaDiCaL,
+    x: &[Vec<Option<Var>>],
+    instance: &Instance,
+    leaf_node: &[Vec<NodeId>],
+    nca: &NcaData,
+    triple_index: &TripleIndex,
+    added_h4: &mut FixedBitSet,
+    n: usize,
+    m: usize,
+    assumps: &[Lit],
+    cross_clauses: &mut usize,
+    cross_sizes: &mut Vec<usize>,
+    t0: &std::time::Instant,
+    budget_s: f64,
+) -> OracleResult {
+    let xl = |i: usize, j: usize| {
+        let (lo, hi) = if i < j { (i, j) } else { (j, i) };
+        x[lo][hi].unwrap()
+    };
+    loop {
+        if t0.elapsed().as_secs_f64() > budget_s {
+            return OracleResult::Interrupted;
+        }
+        match solver.solve_assumps(assumps).unwrap() {
+            SolverResult::Unsat => return OracleResult::Infeasible,
+            SolverResult::Interrupted => return OracleResult::Interrupted,
+            SolverResult::Sat => {
+                let comps = extract_components_from_model(solver, x, n);
+                let mut added = false;
+                // Agreement (A): normally empty when triples are eager, but kept
+                // for safety / lazy-agreement runs.
+                for &(a, b, c) in &collect_h4_violated_triples(&comps, nca, triple_index, added_h4) {
+                    add_h4_triple_clauses(solver, x, a, b, c);
+                    added_h4.insert(triple_index.index(a, b, c));
+                    added = true;
+                }
+                // Crossing (C): separate all crossing block-pairs in trees 1..m.
+                for q in 1..m {
+                    for (a, ap, b, bp) in
+                        find_crossing_witness(&instance.trees[q], &comps, &leaf_node[q])
+                    {
+                        add_clause(
+                            solver,
+                            &[xl(a, ap).neg_lit(), xl(b, bp).neg_lit(), xl(a, b).pos_lit()],
+                        );
+                        *cross_clauses += 1;
+                        cross_sizes.push(4);
+                        added = true;
+                    }
+                }
+                if !added {
+                    return OracleResult::Feasible;
+                }
+            }
+        }
+    }
+}
+
+/// Merge-space core-guided MaxSAT (implicit hitting set) lower-bound probe.
+///
+/// Combines the tight merge encoding (`run_merge_probe`: x_ab merge vars + lazy
+/// width-≤4 crossing separation) with the IHS optimization loop of
+/// `run_maxhs_lb_probe`, instead of the cut encoding's path-diluted theory. The
+/// soft objective stays the tree-0 cut cardinality (`del0`), so the extracted
+/// cores live in cut space but are *proved* by the tight merge theory.
+///
+/// Decisive measurement: the deletion-minimized core-size distribution. The
+/// width-≤4 obstruction theory predicts small cores here (where cut-IHS died on
+/// large ones); if so, IHS converges in few rounds and merge-IHS is the path to
+/// closing the monsters. Reports core sizes, crossing clauses, and the LB.
+pub fn run_merge_ihs_probe(instance: &Instance) {
+    let n = instance.num_leaves as usize;
+    let m = instance.num_trees();
+    let budget_s: f64 = std::env::var("KLADOS_PROBE_BUDGET_S")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(120.0);
+    let opt_known: Option<usize> = std::env::var("KLADOS_PROBE_OPT")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    let t0 = std::time::Instant::now();
+
+    let nca = NcaData::build(instance, n);
+    let triple_index = TripleIndex::new(n);
+    let leaf_node: Vec<Vec<NodeId>> = (0..m)
+        .map(|q| {
+            let t = &instance.trees[q];
+            (0..n).map(|a| t.node_by_label((a + 1) as Label)).collect()
+        })
+        .collect();
+
+    let mut solver = CaDiCaL::default();
+    let mut vm = BasicVarManager::default();
+
+    // del0 cut vars (tree 0) + x = conn merge vars; x_ab <=> connected in tree 0.
+    let t0tree = &instance.trees[0];
+    let del0: Vec<Option<Var>> = (0..t0tree.num_nodes())
+        .map(|v| {
+            if v as NodeId == t0tree.root {
+                None
+            } else {
+                Some(vm.new_var())
+            }
+        })
+        .collect();
+    let x: Vec<Vec<Option<Var>>> = (0..n)
+        .map(|a| (0..n).map(|b| if b > a { Some(vm.new_var()) } else { None }).collect())
+        .collect();
+
+    let mut tree0_link = 0usize;
+    for a in 0..n {
+        for b in (a + 1)..n {
+            let path = path_nodes(t0tree, leaf_node[0][a], leaf_node[0][b]);
+            let mut fwd = vec![x[a][b].unwrap().pos_lit()];
+            for &v in &path {
+                if let Some(dv) = del0[v as usize] {
+                    add_clause(&mut solver, &[x[a][b].unwrap().neg_lit(), dv.neg_lit()]);
+                    fwd.push(dv.pos_lit());
+                    tree0_link += 1;
+                }
+            }
+            add_clause(&mut solver, &fwd);
+        }
+    }
+
+    // Agreement (A) eager: all incompatible triples, marked so the oracle's lazy
+    // pass skips them (parity with the cut maxhs-probe).
+    let mut added_h4 = FixedBitSet::with_capacity(TripleIndex::capacity(n));
+    let mut agree_clauses = 0usize;
+    for a in 0..n {
+        for b in (a + 1)..n {
+            for c in (b + 1)..n {
+                if nca.is_incompatible(a, b, c) {
+                    add_h4_triple_clauses(&mut solver, &x, a, b, c);
+                    added_h4.insert(triple_index.index(a, b, c));
+                    agree_clauses += 3;
+                }
+            }
+        }
+    }
+
+    // Soft objective = tree-0 cut vars.
+    let cut0: Vec<Var> = del0.iter().filter_map(|v| *v).collect();
+    let ncut = cut0.len();
+    let mut var_to_idx: fxhash::FxHashMap<Var, usize> = fxhash::FxHashMap::default();
+    for (i, v) in cut0.iter().enumerate() {
+        var_to_idx.insert(*v, i);
+    }
+    eprintln!(
+        "[merge-ihs] n={} m={} cut0_vars={} agree_cl={} tree0_link={} encode={:.1}s budget={:.0}s",
+        n, m, ncut, agree_clauses, tree0_link, t0.elapsed().as_secs_f64(), budget_s
+    );
+
+    let mut cores: Vec<Vec<usize>> = Vec::new();
+    let mut core_sizes: Vec<usize> = Vec::new();
+    let mut cross_clauses = 0usize;
+    let mut cross_sizes: Vec<usize> = Vec::new();
+    let mut ip_solves = 0usize;
+    let mut ip_ms = 0.0f64;
+    let mut lb_cuts = 0usize;
+    let mut converged = false;
+
+    'outer: loop {
+        if t0.elapsed().as_secs_f64() > budget_s {
+            break;
+        }
+        // 1. Min-cost hitting set over cores -> which tree-0 edges MAY be cut.
+        let (lb, hset) = if cores.is_empty() {
+            (0usize, vec![false; ncut])
+        } else {
+            let ti = std::time::Instant::now();
+            let mut pb = highs::RowProblem::default();
+            let cols: Vec<highs::Col> =
+                (0..ncut).map(|_| pb.add_integer_column(1.0, 0.0..=1.0)).collect();
+            for core in &cores {
+                let coeffs: Vec<(highs::Col, f64)> =
+                    core.iter().map(|&v| (cols[v], 1.0)).collect();
+                pb.add_row(1.0.., &coeffs);
+            }
+            let mut model = pb.optimise(highs::Sense::Minimise);
+            model.set_option("threads", klados_core::highs_threads());
+            let solved = model.solve();
+            ip_ms += ti.elapsed().as_secs_f64() * 1000.0;
+            ip_solves += 1;
+            if solved.status() != highs::HighsModelStatus::Optimal {
+                eprintln!("[merge-ihs] IP status {:?} — abort", solved.status());
+                break;
+            }
+            let vals = solved.get_solution();
+            let cols_v = vals.columns();
+            let mut h = vec![false; ncut];
+            let mut cnt = 0usize;
+            for (v, slot) in h.iter_mut().enumerate() {
+                if cols_v[v] > 0.5 {
+                    *slot = true;
+                    cnt += 1;
+                }
+            }
+            (cnt, h)
+        };
+        lb_cuts = lb;
+
+        // 2. Feasibility: every tree-0 edge OUTSIDE the hitting set must stay uncut.
+        let assumps: Vec<Lit> = (0..ncut)
+            .filter(|&v| !hset[v])
+            .map(|v| cut0[v].neg_lit())
+            .collect();
+        match merge_oracle(
+            &mut solver, &x, instance, &leaf_node, &nca, &triple_index, &mut added_h4,
+            n, m, &assumps, &mut cross_clauses, &mut cross_sizes, &t0, budget_s,
+        ) {
+            OracleResult::Feasible => {
+                converged = true;
+                break;
+            }
+            OracleResult::Interrupted => {
+                eprintln!("[merge-ihs] oracle interrupted/budget in feasibility");
+                break;
+            }
+            OracleResult::Infeasible => {
+                // Core over the forced-uncut soft assumptions.
+                let core_lits = solver.core().unwrap();
+                let mut new_core: Vec<usize> = Vec::new();
+                for l in core_lits {
+                    if let Some(&idx) = var_to_idx.get(&l.var()) {
+                        new_core.push(idx);
+                    }
+                }
+                new_core.sort_unstable();
+                new_core.dedup();
+                if new_core.is_empty() {
+                    eprintln!("[merge-ihs] empty core (base infeasible) — abort");
+                    break;
+                }
+                // Deletion-based minimization through the SAME oracle, so a member
+                // is dropped only if the tight theory is still UNSAT without it.
+                let mut i = 0;
+                while i < new_core.len() {
+                    let trial: Vec<Lit> = new_core
+                        .iter()
+                        .enumerate()
+                        .filter(|&(j, _)| j != i)
+                        .map(|(_, &v)| cut0[v].neg_lit())
+                        .collect();
+                    match merge_oracle(
+                        &mut solver, &x, instance, &leaf_node, &nca, &triple_index,
+                        &mut added_h4, n, m, &trial, &mut cross_clauses, &mut cross_sizes,
+                        &t0, budget_s,
+                    ) {
+                        OracleResult::Infeasible => {
+                            new_core.remove(i);
+                        }
+                        OracleResult::Feasible => i += 1,
+                        OracleResult::Interrupted => break 'outer,
+                    }
+                }
+                core_sizes.push(new_core.len());
+                cores.push(new_core);
+                if cores.len() % 25 == 0 {
+                    let run_max = core_sizes.iter().copied().max().unwrap_or(0);
+                    let run_mean =
+                        core_sizes.iter().sum::<usize>() as f64 / core_sizes.len() as f64;
+                    eprintln!(
+                        "[merge-ihs] .. cores={} lb_cuts={} coresize[max/mean]={}/{:.1} cross_cl={} t={:.0}s",
+                        cores.len(), lb_cuts, run_max, run_mean, cross_clauses,
+                        t0.elapsed().as_secs_f64()
+                    );
+                }
+            }
+        }
+    }
+
+    core_sizes.sort_unstable();
+    let (cmin, cmed, cmax, cmean) = if core_sizes.is_empty() {
+        (0, 0, 0, 0.0)
+    } else {
+        let s = core_sizes.len();
+        (
+            core_sizes[0],
+            core_sizes[s / 2],
+            core_sizes[s - 1],
+            core_sizes.iter().sum::<usize>() as f64 / s as f64,
+        )
+    };
+    let comp_lb = lb_cuts + 1;
+    let opt_str = opt_known.map(|o| o.to_string()).unwrap_or_else(|| "?".into());
+    let gap_str = opt_known
+        .map(|o| (o as i64 - comp_lb as i64).to_string())
+        .unwrap_or_else(|| "?".into());
+    eprintln!(
+        "[merge-ihs] RESULT n={} m={} opt={} | converged={} lb_cuts={} comp_lb={} gap_to_opt={} \
+         | cores={} coresize[min/med/max/mean]={}/{}/{}/{:.1} \
+         | cross_cl={} ip_solves={} ip={:.1}s total={:.1}s",
+        n, m, opt_str, converged, lb_cuts, comp_lb, gap_str,
+        cores.len(), cmin, cmed, cmax, cmean,
+        cross_clauses, ip_solves, ip_ms / 1000.0, t0.elapsed().as_secs_f64()
+    );
+}
+
+/// Reach encoding (Theorem C). Static, O(mn^2), width-<=3 exact encoding for
+/// "is there an agreement forest with <= K blocks?". Replaces the O(mn^4)
+/// crossing quads with auxiliary reach variables u^q_{a,v} ("a's block reaches
+/// node v in tree q") and a single vertex-disjointness clause per leaf pair at
+/// their lca. No CEGAR, no FFI propagator: CDCL propagates merge->reach->conflict
+/// natively. SOUND+COMPLETE: SAT iff a valid <=K-block forest exists.
+pub fn run_reach_probe(instance: &Instance) {
+    let n = instance.num_leaves as usize;
+    let m = instance.num_trees();
+    let budget_s: f64 = std::env::var("KLADOS_PROBE_BUDGET_S")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(120.0);
+    let opt_known: Option<usize> = std::env::var("KLADOS_PROBE_OPT")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    let k_blocks: usize = std::env::var("KLADOS_MERGE_K")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .or_else(|| opt_known.map(|o| o - 1))
+        .expect("set KLADOS_MERGE_K or KLADOS_PROBE_OPT");
+    let t0 = std::time::Instant::now();
+
+    let nca = NcaData::build(instance, n);
+    let leaf_node: Vec<Vec<NodeId>> = (0..m)
+        .map(|q| {
+            let t = &instance.trees[q];
+            (0..n).map(|a| t.node_by_label((a + 1) as Label)).collect()
+        })
+        .collect();
+
+    let mut solver = CaDiCaL::default();
+    let mut vm = BasicVarManager::default();
+
+    // del[0] (cardinality) + x = conn, tied to tree 0 connectivity (as in merge).
+    let t0tree = &instance.trees[0];
+    let del0: Vec<Option<Var>> = (0..t0tree.num_nodes())
+        .map(|v| if v as NodeId == t0tree.root { None } else { Some(vm.new_var()) })
+        .collect();
+    let x: Vec<Vec<Option<Var>>> = (0..n)
+        .map(|a| (0..n).map(|b| if b > a { Some(vm.new_var()) } else { None }).collect())
+        .collect();
+    for a in 0..n {
+        for b in (a + 1)..n {
+            let path = path_nodes(t0tree, leaf_node[0][a], leaf_node[0][b]);
+            let mut fwd = vec![x[a][b].unwrap().pos_lit()];
+            for &v in &path {
+                if let Some(dv) = del0[v as usize] {
+                    add_clause(&mut solver, &[x[a][b].unwrap().neg_lit(), dv.neg_lit()]);
+                    fwd.push(dv.pos_lit());
+                }
+            }
+            add_clause(&mut solver, &fwd);
+        }
+    }
+
+    // Eager agreement (A): all incompatible triples (static, width-3 over x).
+    let mut agree = 0usize;
+    for a in 0..n {
+        for b in (a + 1)..n {
+            for c in (b + 1)..n {
+                if nca.is_incompatible(a, b, c) {
+                    add_h4_triple_clauses(&mut solver, &x, a, b, c);
+                    agree += 3;
+                }
+            }
+        }
+    }
+
+    // Reach variables + (mono) + (def-up) + (VD), for trees q = 1..m.
+    // u[q][a] : node -> Var, for every ancestor `node` of leaf a in tree q.
+    let mut u: Vec<Vec<fxhash::FxHashMap<NodeId, Var>>> =
+        (0..m).map(|_| vec![fxhash::FxHashMap::default(); n]).collect();
+    let mut mono = 0usize;
+    for q in 1..m {
+        let tq = &instance.trees[q];
+        for a in 0..n {
+            // Walk from leaf up to root, creating reach vars + monotone chain.
+            let mut node = tq.parent[leaf_node[q][a] as usize];
+            let mut prev: Option<Var> = None;
+            loop {
+                let var = vm.new_var();
+                u[q][a].insert(node, var);
+                if let Some(pv) = prev {
+                    // higher (var) => lower (pv):  reaching `node` implies reaching child below.
+                    add_clause(&mut solver, &[var.neg_lit(), pv.pos_lit()]);
+                    mono += 1;
+                }
+                prev = Some(var);
+                if node == tq.root {
+                    break;
+                }
+                node = tq.parent[node as usize];
+            }
+        }
+    }
+
+    // (def-up) and (VD) over leaf pairs, at their per-tree lca.
+    let mut defup = 0usize;
+    let mut vd = 0usize;
+    for q in 1..m {
+        let tq = &instance.trees[q];
+        for a in 0..n {
+            for b in (a + 1)..n {
+                let mnode = tq.nearest_common_ancestor(leaf_node[q][a], leaf_node[q][b]);
+                let ua = u[q][a][&mnode];
+                let ub = u[q][b][&mnode];
+                let xab = x[a][b].unwrap();
+                // def-up: x_ab => u^q_{a,m} ; x_ab => u^q_{b,m}
+                add_clause(&mut solver, &[xab.neg_lit(), ua.pos_lit()]);
+                add_clause(&mut solver, &[xab.neg_lit(), ub.pos_lit()]);
+                // VD: u^q_{a,m} & u^q_{b,m} => x_ab
+                add_clause(&mut solver, &[ua.neg_lit(), ub.neg_lit(), xab.pos_lit()]);
+                defup += 2;
+                vd += 1;
+            }
+        }
+    }
+
+    // Cardinality: <= k_blocks-1 cuts in tree 0.
+    let del0_lits: Vec<Lit> = del0.iter().filter_map(|v| v.map(|x| x.pos_lit())).collect();
+    let mut totalizer = Totalizer::default();
+    for lit in del0_lits {
+        totalizer.extend([lit]);
+    }
+    let cut_bound = k_blocks - 1;
+    totalizer.encode_ub(cut_bound..=cut_bound, &mut solver, &mut vm).unwrap();
+    let assumps = totalizer.enforce_ub(cut_bound).unwrap();
+
+    eprintln!(
+        "[reach] n={} m={} K={} (<= {} cuts) | vars={} | agree_cl={} mono={} defup={} vd={} | encode={:.1}s",
+        n, m, k_blocks, cut_bound, vm.n_used(), agree, mono, defup, vd, t0.elapsed().as_secs_f64()
+    );
+
+    // The u-variables are functionally determined by x; bias them false (their
+    // value under sparse optimal partitions) to discourage CDCL from branching
+    // on them and bloating the search.
+    if std::env::var("KLADOS_REACH_PHASE").is_ok() {
+        for q in 1..m {
+            for a in 0..n {
+                for (_, &var) in u[q][a].iter() {
+                    solver.phase_lit(var.neg_lit()).unwrap();
+                }
+            }
+        }
+    }
+
+    let ts = std::time::Instant::now();
+    let res = solver.solve_assumps(&assumps).unwrap();
+    let solve_s = ts.elapsed().as_secs_f64();
+    let opt_str = opt_known.map(|o| o.to_string()).unwrap_or_else(|| "?".into());
+    match res {
+        SolverResult::Unsat => eprintln!(
+            "[reach] RESULT K={} UNSAT -> opt>={} (known opt={}) solve={:.1}s total={:.1}s",
+            k_blocks, k_blocks + 1, opt_str, solve_s, t0.elapsed().as_secs_f64()
+        ),
+        SolverResult::Sat => {
+            eprintln!(
+                "[reach] RESULT K={} SAT (valid forest with <= {} blocks) -> opt<={} (known opt={}) solve={:.1}s total={:.1}s",
+                k_blocks, k_blocks, k_blocks, opt_str, solve_s, t0.elapsed().as_secs_f64()
+            );
+            let comps = extract_components_from_model(&solver, &x, n);
+            let mut hist: BTreeMap<usize, usize> = BTreeMap::new();
+            for c in &comps {
+                *hist.entry(c.len()).or_default() += 1;
+            }
+            let singletons = comps.iter().filter(|c| c.len() == 1).count();
+            let nonsing: usize = comps.iter().filter(|c| c.len() > 1).map(|c| c.len()).sum();
+            let merges: usize = comps.iter().map(|c| c.len() - 1).sum();
+            eprintln!(
+                "[reach] STRUCTURE: blocks={} singletons={} non-singleton-blocks={} active-leaves={} merges(n-k)={} | size-hist={:?}",
+                comps.len(), singletons, comps.len() - singletons, nonsing, merges, hist
+            );
+        }
+        SolverResult::Interrupted => eprintln!("[reach] interrupted after {:.1}s", solve_s),
+    }
+    let _ = budget_s;
+}
+
+/// Bound-bracketed refutation solver built on the static reach encoding.
+///
+/// Encodes the reach formulation ONCE with a Totalizer over tree-0 cuts spanning
+/// the full bound range, then descends K incrementally on the same solver: each
+/// `enforce_ub(K-1)` reuses learned clauses. SAT at K yields a valid ≤K-block
+/// forest (cheap — finding is easy); the descent stops at the first UNSAT, which
+/// proves the last SAT forest optimal (refuting is the expensive step, paid once).
+///
+/// Returns the best forest found (optimal if `proven` is true; otherwise the best
+/// incumbent within `budget_s`). The incumbent starts at all-singletons, so the
+/// number of descent steps is (n − opt) — short precisely for the high-opt /
+/// high-fragmentation monsters where bound-by-accretion (B&P, IHS) fails.
+pub fn reach_refute(instance: &Instance, budget_s: f64) -> (Vec<Tree>, bool) {
+    let n = instance.num_leaves as usize;
+    let m = instance.num_trees();
+    let t0 = std::time::Instant::now();
+
+    let nca = NcaData::build(instance, n);
+    let leaf_node: Vec<Vec<NodeId>> = (0..m)
+        .map(|q| {
+            let t = &instance.trees[q];
+            (0..n).map(|a| t.node_by_label((a + 1) as Label)).collect()
+        })
+        .collect();
+
+    let mut solver = CaDiCaL::default();
+    let mut vm = BasicVarManager::default();
+
+    let t0tree = &instance.trees[0];
+    let del0: Vec<Option<Var>> = (0..t0tree.num_nodes())
+        .map(|v| if v as NodeId == t0tree.root { None } else { Some(vm.new_var()) })
+        .collect();
+    let x: Vec<Vec<Option<Var>>> = (0..n)
+        .map(|a| (0..n).map(|b| if b > a { Some(vm.new_var()) } else { None }).collect())
+        .collect();
+    for a in 0..n {
+        for b in (a + 1)..n {
+            let path = path_nodes(t0tree, leaf_node[0][a], leaf_node[0][b]);
+            let mut fwd = vec![x[a][b].unwrap().pos_lit()];
+            for &v in &path {
+                if let Some(dv) = del0[v as usize] {
+                    add_clause(&mut solver, &[x[a][b].unwrap().neg_lit(), dv.neg_lit()]);
+                    fwd.push(dv.pos_lit());
+                }
+            }
+            add_clause(&mut solver, &fwd);
+        }
+    }
+    // Eager agreement (A).
+    for a in 0..n {
+        for b in (a + 1)..n {
+            for c in (b + 1)..n {
+                if nca.is_incompatible(a, b, c) {
+                    add_h4_triple_clauses(&mut solver, &x, a, b, c);
+                }
+            }
+        }
+    }
+    // Reach vars + monotone chain (per tree 1..m).
+    let mut u: Vec<Vec<fxhash::FxHashMap<NodeId, Var>>> =
+        (0..m).map(|_| vec![fxhash::FxHashMap::default(); n]).collect();
+    for q in 1..m {
+        let tq = &instance.trees[q];
+        for a in 0..n {
+            let mut node = tq.parent[leaf_node[q][a] as usize];
+            let mut prev: Option<Var> = None;
+            loop {
+                let var = vm.new_var();
+                u[q][a].insert(node, var);
+                if let Some(pv) = prev {
+                    add_clause(&mut solver, &[var.neg_lit(), pv.pos_lit()]);
+                }
+                prev = Some(var);
+                if node == tq.root {
+                    break;
+                }
+                node = tq.parent[node as usize];
+            }
+        }
+    }
+    // (def-up) + (VD) at per-tree lca of each pair.
+    for q in 1..m {
+        let tq = &instance.trees[q];
+        for a in 0..n {
+            for b in (a + 1)..n {
+                let mnode = tq.nearest_common_ancestor(leaf_node[q][a], leaf_node[q][b]);
+                let ua = u[q][a][&mnode];
+                let ub = u[q][b][&mnode];
+                let xab = x[a][b].unwrap();
+                add_clause(&mut solver, &[xab.neg_lit(), ua.pos_lit()]);
+                add_clause(&mut solver, &[xab.neg_lit(), ub.pos_lit()]);
+                add_clause(&mut solver, &[ua.neg_lit(), ub.neg_lit(), xab.pos_lit()]);
+            }
+        }
+    }
+
+    // Cardinality over tree-0 cuts, encoded once across the full bound range.
+    let del0_lits: Vec<Lit> = del0.iter().filter_map(|v| v.map(|x| x.pos_lit())).collect();
+    let ncut = del0_lits.len();
+    let mut totalizer = Totalizer::default();
+    for lit in del0_lits {
+        totalizer.extend([lit]);
+    }
+    totalizer.encode_ub(0..=ncut, &mut solver, &mut vm).unwrap();
+
+    // Functionally-determined reach vars: bias false to keep CDCL off them.
+    for q in 1..m {
+        for a in 0..n {
+            for (_, &var) in u[q][a].iter() {
+                solver.phase_lit(var.neg_lit()).unwrap();
+            }
+        }
+    }
+
+    // Chen/greedy bounds: a multi-tree lower bound, plus a warm-start partition.
+    let bounds = maf_bounds(&instance.trees, instance.num_leaves);
+    let lb_blocks = bounds.lower.max(1);
+
+    // Incumbent: the Chen greedy partition if available (else all-singletons).
+    // partition[j] = component index of leaf label j+1; our leaf index a ↔ label a+1.
+    let (mut best, mut ub) = match &bounds.best_partition {
+        Some(part) => {
+            let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+            for a in 0..n {
+                groups.entry(part[a]).or_default().push(a);
+            }
+            let comps: Vec<Vec<usize>> = groups.into_values().collect();
+            // NB: deliberately do NOT phase-seed x toward this partition. Measured
+            // (pub134): biasing CDCL toward the suboptimal Chen partition slows the
+            // wall UNSAT (342s vs 284s) — it misleads the refutation it must prove.
+            // The partition is used only as the warm-start incumbent + UB.
+            let blocks = comps.len();
+            (components_to_trees(&comps, t0tree, instance.num_leaves), blocks)
+        }
+        None => {
+            let singleton_comps: Vec<Vec<usize>> = (0..n).map(|i| vec![i]).collect();
+            (components_to_trees(&singleton_comps, t0tree, instance.num_leaves), n)
+        }
+    };
+
+    eprintln!(
+        "[reach-refute] n={} m={} vars={} ncut={} encode={:.1}s | LB={} UB(chen)={} budget={:.0}s",
+        n, m, vm.n_used(), ncut, t0.elapsed().as_secs_f64(), lb_blocks, ub, budget_s
+    );
+
+    // LB early-stop: the Chen warm-start already meets the lower bound → optimal,
+    // skip the expensive refutation entirely.
+    if ub <= lb_blocks {
+        eprintln!("[reach-refute] incumbent UB={} == LB → opt PROVEN by bounds (no refutation)", ub);
+        return (best, true);
+    }
+
+    // Descend K = ub-1, ub-2, ... ; stop at first UNSAT (proves optimality).
+    loop {
+        if ub <= 1 {
+            return (best, true); // one block is the floor
+        }
+        if t0.elapsed().as_secs_f64() > budget_s {
+            eprintln!("[reach-refute] budget hit, returning incumbent ub={} (unproven)", ub);
+            return (best, false);
+        }
+        let k = ub - 1; // test "≤ k blocks" = "≤ k-1 cuts"
+        let assumps = totalizer.enforce_ub(k - 1).unwrap();
+        let ts = std::time::Instant::now();
+        match solver.solve_assumps(&assumps).unwrap() {
+            SolverResult::Sat => {
+                let comps = extract_components_from_model(&solver, &x, n);
+                let blocks = comps.len();
+                best = components_to_trees(&comps, t0tree, instance.num_leaves);
+                eprintln!(
+                    "[reach-refute] K={} SAT -> blocks={} ({:.1}s, t={:.0}s)",
+                    k, blocks, ts.elapsed().as_secs_f64(), t0.elapsed().as_secs_f64()
+                );
+                ub = blocks; // may jump below k
+                if ub <= lb_blocks {
+                    eprintln!("[reach-refute] UB={} reached LB → opt PROVEN by bounds", ub);
+                    return (best, true);
+                }
+            }
+            SolverResult::Unsat => {
+                eprintln!(
+                    "[reach-refute] K={} UNSAT -> opt={} PROVEN ({:.1}s, t={:.0}s)",
+                    k, ub, ts.elapsed().as_secs_f64(), t0.elapsed().as_secs_f64()
+                );
+                return (best, true);
+            }
+            SolverResult::Interrupted => {
+                eprintln!("[reach-refute] solver interrupted, returning incumbent ub={}", ub);
+                return (best, false);
+            }
+        }
+    }
+}
+
+/// Enumerated-column MIP. Exploits the low-agreement structure (opt = ~90%
+/// singletons + a small matching of pairs/small blocks): enumerate all agreeing
+/// blocks up to KLADOS_ENUM_MAXSIZE, build the set-partition IP (min #blocks,
+/// packing rows per tree-node), and solve EXACTLY with HiGHS MIP — letting its
+/// cut+heuristic engine close the gap BP's branching can't. Exact when opt uses
+/// only enumerated block sizes (verified: idx134/idx121 are all-pairs).
+pub fn run_enummip_probe(instance: &Instance) {
+    let n = instance.num_leaves as usize;
+    let m = instance.num_trees();
+    let opt_known: Option<usize> = std::env::var("KLADOS_PROBE_OPT").ok().and_then(|s| s.parse().ok());
+    let maxsize: usize = std::env::var("KLADOS_ENUM_MAXSIZE").ok().and_then(|s| s.parse().ok()).unwrap_or(2);
+    let time_limit: f64 = std::env::var("KLADOS_ENUM_TLIMIT").ok().and_then(|s| s.parse().ok()).unwrap_or(120.0);
+    let t0 = std::time::Instant::now();
+    let nca = NcaData::build(instance, n);
+    let leaf_node: Vec<Vec<NodeId>> = (0..m)
+        .map(|q| { let t = &instance.trees[q]; (0..n).map(|a| t.node_by_label((a + 1) as Label)).collect() })
+        .collect();
+
+    // V_i[Y]: internal nodes of the Steiner tree of block Y in tree i.
+    let steiner = |block: &[usize], q: usize| -> Vec<NodeId> {
+        let t = &instance.trees[q];
+        let mut lca = leaf_node[q][block[0]];
+        for &a in &block[1..] { lca = t.nearest_common_ancestor(lca, leaf_node[q][a]); }
+        let mut nodes: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+        for &a in block {
+            let mut v = leaf_node[q][a];
+            while v != lca { nodes.insert(v); v = t.parent[v as usize]; }
+        }
+        nodes.insert(lca);
+        nodes.into_iter().collect()
+    };
+    let agrees = |block: &[usize]| -> bool {
+        for i in 0..block.len() { for j in (i+1)..block.len() { for k in (j+1)..block.len() {
+            if nca.is_incompatible(block[i], block[j], block[k]) { return false; }
+        }}}
+        true
+    };
+
+    // COUNT-ONLY mode: O(1)-memory tally of agreeing blocks by size (assess
+    // whether full enumeration is feasible) — never builds the MIP.
+    if std::env::var("KLADOS_ENUM_COUNTONLY").is_ok() {
+        let pairs = n * (n - 1) / 2;
+        let mut c3 = 0usize;
+        for a in 0..n { for b in (a+1)..n { for c in (b+1)..n {
+            if !nca.is_incompatible(a, b, c) { c3 += 1; }
+        }}}
+        let mut c4 = 0usize;
+        if maxsize >= 4 {
+            for a in 0..n { for b in (a+1)..n { for c in (b+1)..n { for d in (c+1)..n {
+                if agrees(&[a, b, c, d]) { c4 += 1; }
+            }}}}
+        }
+        eprintln!(
+            "[enummip-count] n={} m={} | singletons={} pairs={} agreeing_triples={} agreeing_quads={} | {:.1}s",
+            n, m, n, pairs, c3, if maxsize >= 4 { c4 } else { usize::MAX }, t0.elapsed().as_secs_f64()
+        );
+        return;
+    }
+
+    // Enumerate blocks (singletons + pairs + larger agreeing up to maxsize),
+    // with a hard column cap to stay memory-safe.
+    let col_cap: usize = std::env::var("KLADOS_ENUM_COLCAP").ok().and_then(|s| s.parse().ok()).unwrap_or(200_000);
+    let mut blocks: Vec<Vec<usize>> = (0..n).map(|a| vec![a]).collect(); // singletons
+    for a in 0..n { for b in (a+1)..n { blocks.push(vec![a, b]); } }
+    for sz in 3..=maxsize {
+        // enumerate agreeing blocks of exactly size sz by extending size sz-1 ones.
+        let prev: Vec<Vec<usize>> = blocks.iter().filter(|b| b.len() == sz - 1).cloned().collect();
+        for base in &prev {
+            let last = *base.last().unwrap();
+            for d in (last + 1)..n {
+                let mut blk = base.clone();
+                blk.push(d);
+                if agrees(&blk) {
+                    blocks.push(blk);
+                    if blocks.len() > col_cap {
+                        eprintln!("[enummip] column cap {} hit at size {} — aborting (raise cap or lower maxsize)", col_cap, sz);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    // Build MIP.
+    let mut pb = highs::RowProblem::default();
+    let cols: Vec<highs::Col> = blocks.iter().map(|_| pb.add_integer_column(1.0, 0.0..=1.0)).collect();
+    // Partition rows (=1 per leaf).
+    let mut leaf_cols: Vec<Vec<(highs::Col, f64)>> = vec![Vec::new(); n];
+    for (bi, blk) in blocks.iter().enumerate() {
+        for &a in blk { leaf_cols[a].push((cols[bi], 1.0)); }
+    }
+    for a in 0..n { pb.add_row(1.0..=1.0, &leaf_cols[a]); }
+    // Packing rows (<=1 per tree-node), built lazily over used nodes.
+    let mut node_cols: Vec<fxhash::FxHashMap<NodeId, Vec<(highs::Col, f64)>>> =
+        (0..m).map(|_| fxhash::FxHashMap::default()).collect();
+    for (bi, blk) in blocks.iter().enumerate() {
+        if blk.len() < 2 { continue; }
+        for q in 0..m {
+            for v in steiner(blk, q) {
+                node_cols[q].entry(v).or_default().push((cols[bi], 1.0));
+            }
+        }
+    }
+    let mut n_pack = 0usize;
+    for q in 0..m {
+        for (_, cl) in node_cols[q].iter() {
+            if cl.len() >= 2 { pb.add_row(..=1.0, cl); n_pack += 1; }
+        }
+    }
+    eprintln!(
+        "[enummip] n={} m={} maxsize={} | columns={} (pairs+) pack_rows={} | built {:.1}s, solving MIP (tlimit {:.0}s)...",
+        n, m, maxsize, blocks.len(), n_pack, t0.elapsed().as_secs_f64(), time_limit
+    );
+
+    let mut model = pb.optimise(highs::Sense::Minimise);
+    model.set_option("threads", klados_core::highs_threads());
+    model.set_option("time_limit", time_limit);
+    let solved = model.solve();
+    let status = solved.status();
+    let obj = solved.objective_value();
+    let opt_str = opt_known.map(|o| o.to_string()).unwrap_or_else(|| "?".into());
+    eprintln!(
+        "[enummip] RESULT status={:?} MIP_obj={:.1} (blocks) | known opt={} | total={:.1}s",
+        status, obj, opt_str, t0.elapsed().as_secs_f64()
+    );
+}
+
+/// LP relaxation of the reach (pair) formulation. Solves min sum(del0) over the
+/// continuous relaxation of tree-0 linkage + agreement + reach/VD constraints,
+/// to measure how tight the PAIR formulation's LP is vs the column-based DW LP.
+/// Diagnostic: if reach-LP << DW-LP, the pair formulation is loose and SAT
+/// encodings over it are doomed; if ~=, the gap is small/local (cut-worthy).
+pub fn run_reachlp_probe(instance: &Instance) {
+    let n = instance.num_leaves as usize;
+    let m = instance.num_trees();
+    let opt_known: Option<usize> = std::env::var("KLADOS_PROBE_OPT")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    let t0 = std::time::Instant::now();
+    let nca = NcaData::build(instance, n);
+    let leaf_node: Vec<Vec<NodeId>> = (0..m)
+        .map(|q| {
+            let t = &instance.trees[q];
+            (0..n).map(|a| t.node_by_label((a + 1) as Label)).collect()
+        })
+        .collect();
+
+    let mut pb = highs::RowProblem::default();
+    // Columns.
+    let t0tree = &instance.trees[0];
+    let del0: Vec<Option<highs::Col>> = (0..t0tree.num_nodes())
+        .map(|v| {
+            if v as NodeId == t0tree.root {
+                None
+            } else {
+                Some(pb.add_column(1.0, 0.0..=1.0)) // objective: minimize sum del0
+            }
+        })
+        .collect();
+    let x: Vec<Vec<Option<highs::Col>>> = (0..n)
+        .map(|a| (0..n).map(|b| if b > a { Some(pb.add_column(0.0, 0.0..=1.0)) } else { None }).collect())
+        .collect();
+    let xc = |a: usize, b: usize| { let (l, h) = if a < b { (a, b) } else { (b, a) }; x[l][h].unwrap() };
+
+    // Tree-0 linkage.
+    for a in 0..n {
+        for b in (a + 1)..n {
+            let path = path_nodes(t0tree, leaf_node[0][a], leaf_node[0][b]);
+            let mut fwd: Vec<(highs::Col, f64)> = vec![(xc(a, b), 1.0)];
+            for &v in &path {
+                if let Some(dv) = del0[v as usize] {
+                    pb.add_row(..=1.0, &[(xc(a, b), 1.0), (dv, 1.0)]); // x + del <= 1
+                    fwd.push((dv, 1.0));
+                }
+            }
+            pb.add_row(1.0.., &fwd); // x + sum del >= 1
+        }
+    }
+    // Agreement (A).
+    for a in 0..n {
+        for b in (a + 1)..n {
+            for c in (b + 1)..n {
+                if nca.is_incompatible(a, b, c) {
+                    pb.add_row(..=1.0, &[(xc(a, b), 1.0), (xc(a, c), 1.0)]);
+                    pb.add_row(..=1.0, &[(xc(a, b), 1.0), (xc(b, c), 1.0)]);
+                    pb.add_row(..=1.0, &[(xc(a, c), 1.0), (xc(b, c), 1.0)]);
+                }
+            }
+        }
+    }
+    // Reach vars + mono + def-up + VD for q=1..m.
+    let mut u: Vec<Vec<fxhash::FxHashMap<NodeId, highs::Col>>> =
+        (0..m).map(|_| vec![fxhash::FxHashMap::default(); n]).collect();
+    for q in 1..m {
+        let tq = &instance.trees[q];
+        for a in 0..n {
+            let mut node = tq.parent[leaf_node[q][a] as usize];
+            let mut prev: Option<highs::Col> = None;
+            loop {
+                let col = pb.add_column(0.0, 0.0..=1.0);
+                u[q][a].insert(node, col);
+                if let Some(pv) = prev {
+                    pb.add_row(..=0.0, &[(col, 1.0), (pv, -1.0)]); // u_high - u_low <= 0
+                }
+                prev = Some(col);
+                if node == tq.root {
+                    break;
+                }
+                node = tq.parent[node as usize];
+            }
+        }
+    }
+    for q in 1..m {
+        let tq = &instance.trees[q];
+        for a in 0..n {
+            for b in (a + 1)..n {
+                let mnode = tq.nearest_common_ancestor(leaf_node[q][a], leaf_node[q][b]);
+                let ua = u[q][a][&mnode];
+                let ub = u[q][b][&mnode];
+                pb.add_row(0.0.., &[(ua, 1.0), (xc(a, b), -1.0)]); // u_a - x >= 0  (def-up)
+                pb.add_row(0.0.., &[(ub, 1.0), (xc(a, b), -1.0)]);
+                pb.add_row(..=1.0, &[(ua, 1.0), (ub, 1.0), (xc(a, b), -1.0)]); // VD
+            }
+        }
+    }
+
+    eprintln!("[reachlp] n={} m={} built in {:.1}s, solving LP...", n, m, t0.elapsed().as_secs_f64());
+    let mut model = pb.optimise(highs::Sense::Minimise);
+    model.set_option("threads", klados_core::highs_threads());
+    let solved = model.solve();
+    let status = solved.status();
+    if status != highs::HighsModelStatus::Optimal {
+        eprintln!("[reachlp] LP status {:?}", status);
+        return;
+    }
+    let cuts_lp = solved.objective_value();
+    let comp_lp = cuts_lp + 1.0;
+    let opt_str = opt_known.map(|o| o.to_string()).unwrap_or_else(|| "?".into());
+    eprintln!(
+        "[reachlp] RESULT cuts_LP={:.4} comp_LP={:.4} (ceil {}) | known opt={} | solve+build={:.1}s  [compare to DW LP]",
+        cuts_lp, comp_lp, comp_lp.ceil() as i64, opt_str, t0.elapsed().as_secs_f64()
+    );
+}
+
+/// Exact solver exposed as `reach-refute`: bound-bracketed refutation on the
+/// static reach encoding (`reach_refute`). Emits an optimal agreement forest
+/// when proven within budget, else the best incumbent found.
+pub struct ReachRefuteSolver {
+    stats: SolverStats,
+}
+
+impl Default for ReachRefuteSolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ReachRefuteSolver {
+    pub fn new() -> Self {
+        Self { stats: SolverStats::default() }
+    }
+}
+
+impl ExactSolver for ReachRefuteSolver {
+    fn name(&self) -> &'static str {
+        "reach-refute"
+    }
+    fn description(&self) -> &'static str {
+        "Bound-bracketed refutation on the static reach encoding (emits forest)"
+    }
+    fn options(&self) -> &'static [(&'static str, &'static str)] {
+        &[("KLADOS_REACH_BUDGET_S", "wall budget in seconds (default 1700)")]
+    }
+    fn solve(&mut self, instance: &Instance) -> Option<Vec<Tree>> {
+        if instance.num_trees() <= 1 || instance.num_leaves <= 1 {
+            return Some(instance.trees[0..1].to_vec());
+        }
+        let budget_s: f64 = std::env::var("KLADOS_REACH_BUDGET_S")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1700.0);
+        let (forest, proven) = reach_refute(instance, budget_s);
+        eprintln!("[reach-refute] RESULT blocks={} proven_optimal={}", forest.len(), proven);
+        Some(forest)
+    }
+    fn stats(&self) -> &SolverStats {
+        &self.stats
+    }
+}
+
+/// Probe wrapper exposed as the `maxhs-probe` solver choice. Runs the
+/// core-guided lower-bound measurement and prints a report to stderr.
+pub struct MaxhsProbeSolver {
+    stats: SolverStats,
+}
+
+impl Default for MaxhsProbeSolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MaxhsProbeSolver {
+    pub fn new() -> Self {
+        Self {
+            stats: SolverStats::default(),
+        }
+    }
+}
+
+impl ExactSolver for MaxhsProbeSolver {
+    fn name(&self) -> &'static str {
+        "maxhs-probe"
+    }
+    fn description(&self) -> &'static str {
+        "Core-guided implicit-hitting-set lower-bound probe (measurement only)"
+    }
+    fn options(&self) -> &'static [(&'static str, &'static str)] {
+        &[
+            ("KLADOS_PROBE_BUDGET_S", "wall budget in seconds (default 120)"),
+            ("KLADOS_PROBE_OPT", "known optimum for gap reporting"),
+        ]
+    }
+    fn solve(&mut self, instance: &Instance) -> Option<Vec<Tree>> {
+        if instance.num_trees() <= 1 || instance.num_leaves <= 1 {
+            return Some(instance.trees[0..1].to_vec());
+        }
+        if std::env::var("KLADOS_PROBE_MODE").as_deref() == Ok("merge") {
+            run_merge_probe(instance);
+            return None;
+        }
+        if std::env::var("KLADOS_PROBE_MODE").as_deref() == Ok("merge-ihs") {
+            run_merge_ihs_probe(instance);
+            return None;
+        }
+        if std::env::var("KLADOS_PROBE_MODE").as_deref() == Ok("reach") {
+            run_reach_probe(instance);
+            return None;
+        }
+        if std::env::var("KLADOS_PROBE_MODE").as_deref() == Ok("reachlp") {
+            run_reachlp_probe(instance);
+            return None;
+        }
+        if std::env::var("KLADOS_PROBE_MODE").as_deref() == Ok("enummip") {
+            run_enummip_probe(instance);
+            return None;
+        }
+        run_maxhs_lb_probe(instance);
+        // Measurement only — emit the trivial all-singletons forest so the CLI
+        // has something to print; correctness of THIS output is not the point.
+        None
+    }
+    fn stats(&self) -> &SolverStats {
+        &self.stats
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
 // Cut-based encoding (k-independent!)
 // ═══════════════════════════════════════════════════════════════
 
@@ -1104,7 +2708,14 @@ fn sat_solve_maf_cut(
                         }
                     }
 
-                    if h4_mode.uses_lazy_cegar() && !(h4_mode == H4Mode::Staged && h4_promoted) {
+                    // Skip H4 detection if backward clauses were just added this
+                    // round: adding clauses leaves the solver in INPUT state, so
+                    // the model can no longer be read. The re-solve below restores
+                    // SAT state and H4 violations are caught next round.
+                    if added_backward == 0
+                        && h4_mode.uses_lazy_cegar()
+                        && !(h4_mode == H4Mode::Staged && h4_promoted)
+                    {
                         let comps = extract_components_from_model(&solver, &conn, n);
                         let violated_triples = collect_h4_violated_triples(
                             &comps,
@@ -2044,6 +3655,18 @@ fn solve_sat_inner_impl(
         bounds.lower
     };
 
+    // Diagnostic override: force the LB (e.g. from BP's DW LP) to test whether
+    // a tight lower bound shrinks the Totalizer and makes the k=opt-1 refutation
+    // tractable. UNSOUND if the forced value exceeds the true opt — diagnostic only.
+    let lb_components = std::env::var("KLADOS_MAF_SAT_LB")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|forced| {
+            eprintln!("[sat] LB override: {} -> {}", lb_components, forced);
+            forced
+        })
+        .unwrap_or(lb_components);
+
     eprintln!(
         "[sat] Final bounds: LB={}, UB={}, gap={}",
         lb_components,
@@ -2096,7 +3719,7 @@ fn solve_sat_inner_impl(
             ub_components,
             lb_components,
             &mut profile,
-            false, // use_cegar: disabled by default (overhead > benefit on most instances)
+            std::env::var("KLADOS_MAF_SAT_CEGAR").is_ok(), // lazy backward clauses
             h4_mode,
             Some(&kern.reverse_map),
         )?

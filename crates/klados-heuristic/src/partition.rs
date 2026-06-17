@@ -2269,7 +2269,7 @@ fn solve_nodepack_selection_with_limit(
 
     let mut model = pb.optimise(Sense::Maximise);
     model.make_quiet();
-    model.set_option("threads", 1_i32);
+    model.set_option("threads", klados_core::highs_threads());
     model.set_option("presolve", "on");
     if let Some(time_limit_secs) = time_limit_secs {
         model.set_option("time_limit", time_limit_secs.max(0.001));
@@ -2304,7 +2304,7 @@ fn build_global_pricing_workspace(
 
     let mut primal_model = Model::new(ColProblem::default());
     primal_model.make_quiet();
-    primal_model.set_option("threads", 1_i32);
+    primal_model.set_option("threads", klados_core::highs_threads());
     primal_model.set_option("presolve", "on");
     primal_model.set_option("solver", "simplex");
 
@@ -2342,7 +2342,7 @@ fn build_global_pricing_workspace(
 
     let mut dual_model = Model::new(ColProblem::default());
     dual_model.make_quiet();
-    dual_model.set_option("threads", 1_i32);
+    dual_model.set_option("threads", klados_core::highs_threads());
     dual_model.set_option("presolve", "on");
     dual_model.set_option("solver", "simplex");
 
@@ -2534,7 +2534,7 @@ pub(crate) fn solve_paper_rmp_lp_blocks(
 
     let mut model = pb.optimise(Sense::Minimise);
     model.make_quiet();
-    model.set_option("threads", 1_i32);
+    model.set_option("threads", klados_core::highs_threads());
     model.set_option("presolve", "on");
     model.set_option("solver", "simplex");
     let solved = model.solve();
@@ -2599,7 +2599,7 @@ fn solve_stabilized_dual_blocks(
 
     let mut dual_model = Model::new(ColProblem::default());
     dual_model.make_quiet();
-    dual_model.set_option("threads", 1_i32);
+    dual_model.set_option("threads", klados_core::highs_threads());
     dual_model.set_option("presolve", "on");
     dual_model.set_option("solver", "simplex");
 

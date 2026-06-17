@@ -29,6 +29,10 @@ pub enum SolverChoice {
     ILP,
     #[value(name = "sat-olver")]
     MafSatOlver,
+    #[value(name = "maxhs-probe")]
+    MaxhsProbe,
+    #[value(name = "reach-refute")]
+    ReachRefute,
     #[value(name = "whidden")]
     Whidden,
     #[value(name = "greedy-partition-union-addone")]
@@ -72,6 +76,8 @@ impl SolverChoice {
             ILP => "Integer Linear Programming via HiGHS",
             Sat => "SAT-based encoding via rustsat/cadical",
             MafSatOlver => "SAT-based with Olver 2-approx LB seeding",
+            MaxhsProbe => "Core-guided implicit-hitting-set lower-bound probe (measurement)",
+            ReachRefute => "Bound-bracketed refutation on static reach encoding (emits forest)",
             ChenRspr => "Chen-style rSPR branch-and-bound (2-tree only)",
             Whidden => "Whidden 3-way branch-and-bound (2-tree only)",
             BpMulti => "Branch & Price for multi-tree MAF (default)",
@@ -95,6 +101,11 @@ impl SolverChoice {
                 ("KLADOS_MAF_SAT_H4", "H4 mode: full, lazy, seeded-lazy, staged"),
                 ("KLADOS_MAF_SAT_COMPONENT_TRACE", "enable component trace"),
             ],
+            MaxhsProbe => &[
+                ("KLADOS_PROBE_BUDGET_S", "wall budget in seconds (default 120)"),
+                ("KLADOS_PROBE_OPT", "known optimum for gap reporting"),
+            ],
+            ReachRefute => &[("KLADOS_REACH_BUDGET_S", "wall budget in seconds (default 1700)")],
             MafSatOlver => &[
                 ("KLADOS_MAF_SAT_H4", "H4 mode: full, lazy, seeded-lazy, staged"),
                 ("KLADOS_MAF_SAT_H4_PROMOTE_MS", "promote MaxSAT solution"),
@@ -160,6 +171,12 @@ impl SolverChoice {
             SolverChoice::Sat => from_exact(klados_exact::maf_sat::MafSatSolver::new()),
             SolverChoice::MafSatOlver => {
                 from_exact(klados_exact::maf_sat::MafSatOlverSolver::new())
+            }
+            SolverChoice::MaxhsProbe => {
+                from_exact(klados_exact::maf_sat::MaxhsProbeSolver::new())
+            }
+            SolverChoice::ReachRefute => {
+                from_exact(klados_exact::maf_sat::ReachRefuteSolver::new())
             }
             SolverChoice::ChenRspr => from_exact(klados_exact::chen_rspr::ChenRsprSolver::new()),
             SolverChoice::Whidden => from_exact(klados_exact::whidden::WhiddenSolver::new()),

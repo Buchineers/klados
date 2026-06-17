@@ -855,6 +855,48 @@ fn solve_node<P: Pricer, S: BranchSelector>(
             }
         }
         maybe_probe_root_obstruction(reduced, state, &lp, root_regions.as_ref());
+
+        // Subset-row-inequality cutting-plane test: measure how much SRIs lift
+        // the converged root LP toward opt (does branch-and-cut close the gap?).
+        if branchings.depth() == 0 && node_converged && std::env::var("KLADOS_BP_SRI_TEST").is_ok() {
+            let lp0 = lp.objective;
+            let rounds: usize = std::env::var("KLADOS_BP_SRI_ROUNDS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(8);
+            let opt_str = std::env::var("KLADOS_BP_SRI_OPT").unwrap_or_else(|_| "?".into());
+            info!(target: LOG_TARGET, "sri-test: root LP={:.4} ceil={} (opt={})", lp0, lp0.ceil() as i64, opt_str);
+            let mut vals = lp.column_values.clone();
+            let mut last = lp0;
+            for r in 0..rounds {
+                let n_pack = rmp.separate_and_add_cuts(state.columns(), &vals, 1.0e-6);
+                let n_sri = rmp.separate_and_add_sri(state.columns(), &vals, 4000, 1.0e-6);
+                if n_pack + n_sri == 0 {
+                    info!(target: LOG_TARGET, "sri-test: round {} no violated cuts; LP-stable", r);
+                    break;
+                }
+                match rmp.solve() {
+                    Ok(sol) => {
+                        info!(
+                            target: LOG_TARGET,
+                            "sri-test: round {} +{}pack +{}sri -> poolLP={:.4} ceil={}",
+                            r, n_pack, n_sri, sol.objective, sol.objective.ceil() as i64
+                        );
+                        vals = sol.column_values;
+                        last = sol.objective;
+                    }
+                    Err(e) => {
+                        info!(target: LOG_TARGET, "sri-test: solve error {}", e);
+                        break;
+                    }
+                }
+            }
+            info!(
+                target: LOG_TARGET,
+                "sri-test: FINAL pool+SRI LP={:.4} ceil={} (root LP was {:.4}, opt={}) [pool-restricted, no re-pricing]",
+                last, last.ceil() as i64, lp0, opt_str
+            );
+        }
         maybe_log_bridge_footprint(
             "root-incumbent",
             state.incumbent(),
@@ -1313,6 +1355,81 @@ fn probe_root_obstruction_impl(
                 "obstruction-probe: largest core local LB solve failed after {:.1}ms",
                 t_lb.elapsed().as_secs_f64() * 1000.0,
             ),
+        }
+    }
+
+    // Subset-certificate experiment. By leaf-monotonicity opt(S) <= opt(X) for
+    // S subset of X, so a PROPER leaf subset that EXACT-proves the incumbent
+    // value certifies global optimality without the full branch tree. Run exact
+    // BP on cumulative unions of the fractional support regions (largest first),
+    // each under a wall deadline, and report the proven k vs subset size.
+    if std::env::var("KLADOS_BP_SUBSET_EXACT").is_ok() {
+        use std::sync::atomic::Ordering;
+        let deadline_s: f64 = std::env::var("KLADOS_BP_SUBSET_DEADLINE_S")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20.0);
+        let total_leaves = state.num_leaves();
+        // Ordered leaf list: support regions largest-first (the "hard" leaves
+        // come first), so prefixes are increasingly hard subsets.
+        let mut ordered: Vec<usize> = Vec::new();
+        for comp in regions.comps.iter() {
+            for leaf in comp.leaves.ones() {
+                ordered.push(leaf);
+            }
+        }
+        let sizes: Vec<usize> = {
+            let mut s = vec![20usize, 30, 40, 50, 60];
+            s.retain(|&x| x < ordered.len());
+            s.push(ordered.len()); // full support
+            s
+        };
+        info!(
+            target: LOG_TARGET,
+            "subset-exact: support_leaves={} sizes={:?} deadline={:.0}s",
+            ordered.len(), sizes, deadline_s
+        );
+        for &sz in &sizes {
+            let mut acc = FixedBitSet::with_capacity(total_leaves + 1);
+            for &leaf in ordered.iter().take(sz) {
+                acc.insert(leaf);
+            }
+            let (core, _rev) = klados_core::kernelize::restrict_instance_simple(reduced, &acc);
+            let term = Arc::new(AtomicBool::new(false));
+            let deadline_hit = Arc::new(AtomicBool::new(false));
+            let term2 = Arc::clone(&term);
+            let dh2 = Arc::clone(&deadline_hit);
+            let watchdog = std::thread::spawn(move || {
+                let start = Instant::now();
+                while start.elapsed().as_secs_f64() < deadline_s {
+                    if term2.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                dh2.store(true, Ordering::Relaxed);
+                term2.store(true, Ordering::Relaxed);
+            });
+            let t = Instant::now();
+            let res = solve_inner(&core, &term);
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            term.store(true, Ordering::Relaxed);
+            let _ = watchdog.join();
+            let proven = !deadline_hit.load(Ordering::Relaxed);
+            let k = res.map(|f| f.len()).unwrap_or(0);
+            if proven {
+                info!(
+                    target: LOG_TARGET,
+                    "subset-exact: leaves={} PROVEN opt={} ({:.0}ms) -> global LB>={}",
+                    sz, k, ms, k
+                );
+            } else {
+                info!(
+                    target: LOG_TARGET,
+                    "subset-exact: leaves={} TIMEOUT(>{:.0}s) incumbent={}",
+                    sz, deadline_s, k
+                );
+            }
         }
     }
 

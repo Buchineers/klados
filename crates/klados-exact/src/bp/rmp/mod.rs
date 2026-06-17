@@ -94,7 +94,7 @@ impl Rmp {
     pub fn new(initial: &[AfColumn], trees: &[Tree], num_leaves: usize) -> Self {
         let mut model = Model::new(ColProblem::default());
         model.make_quiet();
-        model.set_option("threads", 1_i32);
+        model.set_option("threads", klados_core::highs_threads());
         model.set_option("presolve", "off");
         model.set_option("solver", "simplex");
         model.set_option("simplex_strategy", 1_i32); // dual simplex
@@ -390,6 +390,87 @@ impl Rmp {
             }
         }
         added
+    }
+
+    /// Separate violated subset-row inequalities (rank-1 Chvátal–Gomory cuts for
+    /// set partitioning): for any 3 taxa {a,b,c}, at most one block can contain
+    /// ≥2 of them, so  Σ_{Y:|Y∩{a,b,c}|≥2} x_Y ≤ 1. Adds violated cuts (rows over
+    /// ALL columns covering ≥2, for validity) and returns the number added.
+    pub fn separate_and_add_sri(
+        &mut self,
+        columns: &[AfColumn],
+        column_values: &[f64],
+        max_cuts: usize,
+        eps: f64,
+    ) -> usize {
+        let has = |ci: usize, t: u32| columns[ci].labels().binary_search(&t).is_ok();
+        let frac: Vec<usize> = column_values
+            .iter()
+            .enumerate()
+            .filter(|&(ci, &v)| v > eps && ci < columns.len())
+            .map(|(ci, _)| ci)
+            .collect();
+        let mut active: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        for &ci in &frac {
+            for &l in columns[ci].labels() {
+                active.insert(l);
+            }
+        }
+        let active: Vec<u32> = active.into_iter().collect();
+        let mut violated: Vec<(u32, u32, u32)> = Vec::new();
+        let mut max_lhs = 0.0f64;
+        'outer: for i in 0..active.len() {
+            for j in (i + 1)..active.len() {
+                for k in (j + 1)..active.len() {
+                    let (a, b, c) = (active[i], active[j], active[k]);
+                    let mut lhs = 0.0;
+                    for &ci in &frac {
+                        let cnt = has(ci, a) as u8 + has(ci, b) as u8 + has(ci, c) as u8;
+                        if cnt >= 2 {
+                            lhs += column_values[ci];
+                        }
+                    }
+                    if lhs > max_lhs {
+                        max_lhs = lhs;
+                    }
+                    if lhs > 1.0 + eps {
+                        violated.push((a, b, c));
+                        if violated.len() >= max_cuts {
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
+        if std::env::var("KLADOS_BP_SRI_DIAG").is_ok() {
+            eprintln!(
+                "[sri-diag] frac_cols={} active_taxa={} max_triple_lhs={:.4} violated={}",
+                frac.len(), active.len(), max_lhs, violated.len()
+            );
+        }
+        let ptr = self.model.as_mut().expect("model present").as_mut_ptr();
+        for &(a, b, c) in &violated {
+            let mut indices: Vec<i32> = Vec::new();
+            for ci in 0..columns.len() {
+                let cnt = has(ci, a) as u8 + has(ci, b) as u8 + has(ci, c) as u8;
+                if cnt >= 2 {
+                    indices.push(self.col_handle[ci]);
+                }
+            }
+            let values = vec![1.0_f64; indices.len()];
+            unsafe {
+                highs_sys::Highs_addRow(
+                    ptr,
+                    f64::NEG_INFINITY,
+                    1.0,
+                    indices.len() as i32,
+                    indices.as_ptr(),
+                    values.as_ptr(),
+                );
+            }
+            self.num_rows += 1;
+        }
+        violated.len()
     }
 
     /// Apply per-column bounds derived from `branchings`. RCVF-fixed columns

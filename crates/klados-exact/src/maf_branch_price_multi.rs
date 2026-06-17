@@ -2622,7 +2622,7 @@ impl PersistentRmp {
     fn new(columns: &[BpColumn], trees: &[Tree], num_leaves: usize) -> Result<Self, String> {
         let mut model = Model::new(ColProblem::default());
         model.make_quiet();
-        model.set_option("threads", 1_i32);
+        model.set_option("threads", klados_core::highs_threads());
         // Presolve is wasteful when we warm-start with an existing basis on every solve.
         // We change only column bounds / add columns between solves, so dual simplex
         // can resume from the stored basis directly.
