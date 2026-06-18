@@ -71,6 +71,12 @@ pub struct UndoMachine {
     ops: Vec<UndoOp>,
 }
 
+impl Default for UndoMachine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl UndoMachine {
     pub fn new() -> Self {
         Self {

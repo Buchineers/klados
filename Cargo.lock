@@ -730,9 +730,9 @@ checksum = "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2"
 
 [[package]]
 name = "jiff"
-version = "0.2.24"
+version = "0.2.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f00b5dbd620d61dfdcb6007c9c1f6054ebd75319f163d886a9055cec1155073d"
+checksum = "4603d3033e49e2b0e31229fcab20a5d40089c607d975cd9c80551dc69eed9102"
 dependencies = [
  "jiff-static",
  "log",
@@ -743,9 +743,9 @@ dependencies = [
 
 [[package]]
 name = "jiff-static"
-version = "0.2.24"
+version = "0.2.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e000de030ff8022ea1da3f466fbb0f3a809f5e51ed31f6dd931c35181ad8e6d7"
+checksum = "782d32378dddf207193ac91cefb848ad41abb58195c95168e1291227a0832b47"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -782,9 +782,7 @@ dependencies = [
  "highs",
  "indicatif",
  "klados-core",
- "klados-exact",
- "klados-heuristic",
- "log",
+ "klados-solve",
  "pace26io",
  "serde",
  "serde_json",
@@ -800,34 +798,26 @@ dependencies = [
  "fixedbitset",
  "fxhash",
  "iai-callgrind",
+ "log",
  "pace26io",
 ]
 
 [[package]]
-name = "klados-exact"
+name = "klados-solve"
 version = "0.1.0"
 dependencies = [
+ "env_logger",
  "fixedbitset",
  "fxhash",
  "highs",
  "highs-sys",
  "klados-core",
+ "libc",
  "log",
+ "pace26io",
  "rustsat",
  "rustsat-cadical",
-]
-
-[[package]]
-name = "klados-heuristic"
-version = "0.1.0"
-dependencies = [
- "fixedbitset",
- "fxhash",
- "highs",
- "klados-core",
- "klados-exact",
- "libc",
- "pace26io",
+ "signal-hook",
 ]
 
 [[package]]

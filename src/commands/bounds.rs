@@ -77,7 +77,7 @@ fn compute(algo: BoundsAlgo, instance: &Instance) -> AlgoResult {
                 return pair_err(algo);
             }
             let (l, u) =
-                klados_exact::chen_rspr::chen_pair_bounds(&instance.trees[0], &instance.trees[1]);
+                klados_solve::solvers::chen_rspr::chen_pair_bounds(&instance.trees[0], &instance.trees[1]);
             (l + 1, u + 1)
         }
         BoundsAlgo::ChenApp1 => {
@@ -85,7 +85,7 @@ fn compute(algo: BoundsAlgo, instance: &Instance) -> AlgoResult {
                 return pair_err(algo);
             }
             let (l, u) =
-                klados_exact::chen_rspr::chen_app1_bounds(&instance.trees[0], &instance.trees[1]);
+                klados_solve::solvers::chen_rspr::chen_app1_bounds(&instance.trees[0], &instance.trees[1]);
             (l + 1, u + 1)
         }
         BoundsAlgo::RedBlue => {
@@ -111,7 +111,6 @@ pub fn run(
     algos: &[BoundsAlgo],
     list: Option<&Path>,
     scores_file: Option<&Path>,
-    verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let scores = if let Some(path) = scores_file {
         Some(load_scores(path)?)
@@ -120,9 +119,9 @@ pub fn run(
     };
 
     if let Some(list_file) = list {
-        run_batch(algos, list_file, scores.as_ref(), verbose)
+        run_batch(algos, list_file, scores.as_ref())
     } else {
-        run_single(algos, scores.as_ref(), verbose)
+        run_single(algos, scores.as_ref())
     }
 }
 
@@ -131,7 +130,6 @@ pub fn run(
 fn run_single(
     algos: &[BoundsAlgo],
     scores: Option<&HashMap<String, usize>>,
-    verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let instance = Instance::from_stdin()?;
     let n = instance.num_leaves;
@@ -153,9 +151,9 @@ fn run_single(
                 "  LB={}  UB={}  UB/LB={}  {:.1}ms",
                 r.lower, r.upper, lb_ub_gap, r.ms
             );
-            if let Some(scores) = scores {
-                if let Some(name) = &instance.name {
-                    if let Some(&opt) = scores.get(&name.to_uppercase()) {
+            if let Some(scores) = scores
+                && let Some(name) = &instance.name
+                    && let Some(&opt) = scores.get(&name.to_uppercase()) {
                         let gap = if opt > 0 {
                             r.upper as f64 / opt as f64
                         } else {
@@ -169,8 +167,6 @@ fn run_single(
                             if ok { "✓" } else { "✗ VIOLATION" }
                         );
                     }
-                }
-            }
         }
     }
     Ok(())
@@ -189,7 +185,6 @@ fn run_batch(
     algos: &[BoundsAlgo],
     list_file: &Path,
     scores: Option<&HashMap<String, usize>>,
-    verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (entries, _) = klados_core::parse_list_file(list_file)?;
     let has_scores = scores.is_some();
@@ -216,7 +211,7 @@ fn run_batch(
         })
         .collect();
     eprintln!(
-        "{:>64} {:>3} {:>5}  {:>5} | {} | {} | {}",
+        "{:>64} {:>3} {:>5}  {:>5} | {} | {} | ok",
         "DIGEST",
         "m",
         "n",
@@ -225,8 +220,7 @@ fn run_batch(
             .map(|s| format!("{} {:<5} {:<5} {:<5} {:<5}", s, "LB", "UB", "gap", "ms"))
             .collect::<Vec<_>>()
             .join(" | "),
-        if algos.len() > 1 { "best-gap" } else { "" },
-        "ok"
+        if algos.len() > 1 { "best-gap" } else { "" }
     );
     eprintln!("{}", "-".repeat(180));
 
@@ -353,7 +347,7 @@ fn run_batch(
             ts.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
             let avg_t = ts.iter().sum::<f64>() / n as f64;
             let (min_t, max_t) = (ts[0], ts[n - 1]);
-            let med_t = if n % 2 == 0 {
+            let med_t = if n.is_multiple_of(2) {
                 (ts[n / 2 - 1] + ts[n / 2]) / 2.0
             } else {
                 ts[n / 2]

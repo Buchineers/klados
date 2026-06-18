@@ -426,7 +426,6 @@ fn pick_multi_tree_cut_seeded(
     step: u64,
 ) -> Label {
     let mut a_deeper = 0i32;
-    let mut total_diff: i32 = 0;
     for (i, t) in mtrees.iter().enumerate() {
         if i == ref_idx {
             continue;
@@ -438,7 +437,6 @@ fn pick_multi_tree_cut_seeded(
         }
         let da = depth_in_mtree(t, na) as i32;
         let db = depth_in_mtree(t, nb) as i32;
-        total_diff += da - db;
         if da > db {
             a_deeper += 1;
         } else if db > da {
@@ -567,12 +565,12 @@ pub fn pairwise_refine_ub(trees: &[Tree], num_leaves: usize) -> (usize, Vec<usiz
             for ((comp, _root), leaves) in &groups {
                 comp_groups.entry(*comp).or_default().push(leaves.clone());
             }
-            for (_comp, sub_groups) in &comp_groups {
+            for sub_groups in comp_groups.values() {
                 if sub_groups.len() > 1 {
                     changed = true;
                     // Keep largest sub-group with original comp_id, assign new to rest.
                     let mut sorted = sub_groups.clone();
-                    sorted.sort_by(|a, b| b.len().cmp(&a.len()));
+                    sorted.sort_by_key(|g| std::cmp::Reverse(g.len()));
                     for group in &sorted[1..] {
                         for &j in group {
                             partition[j] = next_comp;
@@ -598,7 +596,7 @@ pub fn pairwise_refine_ub(trees: &[Tree], num_leaves: usize) -> (usize, Vec<usiz
             comp_leaves.entry(partition[j]).or_default().push(j);
         }
 
-        'outer: for (_comp, leaves) in &comp_leaves {
+        'outer: for leaves in comp_leaves.values() {
             if leaves.len() < 3 {
                 continue;
             }

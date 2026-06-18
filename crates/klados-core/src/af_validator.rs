@@ -379,7 +379,7 @@ mod tests {
         let inst = Instance::new(vec![t1.clone(), t2.clone()], 6);
         // Submit T1 as the lone component — its restriction matches T1 (Ok)
         // but not T2 (mismatch).
-        let result = validate_agreement_forest(&inst, &[t1.clone()]);
+        let result = validate_agreement_forest(&inst, std::slice::from_ref(&t1));
         assert!(
             matches!(result, AfValidation::NotIsomorphic { .. }),
             "got {:?}",
