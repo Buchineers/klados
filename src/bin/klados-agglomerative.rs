@@ -1,1 +1,3 @@
-fn main() { klados_solve::solvers::agglomerative::main(); }
+fn main() {
+    klados_solve::solvers::agglomerative::main();
+}

@@ -1,1 +1,3 @@
-fn main() { klados_solve::solvers::root_corridor::main(); }
+fn main() {
+    klados_solve::solvers::root_corridor::main();
+}

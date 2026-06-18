@@ -82,7 +82,12 @@ fn expand_impl(
             for &l in all_labels {
                 ls.insert(l as usize);
             }
-            components.push(make_component(&ls, original_ref_tree, original_num_leaves, indexed));
+            components.push(make_component(
+                &ls,
+                original_ref_tree,
+                original_num_leaves,
+                indexed,
+            ));
         } else if indexed {
             components.push(Tree::singleton(orig_label, original_num_leaves));
         } else {

@@ -546,12 +546,17 @@ impl Solver for MafIlpSolver {
     }
 }
 
-
 // ── Unified Solver impl + entry point ───────────────────────────────────────
 use crate::{RunConfig, Solver, Track};
 
 pub fn main() {
-    crate::run(MafIlpSolver::new(), RunConfig { track: Track::Exact, ..Default::default() });
+    crate::run(
+        MafIlpSolver::new(),
+        RunConfig {
+            track: Track::Exact,
+            ..Default::default()
+        },
+    );
 }
 
 #[cfg(test)]

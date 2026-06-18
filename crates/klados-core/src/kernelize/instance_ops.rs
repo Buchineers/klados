@@ -1,6 +1,6 @@
 //! Instance reduction and restriction operations.
 
-use crate::{Instance, NodeId, Tree, NONE};
+use crate::{Instance, NONE, NodeId, Tree};
 use fixedbitset::FixedBitSet;
 
 /// Reduce an instance by collapsing groups of leaves.

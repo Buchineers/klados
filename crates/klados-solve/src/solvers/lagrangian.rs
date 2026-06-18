@@ -17,29 +17,28 @@
 //! Here the loop degrades gracefully to the Chen+seed pool at that scale.
 
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use fixedbitset::FixedBitSet;
-use fxhash::FxHashSet;
-use klados_core::af_validator::validate_agreement_forest;
-use klados_core::tree::{NONE, NodeId, Tree};
-use klados_core::{Instance, SolverStats};
+use crate::decomp::whidden_cluster::try_whidden_decomp_2tree;
 use crate::solvers::bp::column::{AfColumn, ColumnBuilder, ColumnSet, is_valid_af_component};
 use crate::solvers::bp::pricer::exact_pair_dp::ExactPairDpCache;
 use crate::solvers::bp::pricer::{
-    dispatch_by_m, ExactPairDpPricer, MafPricer, Pricer, PricerScratch, PricingContext,
-    PricingResult,
+    ExactPairDpPricer, MafPricer, Pricer, PricerScratch, PricingContext, PricingResult,
+    dispatch_by_m,
 };
 use crate::solvers::bp::rmp::{Rmp, RmpSolution};
 use crate::solvers::bp::search::{
     BranchSelector, Branchings, LeafPair, MostFractionalPair, SelectionContext,
 };
 use crate::solvers::chen_rspr::chen_pair_agreement;
-use crate::decomp::whidden_cluster::try_whidden_decomp_2tree;
+use fixedbitset::FixedBitSet;
+use fxhash::FxHashSet;
+use klados_core::af_validator::validate_agreement_forest;
+use klados_core::tree::{NONE, NodeId, Tree};
+use klados_core::{Instance, SolverStats};
 use log::debug;
-
 
 const POOL_HARD_CAP: usize = 120_000;
 const POOL_PRUNE_TO: usize = 80_000;
@@ -597,8 +596,7 @@ impl LagrangianSolver {
                 };
                 Some(start + dur)
             };
-            let (rmp_forest, rmp_proved, rmp_pool) =
-                self.solve_rmp(reduced, rmp_deadline, start);
+            let (rmp_forest, rmp_proved, rmp_pool) = self.solve_rmp(reduced, rmp_deadline, start);
             if force_lp || rmp_proved {
                 return (rmp_forest, rmp_proved);
             }
@@ -612,28 +610,27 @@ impl LagrangianSolver {
         // ---- Pool + dedup ----
         let mut pool: Vec<Block> = Vec::new();
         let mut seen = ColumnSet::new();
-        let add_block =
-            |labels: Vec<u32>, pool: &mut Vec<Block>, seen: &mut ColumnSet| -> bool {
-                let mut l = labels;
-                l.sort_unstable();
-                l.dedup();
-                if l.len() < 2 {
-                    return false;
-                }
-                if seen.contains(&l) {
-                    return false;
-                }
-                if !is_valid_af_component(&l, trees) {
-                    return false;
-                }
-                if let Some(b) = make_block(trees, l.clone()) {
-                    seen.insert(l);
-                    pool.push(b);
-                    true
-                } else {
-                    false
-                }
-            };
+        let add_block = |labels: Vec<u32>, pool: &mut Vec<Block>, seen: &mut ColumnSet| -> bool {
+            let mut l = labels;
+            l.sort_unstable();
+            l.dedup();
+            if l.len() < 2 {
+                return false;
+            }
+            if seen.contains(&l) {
+                return false;
+            }
+            if !is_valid_af_component(&l, trees) {
+                return false;
+            }
+            if let Some(b) = make_block(trees, l.clone()) {
+                seen.insert(l);
+                pool.push(b);
+                true
+            } else {
+                false
+            }
+        };
 
         // ---- Warm start: Chen 2-approx forest ----
         let (_chen_lo, _chen_up, chen_sets) = chen_pair_agreement(&trees[0], &trees[1]);
@@ -726,8 +723,7 @@ impl LagrangianSolver {
                     .collect();
                 windows.push(Window::new(inst, rev, img));
             }
-            let sizes: Vec<usize> =
-                windows.iter().map(|w| w.inst.num_leaves as usize).collect();
+            let sizes: Vec<usize> = windows.iter().map(|w| w.inst.num_leaves as usize).collect();
             let (mn, mx) = (
                 sizes.iter().copied().min().unwrap_or(0),
                 sizes.iter().copied().max().unwrap_or(0),
@@ -1028,17 +1024,20 @@ impl LagrangianSolver {
                 if need_init {
                     for l in 1..=n {
                         if h_in_rmp.insert(vec![l])
-                            && let Some(c) = h_builder.try_build(vec![l], trees) {
-                                h_afpool.push(c);
-                            }
+                            && let Some(c) = h_builder.try_build(vec![l], trees)
+                        {
+                            h_afpool.push(c);
+                        }
                     }
                 }
                 let mut fresh: Vec<AfColumn> = Vec::new();
                 for b in &pool {
-                    if b.labels.len() >= 2 && h_in_rmp.insert(b.labels.clone())
-                        && let Some(c) = h_builder.try_build(b.labels.clone(), trees) {
-                            fresh.push(c);
-                        }
+                    if b.labels.len() >= 2
+                        && h_in_rmp.insert(b.labels.clone())
+                        && let Some(c) = h_builder.try_build(b.labels.clone(), trees)
+                    {
+                        fresh.push(c);
+                    }
                 }
                 if need_init {
                     h_afpool.extend(fresh);
@@ -1174,14 +1173,15 @@ impl LagrangianSolver {
             // available). Both sides lifted to original units via the kernel
             // delta. Armed only for the flat top-level solve (see `abort_armed`).
             if self.abort_armed.load(Ordering::Relaxed)
-                && let Some((a, b)) = self.approx_target {
-                    let delta = self.param_reduction.load(Ordering::Relaxed);
-                    let lb_orig = best_lb.ceil().max(0.0) as usize + delta;
-                    let k_orig = best_components + delta;
-                    if lb_orig > 0 && k_orig <= (a * lb_orig as f64).floor() as usize + b {
-                        self.terminate.store(true, Ordering::Relaxed);
-                    }
+                && let Some((a, b)) = self.approx_target
+            {
+                let delta = self.param_reduction.load(Ordering::Relaxed);
+                let lb_orig = best_lb.ceil().max(0.0) as usize + delta;
+                let k_orig = best_components + delta;
+                if lb_orig > 0 && k_orig <= (a * lb_orig as f64).floor() as usize + b {
+                    self.terminate.store(true, Ordering::Relaxed);
                 }
+            }
             // Primal-stall convergence: the greedy primal has plateaued (the LB
             // may still trickle up, but the incumbent isn't moving). Hand off to
             // the local search. Keys on the PRIMAL, not the bound, so it fires
@@ -1394,16 +1394,17 @@ impl LagrangianSolver {
         // once expanded. `improve_packing`/`lns_improve` watch `abort_k_reduced`
         // and stop the instant they hit it (claims the speed bonus).
         if self.abort_armed.load(Ordering::Relaxed)
-            && let Some((a, b)) = self.approx_target {
-                let delta = self.param_reduction.load(Ordering::Relaxed);
-                let lb_orig = best_lb.ceil().max(0.0) as usize + delta;
-                let t_orig = (a * lb_orig as f64).floor() as usize + b;
-                self.abort_k_reduced
-                    .store(t_orig.saturating_sub(delta), Ordering::Relaxed);
-                if best_components <= t_orig.saturating_sub(delta) {
-                    self.terminate.store(true, Ordering::Relaxed);
-                }
+            && let Some((a, b)) = self.approx_target
+        {
+            let delta = self.param_reduction.load(Ordering::Relaxed);
+            let lb_orig = best_lb.ceil().max(0.0) as usize + delta;
+            let t_orig = (a * lb_orig as f64).floor() as usize + b;
+            self.abort_k_reduced
+                .store(t_orig.saturating_sub(delta), Ordering::Relaxed);
+            if best_components <= t_orig.saturating_sub(delta) {
+                self.terminate.store(true, Ordering::Relaxed);
             }
+        }
 
         // ---- Primal improvement loop (iterated local search over the pool) ----
         // The subgradient has converged; now relentlessly re-select a better
@@ -1415,8 +1416,7 @@ impl LagrangianSolver {
             // Seed from the subgradient's BEST incumbent (best over all
             // iterations), not a final-dual greedy — the local search refines
             // the strongest packing found, not a one-shot one.
-            let sel1 =
-                self.improve_packing(&pool, trees, n, &scores, &best_sel, deadline, start);
+            let sel1 = self.improve_packing(&pool, trees, n, &scores, &best_sel, deadline, start);
             let savings1: usize = sel1.iter().map(|&i| pool[i].labels.len() - 1).sum();
             let k1 = nl - savings1;
             if k1 < best_components {
@@ -1559,8 +1559,8 @@ impl LagrangianSolver {
                 return forest;
             }
         }
-        let slice_s = slice_end
-            .map(|se| se.saturating_duration_since(Instant::now()).as_secs_f64());
+        let slice_s =
+            slice_end.map(|se| se.saturating_duration_since(Instant::now()).as_secs_f64());
         debug!(
             "{ind}[lagr][decomp] cascade n={} slice={}",
             sub.num_leaves,
@@ -1664,11 +1664,14 @@ impl LagrangianSolver {
                 let mut l = c;
                 l.sort_unstable();
                 l.dedup();
-                if l.len() >= 2 && !seen.contains(&l) && is_valid_af_component(&l, trees)
-                    && let Some(b) = make_block(trees, l.clone()) {
-                        seen.insert(l);
-                        pool.push(b);
-                    }
+                if l.len() >= 2
+                    && !seen.contains(&l)
+                    && is_valid_af_component(&l, trees)
+                    && let Some(b) = make_block(trees, l.clone())
+                {
+                    seen.insert(l);
+                    pool.push(b);
+                }
             }
             scores = pool.iter().map(|b| block_score(b, alpha, beta)).collect();
             let lb = self.subgradient_step(trees, nl, pool, &scores, alpha, beta, lambda, ub);
@@ -1776,8 +1779,7 @@ impl LagrangianSolver {
                 break;
             }
             let slice_ms = if nodes == 0 { root_ms } else { node_ms };
-            let slice_end =
-                (Instant::now() + Duration::from_millis(slice_ms)).min(plan_deadline);
+            let slice_end = (Instant::now() + Duration::from_millis(slice_ms)).min(plan_deadline);
             let (k, sel, lb) = self.subgradient_slice(
                 trees,
                 n,
@@ -1811,8 +1813,7 @@ impl LagrangianSolver {
             {
                 let uscores: Vec<f64> =
                     pool.iter().map(|b| block_score(b, &alpha, &beta)).collect();
-                let (uk, usel) =
-                    greedy_pack(&pool, &uscores, trees, n, &Branchings::default());
+                let (uk, usel) = greedy_pack(&pool, &uscores, trees, n, &Branchings::default());
                 if uk < global_best_k {
                     global_best_k = uk;
                     global_best_forest = build_forest(&pool, &usel, trees, n, false);
@@ -1832,7 +1833,10 @@ impl LagrangianSolver {
             // the same sum isn't a valid node bound, so we don't prune there
             // (anytime keeps the best regardless).
             if br.depth() == 0 && (lb - 1e-6).ceil() as usize >= global_best_k {
-                debug!("[lagr][lbnb] root certified: k={} lb={:.1}", global_best_k, lb);
+                debug!(
+                    "[lagr][lbnb] root certified: k={} lb={:.1}",
+                    global_best_k, lb
+                );
                 break;
             }
 
@@ -1913,11 +1917,14 @@ impl LagrangianSolver {
             let mut l = c;
             l.sort_unstable();
             l.dedup();
-            if l.len() >= 2 && !seen.contains(&l) && is_valid_af_component(&l, trees)
-                && let Some(b) = make_block(trees, l.clone()) {
-                    seen.insert(l);
-                    pool.push(b);
-                }
+            if l.len() >= 2
+                && !seen.contains(&l)
+                && is_valid_af_component(&l, trees)
+                && let Some(b) = make_block(trees, l.clone())
+            {
+                seen.insert(l);
+                pool.push(b);
+            }
         }
         let scores: Vec<f64> = pool.iter().map(|b| block_score(b, alpha, beta)).collect();
         let lb = self.subgradient_step(trees, nl, pool, &scores, alpha, beta, lambda, ub);
@@ -2005,8 +2012,17 @@ impl LagrangianSolver {
         let mut stall = 0usize;
         while !self.terminate.load(Ordering::Relaxed) && Instant::now() < warmup_end {
             let lb = self.dive_sg_iter(
-                trees, nl, &mut pool, &mut seen, &mut alpha, &mut beta, &mut pricer, &mut scratch,
-                lambda, best_k, &empty,
+                trees,
+                nl,
+                &mut pool,
+                &mut seen,
+                &mut alpha,
+                &mut beta,
+                &mut pricer,
+                &mut scratch,
+                lambda,
+                best_k,
+                &empty,
             );
             if lb > best_lb + 1e-6 {
                 best_lb = lb;
@@ -2049,8 +2065,17 @@ impl LagrangianSolver {
                     break;
                 }
                 self.dive_sg_iter(
-                    trees, nl, &mut pool, &mut seen, &mut alpha, &mut beta, &mut pricer,
-                    &mut scratch, lambda, best_k, &covered,
+                    trees,
+                    nl,
+                    &mut pool,
+                    &mut seen,
+                    &mut alpha,
+                    &mut beta,
+                    &mut pricer,
+                    &mut scratch,
+                    lambda,
+                    best_k,
+                    &covered,
                 );
             }
             // Best dual-scored column that still fits. Any multi-leaf column
@@ -2140,8 +2165,10 @@ impl LagrangianSolver {
         let w = |ci: usize| -> i64 { pool[ci].labels.len() as i64 - 1 };
 
         let mut leaf_owner = vec![usize::MAX; nl + 1];
-        let mut node_owner: Vec<Vec<usize>> =
-            trees.iter().map(|t| vec![usize::MAX; t.num_nodes()]).collect();
+        let mut node_owner: Vec<Vec<usize>> = trees
+            .iter()
+            .map(|t| vec![usize::MAX; t.num_nodes()])
+            .collect();
         let mut in_sel = vec![false; ncol];
         let mut savings: i64 = 0;
 
@@ -2182,8 +2209,9 @@ impl LagrangianSolver {
         // converged. Generous so quality isn't lost, but bounded so the search
         // terminates without a deadline.
         const LS_STALL_LIMIT: usize = 400;
-        let timed_out =
-            |s: &Self| s.terminate.load(Ordering::Relaxed) || deadline.is_some_and(|d| Instant::now() >= d);
+        let timed_out = |s: &Self| {
+            s.terminate.load(Ordering::Relaxed) || deadline.is_some_and(|d| Instant::now() >= d)
+        };
 
         while !timed_out(self) {
             // ---- (1) improving swaps ----
@@ -2473,7 +2501,9 @@ impl LagrangianSolver {
             }
         }
 
-        let internal: Vec<NodeId> = (0..t1.num_nodes() as u32).filter(|&v| !t1.is_leaf(v)).collect();
+        let internal: Vec<NodeId> = (0..t1.num_nodes() as u32)
+            .filter(|&v| !t1.is_leaf(v))
+            .collect();
         if internal.is_empty() {
             return incumbent;
         }
@@ -2662,9 +2692,9 @@ impl LagrangianSolver {
             }
         }
         let add_labels = |labels: Vec<u32>,
-                              pool: &mut Vec<AfColumn>,
-                              seen: &mut ColumnSet,
-                              builder: &mut ColumnBuilder| {
+                          pool: &mut Vec<AfColumn>,
+                          seen: &mut ColumnSet,
+                          builder: &mut ColumnBuilder| {
             let mut l = labels;
             l.sort_unstable();
             l.dedup();
@@ -2875,11 +2905,17 @@ impl LagrangianSolver {
                 .iter()
                 .map(|c| c.pricing_score(&sol.leaf_duals, &sol.node_duals))
                 .collect();
-            if let Some((forest, comps)) = greedy_pack_af(&pool, &scores, trees, n, self.flat_terminal.load(Ordering::Relaxed))
-                && comps < best_components {
-                    best_components = comps;
-                    best_forest = forest;
-                }
+            if let Some((forest, comps)) = greedy_pack_af(
+                &pool,
+                &scores,
+                trees,
+                n,
+                self.flat_terminal.load(Ordering::Relaxed),
+            ) && comps < best_components
+            {
+                best_components = comps;
+                best_forest = forest;
+            }
 
             if iter <= 5 || iter.is_multiple_of(10) || added == 0 {
                 debug!(
@@ -2910,12 +2946,18 @@ impl LagrangianSolver {
                     && gap <= MIP_GAP_LIMIT
                     && !self.terminate.load(Ordering::Relaxed)
                     && let Ok(Some(mip)) = rmp.solve_mip_with_time_limit(0.5)
-                        && let Some((forest, comps)) =
-                            forest_from_lp(&pool, &mip.column_values, trees, n, self.flat_terminal.load(Ordering::Relaxed))
-                            && comps < best_components {
-                                best_components = comps;
-                                best_forest = forest;
-                            }
+                    && let Some((forest, comps)) = forest_from_lp(
+                        &pool,
+                        &mip.column_values,
+                        trees,
+                        n,
+                        self.flat_terminal.load(Ordering::Relaxed),
+                    )
+                    && comps < best_components
+                {
+                    best_components = comps;
+                    best_forest = forest;
+                }
                 // Global pricing with a complete pool ⇒ sol.objective is a valid
                 // LB. best ≤ ⌈lb⌉ certifies optimality. Windowed never certifies.
                 proved = global && best_components <= lb;
@@ -3079,20 +3121,28 @@ impl LagrangianSolver {
                 continue;
             }
 
-            let (sol, certified) =
-                match self.price_node(rmp, pool, seen, &mut pricer, scratch, &br, trees, nl, deadline)
-                {
-                    Some(x) => x,
-                    None => {
-                        if self.terminate.load(Ordering::Relaxed)
-                            || deadline.is_some_and(|d| Instant::now() >= d)
-                        {
-                            hit_deadline = true;
-                            break;
-                        }
-                        continue; // LP error / infeasible node
+            let (sol, certified) = match self.price_node(
+                rmp,
+                pool,
+                seen,
+                &mut pricer,
+                scratch,
+                &br,
+                trees,
+                nl,
+                deadline,
+            ) {
+                Some(x) => x,
+                None => {
+                    if self.terminate.load(Ordering::Relaxed)
+                        || deadline.is_some_and(|d| Instant::now() >= d)
+                    {
+                        hit_deadline = true;
+                        break;
                     }
-                };
+                    continue; // LP error / infeasible node
+                }
+            };
             let lp = sol.objective;
             // Certified LP-bound prune (only Converged gives a valid bound).
             if certified && (lp - 1e-6).ceil() as usize >= best_components {
@@ -3100,18 +3150,24 @@ impl LagrangianSolver {
             }
 
             // Incumbent from this node's LP support.
-            if let Some((forest, comps)) = forest_from_lp(pool, &sol.column_values, trees, n, self.flat_terminal.load(Ordering::Relaxed))
-                && comps < best_components {
-                    best_components = comps;
-                    best_forest = forest;
-                    debug!(
-                        "[lagr][bnb] node={} incumbent={} lp={:.2} t={:.1}s",
-                        nodes,
-                        best_components,
-                        lp,
-                        start.elapsed().as_secs_f64()
-                    );
-                }
+            if let Some((forest, comps)) = forest_from_lp(
+                pool,
+                &sol.column_values,
+                trees,
+                n,
+                self.flat_terminal.load(Ordering::Relaxed),
+            ) && comps < best_components
+            {
+                best_components = comps;
+                best_forest = forest;
+                debug!(
+                    "[lagr][bnb] node={} incumbent={} lp={:.2} t={:.1}s",
+                    nodes,
+                    best_components,
+                    lp,
+                    start.elapsed().as_secs_f64()
+                );
+            }
             nodes += 1;
 
             // Branch on the most-fractional leaf-pair. Pass the certified LP
@@ -3523,7 +3579,11 @@ fn split_t0_windows(tree: &Tree, max_leaves: usize, topdown: bool) -> Vec<Vec<u3
         } else {
             // Closing both would exceed the cap: emit the larger as a window
             // (a connected region), carry the smaller up to keep packing.
-            let (keep, close) = if lo.len() >= ro.len() { (ro, lo) } else { (lo, ro) };
+            let (keep, close) = if lo.len() >= ro.len() {
+                (ro, lo)
+            } else {
+                (lo, ro)
+            };
             if close.len() >= 2 {
                 windows.push(close);
             }
@@ -4050,5 +4110,12 @@ impl Solver for LagrangianSolver {
 }
 
 pub fn main() {
-    crate::run(LagrangianSolver::new(), RunConfig { track: Track::Heuristic, specific: LagrangianConfig::default(), ..Default::default() });
+    crate::run(
+        LagrangianSolver::new(),
+        RunConfig {
+            track: Track::Heuristic,
+            specific: LagrangianConfig::default(),
+            ..Default::default()
+        },
+    );
 }

@@ -1128,7 +1128,8 @@ impl Pricer for LeafPairDpPricer {
             return PricingResult::Converged;
         }
         let target = if ctx.trees.len() == 2 {
-            self.max_per_call.min(adaptive_m2_batch_size(ctx, scratch.m2_batch))
+            self.max_per_call
+                .min(adaptive_m2_batch_size(ctx, scratch.m2_batch))
         } else {
             self.max_per_call
         };
@@ -1162,20 +1163,21 @@ impl Pricer for LeafPairDpPricer {
 
         // Optional anchor-cache stats logging.
         if anchor_cache_enabled(scratch)
-            && let Some(cache) = scratch.anchor_cache.as_ref() {
-                let avg_gap = if cache.gap_positive_refreshes > 0 {
-                    cache.gap_sum / cache.gap_positive_refreshes as f64
-                } else {
-                    0.0
-                };
-                log::debug!(
-                    target: "klados::bp",
-                    "anchor-cache: hits={} skips={} stales={} misses={} refreshes={} gap_pos={} gap_zero={} avg_pos_gap={:.4}",
-                    cache.hits, cache.skips, cache.stales, cache.misses,
-                    cache.refreshes, cache.gap_positive_refreshes,
-                    cache.gap_zero_refreshes, avg_gap,
-                );
-            }
+            && let Some(cache) = scratch.anchor_cache.as_ref()
+        {
+            let avg_gap = if cache.gap_positive_refreshes > 0 {
+                cache.gap_sum / cache.gap_positive_refreshes as f64
+            } else {
+                0.0
+            };
+            log::debug!(
+                target: "klados::bp",
+                "anchor-cache: hits={} skips={} stales={} misses={} refreshes={} gap_pos={} gap_zero={} avg_pos_gap={:.4}",
+                cache.hits, cache.skips, cache.stales, cache.misses,
+                cache.refreshes, cache.gap_positive_refreshes,
+                cache.gap_zero_refreshes, avg_gap,
+            );
+        }
 
         if !result.found.is_empty() {
             // Sort by RC descending, cap at 128 to prevent RMP flooding

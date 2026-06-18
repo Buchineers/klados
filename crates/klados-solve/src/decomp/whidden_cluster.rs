@@ -585,9 +585,10 @@ where
         let maxp = node_to_p.iter().max().copied().unwrap_or(0);
         let mut out = Tree::with_capacity(src.num_leaves.max(maxp));
         if src.root != NONE
-            && let Some(r) = walk(src, node_to_p, clustered, &mut out, src.root) {
-                out.root = r;
-            }
+            && let Some(r) = walk(src, node_to_p, clustered, &mut out, src.root)
+        {
+            out.root = r;
+        }
         out.compute_metadata();
         out
     }
@@ -738,9 +739,10 @@ where
             .max(p_at.iter().max().copied().unwrap_or(0));
         let mut out = Tree::with_capacity(src.num_leaves.max(maxp));
         if src.root != NONE
-            && let Some(r) = walk(src, node_to_p, clustered, &p_at, &mut out, src.root) {
-                out.root = r;
-            }
+            && let Some(r) = walk(src, node_to_p, clustered, &p_at, &mut out, src.root)
+        {
+            out.root = r;
+        }
         out.compute_metadata();
         out
     }
@@ -1172,51 +1174,82 @@ where
             && let Some(rho_pos) = inner_rho_components
                 .iter()
                 .position(|c| component_contains_label(c, rho_label))
-            {
-                // Boundary B = ρ-component minus ρ, in original labels.
-                let boundary_inner = strip_label(
-                    &inner_rho_components[rho_pos],
-                    rho_label,
-                    cluster_size as u32,
+        {
+            // Boundary B = ρ-component minus ρ, in original labels.
+            let boundary_inner = strip_label(
+                &inner_rho_components[rho_pos],
+                rho_label,
+                cluster_size as u32,
+            );
+            let marker_increased_inner = inner_rho_components.len() > decoded_inner.len();
+            if boundary_inner.leaves().next().is_some() {
+                let boundary_decoded = boundary_inner.relabel(&inner_to_orig, instance.num_leaves);
+                let other_inner: Vec<Tree> = inner_rho_components
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != rho_pos)
+                    .map(|(_, c)| c.relabel(&inner_to_orig, instance.num_leaves))
+                    .collect();
+                let anchor_leaf = boundary_decoded
+                    .leaves()
+                    .next()
+                    .expect("boundary is non-empty");
+                let merged = fuse_at_label(
+                    &outer_p_comp_decoded,
+                    &boundary_decoded,
+                    p_decoded,
+                    anchor_leaf,
+                    instance.num_leaves,
                 );
-                let marker_increased_inner = inner_rho_components.len() > decoded_inner.len();
-                if boundary_inner.leaves().next().is_some() {
-                    let boundary_decoded =
-                        boundary_inner.relabel(&inner_to_orig, instance.num_leaves);
-                    let other_inner: Vec<Tree> = inner_rho_components
-                        .iter()
-                        .enumerate()
-                        .filter(|(i, _)| *i != rho_pos)
-                        .map(|(_, c)| c.relabel(&inner_to_orig, instance.num_leaves))
-                        .collect();
-                    let anchor_leaf = boundary_decoded
-                        .leaves()
-                        .next()
-                        .expect("boundary is non-empty");
-                    let merged = fuse_at_label(
-                        &outer_p_comp_decoded,
-                        &boundary_decoded,
-                        p_decoded,
-                        anchor_leaf,
-                        instance.num_leaves,
+                let mut candidate: Vec<Tree> = other_inner;
+                candidate.extend(decoded_outer_non_p.clone());
+                candidate.push(merged);
+                // Optimality guard. The strict-cluster optimum is
+                // |inner| + |outer| − 1 = decoded_inner.len() +
+                // decoded_outer_non_p.len(). The ρ-fallback equals it only
+                // when ρ was a free pendant (|inner_ρ| = |inner|); since
+                // T1|X and T2|X differ in topology, ρ can instead force one
+                // extra cut (|inner_ρ| = |inner| + 1), yielding a valid but
+                // SUBoptimal forest. Accept only when the count matches the
+                // optimum, else bail to full B&P (sound, as before).
+                let expected = decoded_inner.len() + decoded_outer_non_p.len();
+                if candidate.len() == expected
+                    && validate_agreement_forest(instance, &candidate).is_ok()
+                {
+                    log::debug!(
+                        "[whidden] decomp n={}: inner={} outer={} (cluster_node={}, ρ-fallback, {} comps)",
+                        n,
+                        cluster_size,
+                        outer_size + 1,
+                        cluster,
+                        candidate.len()
                     );
-                    let mut candidate: Vec<Tree> = other_inner;
-                    candidate.extend(decoded_outer_non_p.clone());
-                    candidate.push(merged);
-                    // Optimality guard. The strict-cluster optimum is
-                    // |inner| + |outer| − 1 = decoded_inner.len() +
-                    // decoded_outer_non_p.len(). The ρ-fallback equals it only
-                    // when ρ was a free pendant (|inner_ρ| = |inner|); since
-                    // T1|X and T2|X differ in topology, ρ can instead force one
-                    // extra cut (|inner_ρ| = |inner| + 1), yielding a valid but
-                    // SUBoptimal forest. Accept only when the count matches the
-                    // optimum, else bail to full B&P (sound, as before).
-                    let expected = decoded_inner.len() + decoded_outer_non_p.len();
-                    if candidate.len() == expected
-                        && validate_agreement_forest(instance, &candidate).is_ok()
-                    {
+                    return Some(candidate);
+                }
+            }
+            if marker_increased_inner {
+                // Boundary-cut/no-saving case: adding rho to the inner
+                // cluster increased the optimum, so rspr's join_cluster
+                // adjustment removes the cross-boundary -1 saving. The
+                // top side must be solved without P (TP4); stripping P out
+                // of the already solved top-with-P instance is only
+                // feasible, not optimal.
+                let outer_no_p_t1 = t1.relabel(&outer_label_map, outer_size as u32);
+                let outer_no_p_t2 = t2.relabel(&outer_label_map, outer_size as u32);
+                let outer_no_p_instance =
+                    Instance::new(vec![outer_no_p_t1, outer_no_p_t2], outer_size as u32);
+
+                if let Some(outer_no_p_components) = solve(&outer_no_p_instance) {
+                    let mut candidate: Vec<Tree> = decoded_inner.clone();
+                    candidate.extend(
+                        outer_no_p_components
+                            .iter()
+                            .map(|c| c.relabel(&outer_to_orig, instance.num_leaves)),
+                    );
+
+                    if validate_agreement_forest(instance, &candidate).is_ok() {
                         log::debug!(
-                            "[whidden] decomp n={}: inner={} outer={} (cluster_node={}, ρ-fallback, {} comps)",
+                            "[whidden] decomp n={}: inner={} outer={} (cluster_node={}, ρ-boundary-cut, {} comps)",
                             n,
                             cluster_size,
                             outer_size + 1,
@@ -1226,40 +1259,8 @@ where
                         return Some(candidate);
                     }
                 }
-                if marker_increased_inner {
-                    // Boundary-cut/no-saving case: adding rho to the inner
-                    // cluster increased the optimum, so rspr's join_cluster
-                    // adjustment removes the cross-boundary -1 saving. The
-                    // top side must be solved without P (TP4); stripping P out
-                    // of the already solved top-with-P instance is only
-                    // feasible, not optimal.
-                    let outer_no_p_t1 = t1.relabel(&outer_label_map, outer_size as u32);
-                    let outer_no_p_t2 = t2.relabel(&outer_label_map, outer_size as u32);
-                    let outer_no_p_instance =
-                        Instance::new(vec![outer_no_p_t1, outer_no_p_t2], outer_size as u32);
-
-                    if let Some(outer_no_p_components) = solve(&outer_no_p_instance) {
-                        let mut candidate: Vec<Tree> = decoded_inner.clone();
-                        candidate.extend(
-                            outer_no_p_components
-                                .iter()
-                                .map(|c| c.relabel(&outer_to_orig, instance.num_leaves)),
-                        );
-
-                        if validate_agreement_forest(instance, &candidate).is_ok() {
-                            log::debug!(
-                                "[whidden] decomp n={}: inner={} outer={} (cluster_node={}, ρ-boundary-cut, {} comps)",
-                                n,
-                                cluster_size,
-                                outer_size + 1,
-                                cluster,
-                                candidate.len()
-                            );
-                            return Some(candidate);
-                        }
-                    }
-                }
             }
+        }
     }
 
     // No valid anchor — decomposition fails for this cluster point.
@@ -1485,10 +1486,11 @@ fn replace_and_relabel(
     }
 
     if tree.root != NONE
-        && let Some(root) = build(tree, target, placeholder, label_map, &mut out, tree.root) {
-            out.root = root;
-            out.parent[root as usize] = NONE;
-        }
+        && let Some(root) = build(tree, target, placeholder, label_map, &mut out, tree.root)
+    {
+        out.root = root;
+        out.parent[root as usize] = NONE;
+    }
     out.compute_metadata();
     out
 }
@@ -1555,10 +1557,11 @@ fn replace_subtree_with_leaf(
     }
 
     if tree.root != NONE
-        && let Some(root) = build(tree, target, placeholder, &mut out, tree.root) {
-            out.root = root;
-            out.parent[root as usize] = NONE;
-        }
+        && let Some(root) = build(tree, target, placeholder, &mut out, tree.root)
+    {
+        out.root = root;
+        out.parent[root as usize] = NONE;
+    }
     out.compute_metadata();
     out
 }
@@ -1664,10 +1667,10 @@ fn fuse_at_label(
     if outer_comp.root != NONE
         && let Some(root) =
             copy_outer_with_splice(outer_comp, inner_comp, p_label, &mut out, outer_comp.root)
-        {
-            out.root = root;
-            out.parent[root as usize] = NONE;
-        }
+    {
+        out.root = root;
+        out.parent[root as usize] = NONE;
+    }
     out.compute_metadata();
     out
 }
@@ -2108,7 +2111,6 @@ mod tests {
     /// Optimal MAF = 3: {1,2}, {3,4}, {5,6} (exchange 1↔3).
     #[test]
     fn test_common_cluster_point_decomposition() {
-        
         use crate::solvers::maf_branch_price_multi::MafBranchPriceMultiSolver;
         use klados_core::af_validator::validate_agreement_forest;
         use klados_core::brute_maf::brute_force_maf;

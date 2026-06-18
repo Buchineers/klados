@@ -43,8 +43,8 @@ use klados_core::solve_pipeline::{ClusterAlgo, SolveConfig, solve_with_pipeline}
 use klados_core::{Instance, SolverStats, Tree};
 use log::{debug, info};
 
-use crate::solvers::chen_rspr::chen_pair_agreement;
 use crate::decomp::whidden_cluster::try_whidden_decomp_2tree;
+use crate::solvers::chen_rspr::chen_pair_agreement;
 
 const LOG_TARGET: &str = "klados::bp";
 
@@ -860,7 +860,14 @@ fn make_leafset(labels: &[u32], num_leaves: u32) -> FixedBitSet {
 use crate::{RunConfig, Solver, Track};
 
 pub fn main() {
-    crate::run(BpSolver::new(), RunConfig { track: Track::Exact, specific: BpConfig::default(), ..Default::default() });
+    crate::run(
+        BpSolver::new(),
+        RunConfig {
+            track: Track::Exact,
+            specific: BpConfig::default(),
+            ..Default::default()
+        },
+    );
 }
 
 #[cfg(test)]

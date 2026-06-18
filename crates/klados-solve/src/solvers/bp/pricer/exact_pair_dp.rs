@@ -9,7 +9,7 @@
 
 use klados_core::{NONE, Tree};
 
-use super::{adaptive_m2_batch_size, Pricer, PricerScratch, PricingContext, PricingResult};
+use super::{Pricer, PricerScratch, PricingContext, PricingResult, adaptive_m2_batch_size};
 
 const PRICING_EPS: f64 = 1.0e-8;
 const NEG_INF: f64 = f64::NEG_INFINITY;
@@ -124,7 +124,12 @@ impl Pricer for ExactPairDpPricer {
 
     fn price(&mut self, ctx: &PricingContext, scratch: &mut PricerScratch) -> PricingResult {
         debug_assert_eq!(ctx.trees.len(), 2);
-        price_exact_pair_dp(ctx, scratch, self.max_per_call.min(adaptive_m2_batch_size(ctx, scratch.m2_batch)))
+        price_exact_pair_dp(
+            ctx,
+            scratch,
+            self.max_per_call
+                .min(adaptive_m2_batch_size(ctx, scratch.m2_batch)),
+        )
     }
 }
 
@@ -298,7 +303,13 @@ pub(crate) fn collect_positive_candidates_ref(
     // strictly positive reduced cost (`score > 1 + ε`), i.e. score > the
     // "strictly improving" threshold. Routed through the generic threshold
     // path with `threshold = 1 + ε`.
-    collect_candidates_above(ctx, cache, ref_tree_idx, forbidden_anchors, 1.0 + PRICING_EPS)
+    collect_candidates_above(
+        ctx,
+        cache,
+        ref_tree_idx,
+        forbidden_anchors,
+        1.0 + PRICING_EPS,
+    )
 }
 
 /// Run the m=2 DP and return every anchor-best column whose score is
@@ -586,15 +597,7 @@ fn collect_candidates_above(
             }
             if score > threshold {
                 let mut labels = Vec::new();
-                extract_closed(
-                    u,
-                    v,
-                    t0,
-                    dp_closed,
-                    dp_open,
-                    stride,
-                    &mut labels,
-                );
+                extract_closed(u, v, t0, dp_closed, dp_open, stride, &mut labels);
                 labels.sort_unstable();
                 labels.dedup();
                 if labels.len() >= 2 {

@@ -11,7 +11,6 @@ use klados_core::lower_bound::greedy_multi_tree_partition;
 use klados_core::{Instance, SolverStats, Tree};
 use log::{debug, info};
 
-
 /// Tuning knobs for [`PartitionHeuristicSolver`].
 #[derive(Clone, Debug, Default)]
 pub struct PartitionConfig {
@@ -3134,7 +3133,6 @@ pub fn run_packing_gap_experiment(instance: &Instance, best_known: usize) -> Gap
     }
 }
 
-
 // ── Unified Solver impl + entry point ───────────────────────────────────────
 use crate::{RunConfig, Solver, Track};
 
@@ -3155,5 +3153,11 @@ impl Solver for PartitionHeuristicSolver {
 }
 
 pub fn main() {
-    crate::run(PartitionHeuristicSolver::greedy_union_add_one(), RunConfig { track: Track::Heuristic, ..Default::default() });
+    crate::run(
+        PartitionHeuristicSolver::greedy_union_add_one(),
+        RunConfig {
+            track: Track::Heuristic,
+            ..Default::default()
+        },
+    );
 }

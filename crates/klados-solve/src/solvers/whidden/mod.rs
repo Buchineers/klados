@@ -46,10 +46,10 @@ impl Drop for SplitDiagPrinter {
         }
         let rs = unsafe { &*self.stats_ptr };
         let n = rs.split_diag_nodes.max(1);
-        let avg_blocks = rs.split_diag_disjoint_blocks_sum as f64
-            / rs.split_diag_disjoint.max(1) as f64;
-        let avg_max_block = rs.split_diag_disjoint_max_block_sum as f64
-            / rs.split_diag_disjoint.max(1) as f64;
+        let avg_blocks =
+            rs.split_diag_disjoint_blocks_sum as f64 / rs.split_diag_disjoint.max(1) as f64;
+        let avg_max_block =
+            rs.split_diag_disjoint_max_block_sum as f64 / rs.split_diag_disjoint.max(1) as f64;
         debug!(
             "[split-diag] n_input={} sampled={} overlap={} ({:.1}%) disjoint={} ({:.1}%) single={} ({:.1}%) avg_blocks={:.2} avg_max_block={:.1}",
             self.n_input,
@@ -65,8 +65,8 @@ impl Drop for SplitDiagPrinter {
         );
         // Day 6: report SPLIT rule entry-point firing (only if checked).
         if rs.split_rule_checked > 0 {
-            let avg_core_cut = rs.split_rule_core_edges as f64
-                / rs.split_rule_core_cutsets.max(1) as f64;
+            let avg_core_cut =
+                rs.split_rule_core_edges as f64 / rs.split_rule_core_cutsets.max(1) as f64;
             debug!(
                 "[split-rule] checked={} overlap_found={} ({:.1}%) disjoint_found={} ({:.1}%) applied={} core_cutsets={} size1={} ({:.1}%) avg_cut_size={:.2}",
                 rs.split_rule_checked,
@@ -287,10 +287,16 @@ impl Solver for WhiddenSolver {
     }
 }
 
-
 // ── Unified Solver impl + entry point ───────────────────────────────────────
 use crate::{RunConfig, Solver, Track};
 
 pub fn main() {
-    crate::run(WhiddenSolver::new(), RunConfig { track: Track::Exact, specific: BBConfig::default(), ..Default::default() });
+    crate::run(
+        WhiddenSolver::new(),
+        RunConfig {
+            track: Track::Exact,
+            specific: BBConfig::default(),
+            ..Default::default()
+        },
+    );
 }

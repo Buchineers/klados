@@ -60,7 +60,9 @@ pub fn solve_lower(instance: &Instance, budget: Duration) -> Option<Vec<Tree>> {
         lagr.set_approx_target(a, b);
         // Reserve a slice for exact bp only when bp can actually run.
         let bp_reserve = if instance.num_leaves <= BP_MAX_LEAVES {
-            deadline.saturating_duration_since(Instant::now()).mul_f64(0.3)
+            deadline
+                .saturating_duration_since(Instant::now())
+                .mul_f64(0.3)
         } else {
             Duration::ZERO
         };
@@ -96,7 +98,11 @@ pub fn solve_lower(instance: &Instance, budget: Duration) -> Option<Vec<Tree>> {
             std::thread::sleep(remaining);
             tw.store(true, Ordering::Relaxed);
         });
-        debug!("[lower] exact bp (n={}, {:.0}s left)", instance.num_leaves, remaining.as_secs_f64());
+        debug!(
+            "[lower] exact bp (n={}, {:.0}s left)",
+            instance.num_leaves,
+            remaining.as_secs_f64()
+        );
         if let Some(forest) = crate::solvers::bp::bp_solve_capped(instance, &terminate) {
             // bp returns the proven optimum; validate defensively before trusting.
             if validate_agreement_forest(instance, &forest).is_ok() {
@@ -109,7 +115,6 @@ pub fn solve_lower(instance: &Instance, budget: Duration) -> Option<Vec<Tree>> {
     debug!("[lower] no certifiable forest within bound -> emit nothing");
     None
 }
-
 
 // ── Unified Solver wrapper + entry point ────────────────────────────────────
 use crate::{RunConfig, Solver, Track};
@@ -138,5 +143,11 @@ impl Solver for LowerSolver {
 }
 
 pub fn main() {
-    crate::run(LowerSolver::new(), RunConfig { track: Track::LowerBound, ..Default::default() });
+    crate::run(
+        LowerSolver::new(),
+        RunConfig {
+            track: Track::LowerBound,
+            ..Default::default()
+        },
+    );
 }

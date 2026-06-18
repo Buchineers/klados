@@ -19,10 +19,8 @@ use crate::{RunConfig, Solver};
 /// (the only environment read in the codebase); otherwise the in-config default
 /// (set by the calling binary) applies.
 pub fn run<S: Solver>(mut solver: S, mut cfg: RunConfig<S::Config>) {
-    let _ = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("warn"),
-    )
-    .try_init();
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+        .try_init();
 
     if !S::SUPPORTED_TRACKS.contains(&cfg.track) {
         log::error!("solver does not support the {:?} track", cfg.track);
@@ -31,17 +29,19 @@ pub fn run<S: Solver>(mut solver: S, mut cfg: RunConfig<S::Config>) {
 
     if let Ok(t) = std::env::var("STRIDE_TIMEOUT") {
         // Guard `from_secs_f64`, which panics on negative / NaN / inf / overflow.
-        if let Some(secs) = t.trim().parse::<f64>().ok().filter(|s| s.is_finite() && *s > 0.0) {
+        if let Some(secs) = t
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|s| s.is_finite() && *s > 0.0)
+        {
             cfg.budget = Some(Duration::from_secs_f64(secs));
         }
     }
 
     if let Some(action) = solver.sigterm_handler(cfg.track) {
         let action: Arc<dyn Fn() + Send + Sync> = Arc::from(action);
-        for sig in [
-            signal_hook::consts::SIGTERM,
-            signal_hook::consts::SIGINT,
-        ] {
+        for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
             let a = action.clone();
             // SAFETY: the registered closure only performs async-signal-safe
             // work (an atomic store, or `libc::kill`); it allocates nothing,

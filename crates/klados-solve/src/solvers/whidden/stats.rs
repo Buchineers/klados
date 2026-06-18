@@ -74,22 +74,22 @@ pub struct WhiddenRuleStats {
     // Counts whether the current TwinForest state, before branching, has
     // overlapping component embeddings in T1 (Mestel's SPLIT triggers) or
     // pairwise disjoint embeddings (Mestel's DECOMPOSE triggers).
-    pub split_diag_nodes: u64,           // # nodes where the check was run
-    pub split_diag_overlap: u64,         // # nodes with at least one overlapping pair
-    pub split_diag_disjoint: u64,        // # nodes where all pairs are disjoint (≥2 comps)
-    pub split_diag_single_component: u64,// # nodes with only one component (vacuous)
-    pub split_diag_disjoint_blocks_sum: u64,    // sum of block counts at disjoint nodes
+    pub split_diag_nodes: u64,            // # nodes where the check was run
+    pub split_diag_overlap: u64,          // # nodes with at least one overlapping pair
+    pub split_diag_disjoint: u64,         // # nodes where all pairs are disjoint (≥2 comps)
+    pub split_diag_single_component: u64, // # nodes with only one component (vacuous)
+    pub split_diag_disjoint_blocks_sum: u64, // sum of block counts at disjoint nodes
     pub split_diag_disjoint_max_block_sum: u64, // sum of max block sizes at disjoint nodes
 
     // SPLIT rule (Mestel 2024) firing counters. Active when
     // BBConfig::use_split_or_decompose is on.
-    pub split_rule_checked: u64,        // # times SPLIT rule entry point was hit
-    pub split_rule_overlap_found: u64,  // # times overlap detected → SPLIT would fire
+    pub split_rule_checked: u64, // # times SPLIT rule entry point was hit
+    pub split_rule_overlap_found: u64, // # times overlap detected → SPLIT would fire
     pub split_rule_disjoint_found: u64, // # times disjoint → DECOMPOSE would fire
-    pub split_rule_applied: u64,        // # times SPLIT actually applied (Day 7+)
-    pub split_rule_core_cutsets: u64,   // total cutsets across constructed SPLIT cores
-    pub split_rule_core_edges: u64,     // total edge multiplicity across those cutsets
-    pub split_rule_size1_cutsets: u64,  // cutsets with exactly one edge
+    pub split_rule_applied: u64, // # times SPLIT actually applied (Day 7+)
+    pub split_rule_core_cutsets: u64, // total cutsets across constructed SPLIT cores
+    pub split_rule_core_edges: u64, // total edge multiplicity across those cutsets
+    pub split_rule_size1_cutsets: u64, // cutsets with exactly one edge
 
     // Bound cache & propagation
     pub bc_lookups: u64,

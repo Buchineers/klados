@@ -8,14 +8,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::solvers::maf_sat::MafSatSolver;
+use crate::solvers::whidden::WhiddenSolver;
 use fixedbitset::FixedBitSet;
 use klados_core::kernelize::restrict_instance_simple;
 use klados_core::tree::{NONE, NodeId, Tree};
 use klados_core::{Instance, SolverStats};
 use log::info;
-use crate::solvers::maf_sat::MafSatSolver;
-use crate::solvers::whidden::WhiddenSolver;
-
 
 const REGION_REOPT_MAX_LABELS: usize = 96;
 const REGION_REOPT_MAX_ROOTS: usize = 12;
@@ -130,13 +129,12 @@ impl TreePrecomp {
             if first_occ[node as usize] == u32::MAX {
                 first_occ[node as usize] = pos;
             }
-            if !returning
-                && let Some((left, right)) = tree.children(node) {
-                    stack.push((node, true));
-                    stack.push((right, false));
-                    stack.push((node, true));
-                    stack.push((left, false));
-                }
+            if !returning && let Some((left, right)) = tree.children(node) {
+                stack.push((node, true));
+                stack.push((right, false));
+                stack.push((node, true));
+                stack.push((left, false));
+            }
         }
 
         let len = euler.len();
@@ -526,13 +524,16 @@ fn region_components_from_exact(
 fn exact_local_solve(region_instance: &Instance) -> Option<(Vec<Tree>, &'static str)> {
     if region_instance.num_trees() == 2 && region_instance.num_leaves <= WHIDDEN_LOCAL_MAX_LEAVES {
         let mut whidden = WhiddenSolver::new();
-        if let Some(sol) = crate::Solver::solve(&mut whidden, region_instance, &crate::RunConfig::default()) {
+        if let Some(sol) =
+            crate::Solver::solve(&mut whidden, region_instance, &crate::RunConfig::default())
+        {
             return Some((sol, "whidden"));
         }
     }
 
     let mut sat = MafSatSolver::new();
-    crate::Solver::solve(&mut sat, region_instance, &crate::RunConfig::default()).map(|sol| (sol, "sat"))
+    crate::Solver::solve(&mut sat, region_instance, &crate::RunConfig::default())
+        .map(|sol| (sol, "sat"))
 }
 
 fn apply_exact_region_if_improves(
@@ -1575,5 +1576,11 @@ impl Solver for AgglomerativeSolver {
 }
 
 pub fn main() {
-    crate::run(AgglomerativeSolver::new(), RunConfig { track: Track::Heuristic, ..Default::default() });
+    crate::run(
+        AgglomerativeSolver::new(),
+        RunConfig {
+            track: Track::Heuristic,
+            ..Default::default()
+        },
+    );
 }

@@ -273,9 +273,11 @@ fn analyze_whidden(instance: &Instance) -> WhiddenStats {
         }
         raw_relaxed.push((node, sz));
         if let Some((l, r)) = t1.children(node)
-            && is_cl[l as usize] && is_cl[r as usize] {
-                continue;
-            }
+            && is_cl[l as usize]
+            && is_cl[r as usize]
+        {
+            continue;
+        }
         is_cl[node as usize] = true;
         pts.push((node, sz));
     }

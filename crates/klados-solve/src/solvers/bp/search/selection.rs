@@ -167,10 +167,11 @@ impl BranchSelector for StrongBranching {
         // Past the depth cap, fall back to most-fractional (the first
         // entry, which is already sorted by closeness to 0.5).
         if let Some(d) = self.max_depth
-            && ctx.branchings.depth() >= d {
-                let (l, r) = ctx.branchings.split_on(candidates[0].0);
-                return Some(vec![l, r]);
-            }
+            && ctx.branchings.depth() >= d
+        {
+            let (l, r) = ctx.branchings.split_on(candidates[0].0);
+            return Some(vec![l, r]);
+        }
 
         let pool = std::cmp::min(self.candidates, candidates.len());
         let mut best: Option<(LeafPair, f64)> = None;

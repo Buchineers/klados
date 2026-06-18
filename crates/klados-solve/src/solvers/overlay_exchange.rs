@@ -224,12 +224,13 @@ impl OverlayExchangeSolver {
 
         // Zero-split/coarsening fast path: all opened leaves become one block.
         if let Some(col) = builder.try_build(labels.clone(), &instance.trees)
-            && coverage_disjoint(&outside, col.coverage()) {
-                return Some(Replacement {
-                    open: open.to_vec(),
-                    blocks: vec![labels],
-                });
-            }
+            && coverage_disjoint(&outside, col.coverage())
+        {
+            return Some(Replacement {
+                open: open.to_vec(),
+                blocks: vec![labels],
+            });
+        }
 
         if labels.len() > self.config.local_leaf_cap {
             return None;
@@ -295,10 +296,11 @@ impl<'a, 'b> LocalGen<'a, 'b> {
                     return;
                 }
                 if let Some(col) = self.builder.try_build(cur.clone(), &self.instance.trees)
-                    && coverage_disjoint(self.outside, col.coverage()) {
-                        self.out.push(ocomp_from_col(self.instance, col));
-                        self.enumerate(i + 1, cur);
-                    }
+                    && coverage_disjoint(self.outside, col.coverage())
+                {
+                    self.out.push(ocomp_from_col(self.instance, col));
+                    self.enumerate(i + 1, cur);
+                }
             } else {
                 self.enumerate(i + 1, cur);
             }

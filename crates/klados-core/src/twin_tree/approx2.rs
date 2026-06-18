@@ -232,10 +232,9 @@ fn check_is_roi(
         // Condition C: component extends outside L(u), entire component under lca_T2(inside)
         if inside != a_mask {
             let u_hat = pw_lca_of_mask(tf, T2, t2d, inside);
-            if u_hat != NONE
-                && (a_mask & t2_leaf_masks[u_hat as usize]) == a_mask {
-                    return true;
-                }
+            if u_hat != NONE && (a_mask & t2_leaf_masks[u_hat as usize]) == a_mask {
+                return true;
+            }
         }
     }
 

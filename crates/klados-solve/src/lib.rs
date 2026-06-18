@@ -66,4 +66,3 @@ pub trait Solver {
         None
     }
 }
-
