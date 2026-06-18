@@ -59,11 +59,10 @@ fn postorder_arena_iter_192() -> u32 {
     let (tree, _, _) = setup_192();
     let mut sum = 0u32;
     for node in tree.post_order() {
-        if tree.is_leaf(node) {
-            if let Some(lbl) = tree.leaf_label(node) {
+        if tree.is_leaf(node)
+            && let Some(lbl) = tree.leaf_label(node) {
                 sum = sum.wrapping_add(lbl);
             }
-        }
     }
     use_value(sum)
 }

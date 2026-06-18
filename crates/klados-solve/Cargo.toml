@@ -1,0 +1,20 @@
+[package]
+name = "klados-solve"
+version = "0.1.0"
+edition = "2024"
+description = "Exact and heuristic solvers for the klados MAF solver"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+klados-core = { workspace = true }
+pace26io = { workspace = true }
+fixedbitset = { workspace = true }
+fxhash = { workspace = true }
+highs = { workspace = true }
+highs-sys = { workspace = true }
+rustsat = { workspace = true }
+rustsat-cadical = { workspace = true }
+log = "0.4"
+env_logger = "0.11"
+libc = "0.2"
+signal-hook = "0.4.3"

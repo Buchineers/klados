@@ -243,9 +243,9 @@ fn extract_chains(tree: &Tree, n: usize) -> Vec<Vec<u32>> {
             cur = next_node;
         }
 
-        if !tree.is_leaf(cur) {
-            if let Some((left, right)) = tree.children(cur) {
-                if tree.is_leaf(left) && tree.is_leaf(right) {
+        if !tree.is_leaf(cur)
+            && let Some((left, right)) = tree.children(cur)
+                && tree.is_leaf(left) && tree.is_leaf(right) {
                     let ll = tree.label[left as usize];
                     let rl = tree.label[right as usize];
                     if ll > 0 {
@@ -255,8 +255,6 @@ fn extract_chains(tree: &Tree, n: usize) -> Vec<Vec<u32>> {
                         chain.push(rl);
                     }
                 }
-            }
-        }
 
         if chain.len() >= 3 {
             chains.push(chain);

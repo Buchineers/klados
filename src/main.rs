@@ -2,15 +2,14 @@
 //!
 //! κλάδος (klados) - Ancient Greek for "branch"
 
+#![allow(clippy::too_many_arguments)]
+
 mod commands;
-mod lower;
-mod solver;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use commands::bounds::BoundsAlgo;
 use klados_core::Instance;
 use klados_core::kernelize::VictimStrategy;
-use solver::SolverChoice;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -25,12 +24,25 @@ struct Cli {
     command: Commands,
 }
 
+impl Cli {
+    fn verbose(&self) -> bool {
+        match &self.command {
+            Commands::Solve { verbose, .. } => *verbose,
+            Commands::Bounds { .. } => false,
+            Commands::Kernelize { verbose, .. } => *verbose,
+            Commands::KernelizeDiag => false,
+            Commands::ClusterAnalyze => false,
+            Commands::Info => false,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Commands {
-    /// Solve an instance. Run without arguments to list available solvers.
+    /// Solve an instance (reads from stdin). Run without a name to list solvers.
     Solve {
-        #[arg(value_enum)]
-        solver: Option<SolverChoice>,
+        /// Solver name; omit to list available solvers.
+        solver: Option<String>,
         #[arg(short, long)]
         verbose: bool,
     },
@@ -47,8 +59,6 @@ enum Commands {
         /// Known scores JSON for validation.
         #[arg(long, short = 's', value_name = "FILE")]
         scores: Option<PathBuf>,
-        #[arg(short, long)]
-        verbose: bool,
     },
 
     /// Apply kernelization rules.
@@ -82,30 +92,35 @@ enum Commands {
 // ── Main ───────────────────────────────────────────────────────────────────
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
-        .target(env_logger::Target::Stderr)
-        .init();
-
     let cli = Cli::parse();
 
+    let verbose = cli.verbose();
+    let default_level = if verbose { "debug" } else { "info" };
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or(default_level),
+    )
+    .init();
+
     match cli.command {
-        Commands::Solve {
-            solver,
-            verbose: _verbose,
-        } => {
-            if solver.is_none() {
-                solver::list_solvers();
-                return Ok(());
+        Commands::Solve { solver, verbose: _ } => match solver {
+            None => {
+                for info in klados_solve::catalog() {
+                    println!("{:<22}  {}", info.name, info.description);
+                }
             }
-            let instance = Instance::from_stdin()?;
-            solver::solve_and_print(&instance, solver.unwrap())?;
-        }
+            Some(name) => match klados_solve::catalog().iter().find(|i| i.name == name) {
+                Some(info) => (info.run)(),
+                None => {
+                    eprintln!("unknown solver: {name}");
+                    eprintln!("run `klados solve` (no argument) to list available solvers");
+                }
+            },
+        },
 
         Commands::Bounds {
             algos,
             list,
             scores,
-            verbose,
         } => {
             if algos.is_empty() {
                 eprintln!("bounds: specify at least one --algo. Options:");
@@ -114,7 +129,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 return Ok(());
             }
-            commands::bounds::run(&algos, list.as_deref(), scores.as_deref(), verbose)?;
+            commands::bounds::run(&algos, list.as_deref(), scores.as_deref())?;
         }
 
         Commands::Kernelize {
