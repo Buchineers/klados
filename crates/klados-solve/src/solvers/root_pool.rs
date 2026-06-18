@@ -19,13 +19,15 @@ use klados_core::lower_bound::{best_randomized_partition, pairwise_refine_ub};
 use klados_core::{Instance, SolverStats, Tree};
 use log::debug;
 
+use crate::decomp::whidden_cluster::try_whidden_decomp_2tree;
 use crate::solvers::bp::column::{AfColumn, ColumnBuilder, ColumnSet};
 use crate::solvers::bp::pricer::exact_pair_dp::collect_corridor_candidates_ref;
-use crate::solvers::bp::pricer::{Pricer, PricerScratch, PricingContext, PricingResult, dispatch_by_m};
+use crate::solvers::bp::pricer::{
+    Pricer, PricerScratch, PricingContext, PricingResult, dispatch_by_m,
+};
 use crate::solvers::bp::rmp::{Rmp, RmpSolution};
 use crate::solvers::bp::search::Branchings;
 use crate::solvers::chen_rspr::chen_pair_agreement;
-use crate::decomp::whidden_cluster::try_whidden_decomp_2tree;
 
 /// Tuning knobs for [`RootPoolSolver`].
 #[derive(Clone, Debug)]
@@ -101,10 +103,7 @@ impl RootPoolSolver {
 
     pub(crate) fn solve_with_outcome(&mut self, instance: &Instance) -> Option<RootPoolOutcome> {
         let total_started = Instant::now();
-        if !self.config.no_kernel
-            && instance.num_trees() > 1
-            && instance.num_leaves > 2
-        {
+        if !self.config.no_kernel && instance.num_trees() > 1 && instance.num_leaves > 2 {
             let kern = kernelize_best(instance, &Default::default());
             if kern.instance.num_leaves < instance.num_leaves || kern.param_reduction > 0 {
                 if kern.instance.num_trees() == 2 && kern.instance.num_leaves >= 20 {
@@ -262,7 +261,9 @@ impl RootPoolSolver {
         let mut cuts_total = 0usize;
         let mut converged = false;
 
-        while cg_iters < self.config.max_cg_iters && started.elapsed() < Duration::from_millis(self.config.max_wall_ms) {
+        while cg_iters < self.config.max_cg_iters
+            && started.elapsed() < Duration::from_millis(self.config.max_wall_ms)
+        {
             let lp = match rmp.solve() {
                 Ok(lp) => lp,
                 Err(_) => break,
@@ -277,9 +278,10 @@ impl RootPoolSolver {
             }
 
             if let Some(labels) = round_lp(&columns, &lp.column_values, n)
-                && labels.len() < best_cols.len() {
-                    best_cols = labels;
-                }
+                && labels.len() < best_cols.len()
+            {
+                best_cols = labels;
+            }
 
             let result = pricer.price(
                 &PricingContext {
@@ -528,9 +530,10 @@ impl RootPoolSolver {
                     continue;
                 }
                 if let Some(labels) = integral_solution(&columns, &mip.column_values, n)
-                    && labels.len() < best_cols.len() {
-                        best_cols = labels;
-                    }
+                    && labels.len() < best_cols.len()
+                {
+                    best_cols = labels;
+                }
                 break;
             }
         }
@@ -1039,5 +1042,12 @@ fn labels_to_trees(instance: &Instance, labels: &[Vec<u32>]) -> Vec<Tree> {
 use crate::{RunConfig, Solver, Track};
 
 pub fn main() {
-    crate::run(RootPoolSolver::new(), RunConfig { track: Track::Heuristic, specific: RootPoolConfig::default(), ..Default::default() });
+    crate::run(
+        RootPoolSolver::new(),
+        RunConfig {
+            track: Track::Heuristic,
+            specific: RootPoolConfig::default(),
+            ..Default::default()
+        },
+    );
 }

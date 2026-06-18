@@ -885,7 +885,9 @@ mod tests {
     use super::*;
     use crate::solvers::bp::column::{AfColumn, ColumnBuilder, ColumnSet};
     use crate::solvers::bp::pricer::PricingContext;
-    use crate::solvers::bp::pricer::exact_pair_dp::{ExactPairDpCache, collect_corridor_candidates_ref};
+    use crate::solvers::bp::pricer::exact_pair_dp::{
+        ExactPairDpCache, collect_corridor_candidates_ref,
+    };
     use crate::solvers::bp::search::Branchings;
     use klados_core::tree::{Label, NodeId};
 

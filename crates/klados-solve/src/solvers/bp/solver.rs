@@ -13,23 +13,22 @@ use std::time::Instant;
 
 use fixedbitset::FixedBitSet;
 use klados_core::af_validator::validate_agreement_forest;
-use klados_core::lower_bound::{
-    best_randomized_partition,
-    pairwise_refine_ub,
-};
+use klados_core::lower_bound::{best_randomized_partition, pairwise_refine_ub};
 use klados_core::{Instance, Tree};
 use log::{debug, info};
 
+use crate::decomp::whidden_cluster::{
+    analyze_whidden_decomp_potential, try_whidden_relaxed_incumbent_2tree,
+};
 use crate::solvers::bp::column::{AfColumn, ColumnBuilder};
-use crate::solvers::bp::pricer::{Pricer, PricerScratch, PricingContext, PricingResult, dispatch_by_m};
+use crate::solvers::bp::pricer::{
+    Pricer, PricerScratch, PricingContext, PricingResult, dispatch_by_m,
+};
 use crate::solvers::bp::rmp::Rmp;
 use crate::solvers::bp::search::{
     BranchSelector, Branchings, Incumbent, SearchState, SelectionContext, Telemetry,
 };
 use crate::solvers::chen_rspr::{chen_pair_agreement, chen_pair_bounds};
-use crate::decomp::whidden_cluster::{
-    analyze_whidden_decomp_potential, try_whidden_relaxed_incumbent_2tree,
-};
 
 const LOG_TARGET: &str = "klados::bp";
 
@@ -342,11 +341,7 @@ where
     if n <= 1 {
         return Some(trees[0..1].to_vec());
     }
-    maybe_log_core_decomp_potential(
-        reduced,
-        cfg.core_decomp_analyze,
-        cfg.core_decomp_min_leaves,
-    );
+    maybe_log_core_decomp_potential(reduced, cfg.core_decomp_analyze, cfg.core_decomp_min_leaves);
 
     // Chen pairwise lower bound — a sound combinatorial floor on the
     // component count, valid for every B&B node of this (sub)instance.
@@ -411,16 +406,20 @@ where
     // bp-multi's behavior; this was the missing primal heuristic that
     // explains the recurring "LP=optimum but support fractional" gap.
     let relaxed_incumbent_enabled = cfg.relaxed_incumbent;
-    if relaxed_incumbent_enabled && trees.len() == 2 && reduced.num_leaves >= 20
-        && let Some(incumbent_forest) = try_whidden_relaxed_incumbent_2tree(reduced, solve_sub, false) {
-            install_incumbent(
-                &mut state,
-                &mut rmp,
-                trees,
-                &mut seed_builder,
-                incumbent_forest,
-            );
-        }
+    if relaxed_incumbent_enabled
+        && trees.len() == 2
+        && reduced.num_leaves >= 20
+        && let Some(incumbent_forest) =
+            try_whidden_relaxed_incumbent_2tree(reduced, solve_sub, false)
+    {
+        install_incumbent(
+            &mut state,
+            &mut rmp,
+            trees,
+            &mut seed_builder,
+            incumbent_forest,
+        );
+    }
 
     let mut scratch = PricerScratch::new(trees);
     scratch.m2_batch = cfg.m2_batch;
@@ -463,12 +462,7 @@ where
     let mut stack: Vec<(Branchings, f64)> = vec![(Branchings::default(), f64::NEG_INFINITY)];
     let mut last_progress_log = std::time::Instant::now();
     let allow_bound_prune = use_bound_prune_shortcuts(reduced, trees);
-    let allow_rcvf = use_rcvf_shortcuts(
-        reduced,
-        trees,
-        cfg.no_rcvf,
-        cfg.tiny_rcvf,
-    );
+    let allow_rcvf = use_rcvf_shortcuts(reduced, trees, cfg.no_rcvf, cfg.tiny_rcvf);
     while let Some((b, parent_lp_bound)) = stack.pop() {
         // Periodic progress log so we can see telemetry on timeouts, not
         // just on successful completion. Every 5 seconds is rare enough
@@ -512,7 +506,13 @@ where
             0
         };
         // The Chen lower bound is a sound floor independent of the LP.
-        if allow_bound_prune && can_prune_by_bound(inherited_lb.max(chen_lb), state.best_ub(), cfg.disable_bound_prune) {
+        if allow_bound_prune
+            && can_prune_by_bound(
+                inherited_lb.max(chen_lb),
+                state.best_ub(),
+                cfg.disable_bound_prune,
+            )
+        {
             tel.bound_prunes += 1;
             continue;
         }
@@ -842,9 +842,7 @@ fn solve_node<P: Pricer, S: BranchSelector>(
         // LP mass currently paid inside it, then the missing proof object is a
         // global obstruction cut rather than another local branch.
         if root_regions.is_none()
-            && (cfg.obstruction_probe
-                || cfg.bridge_probe
-                || cfg.root_support_incumbent)
+            && (cfg.obstruction_probe || cfg.bridge_probe || cfg.root_support_incumbent)
         {
             *root_regions = build_root_support_regions(state, &lp);
         }
@@ -911,7 +909,11 @@ fn solve_node<P: Pricer, S: BranchSelector>(
                     .take()
                     .filter(|c| c.fits(n0, n1, state.num_leaves()))
                     .unwrap_or_else(|| {
-                        crate::solvers::corridor::topk_m2::TopKDpCache::new(n0, n1, state.num_leaves())
+                        crate::solvers::corridor::topk_m2::TopKDpCache::new(
+                            n0,
+                            n1,
+                            state.num_leaves(),
+                        )
                     });
                 let cols = crate::solvers::corridor::topk_m2::enumerate_corridor(
                     &crate::solvers::corridor::topk_m2::CorridorInput {
@@ -998,22 +1000,24 @@ fn solve_node<P: Pricer, S: BranchSelector>(
     // missing integer optimum. A diving / MIP-on-pool heuristic would be
     // stronger but is deferred.
     if let Some(inc) = try_round_primal(state, &lp.column_values)
-        && inc.k < state.best_ub() {
-            let updated = state.update_incumbent(inc);
-            if updated {
-                tel.incumbent_updates += 1;
-                debug!(
-                    target: LOG_TARGET,
-                    "primal heuristic improved incumbent: ub={} (cg_iter={})",
-                    state.best_ub(), tel.cg_iters,
-                );
+        && inc.k < state.best_ub()
+    {
+        let updated = state.update_incumbent(inc);
+        if updated {
+            tel.incumbent_updates += 1;
+            debug!(
+                target: LOG_TARGET,
+                "primal heuristic improved incumbent: ub={} (cg_iter={})",
+                state.best_ub(), tel.cg_iters,
+            );
 
-                if allow_bound_prune && can_prune_by_bound(lb, state.best_ub(), cfg.disable_bound_prune) {
-                    tel.bound_prunes += 1;
-                    return NodeOutcome::Pruned;
-                }
+            if allow_bound_prune && can_prune_by_bound(lb, state.best_ub(), cfg.disable_bound_prune)
+            {
+                tel.bound_prunes += 1;
+                return NodeOutcome::Pruned;
             }
         }
+    }
 
     // MIP-on-pool primal heuristic. Disabled by default; enable via
     // `BpConfig.mip_heuristic`. Fires when the LP objective is at an
@@ -1023,10 +1027,7 @@ fn solve_node<P: Pricer, S: BranchSelector>(
     // directly. Time-capped (100ms by default) so the failure mode is
     // bounded.
     let lp_frac = lp.objective.ceil() - lp.objective;
-    if cfg.mip_heuristic
-        && lb < state.best_ub()
-        && lp_frac < 1e-4
-    {
+    if cfg.mip_heuristic && lb < state.best_ub() && lp_frac < 1e-4 {
         debug!(target: LOG_TARGET, "Running MIP heuristic on pool of {} columns (lp_obj={:.4})", state.columns().len(), lp.objective);
         let mut mip_attempts = 0;
         while mip_attempts < 5 {
@@ -1053,7 +1054,9 @@ fn solve_node<P: Pricer, S: BranchSelector>(
                                 state.best_ub(), tel.cg_iters, branchings.depth(),
                             );
 
-                            if allow_bound_prune && can_prune_by_bound(lb, state.best_ub(), cfg.disable_bound_prune) {
+                            if allow_bound_prune
+                                && can_prune_by_bound(lb, state.best_ub(), cfg.disable_bound_prune)
+                            {
                                 tel.bound_prunes += 1;
                                 return NodeOutcome::Pruned;
                             }
@@ -1673,9 +1676,10 @@ fn maybe_log_bridge_footprint(
             touched_hist[q] += 1;
         }
         if q == 1
-            && let Some(rid) = touched.ones().next() {
-                local_component_counts[rid] += 1;
-            }
+            && let Some(rid) = touched.ones().next()
+        {
+            local_component_counts[rid] += 1;
+        }
         if q > 1 {
             bridge_columns += 1;
             bridge_savings += q - 1;

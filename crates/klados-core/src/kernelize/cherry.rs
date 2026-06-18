@@ -44,35 +44,37 @@ fn find_common_cherry(trees: &[Tree], num_leaves: u32) -> Option<(u32, u32)> {
     let ref_tree = &trees[0];
     for node in ref_tree.post_order() {
         if let Some((l, r)) = ref_tree.children(node)
-            && ref_tree.is_leaf(l) && ref_tree.is_leaf(r) {
-                let ll = ref_tree.label[l as usize];
-                let rl = ref_tree.label[r as usize];
-                if ll == 0 || rl == 0 {
-                    continue;
-                }
+            && ref_tree.is_leaf(l)
+            && ref_tree.is_leaf(r)
+        {
+            let ll = ref_tree.label[l as usize];
+            let rl = ref_tree.label[r as usize];
+            if ll == 0 || rl == 0 {
+                continue;
+            }
 
-                // Check if this cherry exists in all other trees
-                let mut common = true;
-                for other in &trees[1..] {
-                    let nl = other.node_by_label(ll);
-                    let nr = other.node_by_label(rl);
-                    if nl == NONE || nr == NONE {
-                        common = false;
-                        break;
-                    }
-                    let pl = other.parent[nl as usize];
-                    let pr = other.parent[nr as usize];
-                    if pl == NONE || pl != pr {
-                        common = false;
-                        break;
-                    }
+            // Check if this cherry exists in all other trees
+            let mut common = true;
+            for other in &trees[1..] {
+                let nl = other.node_by_label(ll);
+                let nr = other.node_by_label(rl);
+                if nl == NONE || nr == NONE {
+                    common = false;
+                    break;
                 }
-
-                if common {
-                    let (keep, remove) = if ll < rl { (ll, rl) } else { (rl, ll) };
-                    return Some((keep, remove));
+                let pl = other.parent[nl as usize];
+                let pr = other.parent[nr as usize];
+                if pl == NONE || pl != pr {
+                    common = false;
+                    break;
                 }
             }
+
+            if common {
+                let (keep, remove) = if ll < rl { (ll, rl) } else { (rl, ll) };
+                return Some((keep, remove));
+            }
+        }
     }
     None
 }

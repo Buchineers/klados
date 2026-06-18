@@ -96,10 +96,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let verbose = cli.verbose();
     let default_level = if verbose { "debug" } else { "info" };
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or(default_level),
-    )
-    .init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level))
+        .init();
 
     match cli.command {
         Commands::Solve { solver, verbose: _ } => match solver {

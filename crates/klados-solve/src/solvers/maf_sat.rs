@@ -1,13 +1,13 @@
 use fixedbitset::FixedBitSet;
 use klados_core::tree::{Label, NodeId, Tree};
 use klados_core::{Instance, SolverStats};
+use log::{debug, info};
 use rustsat::encodings::card::{BoundUpper, Totalizer};
 use rustsat::instances::{BasicVarManager, ManageVars};
 use rustsat::solvers::{PhaseLit, Solve, SolveIncremental, SolverResult};
 use rustsat::types::{Clause, Lit, TernaryVal, Var};
 use rustsat_cadical::CaDiCaL;
 use std::collections::BTreeMap;
-use log::{debug, info};
 
 use crate::cluster_reduction::{self, ClusterReductionResult};
 use crate::kernelize::{self, KernelizeConfig};
@@ -1057,12 +1057,13 @@ fn sat_solve_maf_cut(
                                 for q in 0..m {
                                     for &v in &paths[q][a][b] {
                                         if let Some(dv) = del[q][v as usize]
-                                            && solver.var_val(dv).unwrap() == TernaryVal::True {
-                                                violated_clauses.push([
-                                                    conn[a][b].unwrap().neg_lit(),
-                                                    dv.neg_lit(),
-                                                ]);
-                                            }
+                                            && solver.var_val(dv).unwrap() == TernaryVal::True
+                                        {
+                                            violated_clauses.push([
+                                                conn[a][b].unwrap().neg_lit(),
+                                                dv.neg_lit(),
+                                            ]);
+                                        }
                                     }
                                 }
                             }
@@ -1077,7 +1078,9 @@ fn sat_solve_maf_cut(
                         }
                     }
 
-                    if config.h4_mode.uses_lazy_cegar() && !(config.h4_mode == H4Mode::Staged && h4_promoted) {
+                    if config.h4_mode.uses_lazy_cegar()
+                        && !(config.h4_mode == H4Mode::Staged && h4_promoted)
+                    {
                         let comps = extract_components_from_model(&solver, &conn, n);
                         let violated_triples = collect_h4_violated_triples(
                             &comps,
@@ -1847,7 +1850,11 @@ fn sat_solve_maf_olver(
 // Outer pipeline
 // ═══════════════════════════════════════════════════════════════
 
-fn solve_sat(instance: &Instance, stats: &mut SolverStats, config: &MafSatConfig) -> Option<Vec<Tree>> {
+fn solve_sat(
+    instance: &Instance,
+    stats: &mut SolverStats,
+    config: &MafSatConfig,
+) -> Option<Vec<Tree>> {
     solve_sat_inner(instance, stats, vec![], config)
 }
 
@@ -1857,11 +1864,25 @@ fn solve_sat_inner(
     preferred_singleton_labels: Vec<u32>,
     config: &MafSatConfig,
 ) -> Option<Vec<Tree>> {
-    solve_sat_inner_impl(instance, stats, preferred_singleton_labels, false, false, config)
+    solve_sat_inner_impl(
+        instance,
+        stats,
+        preferred_singleton_labels,
+        false,
+        false,
+        config,
+    )
 }
 
 fn solve_sat_olver(instance: &Instance, stats: &mut SolverStats) -> Option<Vec<Tree>> {
-    solve_sat_inner_impl(instance, stats, vec![], false, true, &MafSatConfig::default())
+    solve_sat_inner_impl(
+        instance,
+        stats,
+        vec![],
+        false,
+        true,
+        &MafSatConfig::default(),
+    )
 }
 
 fn solve_sat_inner_impl(
@@ -1873,7 +1894,10 @@ fn solve_sat_inner_impl(
     config: &MafSatConfig,
 ) -> Option<Vec<Tree>> {
     let n = instance.num_leaves as usize;
-    let mut profile = SolveProfile { n, ..Default::default() };
+    let mut profile = SolveProfile {
+        n,
+        ..Default::default()
+    };
 
     let kern_config = KernelizeConfig {
         protected_labels: preferred_singleton_labels.clone(),
@@ -2073,16 +2097,28 @@ fn solve_sat_inner_impl(
     Some(components)
 }
 
-
 // ── entry points ────────────────────────────────────────────────────────────
 use crate::{RunConfig, Solver, Track};
 
 pub fn main() {
-    crate::run(MafSatSolver::new(), RunConfig { track: Track::Exact, specific: MafSatConfig::default(), ..Default::default() });
+    crate::run(
+        MafSatSolver::new(),
+        RunConfig {
+            track: Track::Exact,
+            specific: MafSatConfig::default(),
+            ..Default::default()
+        },
+    );
 }
 
 pub fn olver_main() {
-    crate::run(MafSatOlverSolver::new(), RunConfig { track: Track::Exact, ..Default::default() });
+    crate::run(
+        MafSatOlverSolver::new(),
+        RunConfig {
+            track: Track::Exact,
+            ..Default::default()
+        },
+    );
 }
 
 #[cfg(test)]
@@ -2212,7 +2248,10 @@ mod tests {
             H4Mode::Staged,
         ] {
             let mut profile = SolveProfile::default();
-            let config = MafSatConfig { h4_mode: mode, ..MafSatConfig::default() };
+            let config = MafSatConfig {
+                h4_mode: mode,
+                ..MafSatConfig::default()
+            };
             let result = sat_solve_maf_cut(&instance, 4, 1, &mut profile, false, &config, None);
             assert!(result.is_some(), "mode {:?} returned no solution", mode);
             assert_eq!(result.unwrap().len(), 3, "mode {:?}", mode);
@@ -2231,7 +2270,10 @@ mod tests {
             H4Mode::Staged,
         ] {
             let mut profile = SolveProfile::default();
-            let config = MafSatConfig { h4_mode: mode, ..MafSatConfig::default() };
+            let config = MafSatConfig {
+                h4_mode: mode,
+                ..MafSatConfig::default()
+            };
             let result = sat_solve_maf_cut(&instance, 4, 1, &mut profile, false, &config, None);
             assert!(result.is_some(), "mode {:?} returned no solution", mode);
             assert_eq!(result.unwrap().len(), 1, "mode {:?}", mode);

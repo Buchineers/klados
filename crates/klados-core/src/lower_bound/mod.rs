@@ -14,8 +14,8 @@ mod tree_data;
 use crate::tree::Tree;
 
 pub use cherry::{
-    best_randomized_partition, cherry_reduce_ub, greedy_multi_tree_partition,
-    greedy_multi_tree_ub, greedy_multi_tree_ub_seeded, pairwise_refine_ub,
+    best_randomized_partition, cherry_reduce_ub, greedy_multi_tree_partition, greedy_multi_tree_ub,
+    greedy_multi_tree_ub_seeded, pairwise_refine_ub,
 };
 pub use red_blue::{RedBlueResult, red_blue_approx, red_blue_approx_detailed};
 

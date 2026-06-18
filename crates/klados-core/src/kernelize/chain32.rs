@@ -187,9 +187,10 @@ fn find_all_32_chain_candidates_2tree(t1: &Tree, t2: &Tree, num_leaves: u32) -> 
     let mut candidates = Vec::new();
     for p in 1..=num_leaves {
         if let Some(victim) = check_32_at_pivot(t1, t2, p, num_leaves)
-            && !candidates.contains(&victim) {
-                candidates.push(victim);
-            }
+            && !candidates.contains(&victim)
+        {
+            candidates.push(victim);
+        }
     }
     candidates
 }
@@ -273,9 +274,10 @@ fn find_all_32_chain_candidates_multi(
     let mut candidates = Vec::new();
     for p in 1..=num_leaves {
         if let Some(victim) = check_32_multi_at_pivot(trees, p, max_partners)
-            && !candidates.contains(&victim) {
-                candidates.push(victim);
-            }
+            && !candidates.contains(&victim)
+        {
+            candidates.push(victim);
+        }
     }
     candidates
 }
@@ -310,7 +312,10 @@ fn check_32_multi_at_pivot(trees: &[Tree], p: u32, max_partners: usize) -> Optio
     // trees where p's partner IS the victim must satisfy the interceptor condition
     // with some other partner as keeper. Trees where p's partner is NOT the victim
     // are automatically in "cherry state" (they don't have the victim as partner).
-    unique_sibs.iter().find(|&&victim| try_32_delete_multi_partner(trees, &siblings, &unique_sibs, victim)).copied()
+    unique_sibs
+        .iter()
+        .find(|&&victim| try_32_delete_multi_partner(trees, &siblings, &unique_sibs, victim))
+        .copied()
 }
 
 /// Check if `victim` can be deleted with multiple possible keepers.

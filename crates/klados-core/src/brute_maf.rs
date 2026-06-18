@@ -50,9 +50,10 @@ pub fn brute_force_maf(instance: &Instance) -> Option<BruteMafResult> {
         // Early prune: only consider partitions strictly smaller than best.
         let k = part.iter().filter(|p| !p.is_empty()).count();
         if let Some(ref b) = best
-            && k >= b.num_components {
-                return;
-            }
+            && k >= b.num_components
+        {
+            return;
+        }
 
         // Materialize partition as component trees: each component's tree is
         // the restriction of T0 to the component's leaves.

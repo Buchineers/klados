@@ -66,8 +66,7 @@ pub struct PricingContext<'a> {
 impl<'a> PricingContext<'a> {
     #[inline]
     pub fn is_cancelled(&self) -> bool {
-        self.terminate
-            .load(core::sync::atomic::Ordering::Relaxed)
+        self.terminate.load(core::sync::atomic::Ordering::Relaxed)
             || self.deadline.is_some_and(|d| Instant::now() >= d)
     }
 }

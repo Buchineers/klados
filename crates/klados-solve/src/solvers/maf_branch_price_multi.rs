@@ -90,9 +90,9 @@ fn compute_local_bounds(trees: &[Tree], num_leaves: u32) -> LocalBounds {
 
 use klados_core::cluster_decomposition;
 
-use crate::solvers::chen_rspr::chen_pair_agreement;
 use crate::cluster_reduction::{self, ClusterReductionResult};
 use crate::kernelize::{self, KernelizeConfig};
+use crate::solvers::chen_rspr::chen_pair_agreement;
 
 const NEG_INF: f64 = -1.0e100;
 const PAIRDP_BATCH_SIZE: usize = 64;
@@ -841,62 +841,63 @@ fn solve_branch_price_multi_cached(
     // previously-prototyped batch/relaxed join variants remain opt-in inside
     // whidden_cluster because a valid AF from those variants is not by itself
     // an optimality certificate.
-    if reduced.num_trees() == 2 && reduced.num_leaves >= WHIDDEN_DECOMP_MIN_LEAVES
-        && let Some(solution) =
-            crate::decomp::whidden_cluster::try_whidden_decomp_2tree(
-                reduced,
-                &mut |subinstance| {
-                    solve_branch_price_multi_cached(subinstance, &mut SolverStats::default(), memo)
-                },
-                &crate::decomp::whidden_cluster::NEVER_TERMINATE,
-            )
-        {
-            if let Some(view) = memo_view.as_ref() {
-                store_cached_solution(memo, view, &solution);
-            }
-            let exact_k = solution.len() + param_reduction_32;
-            stats.lower_bound = exact_k;
-            stats.upper_bound = Some(exact_k);
-            let components = kernelize::expand_solution(
-                solution,
-                &kern,
-                instance.reference_tree(),
-                instance.num_leaves,
-            );
-            info!(
-                "[bp-multi] optimal: {} components (whidden strict cluster decomp, n={}), {:.1}ms total",
-                components.len(),
-                reduced.num_leaves,
-                t_total.elapsed().as_secs_f64() * 1000.0,
-            );
-            return Some(components);
+    if reduced.num_trees() == 2
+        && reduced.num_leaves >= WHIDDEN_DECOMP_MIN_LEAVES
+        && let Some(solution) = crate::decomp::whidden_cluster::try_whidden_decomp_2tree(
+            reduced,
+            &mut |subinstance| {
+                solve_branch_price_multi_cached(subinstance, &mut SolverStats::default(), memo)
+            },
+            &crate::decomp::whidden_cluster::NEVER_TERMINATE,
+        )
+    {
+        if let Some(view) = memo_view.as_ref() {
+            store_cached_solution(memo, view, &solution);
         }
+        let exact_k = solution.len() + param_reduction_32;
+        stats.lower_bound = exact_k;
+        stats.upper_bound = Some(exact_k);
+        let components = kernelize::expand_solution(
+            solution,
+            &kern,
+            instance.reference_tree(),
+            instance.num_leaves,
+        );
+        info!(
+            "[bp-multi] optimal: {} components (whidden strict cluster decomp, n={}), {:.1}ms total",
+            components.len(),
+            reduced.num_leaves,
+            t_total.elapsed().as_secs_f64() * 1000.0,
+        );
+        return Some(components);
+    }
 
-    if RSPR_CLUSTER_DECOMP_EXPERIMENTAL && reduced.num_leaves >= RSPR_CLUSTER_MIN_LEAVES
+    if RSPR_CLUSTER_DECOMP_EXPERIMENTAL
+        && reduced.num_leaves >= RSPR_CLUSTER_MIN_LEAVES
         && let Some(solution) =
             cluster_decomposition::try_rspr_cluster_decomposition(reduced, &mut |subinstance| {
                 solve_branch_price_multi_cached(subinstance, &mut SolverStats::default(), memo)
             })
-        {
-            if let Some(view) = memo_view.as_ref() {
-                store_cached_solution(memo, view, &solution);
-            }
-            let exact_k = solution.len() + param_reduction_32;
-            stats.lower_bound = exact_k;
-            stats.upper_bound = Some(exact_k);
-            let components = kernelize::expand_solution(
-                solution,
-                &kern,
-                instance.reference_tree(),
-                instance.num_leaves,
-            );
-            info!(
-                "[bp-multi] optimal: {} components (rspr cluster decomp), {:.1}ms total",
-                components.len(),
-                t_total.elapsed().as_secs_f64() * 1000.0,
-            );
-            return Some(components);
+    {
+        if let Some(view) = memo_view.as_ref() {
+            store_cached_solution(memo, view, &solution);
         }
+        let exact_k = solution.len() + param_reduction_32;
+        stats.lower_bound = exact_k;
+        stats.upper_bound = Some(exact_k);
+        let components = kernelize::expand_solution(
+            solution,
+            &kern,
+            instance.reference_tree(),
+            instance.num_leaves,
+        );
+        info!(
+            "[bp-multi] optimal: {} components (rspr cluster decomp), {:.1}ms total",
+            components.len(),
+            t_total.elapsed().as_secs_f64() * 1000.0,
+        );
+        return Some(components);
+    }
 
     let cluster_result = cluster_reduction::try_cluster_reduction(reduced, &mut |subinstance| {
         solve_branch_price_multi_cached(subinstance, &mut SolverStats::default(), memo)
@@ -1008,49 +1009,50 @@ fn solve_branch_price_multi_cached(
     // is ported in full.
     if reduced.num_trees() == 2 && reduced.num_leaves >= WHIDDEN_DECOMP_MIN_LEAVES {
         let relaxed_t0 = Instant::now();
-        if let Some(incumbent) =
-            crate::decomp::whidden_cluster::try_whidden_relaxed_incumbent_2tree(reduced, &mut |sub| {
-                solve_branch_price_multi_cached(sub, &mut SolverStats::default(), memo)
-            }, false)
-            && incumbent.len() < best_ub {
-                let mut values = vec![0.0; columns.len()];
-                let mut ok = true;
-                let mut added = 0usize;
-                for component in &incumbent {
-                    let labels: Vec<u32> = component.leaves().collect();
-                    if labels.is_empty() {
-                        continue;
-                    }
-                    let ci = match columns.iter().position(|col| col.labels == labels) {
-                        Some(ci) => ci,
-                        None => {
-                            if !seen.insert(labels.clone()) {
-                                ok = false;
-                                break;
-                            }
-                            let ci = columns.len();
-                            columns.push(column_builder.build_column(labels, trees));
-                            values.push(0.0);
-                            added += 1;
-                            ci
+        if let Some(incumbent) = crate::decomp::whidden_cluster::try_whidden_relaxed_incumbent_2tree(
+            reduced,
+            &mut |sub| solve_branch_price_multi_cached(sub, &mut SolverStats::default(), memo),
+            false,
+        ) && incumbent.len() < best_ub
+        {
+            let mut values = vec![0.0; columns.len()];
+            let mut ok = true;
+            let mut added = 0usize;
+            for component in &incumbent {
+                let labels: Vec<u32> = component.leaves().collect();
+                if labels.is_empty() {
+                    continue;
+                }
+                let ci = match columns.iter().position(|col| col.labels == labels) {
+                    Some(ci) => ci,
+                    None => {
+                        if !seen.insert(labels.clone()) {
+                            ok = false;
+                            break;
                         }
-                    };
-                    if ci >= values.len() {
-                        values.resize(columns.len(), 0.0);
+                        let ci = columns.len();
+                        columns.push(column_builder.build_column(labels, trees));
+                        values.push(0.0);
+                        added += 1;
+                        ci
                     }
-                    values[ci] = 1.0;
+                };
+                if ci >= values.len() {
+                    values.resize(columns.len(), 0.0);
                 }
-                if ok {
-                    best_ub = incumbent.len();
-                    best_solution = Some(values);
-                    info!(
-                        "[bp-multi] relaxed whidden incumbent: {} components, {} cols added, {:.1}ms",
-                        best_ub,
-                        added,
-                        relaxed_t0.elapsed().as_secs_f64() * 1000.0,
-                    );
-                }
+                values[ci] = 1.0;
             }
+            if ok {
+                best_ub = incumbent.len();
+                best_solution = Some(values);
+                info!(
+                    "[bp-multi] relaxed whidden incumbent: {} components, {} cols added, {:.1}ms",
+                    best_ub,
+                    added,
+                    relaxed_t0.elapsed().as_secs_f64() * 1000.0,
+                );
+            }
+        }
     }
 
     let mut state = BpState {
@@ -3086,10 +3088,15 @@ fn clean_dual(value: f64) -> f64 {
     if value.abs() <= 1.0e-9 { 0.0 } else { value }
 }
 
-
 // ── Unified Solver impl + entry point ───────────────────────────────────────
 use crate::{RunConfig, Solver, Track};
 
 pub fn main() {
-    crate::run(MafBranchPriceMultiSolver::new(), RunConfig { track: Track::Exact, ..Default::default() });
+    crate::run(
+        MafBranchPriceMultiSolver::new(),
+        RunConfig {
+            track: Track::Exact,
+            ..Default::default()
+        },
+    );
 }

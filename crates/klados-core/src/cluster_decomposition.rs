@@ -287,9 +287,11 @@ fn find_cluster_points_multi(
     let mut result = Vec::new();
     for &node in &candidates {
         if let Some((left, right)) = t0.children(node)
-            && is_cluster_point[left as usize] && is_cluster_point[right as usize] {
-                continue;
-            }
+            && is_cluster_point[left as usize]
+            && is_cluster_point[right as usize]
+        {
+            continue;
+        }
         result.push(node);
     }
 

@@ -84,7 +84,8 @@ fn run_battery(n: u32, num_pairs: usize, base_seed: u64) {
 
         let oracle = brute_force_maf(&inst).expect("brute force should run for small n");
 
-        let mut solver = klados_solve::solvers::maf_branch_price_multi::MafBranchPriceMultiSolver::new();
+        let mut solver =
+            klados_solve::solvers::maf_branch_price_multi::MafBranchPriceMultiSolver::new();
         let solver_result = solver.solve(&inst, &RunConfig::default());
         let comps = match solver_result {
             Some(c) => c,

@@ -689,17 +689,7 @@ fn bb_inner(
         //     branches recursively and returns `Branched`; when DECOMPOSE
         //     matches it mutates T2 and returns `Applied`; otherwise normal
         //     Whidden case logic takes over.
-        match try_split_or_decompose(
-            tf,
-            k,
-            um,
-            stats,
-            rule_stats,
-            config,
-            tt,
-            bc,
-            parent_bounds,
-        ) {
+        match try_split_or_decompose(tf, k, um, stats, rule_stats, config, tt, bc, parent_bounds) {
             SplitRuleResult::NotApplicable => {}
             SplitRuleResult::Branched(result) => {
                 if result.is_none() {
@@ -947,10 +937,13 @@ fn find_any_pair(tf: &TwinForest, node: NodeId, config: &BBConfig) -> PairResult
         return PairResult::NoPairs;
     }
 
-    if rc != NONE && tf.is_leaf(T1, lc) && tf.is_leaf(T1, rc)
-        && let Some(result) = classify_pair(tf, node, lc, rc, config) {
-            return result;
-        }
+    if rc != NONE
+        && tf.is_leaf(T1, lc)
+        && tf.is_leaf(T1, rc)
+        && let Some(result) = classify_pair(tf, node, lc, rc, config)
+    {
+        return result;
+    }
 
     if lc != NONE {
         let r = find_any_pair(tf, lc, config);
@@ -987,45 +980,48 @@ fn find_preferred_pair(
         return PairResult::NoPairs;
     }
 
-    if rc != NONE && tf.is_leaf(T1, lc) && tf.is_leaf(T1, rc)
-        && let Some(result) = classify_pair(tf, node, lc, rc, config) {
-            match &result {
-                PairResult::Case2 { .. } => return result,
-                PairResult::Case3 {
-                    t2_a,
-                    t2_c,
-                    cut_b_only,
-                    cut_a_only,
-                    cut_c_only,
-                    ..
-                } => {
-                    if *cut_b_only || *cut_a_only || *cut_c_only {
-                        if config.prefer_nonbranching {
-                            rule_stats.prefer_nonbranching_hits += 1;
-                        }
-                        return result; // 1-way branching
+    if rc != NONE
+        && tf.is_leaf(T1, lc)
+        && tf.is_leaf(T1, rc)
+        && let Some(result) = classify_pair(tf, node, lc, rc, config)
+    {
+        match &result {
+            PairResult::Case2 { .. } => return result,
+            PairResult::Case3 {
+                t2_a,
+                t2_c,
+                cut_b_only,
+                cut_a_only,
+                cut_c_only,
+                ..
+            } => {
+                if *cut_b_only || *cut_a_only || *cut_c_only {
+                    if config.prefer_nonbranching {
+                        rule_stats.prefer_nonbranching_hits += 1;
                     }
-                    if config.deepest_order {
-                        // Score: max T2 depth of the pair (primary),
-                        // min T2 depth (secondary tiebreak)
-                        let da = depth_to_root(tf, T2, *t2_a);
-                        let dc = depth_to_root(tf, T2, *t2_c);
-                        let depth1 = da.max(dc);
-                        let depth2 = da.min(dc);
-                        if matches!(fallback, PairResult::NoPairs)
-                            || depth1 > best_depth.0
-                            || (depth1 == best_depth.0 && depth2 > best_depth.1)
-                        {
-                            *fallback = result;
-                            *best_depth = (depth1, depth2);
-                        }
-                    } else if matches!(fallback, PairResult::NoPairs) {
-                        *fallback = result;
-                    }
+                    return result; // 1-way branching
                 }
-                _ => {}
+                if config.deepest_order {
+                    // Score: max T2 depth of the pair (primary),
+                    // min T2 depth (secondary tiebreak)
+                    let da = depth_to_root(tf, T2, *t2_a);
+                    let dc = depth_to_root(tf, T2, *t2_c);
+                    let depth1 = da.max(dc);
+                    let depth2 = da.min(dc);
+                    if matches!(fallback, PairResult::NoPairs)
+                        || depth1 > best_depth.0
+                        || (depth1 == best_depth.0 && depth2 > best_depth.1)
+                    {
+                        *fallback = result;
+                        *best_depth = (depth1, depth2);
+                    }
+                } else if matches!(fallback, PairResult::NoPairs) {
+                    *fallback = result;
+                }
             }
+            _ => {}
         }
+    }
 
     if lc != NONE {
         let r = find_preferred_pair(tf, lc, config, rule_stats, fallback, best_depth);
@@ -1131,18 +1127,22 @@ fn classify_pair(
                     if t2_l != NONE {
                         // Subcase 1: path_length 4 (balanced)
                         // T2_c.parent.parent == T2_l
-                        if t2_c_parent != NONE && tf.parent[T2][t2_c_parent as usize] == t2_l
-                            && tf.sibling(T2, t2_l) == t2_s {
-                                cut_b_only = true;
-                            }
+                        if t2_c_parent != NONE
+                            && tf.parent[T2][t2_c_parent as usize] == t2_l
+                            && tf.sibling(T2, t2_l) == t2_s
+                        {
+                            cut_b_only = true;
+                        }
                         // Subcase 2: path_length 5
                         // T2_c.parent == T2_l.parent
                         if !cut_b_only {
                             let t2_l2 = tf.parent[T2][t2_l as usize];
-                            if t2_l2 != NONE && t2_c_parent == t2_l2
-                                && tf.sibling(T2, t2_l2) == t2_s {
-                                    cut_b_only = true;
-                                }
+                            if t2_l2 != NONE
+                                && t2_c_parent == t2_l2
+                                && tf.sibling(T2, t2_l2) == t2_s
+                            {
+                                cut_b_only = true;
+                            }
                         }
                     }
                 }
@@ -1508,9 +1508,7 @@ pub(super) enum OverlapResult {
     SingleComponent,
     /// All components have pairwise disjoint T1-embeddings.
     /// DECOMPOSE rule applies: solve each sub-instance independently.
-    AllDisjoint {
-        components: Vec<ComponentShape>,
-    },
+    AllDisjoint { components: Vec<ComponentShape> },
     /// At least two components share a T1 edge.
     /// SPLIT rule applies: branch on which component "wins" the shared edge.
     Overlap {
@@ -1654,10 +1652,8 @@ fn embedding_descent(
         }
         let lc = tf.left[ti][cur as usize];
         let rc = tf.right[ti][cur as usize];
-        let left_has = lc != NONE
-            && active_labels_under_in(tf, ti, lc, active).count_ones(..) > 0;
-        let right_has = rc != NONE
-            && active_labels_under_in(tf, ti, rc, active).count_ones(..) > 0;
+        let left_has = lc != NONE && active_labels_under_in(tf, ti, lc, active).count_ones(..) > 0;
+        let right_has = rc != NONE && active_labels_under_in(tf, ti, rc, active).count_ones(..) > 0;
         match (left_has, right_has) {
             (true, true) => return Some(cur),
             (true, false) => cur = lc,
@@ -1795,8 +1791,7 @@ fn single_edge_split(
         // pure of the opposite color.
         let clean = matches!(
             (below_class, above_class),
-            (SubtreeClass::PureY, SubtreeClass::PureZ)
-                | (SubtreeClass::PureZ, SubtreeClass::PureY)
+            (SubtreeClass::PureY, SubtreeClass::PureZ) | (SubtreeClass::PureZ, SubtreeClass::PureY)
         );
         if clean && found.is_none() {
             found = Some(c);
@@ -1831,8 +1826,7 @@ fn walk_embedding(
     let lc = tf.left[ti][root as usize];
     let rc = tf.right[ti][root as usize];
     let left_has = lc != NONE && active_labels_under_in(tf, ti, lc, active).count_ones(..) > 0;
-    let right_has =
-        rc != NONE && active_labels_under_in(tf, ti, rc, active).count_ones(..) > 0;
+    let right_has = rc != NONE && active_labels_under_in(tf, ti, rc, active).count_ones(..) > 0;
     match (left_has, right_has) {
         (true, true) => {
             visit(root);
@@ -1848,19 +1842,13 @@ fn walk_embedding(
 /// Re-root the embedding after a pendant has been removed. Descends from
 /// the old root through degree-2 embedding nodes until reaching a true
 /// branching node (or a leaf).
-fn re_root_embedding(
-    tf: &TwinForest,
-    ti: usize,
-    old_root: NodeId,
-    active: &FixedBitSet,
-) -> NodeId {
+fn re_root_embedding(tf: &TwinForest, ti: usize, old_root: NodeId, active: &FixedBitSet) -> NodeId {
     let mut cur = old_root;
     while cur != NONE && !tf.is_leaf(ti, cur) {
         let lc = tf.left[ti][cur as usize];
         let rc = tf.right[ti][cur as usize];
         let left_has = lc != NONE && active_labels_under_in(tf, ti, lc, active).count_ones(..) > 0;
-        let right_has =
-            rc != NONE && active_labels_under_in(tf, ti, rc, active).count_ones(..) > 0;
+        let right_has = rc != NONE && active_labels_under_in(tf, ti, rc, active).count_ones(..) > 0;
         match (left_has, right_has) {
             (true, true) => return cur,
             (true, false) => cur = lc,
@@ -2051,7 +2039,8 @@ pub(super) fn try_split_or_decompose(
             // substantive component is small enough that Whidden's
             // case2/case3 will dispatch them quickly. Only fire SoD when
             // at least one component is genuinely large.
-            let max_count = substantive.iter()
+            let max_count = substantive
+                .iter()
                 .map(|c| c.leafset.count_ones(..))
                 .max()
                 .unwrap_or(0);
@@ -2107,25 +2096,17 @@ fn apply_split(
     let mut cores: Vec<(usize, Vec<SplittingCut>)> = Vec::with_capacity(2);
     for &loser_idx in &branch_specs {
         let loser = &components[loser_idx];
-        let y_labels =
-            active_labels_under_in(tf, T1, shared_edge_t1, &loser.leafset);
+        let y_labels = active_labels_under_in(tf, T1, shared_edge_t1, &loser.leafset);
         if y_labels.count_ones(..) == 0 || y_labels == loser.leafset {
             return None;
         }
-        let core = splitting_core_in_tree(
-            tf,
-            T2,
-            loser.t2_root,
-            &loser.leafset,
-            &y_labels,
-        );
+        let core = splitting_core_in_tree(tf, T2, loser.t2_root, &loser.leafset, &y_labels);
         if core.is_empty() {
             return None;
         }
         rule_stats.split_rule_core_cutsets += core.len() as u64;
         rule_stats.split_rule_core_edges += core.iter().map(|k| k.len() as u64).sum::<u64>();
-        rule_stats.split_rule_size1_cutsets +=
-            core.iter().filter(|k| k.len() == 1).count() as u64;
+        rule_stats.split_rule_size1_cutsets += core.iter().filter(|k| k.len() == 1).count() as u64;
         cores.push((loser_idx, core));
     }
 
@@ -2184,11 +2165,7 @@ fn apply_split(
 /// all cuts before contracting can leave 0-child internals behind when a
 /// cutset contains siblings; later Whidden case3 logic is not prepared to
 /// navigate those empty placeholders.
-fn apply_t2_cutset(
-    tf: &mut TwinForest,
-    um: &mut UndoMachine,
-    cutset: &[NodeId],
-) -> Option<u32> {
+fn apply_t2_cutset(tf: &mut TwinForest, um: &mut UndoMachine, cutset: &[NodeId]) -> Option<u32> {
     let mut unique = cutset.to_vec();
     unique.sort_unstable();
     unique.dedup();
@@ -2258,9 +2235,7 @@ fn apply_sub_maf_cuts(
             continue;
         }
         for (sub_id, sub_tree) in sub_maf.iter().enumerate() {
-            if new_lbl < sub_tree.label_to_node.len()
-                && sub_tree.label_to_node[new_lbl] != NONE
-            {
+            if new_lbl < sub_tree.label_to_node.len() && sub_tree.label_to_node[new_lbl] != NONE {
                 leaf_color[orig_lbl] = sub_id as i32;
                 break;
             }
@@ -2274,7 +2249,9 @@ fn apply_sub_maf_cuts(
         let mut visited = std::collections::HashSet::new();
         let mut stack = vec![component_root];
         while let Some(node) = stack.pop() {
-            if node == NONE || !visited.insert(node) { continue; }
+            if node == NONE || !visited.insert(node) {
+                continue;
+            }
             if tf.is_leaf(T2, node) {
                 let lbl = tf.label[T2][node as usize] as usize;
                 if lbl != 0 && lbl < leaf_color.len() {
@@ -2286,8 +2263,12 @@ fn apply_sub_maf_cuts(
             } else {
                 let l = tf.left[T2][node as usize];
                 let r = tf.right[T2][node as usize];
-                if l != NONE { stack.push(l); }
-                if r != NONE && r != l { stack.push(r); }
+                if l != NONE {
+                    stack.push(l);
+                }
+                if r != NONE && r != l {
+                    stack.push(r);
+                }
             }
         }
     }
@@ -2323,7 +2304,12 @@ fn apply_sub_maf_cuts(
             // But only if not root and the leaf's color is wholly contained.
             // For singletons (color appears once in T2 subtree), this is
             // always self-contained, so the leaf can be cut.
-            if !is_root && counts.iter().enumerate().all(|(c, &n)| n == 0 || n == total_count[c]) {
+            if !is_root
+                && counts
+                    .iter()
+                    .enumerate()
+                    .all(|(c, &n)| n == 0 || n == total_count[c])
+            {
                 cuts_to_make.push(node);
             }
             return counts;
@@ -2334,15 +2320,21 @@ fn apply_sub_maf_cuts(
         // Degenerate degree-1: `left == right` — recurse only once.
         if lc != NONE && lc == rc {
             let sub = count_colors(tf, lc, leaf_color, total_count, cuts_to_make, false);
-            for i in 0..nc { counts[i] += sub[i]; }
+            for i in 0..nc {
+                counts[i] += sub[i];
+            }
         } else {
             if lc != NONE {
                 let sub = count_colors(tf, lc, leaf_color, total_count, cuts_to_make, false);
-                for i in 0..nc { counts[i] += sub[i]; }
+                for i in 0..nc {
+                    counts[i] += sub[i];
+                }
             }
             if rc != NONE {
                 let sub = count_colors(tf, rc, leaf_color, total_count, cuts_to_make, false);
-                for i in 0..nc { counts[i] += sub[i]; }
+                for i in 0..nc {
+                    counts[i] += sub[i];
+                }
             }
         }
         // Decide cut on the edge from this node up to its parent.
@@ -2350,7 +2342,10 @@ fn apply_sub_maf_cuts(
         // has all its leaves in this subtree). Skip for root.
         if !is_root {
             let any = counts.iter().any(|&n| n > 0);
-            let complete = counts.iter().enumerate().all(|(c, &n)| n == 0 || n == total_count[c]);
+            let complete = counts
+                .iter()
+                .enumerate()
+                .all(|(c, &n)| n == 0 || n == total_count[c]);
             if any && complete {
                 cuts_to_make.push(node);
             }
@@ -2358,7 +2353,12 @@ fn apply_sub_maf_cuts(
         counts
     }
     let _ = count_colors(
-        tf, component_root, &leaf_color, &total_count, &mut cuts_to_make, true,
+        tf,
+        component_root,
+        &leaf_color,
+        &total_count,
+        &mut cuts_to_make,
+        true,
     );
 
     // The bottom-up pass can record nested cuts (e.g., a leaf and its
@@ -2468,8 +2468,7 @@ fn apply_decompose(
         }
         // Build relabel map: in-component leaves get new labels 1..count,
         // others get 0 (= drop). Also build the reverse map (new → orig).
-        let mut label_map: Vec<klados_core::tree::Label> =
-            vec![0; tf.num_leaves as usize + 1];
+        let mut label_map: Vec<klados_core::tree::Label> = vec![0; tf.num_leaves as usize + 1];
         let mut label_to_orig: Vec<klados_core::tree::Label> = vec![0; count + 1];
         for (new_label, old_lbl) in (1u32..).zip(leafset.ones()) {
             label_map[old_lbl] = new_label as klados_core::tree::Label;
@@ -2489,7 +2488,11 @@ fn apply_decompose(
         }
         let mut sub_solver =
             crate::solvers::whidden::WhiddenSolver::new().with_split_or_decompose(false);
-        let sub_solution = match crate::Solver::solve(&mut sub_solver, &sub_instance, &crate::RunConfig::default()) {
+        let sub_solution = match crate::Solver::solve(
+            &mut sub_solver,
+            &sub_instance,
+            &crate::RunConfig::default(),
+        ) {
             Some(s) => s,
             None => {
                 debug!(
@@ -3393,10 +3396,19 @@ mod splitting_core_tests {
 
         let core = splitting_core(&tf, t1.root, &active, &y);
         let ineq = splitting_core_inequality(&core);
-        assert!(ineq <= 0.5 + 1e-9, "inequality violated: {} cuts={:?}", ineq, core);
+        assert!(
+            ineq <= 0.5 + 1e-9,
+            "inequality violated: {} cuts={:?}",
+            ineq,
+            core
+        );
         // The inductive case MUST produce a non-empty core. The paper
         // guarantees Lemma 1's existence.
-        assert!(!core.is_empty(), "inductive case produced empty core for {:?}", core);
+        assert!(
+            !core.is_empty(),
+            "inductive case produced empty core for {:?}",
+            core
+        );
         // For ((1,3),(2,4)) with Y={1,2}: at v_left (cherry of 1,3) we
         // have (PureY={1}, PureZ={3}, Mixed_outside={2,4}). Recursion on
         // T \ {1} and T \ {3} should produce cores of size 1 each, and
@@ -3456,8 +3468,18 @@ mod splitting_core_tests {
         let y = bits(&[1, 2, 3, 4], 9);
         let core = splitting_core(&tf, t.root, &active, &y);
         let ineq = splitting_core_inequality(&core);
-        assert!(ineq <= 0.5 + 1e-9, "inequality violated: {} cuts={:?}", ineq, core);
+        assert!(
+            ineq <= 0.5 + 1e-9,
+            "inequality violated: {} cuts={:?}",
+            ineq,
+            core
+        );
         // Clean split: should find a single edge cut.
-        assert_eq!(core.len(), 1, "expected 1 cut for clean split, got {:?}", core);
+        assert_eq!(
+            core.len(),
+            1,
+            "expected 1 cut for clean split, got {:?}",
+            core
+        );
     }
 }

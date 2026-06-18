@@ -376,9 +376,10 @@ fn parse_solution(output: &str) -> std::collections::HashSet<usize> {
         if let Some(rest) = line.strip_prefix("v ") {
             for lit in rest.split_whitespace() {
                 if let Ok(var) = lit.parse::<isize>()
-                    && var > 0 {
-                        true_vars.insert((var - 1) as usize);
-                    }
+                    && var > 0
+                {
+                    true_vars.insert((var - 1) as usize);
+                }
             }
         }
     }
@@ -401,9 +402,10 @@ fn extract_induced_subtree(tree: &Tree, labels: &[Label]) -> Tree {
     ) -> Option<Vec<Label>> {
         if tree.is_leaf(node) {
             if let Some(label) = tree.leaf_label(node)
-                && label_set.contains(&label) {
-                    return Some(vec![label]);
-                }
+                && label_set.contains(&label)
+            {
+                return Some(vec![label]);
+            }
             return None;
         }
 
@@ -562,5 +564,11 @@ impl Solver for MaxSatSolver {
 }
 
 pub fn main() {
-    crate::run(MaxSatSolver::new(), RunConfig { track: Track::Heuristic, ..Default::default() });
+    crate::run(
+        MaxSatSolver::new(),
+        RunConfig {
+            track: Track::Heuristic,
+            ..Default::default()
+        },
+    );
 }

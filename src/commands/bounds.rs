@@ -76,16 +76,20 @@ fn compute(algo: BoundsAlgo, instance: &Instance) -> AlgoResult {
             if instance.num_trees() != 2 {
                 return pair_err(algo);
             }
-            let (l, u) =
-                klados_solve::solvers::chen_rspr::chen_pair_bounds(&instance.trees[0], &instance.trees[1]);
+            let (l, u) = klados_solve::solvers::chen_rspr::chen_pair_bounds(
+                &instance.trees[0],
+                &instance.trees[1],
+            );
             (l + 1, u + 1)
         }
         BoundsAlgo::ChenApp1 => {
             if instance.num_trees() != 2 {
                 return pair_err(algo);
             }
-            let (l, u) =
-                klados_solve::solvers::chen_rspr::chen_app1_bounds(&instance.trees[0], &instance.trees[1]);
+            let (l, u) = klados_solve::solvers::chen_rspr::chen_app1_bounds(
+                &instance.trees[0],
+                &instance.trees[1],
+            );
             (l + 1, u + 1)
         }
         BoundsAlgo::RedBlue => {
@@ -153,20 +157,21 @@ fn run_single(
             );
             if let Some(scores) = scores
                 && let Some(name) = &instance.name
-                    && let Some(&opt) = scores.get(&name.to_uppercase()) {
-                        let gap = if opt > 0 {
-                            r.upper as f64 / opt as f64
-                        } else {
-                            0.0
-                        };
-                        let ok = r.lower <= opt && opt <= r.upper;
-                        eprintln!(
-                            "  OPT={}  UB/OPT={:.2}x  {}",
-                            opt,
-                            gap,
-                            if ok { "✓" } else { "✗ VIOLATION" }
-                        );
-                    }
+                && let Some(&opt) = scores.get(&name.to_uppercase())
+            {
+                let gap = if opt > 0 {
+                    r.upper as f64 / opt as f64
+                } else {
+                    0.0
+                };
+                let ok = r.lower <= opt && opt <= r.upper;
+                eprintln!(
+                    "  OPT={}  UB/OPT={:.2}x  {}",
+                    opt,
+                    gap,
+                    if ok { "✓" } else { "✗ VIOLATION" }
+                );
+            }
         }
     }
     Ok(())

@@ -520,8 +520,13 @@ impl Tree {
 /// trees (enumerate sorted via `label_to_node`) and unindexed forest pieces
 /// (scan the node `label` array). Returned by [`Tree::leaves`].
 pub enum LeafIter<'a> {
-    Indexed { tree: &'a Tree, next: Label },
-    Scan { labels: core::slice::Iter<'a, Label> },
+    Indexed {
+        tree: &'a Tree,
+        next: Label,
+    },
+    Scan {
+        labels: core::slice::Iter<'a, Label>,
+    },
 }
 
 impl Iterator for LeafIter<'_> {

@@ -49,16 +49,18 @@ use klados_core::af_validator::{AfValidation, validate_agreement_forest};
 use klados_core::kernelize::{expand_solution, kernelize_best};
 use klados_core::{Instance, SolverStats, Tree};
 
-use crate::{RunConfig, Solver, Track};
+use crate::decomp::whidden_cluster::try_whidden_decomp_2tree;
 use crate::solvers::bp::BpSolver;
 use crate::solvers::bp::column::{AfColumn, ColumnBuilder, ColumnSet};
 use crate::solvers::bp::pricer::exact_pair_dp::{ExactPairDpCache, collect_corridor_candidates};
-use crate::solvers::bp::pricer::{Pricer, PricerScratch, PricingContext, PricingResult, dispatch_by_m};
+use crate::solvers::bp::pricer::{
+    Pricer, PricerScratch, PricingContext, PricingResult, dispatch_by_m,
+};
 use crate::solvers::bp::rmp::Rmp;
 use crate::solvers::bp::search::Branchings;
 use crate::solvers::corridor::topk_m2;
 use crate::solvers::root_pool::seed_columns_and_incumbent;
-use crate::decomp::whidden_cluster::try_whidden_decomp_2tree;
+use crate::{RunConfig, Solver, Track};
 
 const PRICING_EPS: f64 = 1.0e-8;
 
@@ -179,18 +181,18 @@ impl CorridorSolver {
                 reduced,
                 &mut solve_sub,
                 &crate::decomp::whidden_cluster::NEVER_TERMINATE,
-            )
-                && !sub_failed {
-                    let expanded = expand_solution(
-                        forest,
-                        &kern,
-                        instance.reference_tree(),
-                        instance.num_leaves,
-                    );
-                    self.stats.upper_bound = Some(expanded.len());
-                    self.stats.lower_bound = expanded.len();
-                    return Some(expanded);
-                }
+            ) && !sub_failed
+            {
+                let expanded = expand_solution(
+                    forest,
+                    &kern,
+                    instance.reference_tree(),
+                    instance.num_leaves,
+                );
+                self.stats.upper_bound = Some(expanded.len());
+                self.stats.lower_bound = expanded.len();
+                return Some(expanded);
+            }
         }
 
         let reduced_forest = self.solve_m2_core(reduced)?;
@@ -295,9 +297,10 @@ impl CorridorSolver {
             // a tighter U gives a smaller corridor.
             if let Some(lp_sol) = solve_lp(&mut rmp)
                 && let Some(rounded) = lp_round(&columns, &lp_sol.column_values, n)
-                    && rounded.len() < best_cols.len() {
-                        best_cols = rounded;
-                    }
+                && rounded.len() < best_cols.len()
+            {
+                best_cols = rounded;
+            }
 
             let upper = best_cols.len();
             let lb = (lp_obj - 1.0e-6).ceil() as usize;
@@ -406,11 +409,12 @@ impl CorridorSolver {
                 for (_score, labels, anchor0, anchor1) in candidates {
                     forbidden_anchors.push((anchor0, anchor1));
                     if seen.insert(labels.clone())
-                        && let Some(col) = builder.try_build(labels, trees) {
-                            rmp.add_column(&col);
-                            columns.push(col);
-                            newly_added += 1;
-                        }
+                        && let Some(col) = builder.try_build(labels, trees)
+                    {
+                        rmp.add_column(&col);
+                        columns.push(col);
+                        newly_added += 1;
+                    }
                 }
                 total_corridor_added += newly_added;
                 debug!(
@@ -433,10 +437,11 @@ impl CorridorSolver {
                     // top-K-per-anchor; documented limitation.)
                     let mip = solve_mip_to_optimality(&mut rmp, &columns, n);
                     if let Some(labels) = mip
-                        && labels.len() < best_cols.len() {
-                            best_cols = labels;
-                            improved_this_outer = true;
-                        }
+                        && labels.len() < best_cols.len()
+                    {
+                        best_cols = labels;
+                        improved_this_outer = true;
+                    }
                     break;
                 }
 
@@ -444,11 +449,12 @@ impl CorridorSolver {
                 // U we restart from outer (γ shrinks → tighter corridor).
                 let mip = solve_mip_to_optimality(&mut rmp, &columns, n);
                 if let Some(labels) = mip
-                    && labels.len() < best_cols.len() {
-                        best_cols = labels;
-                        improved_this_outer = true;
-                        break;
-                    }
+                    && labels.len() < best_cols.len()
+                {
+                    best_cols = labels;
+                    improved_this_outer = true;
+                    break;
+                }
             }
 
             if improved_this_outer {

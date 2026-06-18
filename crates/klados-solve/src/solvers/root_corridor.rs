@@ -70,7 +70,8 @@ impl Solver for RootCorridorSolver {
             n
         };
 
-        let allow_2tree_probe = instance.num_trees() == 2 && n <= self.config.max_probe_original_2tree;
+        let allow_2tree_probe =
+            instance.num_trees() == 2 && n <= self.config.max_probe_original_2tree;
 
         if probe_leaves <= self.config.max_probe_leaves || allow_2tree_probe {
             let mut root = RootPoolSolver::for_corridor_probe();
@@ -131,5 +132,11 @@ impl Solver for RootCorridorSolver {
 use crate::{RunConfig, Solver, Track};
 
 pub fn main() {
-    crate::run(RootCorridorSolver::new(), RunConfig { track: Track::Exact, ..Default::default() });
+    crate::run(
+        RootCorridorSolver::new(),
+        RunConfig {
+            track: Track::Exact,
+            ..Default::default()
+        },
+    );
 }

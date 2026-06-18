@@ -20,10 +20,15 @@ pub mod topk_m2;
 
 pub use legacy_anchor_best::CorridorSolver;
 
-
 // ── entry point ─────────────────────────────────────────────────────────────
 use crate::{RunConfig, Track};
 
 pub fn main() {
-    crate::run(CorridorSolver::new(), RunConfig { track: Track::Exact, ..Default::default() });
+    crate::run(
+        CorridorSolver::new(),
+        RunConfig {
+            track: Track::Exact,
+            ..Default::default()
+        },
+    );
 }
