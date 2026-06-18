@@ -454,10 +454,6 @@ impl Rmp {
         })
     }
 
-    pub fn solve_mip(&mut self) -> Result<Option<RmpSolution>, String> {
-        self.solve_mip_with_time_limit(0.1)
-    }
-
     pub fn solve_mip_with_time_limit(
         &mut self,
         mip_time_limit: f64,

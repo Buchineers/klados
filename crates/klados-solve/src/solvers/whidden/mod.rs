@@ -184,8 +184,10 @@ impl WhiddenSolver {
         });
         let _decr = SplitDiagDepthDecrement;
         let is_outermost = entry_depth == 0;
-        // Diagnostic print runs unconditionally on outermost exit via Drop.
-        let _diag_guard = if is_outermost {
+        // Diagnostic print fires on outermost exit via Drop. Gated on debug
+        // logging (replaces the former KLADOS_WHIDDEN_SPLIT_DIAG env gate) so
+        // the guard isn't even constructed unless someone is watching.
+        let _diag_guard = if is_outermost && log::log_enabled!(log::Level::Debug) {
             Some(SplitDiagPrinter {
                 stats_ptr: &self.rule_stats as *const _,
                 n_input: instance.num_leaves,

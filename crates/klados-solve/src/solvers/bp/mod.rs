@@ -79,8 +79,19 @@ struct CanonicalMemoView {
     canonical_to_label: Vec<u32>,
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct BpExperimental {
+/// Stage-2 configuration. The defaults match what the current pricer can
+/// soundly support: cluster algorithms stay disabled until a sound pricer
+/// (m=2 pair-DP / small-m m-DP) lands, since cluster reduction's stitching
+/// requires optimal sub-solves.
+#[derive(Clone, Debug)]
+pub struct BpConfig {
+    pub kernelize: bool,
+    pub cluster_algo: ClusterAlgo,
+    pub mip_time_limit: f64,
+    pub m2_batch: usize,
+    pub m2_exact_dp_cells: usize,
+    pub m2_exact_reserve_cap: usize,
+    pub use_anchor_cache: bool,
     pub no_chen_lb: bool,
     pub core_decomp_analyze: bool,
     pub core_decomp_min_leaves: usize,
@@ -101,32 +112,6 @@ pub struct BpExperimental {
     pub all_region_support_mip: bool,
 }
 
-impl BpExperimental {
-    fn defaults() -> Self {
-        Self {
-            relaxed_incumbent: true,
-            core_decomp_min_leaves: 150,
-            ..Default::default()
-        }
-    }
-}
-
-/// Stage-2 configuration. The defaults match what the current pricer can
-/// soundly support: cluster algorithms stay disabled until a sound pricer
-/// (m=2 pair-DP / small-m m-DP) lands, since cluster reduction's stitching
-/// requires optimal sub-solves.
-#[derive(Clone, Debug)]
-pub struct BpConfig {
-    pub kernelize: bool,
-    pub cluster_algo: ClusterAlgo,
-    pub mip_time_limit: f64,
-    pub m2_batch: usize,
-    pub m2_exact_dp_cells: usize,
-    pub m2_exact_reserve_cap: usize,
-    pub use_anchor_cache: bool,
-    pub experimental: BpExperimental,
-}
-
 impl Default for BpConfig {
     fn default() -> Self {
         Self {
@@ -134,10 +119,27 @@ impl Default for BpConfig {
             cluster_algo: ClusterAlgo::ClusterReduction,
             mip_time_limit: 0.1,
             m2_batch: 0,
-            m2_exact_dp_cells: 0,
+            m2_exact_dp_cells: 64_000_000,
             m2_exact_reserve_cap: 0,
             use_anchor_cache: false,
-            experimental: BpExperimental::defaults(),
+            no_chen_lb: false,
+            core_decomp_analyze: false,
+            core_decomp_min_leaves: 150,
+            disable_bound_prune: false,
+            no_rcvf: false,
+            tiny_rcvf: false,
+            relaxed_incumbent: true,
+            obstruction_probe: false,
+            bridge_probe: false,
+            root_support_incumbent: false,
+            corridor_enrich: false,
+            corridor_max_k: 0,
+            mip_heuristic: false,
+            root_support_mip: false,
+            obstruction_local_lb: false,
+            obstruction_solve_core: false,
+            region_support_mip: false,
+            all_region_support_mip: false,
         }
     }
 }
@@ -150,12 +152,7 @@ impl BpConfig {
         Self {
             kernelize: true,
             cluster_algo: ClusterAlgo::None,
-            mip_time_limit: 0.1,
-            m2_batch: 0,
-            m2_exact_dp_cells: 0,
-            m2_exact_reserve_cap: 0,
-            use_anchor_cache: false,
-            experimental: BpExperimental::defaults(),
+            ..Default::default()
         }
     }
 }
@@ -196,7 +193,7 @@ impl Solver for BpSolver {
         // (subproblems aborted), fall back to Chen 2-approximation.
         if instance.num_trees() == 2 && !validate_agreement_forest(instance, &components).is_ok() {
             let (_, _, leafsets) = chen_pair_agreement(&instance.trees[0], &instance.trees[1]);
-            components = leafsets_to_trees(&leafsets, instance);
+            components = crate::solvers::chen_rspr::leafsets_to_trees(&leafsets, instance);
         }
         self.stats.upper_bound = Some(components.len());
         self.stats.lower_bound = components.len();
@@ -858,27 +855,6 @@ fn make_leafset(labels: &[u32], num_leaves: u32) -> FixedBitSet {
     }
     bits
 }
-
-/// Convert Chen leaf-sets to agreement forest trees.
-fn leafsets_to_trees(leafsets: &[Vec<u32>], instance: &Instance) -> Vec<Tree> {
-    let t1 = &instance.trees[0];
-    let n = instance.num_leaves;
-    leafsets
-        .iter()
-        .map(|labels| {
-            if labels.len() == 1 {
-                Tree::singleton(labels[0], n)
-            } else {
-                let mut bitset = fixedbitset::FixedBitSet::with_capacity(n as usize + 1);
-                for &l in labels {
-                    bitset.insert(l as usize);
-                }
-                Tree::component_from_leafset(&bitset, t1, n)
-            }
-        })
-        .collect()
-}
-
 
 // ── entry point ─────────────────────────────────────────────────────────────
 use crate::{RunConfig, Solver, Track};

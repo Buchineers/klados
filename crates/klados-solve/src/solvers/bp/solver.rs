@@ -344,13 +344,13 @@ where
     }
     maybe_log_core_decomp_potential(
         reduced,
-        cfg.experimental.core_decomp_analyze,
-        cfg.experimental.core_decomp_min_leaves,
+        cfg.core_decomp_analyze,
+        cfg.core_decomp_min_leaves,
     );
 
     // Chen pairwise lower bound — a sound combinatorial floor on the
     // component count, valid for every B&B node of this (sub)instance.
-    let chen_lb = chen_lower_bound(trees, cfg.experimental.no_chen_lb);
+    let chen_lb = chen_lower_bound(trees, cfg.no_chen_lb);
 
     // Seed singletons via a temporary builder; the runtime builder lives in
     // PricerScratch so all pricer tiers share it.
@@ -410,7 +410,7 @@ where
     // integer solution and we lose by branching needlessly. Matches
     // bp-multi's behavior; this was the missing primal heuristic that
     // explains the recurring "LP=optimum but support fractional" gap.
-    let relaxed_incumbent_enabled = cfg.experimental.relaxed_incumbent;
+    let relaxed_incumbent_enabled = cfg.relaxed_incumbent;
     if relaxed_incumbent_enabled && trees.len() == 2 && reduced.num_leaves >= 20
         && let Some(incumbent_forest) = try_whidden_relaxed_incumbent_2tree(reduced, solve_sub, false) {
             install_incumbent(
@@ -466,8 +466,8 @@ where
     let allow_rcvf = use_rcvf_shortcuts(
         reduced,
         trees,
-        cfg.experimental.no_rcvf,
-        cfg.experimental.tiny_rcvf,
+        cfg.no_rcvf,
+        cfg.tiny_rcvf,
     );
     while let Some((b, parent_lp_bound)) = stack.pop() {
         // Periodic progress log so we can see telemetry on timeouts, not
@@ -512,7 +512,7 @@ where
             0
         };
         // The Chen lower bound is a sound floor independent of the LP.
-        if allow_bound_prune && can_prune_by_bound(inherited_lb.max(chen_lb), state.best_ub(), cfg.experimental.disable_bound_prune) {
+        if allow_bound_prune && can_prune_by_bound(inherited_lb.max(chen_lb), state.best_ub(), cfg.disable_bound_prune) {
             tel.bound_prunes += 1;
             continue;
         }
@@ -568,7 +568,7 @@ where
                         state.incumbent(),
                         state.columns(),
                         root_regions.as_ref(),
-                        cfg.experimental.bridge_probe,
+                        cfg.bridge_probe,
                     );
                     // RCVF replay happens at the top of the next solve_node.
                 }
@@ -783,7 +783,7 @@ fn solve_node<P: Pricer, S: BranchSelector>(
         chen_lb
     };
 
-    if allow_bound_prune && can_prune_by_bound(lb, state.best_ub(), cfg.experimental.disable_bound_prune) {
+    if allow_bound_prune && can_prune_by_bound(lb, state.best_ub(), cfg.disable_bound_prune) {
         debug!(
             target: LOG_TARGET,
             "node pruned by bound: lb={} (lp={:.4} chen={}) ub={}",
@@ -842,13 +842,13 @@ fn solve_node<P: Pricer, S: BranchSelector>(
         // LP mass currently paid inside it, then the missing proof object is a
         // global obstruction cut rather than another local branch.
         if root_regions.is_none()
-            && (cfg.experimental.obstruction_probe
-                || cfg.experimental.bridge_probe
-                || cfg.experimental.root_support_incumbent)
+            && (cfg.obstruction_probe
+                || cfg.bridge_probe
+                || cfg.root_support_incumbent)
         {
             *root_regions = build_root_support_regions(state, &lp);
         }
-        if cfg.experimental.root_support_incumbent
+        if cfg.root_support_incumbent
             && let Some(regions) = root_regions.as_ref()
         {
             let t0 = Instant::now();
@@ -866,13 +866,13 @@ fn solve_node<P: Pricer, S: BranchSelector>(
                 }
             }
         }
-        maybe_probe_root_obstruction(reduced, state, &lp, root_regions.as_ref(), &cfg.experimental);
+        maybe_probe_root_obstruction(reduced, state, &lp, root_regions.as_ref(), cfg);
         maybe_log_bridge_footprint(
             "root-incumbent",
             state.incumbent(),
             state.columns(),
             root_regions.as_ref(),
-            cfg.experimental.bridge_probe,
+            cfg.bridge_probe,
         );
 
         // ── Corridor-enriched B&P (DISABLED by default; ablation only) ─
@@ -892,9 +892,9 @@ fn solve_node<P: Pricer, S: BranchSelector>(
         // exactly the columns it needs; the root-corridor theorem
         // is *informative* about completeness but the upfront-add
         // formulation isn't a shortcut.
-        // Re-enable via `BpExperimental.corridor_enrich` for further
+        // Re-enable via `BpConfig.corridor_enrich` for further
         // experimentation.
-        let corridor_enrich = cfg.experimental.corridor_enrich;
+        let corridor_enrich = cfg.corridor_enrich;
         if corridor_enrich && trees.len() == 2 {
             let upper = state.best_ub();
             let lb = (lp.objective - 1.0e-6).ceil() as usize;
@@ -903,7 +903,7 @@ fn solve_node<P: Pricer, S: BranchSelector>(
             if lb < upper {
                 let gamma = (upper as f64) - 1.0 - lp.objective;
                 let threshold = 1.0 - gamma - 1.0e-8;
-                let max_k = cfg.experimental.corridor_max_k.max(1);
+                let max_k = cfg.corridor_max_k.max(1);
                 let n0 = trees[0].num_nodes();
                 let n1 = trees[1].num_nodes();
                 let mut cache = scratch
@@ -1008,7 +1008,7 @@ fn solve_node<P: Pricer, S: BranchSelector>(
                     state.best_ub(), tel.cg_iters,
                 );
 
-                if allow_bound_prune && can_prune_by_bound(lb, state.best_ub(), cfg.experimental.disable_bound_prune) {
+                if allow_bound_prune && can_prune_by_bound(lb, state.best_ub(), cfg.disable_bound_prune) {
                     tel.bound_prunes += 1;
                     return NodeOutcome::Pruned;
                 }
@@ -1016,14 +1016,14 @@ fn solve_node<P: Pricer, S: BranchSelector>(
         }
 
     // MIP-on-pool primal heuristic. Disabled by default; enable via
-    // `BpExperimental.mip_heuristic`. Fires when the LP objective is at an
+    // `BpConfig.mip_heuristic`. Fires when the LP objective is at an
     // integer boundary but the support is fractional — exactly the case
     // where pure branching nudges the LP by ε per node and a MIP solve
     // over the existing pool finds the missing integer combination
     // directly. Time-capped (100ms by default) so the failure mode is
     // bounded.
     let lp_frac = lp.objective.ceil() - lp.objective;
-    if cfg.experimental.mip_heuristic
+    if cfg.mip_heuristic
         && lb < state.best_ub()
         && lp_frac < 1e-4
     {
@@ -1053,7 +1053,7 @@ fn solve_node<P: Pricer, S: BranchSelector>(
                                 state.best_ub(), tel.cg_iters, branchings.depth(),
                             );
 
-                            if allow_bound_prune && can_prune_by_bound(lb, state.best_ub(), cfg.experimental.disable_bound_prune) {
+                            if allow_bound_prune && can_prune_by_bound(lb, state.best_ub(), cfg.disable_bound_prune) {
                                 tel.bound_prunes += 1;
                                 return NodeOutcome::Pruned;
                             }
@@ -1217,9 +1217,9 @@ fn maybe_probe_root_obstruction(
     state: &SearchState,
     lp: &crate::solvers::bp::rmp::RmpSolution,
     root_regions: Option<&RootSupportRegions>,
-    experimental: &crate::solvers::bp::BpExperimental,
+    cfg: &crate::solvers::bp::BpConfig,
 ) {
-    if !experimental.obstruction_probe {
+    if !cfg.obstruction_probe {
         return;
     }
 
@@ -1230,7 +1230,7 @@ fn maybe_probe_root_obstruction(
 
     IN_OBSTRUCTION_PROBE.with(|flag| flag.set(true));
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        probe_root_obstruction_impl(reduced, state, lp, root_regions, experimental)
+        probe_root_obstruction_impl(reduced, state, lp, root_regions, cfg)
     }));
     IN_OBSTRUCTION_PROBE.with(|flag| flag.set(false));
     if result.is_err() {
@@ -1243,7 +1243,7 @@ fn probe_root_obstruction_impl(
     state: &SearchState,
     lp: &crate::solvers::bp::rmp::RmpSolution,
     root_regions: Option<&RootSupportRegions>,
-    experimental: &crate::solvers::bp::BpExperimental,
+    cfg: &crate::solvers::bp::BpConfig,
 ) {
     let Some(regions) = root_regions else {
         info!(target: LOG_TARGET, "obstruction-probe: empty LP support");
@@ -1274,7 +1274,7 @@ fn probe_root_obstruction_impl(
         );
     }
 
-    if experimental.root_support_mip {
+    if cfg.root_support_mip {
         probe_root_support_mip(reduced, state, lp, regions);
     }
 
@@ -1286,8 +1286,8 @@ fn probe_root_obstruction_impl(
         return;
     }
 
-    let want_local_lb = experimental.obstruction_local_lb;
-    let want_exact_core = experimental.obstruction_solve_core;
+    let want_local_lb = cfg.obstruction_local_lb;
+    let want_exact_core = cfg.obstruction_solve_core;
     if !want_local_lb && !want_exact_core {
         return;
     }
@@ -1324,10 +1324,10 @@ fn probe_root_obstruction_impl(
         }
     }
 
-    if experimental.region_support_mip {
+    if cfg.region_support_mip {
         probe_region_support_mip(reduced, state, largest);
     }
-    if experimental.all_region_support_mip {
+    if cfg.all_region_support_mip {
         probe_all_region_support_mips(reduced, state, regions);
     }
 

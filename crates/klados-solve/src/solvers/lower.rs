@@ -34,10 +34,6 @@ use std::time::{Duration, Instant};
 /// budget, so it is skipped and the whole budget goes to Lagrangian.
 const BP_MAX_LEAVES: u32 = 800;
 
-/// Per-instance wall budget when `cfg.budget` is unset. The track caps each
-/// instance at 610 s.
-const DEFAULT_WALL_SECS: f64 = 600.0;
-
 /// `true` iff `forest` is a valid agreement forest AND provably within the track
 /// bound: `|forest| <= floor(a * lb) + b` with `lb` a SOUND lower bound on `k*`.
 fn certifiable(instance: &Instance, forest: &[Tree], a: f64, b: usize, lb: usize) -> bool {
@@ -51,10 +47,10 @@ fn certifiable(instance: &Instance, forest: &[Tree], a: f64, b: usize, lb: usize
 ///
 /// `budget` is the wall limit (`cfg.budget` ← `STRIDE_TIMEOUT`); the racer
 /// subdivides it (lagrangian then exact `bp`) and leaves a 3 s flush margin.
-pub fn solve_lower(instance: &Instance, budget: Option<Duration>) -> Option<Vec<Tree>> {
+pub fn solve_lower(instance: &Instance, budget: Duration) -> Option<Vec<Tree>> {
     let (a, b) = instance.approx.unwrap_or((1.0, 0));
     let start = Instant::now();
-    let wall_secs = budget.map_or(DEFAULT_WALL_SECS, |b| b.as_secs_f64());
+    let wall_secs = budget.as_secs_f64();
     let deadline = start + Duration::from_secs_f64((wall_secs - 3.0).max(1.0));
 
     // ── Lagrangian (track-aware): seeds Chen, raises a tight dual LB, and
@@ -134,7 +130,7 @@ impl Solver for LowerSolver {
     type Config = ();
     const SUPPORTED_TRACKS: &'static [Track] = &[Track::LowerBound];
     fn solve(&mut self, inst: &Instance, cfg: &RunConfig<()>) -> Option<Vec<Tree>> {
-        solve_lower(inst, cfg.budget)
+        solve_lower(inst, cfg.budget.unwrap_or(Duration::from_secs(600)))
     }
     fn stats(&self) -> &SolverStats {
         &self.stats

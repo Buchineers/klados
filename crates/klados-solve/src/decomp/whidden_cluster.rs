@@ -859,14 +859,16 @@ where
     }
     let validation = validate_agreement_forest(instance, &result);
     if !validation.is_ok() {
-        let sizes: Vec<usize> = solved.iter().map(|s| s.leaves.count_ones(..)).collect();
-        debug!(
-            "[whidden] batch n={}: validation failed for {} clusters sizes={:?}: {:?}",
-            n,
-            solved.len(),
-            sizes,
-            validation
-        );
+        if log::log_enabled!(log::Level::Debug) {
+            let sizes: Vec<usize> = solved.iter().map(|s| s.leaves.count_ones(..)).collect();
+            debug!(
+                "[whidden] batch n={}: validation failed for {} clusters sizes={:?}: {:?}",
+                n,
+                solved.len(),
+                sizes,
+                validation
+            );
+        }
         return None;
     }
     log::debug!(

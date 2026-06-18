@@ -84,7 +84,7 @@ impl PricerScratch {
             column_reserve: Vec::new(),
             pricing_stats: PricingStats::default(),
             m2_batch: 0,
-            m2_exact_dp_cells: 0,
+            m2_exact_dp_cells: 64_000_000,
             m2_exact_reserve_cap: 0,
             use_anchor_cache: false,
         }
