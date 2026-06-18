@@ -293,12 +293,9 @@ impl<'a, 'c> LazyKBest<'a, 'c> {
     ///
     /// After this returns, calling `next()` enumerates anchor-best
     /// columns in score-descending order until threshold cuts off.
-    pub fn new(input: LazyKBestInput<'a>, cache: &'c mut LazyKBestCache) -> Self {
+    pub fn new(input: LazyKBestInput<'a>, cache: &'c mut LazyKBestCache, max_alt: u32) -> Self {
         Self::run_forward_dp(&input, cache);
         let heap = Self::seed_heap(&input, cache);
-        // Anchor-alternatives cap for this experimental enumerator
-        // (only the equivalence test constructs this).
-        let max_alt = 8;
         Self {
             input,
             cache,
@@ -310,7 +307,6 @@ impl<'a, 'c> LazyKBest<'a, 'c> {
     fn run_forward_dp(input: &LazyKBestInput, cache: &mut LazyKBestCache) {
         let t0 = input.t0;
         let t1 = input.t1;
-        let _n0 = t0.num_nodes();
         let n1 = t1.num_nodes();
 
         for c in cache.dp_closed.iter_mut() {
@@ -960,6 +956,7 @@ mod tests {
                 threshold,
             },
             &mut lazy_cache,
+            8,
         );
         let mut lazy_keys: Vec<(Vec<u32>, f64)> = Vec::new();
         while let Some(col) = lazy.next_column() {

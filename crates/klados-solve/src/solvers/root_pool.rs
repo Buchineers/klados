@@ -46,6 +46,7 @@ pub struct RootPoolConfig {
     pub enumerate_shell: bool,
     pub lazy_audit: bool,
     pub shell_enum_max_passes: usize,
+    pub anchor_k: u32,
 }
 
 impl Default for RootPoolConfig {
@@ -66,6 +67,7 @@ impl Default for RootPoolConfig {
             enumerate_shell: false,
             lazy_audit: false,
             shell_enum_max_passes: 32,
+            anchor_k: 8,
         }
     }
 }
@@ -460,6 +462,7 @@ impl RootPoolSolver {
                 &mut best_cols,
                 self.config.mip_passes,
                 self.config.mip_time_limit,
+                self.config.anchor_k,
             );
             if added > 0 && pool_before > 0 {
                 // Scale roughly with pool growth, clamped to a sane upper.
@@ -607,6 +610,7 @@ fn lazy_audit_shell(
     _best_cols: &mut Vec<Vec<u32>>,
     _mip_passes: usize,
     _mip_time_limit: f64,
+    anchor_k: u32,
 ) -> usize {
     use crate::solvers::corridor::lazy_kbest::{LazyKBest, LazyKBestCache, LazyKBestInput};
 
@@ -647,6 +651,7 @@ fn lazy_audit_shell(
             threshold,
         },
         &mut lazy_cache,
+        anchor_k,
     );
     while let Some(col) = iter.next_column() {
         if !seen.insert(col.labels.clone()) {

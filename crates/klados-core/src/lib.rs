@@ -3,9 +3,13 @@
 //! Provides arena-based tree representation for cache-efficient traversal
 //! during the FPT search.
 //!
-//! Indexed `for i in 0..n` loops over parallel arrays are an intentional
-//! pattern in the numerical kernels; clippy's iterator suggestion there is
-//! churn that hurts readability, so the lint is silenced crate-wide.
+//! Two clippy lints are silenced crate-wide because both fire pervasively
+//! in the numerical kernels:
+//! - `needless_range_loop`: indexed `for i in 0..n` over parallel arrays is the
+//!   intentional pattern here; the iterator rewrite is churn that hurts
+//!   readability.
+//! - `too_many_arguments`: the DP/branch-and-bound hot paths thread many scalar
+//!   buffers explicitly to avoid per-call struct packing.
 
 #![allow(clippy::needless_range_loop)]
 #![allow(clippy::too_many_arguments)]

@@ -774,6 +774,26 @@ pub fn chen_pair_agreement(t1: &Tree, t2: &Tree) -> (usize, usize, Vec<Vec<u32>>
     )
 }
 
+/// Convert Chen leaf-sets to agreement forest trees.
+pub fn leafsets_to_trees(leafsets: &[Vec<u32>], instance: &Instance) -> Vec<Tree> {
+    let t1 = &instance.trees[0];
+    let n = instance.num_leaves;
+    leafsets
+        .iter()
+        .map(|labels| {
+            if labels.len() == 1 {
+                Tree::singleton(labels[0], n)
+            } else {
+                let mut bitset = FixedBitSet::with_capacity(n as usize + 1);
+                for &l in labels {
+                    bitset.insert(l as usize);
+                }
+                Tree::component_from_leafset(&bitset, t1, n)
+            }
+        })
+        .collect()
+}
+
 fn improved_upper_from_state(tf: &TwinForest, state: &ChenAppState) -> usize {
     chen_agreement_leafsets_from_state(tf, state)
         .len()

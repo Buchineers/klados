@@ -134,11 +134,7 @@ impl Pricer for ExactPairDpPricer {
 /// Above this the pricer declines (returns `Exhausted`) and the exhaustive
 /// leaf-pair tier behind it provides the sound convergence proof instead.
 pub(crate) fn exact_dp_cell_cap(scratch: &PricerScratch) -> usize {
-    if scratch.m2_exact_dp_cells > 0 {
-        scratch.m2_exact_dp_cells
-    } else {
-        64_000_000
-    }
+    scratch.m2_exact_dp_cells
 }
 
 fn price_exact_pair_dp(
