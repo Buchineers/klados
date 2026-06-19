@@ -1,13 +1,19 @@
 [package]
 name = "klados"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
 description = "PACE 2026 Maximum Agreement Forest solver"
-license = "GPL-3.0-or-later"
 
 [workspace]
 members = ["crates/*"]
-resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
 
 [workspace.dependencies]
 # Internal crates
@@ -21,17 +27,31 @@ pace26io = "0.2"
 fixedbitset = "0.5"
 fxhash = "0.2"
 
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
 # LP/ILP solver
-highs = "2.0"
-highs-sys = "1.12"
+highs = "2"
+highs-sys = "1"
 
 # SAT solver
 rustsat = "0.7"
 rustsat-cadical = "0.7"
 
+# Runtime
+signal-hook = "0.4"
+libc = "0.2"
+
+# Serialization
+serde_json = "1"
+
 # CLI (for main binary)
 clap = { version = "4.5", features = ["derive"] }
-env_logger = "0.11"
+
+# Dev / benchmarks
+criterion = "0.8"
+iai-callgrind = "0.16"
 
 [dependencies]
 klados-core = { workspace = true }
@@ -40,17 +60,7 @@ pace26io = { workspace = true }
 clap = { workspace = true }
 env_logger = { workspace = true }
 fixedbitset = { workspace = true }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-signal-hook = "0.4.3"
-indicatif = "0.18.4"
-highs = { workspace = true }
-
-[[bin]]
-name = "klados"
-path = "src/main.rs"
-
-# Per-solver binaries (src/bin/klados-<name>.rs) are auto-discovered by Cargo.
+serde_json = { workspace = true }
 
 [profile.release]
 lto = "fat"
