@@ -383,23 +383,12 @@ impl LeafPairDpPricer {
             }
         }
 
-        // pair_side_parent_prefix_beta (O(p²·m), no tree traversal)
-        for ti in 0..self.num_trees {
-            self.pair_side_parent_prefix_beta[ti].clear();
-            self.pair_side_parent_prefix_beta[ti].resize(pair_count, 0.0);
-            let tree = &trees[ti];
-            for idx in 0..pair_count {
-                let anc = self.pair_side_child[ti][idx] as usize;
-                let parent = tree.parent[anc];
-                self.pair_side_parent_prefix_beta[ti][idx] = if parent == NONE {
-                    0.0
-                } else {
-                    self.prefix_beta[ti][parent as usize]
-                };
-            }
-        }
-
-        // pair_penalty, pair_ub, pair_singleton_penalty (O(p²·m))
+        // pair_penalty, pair_ub, pair_singleton_penalty and
+        // pair_side_parent_prefix_beta in one O(p²·m) pass (same arithmetic as
+        // the old two-pass form). `pair_side_parent_prefix_beta` is the `lower`
+        // term, computed once; `upper` depends only on `a` so it is hoisted out
+        // of the `c` loop; `nps[r]` is read directly instead of via a per-tree
+        // scratch vector (which allocated every call).
         self.pair_penalty.clear();
         self.pair_penalty.resize(pair_count, 0.0);
         self.pair_ub.clear();
@@ -409,47 +398,44 @@ impl LeafPairDpPricer {
 
         for ti in 0..self.num_trees {
             let tree = &trees[ti];
-            let mut nps = vec![0.0; tree.num_nodes()];
-            for node in 0..tree.num_nodes() {
-                let parent = tree.parent[node];
-                nps[node] = if parent == NONE {
-                    0.0
-                } else {
-                    self.prefix_beta[ti][parent as usize]
-                };
-            }
+            self.pair_side_parent_prefix_beta[ti].clear();
+            self.pair_side_parent_prefix_beta[ti].resize(pair_count, 0.0);
             for a in 0..p {
                 let base = a * p;
                 let leaf_a_node = self.label_node[ti][self.active_labels[a] as usize];
+                // `upper` = prefix-β at the parent of leaf a; depends only on a.
+                let upper = if leaf_a_node != NONE {
+                    let dp = tree.parent[leaf_a_node as usize];
+                    if dp != NONE {
+                        self.prefix_beta[ti][dp as usize]
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
                 for c in 0..p {
                     let idx = base + c;
                     let r = self.pair_root[ti][idx] as usize;
-                    self.pair_penalty[idx] += nps[r];
+                    let pr = tree.parent[r];
+                    let nps_r = if pr != NONE {
+                        self.prefix_beta[ti][pr as usize]
+                    } else {
+                        0.0
+                    };
+                    self.pair_penalty[idx] += nps_r;
                     if self.sum_alpha[ti][r] < self.pair_ub[idx] {
                         self.pair_ub[idx] = self.sum_alpha[ti][r];
                     }
 
                     let anc = self.pair_side_child[ti][idx];
-                    let upper = if leaf_a_node != NONE {
-                        let dp = tree.parent[leaf_a_node as usize];
-                        if dp != NONE {
-                            self.prefix_beta[ti][dp as usize]
-                        } else {
-                            0.0
-                        }
+                    let ap = tree.parent[anc as usize];
+                    let lower = if ap != NONE {
+                        self.prefix_beta[ti][ap as usize]
                     } else {
                         0.0
                     };
-                    let lower = if anc != NONE {
-                        let ap = tree.parent[anc as usize];
-                        if ap != NONE {
-                            self.prefix_beta[ti][ap as usize]
-                        } else {
-                            0.0
-                        }
-                    } else {
-                        0.0
-                    };
+                    self.pair_side_parent_prefix_beta[ti][idx] = lower;
                     let diff = upper - lower;
                     if anc != leaf_a_node && diff > 0.0 {
                         self.pair_singleton_penalty[idx] += diff;
