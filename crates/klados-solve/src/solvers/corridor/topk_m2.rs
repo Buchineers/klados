@@ -50,8 +50,6 @@
 
 use klados_core::{NONE, Tree};
 
-const NEG_INF: f64 = f64::NEG_INFINITY;
-
 #[inline]
 fn cell_idx(n1: usize, u: usize, v: usize) -> usize {
     u * n1 + v
