@@ -11,11 +11,11 @@ The solver includes over a dozen exact and heuristic approaches: Branch & Price 
 ## Build
 
 ```bash
-make build           # release build of the main `klados` binary (static musl)
-make build-submission # release build of all per-solver binaries (static musl)
-make check           # cargo check + clippy + fmt-check (PR gate)
-make test            # run workspace tests
-make fmt             # auto-format code
+make build              # release build of the main `klados` binary (static musl)
+make build-submission   # release build of all per-solver binaries (static musl)
+make check              # cargo check + clippy + fmt-check (PR gate)
+make test               # run workspace tests
+make fmt                # auto-format code
 ```
 
 `make build` and `make build-submission` produce statically linked `x86_64-unknown-linux-musl` binaries (via `cargo-zigbuild` if available, with a fallback to plain `cargo`).
