@@ -48,6 +48,11 @@ pub fn catalog() -> &'static [SolverInfo] {
             run: chen_rspr::main,
         },
         SolverInfo {
+            name: "ncpack",
+            description: "Non-crossing packing for high-frag multi-tree MAF (matching + lifts)",
+            run: ncpack::main,
+        },
+        SolverInfo {
             name: "whidden",
             description: "Whidden 3-way branch-and-bound (2-tree only)",
             run: whidden::main,

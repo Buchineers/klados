@@ -110,6 +110,26 @@ pub struct BpConfig {
     pub obstruction_solve_core: bool,
     pub region_support_mip: bool,
     pub all_region_support_mip: bool,
+    pub all_region_exact_rank: bool,
+    pub all_region_exact_max_leaves: usize,
+    pub tree_side_exact_rank: bool,
+    pub tree_laminar_exact_rank: bool,
+    pub tree_side_exact_max_leaves: usize,
+    pub tree_side_exact_limit: usize,
+    pub residual_completion_probe: bool,
+    pub residual_completion_max_cols: usize,
+    pub residual_completion_max_residual_leaves: usize,
+    pub rank_cut_probe: bool,
+    pub rank_cut_probe_max_cols: usize,
+    pub ncpack_incumbent: bool,
+    pub ncpack_min_trees: usize,
+    pub ncpack_max_leaves: usize,
+    pub ncpack_node_budget: u64,
+    /// GATED ncpack mu* lower-bound floor (single-block certificate; validated
+    /// but unproven). `KLADOS_BP_NCPACK_LB=1`.
+    pub ncpack_lb: bool,
+    pub ncpack_lb_kmax: usize,
+    pub ncpack_lb_budget_secs: u64,
 }
 
 impl Default for BpConfig {
@@ -140,6 +160,24 @@ impl Default for BpConfig {
             obstruction_solve_core: false,
             region_support_mip: false,
             all_region_support_mip: false,
+            all_region_exact_rank: false,
+            all_region_exact_max_leaves: 48,
+            tree_side_exact_rank: false,
+            tree_laminar_exact_rank: false,
+            tree_side_exact_max_leaves: 48,
+            tree_side_exact_limit: 64,
+            residual_completion_probe: false,
+            residual_completion_max_cols: 24,
+            residual_completion_max_residual_leaves: 48,
+            rank_cut_probe: false,
+            rank_cut_probe_max_cols: 48,
+            ncpack_incumbent: true,
+            ncpack_min_trees: 8,
+            ncpack_max_leaves: 250,
+            ncpack_node_budget: 50_000_000,
+            ncpack_lb: false,
+            ncpack_lb_kmax: 6,
+            ncpack_lb_budget_secs: 60,
         }
     }
 }
@@ -154,6 +192,91 @@ impl BpConfig {
             cluster_algo: ClusterAlgo::None,
             ..Default::default()
         }
+    }
+
+    pub fn from_env() -> Self {
+        let mut cfg = Self::default();
+        if std::env::var("KLADOS_BP_OBSTRUCTION_PROBE").as_deref() == Ok("1") {
+            cfg.obstruction_probe = true;
+        }
+        if std::env::var("KLADOS_BP_BRIDGE_PROBE").as_deref() == Ok("1") {
+            cfg.bridge_probe = true;
+        }
+        if std::env::var("KLADOS_BP_ROOT_SUPPORT_INCUMBENT").as_deref() == Ok("1") {
+            cfg.root_support_incumbent = true;
+        }
+        if std::env::var("KLADOS_BP_ROOT_SUPPORT_MIP").as_deref() == Ok("1") {
+            cfg.root_support_mip = true;
+        }
+        if std::env::var("KLADOS_BP_OBSTRUCTION_LOCAL_LB").as_deref() == Ok("1") {
+            cfg.obstruction_local_lb = true;
+        }
+        if std::env::var("KLADOS_BP_OBSTRUCTION_SOLVE_CORE").as_deref() == Ok("1") {
+            cfg.obstruction_solve_core = true;
+        }
+        if std::env::var("KLADOS_BP_REGION_SUPPORT_MIP").as_deref() == Ok("1") {
+            cfg.region_support_mip = true;
+        }
+        if std::env::var("KLADOS_BP_ALL_REGION_SUPPORT_MIP").as_deref() == Ok("1") {
+            cfg.all_region_support_mip = true;
+        }
+        if std::env::var("KLADOS_BP_ALL_REGION_EXACT_RANK").as_deref() == Ok("1") {
+            cfg.all_region_exact_rank = true;
+        }
+        if let Ok(raw) = std::env::var("KLADOS_BP_ALL_REGION_EXACT_MAX_LEAVES")
+            && let Ok(value) = raw.parse::<usize>()
+        {
+            cfg.all_region_exact_max_leaves = value.clamp(1, 256);
+        }
+        if std::env::var("KLADOS_BP_TREE_SIDE_EXACT_RANK").as_deref() == Ok("1") {
+            cfg.tree_side_exact_rank = true;
+        }
+        if std::env::var("KLADOS_BP_TREE_LAMINAR_EXACT_RANK").as_deref() == Ok("1") {
+            cfg.tree_laminar_exact_rank = true;
+        }
+        if let Ok(raw) = std::env::var("KLADOS_BP_TREE_SIDE_EXACT_MAX_LEAVES")
+            && let Ok(value) = raw.parse::<usize>()
+        {
+            cfg.tree_side_exact_max_leaves = value.clamp(1, 256);
+        }
+        if let Ok(raw) = std::env::var("KLADOS_BP_TREE_SIDE_EXACT_LIMIT")
+            && let Ok(value) = raw.parse::<usize>()
+        {
+            cfg.tree_side_exact_limit = value.clamp(1, 4096);
+        }
+        if std::env::var("KLADOS_BP_RESIDUAL_COMPLETION_PROBE").as_deref() == Ok("1") {
+            cfg.residual_completion_probe = true;
+        }
+        if let Ok(raw) = std::env::var("KLADOS_BP_RESIDUAL_COMPLETION_MAX_COLS")
+            && let Ok(value) = raw.parse::<usize>()
+        {
+            cfg.residual_completion_max_cols = value.clamp(1, 256);
+        }
+        if let Ok(raw) = std::env::var("KLADOS_BP_RESIDUAL_COMPLETION_MAX_RESIDUAL_LEAVES")
+            && let Ok(value) = raw.parse::<usize>()
+        {
+            cfg.residual_completion_max_residual_leaves = value.clamp(1, 256);
+        }
+        if std::env::var("KLADOS_BP_NCPACK_INCUMBENT").as_deref() == Ok("0") {
+            cfg.ncpack_incumbent = false;
+        }
+        if std::env::var("KLADOS_BP_NCPACK_LB").as_deref() == Ok("1") {
+            cfg.ncpack_lb = true;
+        }
+        if let Ok(raw) = std::env::var("KLADOS_BP_NCPACK_LB_BUDGET_SECS")
+            && let Ok(value) = raw.parse::<u64>()
+        {
+            cfg.ncpack_lb_budget_secs = value.clamp(1, 600);
+        }
+        if std::env::var("KLADOS_BP_RANK_CUT_PROBE").as_deref() == Ok("1") {
+            cfg.rank_cut_probe = true;
+        }
+        if let Ok(raw) = std::env::var("KLADOS_BP_RANK_CUT_MAX_COLS")
+            && let Ok(value) = raw.parse::<usize>()
+        {
+            cfg.rank_cut_probe_max_cols = value.clamp(8, 96);
+        }
+        cfg
     }
 }
 
@@ -864,7 +987,7 @@ pub fn main() {
         BpSolver::new(),
         RunConfig {
             track: Track::Exact,
-            specific: BpConfig::default(),
+            specific: BpConfig::from_env(),
             ..Default::default()
         },
     );

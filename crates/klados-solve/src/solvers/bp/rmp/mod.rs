@@ -26,6 +26,7 @@
 pub mod bounds;
 
 use highs::{ColProblem, HighsModelStatus, Model};
+use fixedbitset::FixedBitSet;
 use klados_core::Tree;
 
 use crate::solvers::bp::column::AfColumn;
@@ -390,6 +391,150 @@ impl Rmp {
             }
         }
         added
+    }
+
+    /// Diagnostic-only local-rank row:
+    ///
+    /// ```text
+    /// sum_{c: labels(c) intersects leaves} x_c >= lower_bound
+    /// ```
+    ///
+    /// This is intended for temporary restricted-pool experiments. The row is
+    /// not tracked for future [`add_column`] calls, so callers must not add
+    /// more columns to this RMP after installing such rows.
+    pub fn add_diagnostic_local_rank_row(
+        &mut self,
+        columns: &[AfColumn],
+        leaves: &FixedBitSet,
+        lower_bound: usize,
+    ) {
+        let mut indices = Vec::new();
+        for (ci, col) in columns.iter().enumerate() {
+            if col
+                .labels()
+                .iter()
+                .any(|&label| leaves.contains(label as usize))
+            {
+                indices.push(self.col_handle[ci]);
+            }
+        }
+        if indices.is_empty() {
+            return;
+        }
+        let values = vec![1.0_f64; indices.len()];
+        let ptr = self.model.as_mut().expect("model present").as_mut_ptr();
+        unsafe {
+            highs_sys::Highs_addRow(
+                ptr,
+                lower_bound as f64,
+                f64::INFINITY,
+                indices.len() as i32,
+                indices.as_ptr(),
+                values.as_ptr(),
+            );
+        }
+        self.num_rows += 1;
+    }
+
+    /// Diagnostic-only residual-completion row:
+    ///
+    /// ```text
+    /// sum_{c in compatible_cols} x_c - residual_lower_bound * x_anchor >= 0
+    /// ```
+    ///
+    /// This is intended for temporary restricted-pool experiments. The row is
+    /// not tracked for future [`add_column`] calls, so callers must not add
+    /// more columns to this RMP after installing such rows.
+    pub fn add_diagnostic_residual_completion_row(
+        &mut self,
+        anchor_col: usize,
+        compatible_cols: &[usize],
+        residual_lower_bound: usize,
+    ) {
+        let mut indices = Vec::with_capacity(compatible_cols.len() + 1);
+        let mut values = Vec::with_capacity(compatible_cols.len() + 1);
+        for &ci in compatible_cols {
+            indices.push(self.col_handle[ci]);
+            values.push(1.0_f64);
+        }
+        indices.push(self.col_handle[anchor_col]);
+        values.push(-(residual_lower_bound as f64));
+
+        let ptr = self.model.as_mut().expect("model present").as_mut_ptr();
+        unsafe {
+            highs_sys::Highs_addRow(
+                ptr,
+                0.0,
+                f64::INFINITY,
+                indices.len() as i32,
+                indices.as_ptr(),
+                values.as_ptr(),
+            );
+        }
+        self.num_rows += 1;
+    }
+
+    /// Diagnostic-only anchor-family residual-completion row:
+    ///
+    /// ```text
+    /// sum_{c in compatible_union} x_c
+    ///   - sum_{(a, r) in anchor_terms} r * x_a >= 0
+    /// ```
+    ///
+    /// This is intended for temporary restricted-pool experiments. The row is
+    /// not tracked for future [`add_column`] calls, so callers must not add
+    /// more columns to this RMP after installing such rows.
+    pub fn add_diagnostic_anchor_family_residual_row(
+        &mut self,
+        anchor_terms: &[(usize, usize)],
+        compatible_union: &[usize],
+    ) {
+        let mut terms = Vec::with_capacity(anchor_terms.len() + compatible_union.len());
+        for &ci in compatible_union {
+            terms.push((self.col_handle[ci], 1.0_f64));
+        }
+        for &(ci, rank) in anchor_terms {
+            terms.push((self.col_handle[ci], -(rank as f64)));
+        }
+        terms.sort_by_key(|&(idx, _)| idx);
+
+        let mut indices = Vec::with_capacity(terms.len());
+        let mut values = Vec::with_capacity(terms.len());
+        for (idx, value) in terms {
+            if let Some(last_idx) = indices.last()
+                && *last_idx == idx
+            {
+                let last = values.last_mut().expect("value for index");
+                *last += value;
+                continue;
+            }
+            indices.push(idx);
+            values.push(value);
+        }
+        let mut compact_indices = Vec::with_capacity(indices.len());
+        let mut compact_values = Vec::with_capacity(values.len());
+        for (idx, value) in indices.into_iter().zip(values.into_iter()) {
+            if value.abs() > 1.0e-12 {
+                compact_indices.push(idx);
+                compact_values.push(value);
+            }
+        }
+        if compact_indices.is_empty() {
+            return;
+        }
+
+        let ptr = self.model.as_mut().expect("model present").as_mut_ptr();
+        unsafe {
+            highs_sys::Highs_addRow(
+                ptr,
+                0.0,
+                f64::INFINITY,
+                compact_indices.len() as i32,
+                compact_indices.as_ptr(),
+                compact_values.as_ptr(),
+            );
+        }
+        self.num_rows += 1;
     }
 
     /// Apply per-column bounds derived from `branchings`. RCVF-fixed columns

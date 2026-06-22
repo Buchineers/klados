@@ -10,6 +10,7 @@ pub mod corridor;
 pub mod maf_branch_price_multi;
 pub mod maf_ilp;
 pub mod maf_sat;
+pub mod ncpack;
 pub mod overlay_exchange;
 pub mod root_corridor;
 pub mod root_pool;
