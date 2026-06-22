@@ -23,8 +23,6 @@ use super::exact_pair_dp::ExactPairDpPricer;
 use super::leaf_pair_dp::LeafPairDpPricer;
 use super::{Pricer, PricerScratch, PricingContext, PricingResult, adaptive_m2_batch_size};
 
-const PRICING_EPS: f64 = 1.0e-8;
-
 pub struct MafPricer {
     /// Generation: the multi-tree leaf-pair DP. Returns `Found` or defers;
     /// never certifies.

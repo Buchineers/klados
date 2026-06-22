@@ -176,47 +176,6 @@ fn lca_of_labels(tree: &Tree, leafset: &FixedBitSet) -> NodeId {
     acc
 }
 
-fn leaves_under(tree: &Tree, node: NodeId, n: u32) -> FixedBitSet {
-    let mut s = FixedBitSet::with_capacity(n as usize + 1);
-    if node == NONE {
-        return s;
-    }
-    let mut stack = vec![node];
-    while let Some(v) = stack.pop() {
-        if tree.is_leaf(v) {
-            let lbl = tree.label[v as usize];
-            if lbl > 0 && lbl <= n {
-                s.insert(lbl as usize);
-            }
-        } else if let Some((l, r)) = tree.children(v) {
-            stack.push(l);
-            stack.push(r);
-        }
-    }
-    s
-}
-
-/// True if `a` and `b` lie on a single root-to-leaf path (one is the other's
-/// ancestor, possibly equal).
-fn comparable(tree: &Tree, a: NodeId, b: NodeId) -> bool {
-    descendant_or_equal(tree, a, b) || descendant_or_equal(tree, b, a)
-}
-
-/// True if `desc` is `anc` or a descendant of `anc`.
-fn descendant_or_equal(tree: &Tree, desc: NodeId, anc: NodeId) -> bool {
-    if desc == NONE || anc == NONE {
-        return false;
-    }
-    let mut cur = desc;
-    while cur != NONE {
-        if cur == anc {
-            return true;
-        }
-        cur = tree.parent[cur as usize];
-    }
-    false
-}
-
 fn component_leafset(comp: &Tree, n: u32) -> FixedBitSet {
     let mut s = FixedBitSet::with_capacity(n as usize + 1);
     for lbl in comp.leaves() {
