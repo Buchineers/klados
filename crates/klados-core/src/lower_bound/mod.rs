@@ -20,8 +20,15 @@ pub use cherry::{
 };
 pub use red_blue::{RedBlueResult, red_blue_approx, red_blue_approx_detailed};
 pub use triple_pack::{
-    DiscordantTriplePackingResult, discordant_triple_packing_detailed,
+    DiscordantTripleFractionalPackingConfig, DiscordantTripleFractionalPackingResult,
+    DiscordantTriplePackingResult, DiscordantTripleSortedPackingConfig,
+    discordant_triple_best_packing_lower_bound, discordant_triple_fractional_packing_detailed,
+    discordant_triple_fractional_packing_lower_bound,
+    discordant_triple_fractional_packing_with_config,
+    discordant_triple_fractional_packing_with_reference, discordant_triple_packing_detailed,
     discordant_triple_packing_lower_bound, discordant_triple_packing_with_reference,
+    discordant_triple_sorted_packing_detailed, discordant_triple_sorted_packing_lower_bound,
+    discordant_triple_sorted_packing_with_config, discordant_triple_sorted_packing_with_reference,
 };
 
 pub struct MafBounds {

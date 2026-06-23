@@ -9,7 +9,9 @@ use std::time::Instant;
 
 use klados_core::Instance;
 use klados_core::lower_bound::{
-    discordant_triple_packing_lower_bound, maf_bounds, red_blue_approx_detailed,
+    discordant_triple_best_packing_lower_bound, discordant_triple_fractional_packing_lower_bound,
+    discordant_triple_packing_lower_bound, discordant_triple_sorted_packing_lower_bound,
+    maf_bounds, red_blue_approx_detailed,
 };
 
 // ── Algorithm selection ────────────────────────────────────────────────────
@@ -26,6 +28,12 @@ pub enum BoundsAlgo {
     RedBlue,
     #[value(name = "triple-pack")]
     TriplePack,
+    #[value(name = "triple-frac")]
+    TripleFrac,
+    #[value(name = "triple-sort")]
+    TripleSort,
+    #[value(name = "triple-best")]
+    TripleBest,
 }
 
 impl BoundsAlgo {
@@ -36,6 +44,9 @@ impl BoundsAlgo {
             BoundsAlgo::ChenApp1 => "chen-app1",
             BoundsAlgo::RedBlue => "red-blue",
             BoundsAlgo::TriplePack => "triple-pack",
+            BoundsAlgo::TripleFrac => "triple-frac",
+            BoundsAlgo::TripleSort => "triple-sort",
+            BoundsAlgo::TripleBest => "triple-best",
         }
     }
 
@@ -46,6 +57,9 @@ impl BoundsAlgo {
             BoundsAlgo::ChenApp1 => "2-approx",
             BoundsAlgo::RedBlue => "2-approx",
             BoundsAlgo::TriplePack => "edge-disjoint triples",
+            BoundsAlgo::TripleFrac => "fractional triple dual",
+            BoundsAlgo::TripleSort => "shortest triple regions",
+            BoundsAlgo::TripleBest => "best triple packing",
         }
     }
 }
@@ -109,6 +123,18 @@ fn compute(algo: BoundsAlgo, instance: &Instance) -> AlgoResult {
             let lb = discordant_triple_packing_lower_bound(&instance.trees);
             (lb, instance.num_leaves as usize)
         }
+        BoundsAlgo::TripleFrac => {
+            let lb = discordant_triple_fractional_packing_lower_bound(&instance.trees);
+            (lb, instance.num_leaves as usize)
+        }
+        BoundsAlgo::TripleSort => {
+            let lb = discordant_triple_sorted_packing_lower_bound(&instance.trees);
+            (lb, instance.num_leaves as usize)
+        }
+        BoundsAlgo::TripleBest => {
+            let lb = discordant_triple_best_packing_lower_bound(&instance.trees);
+            (lb, instance.num_leaves as usize)
+        }
     };
 
     AlgoResult {
@@ -169,16 +195,17 @@ fn run_single(
                 && let Some(name) = &instance.name
                 && let Some(&opt) = scores.get(&name.to_uppercase())
             {
-                let gap = if opt > 0 {
-                    r.upper as f64 / opt as f64
+                let (lb_ratio, ub_ratio) = if opt > 0 {
+                    (r.lower as f64 / opt as f64, r.upper as f64 / opt as f64)
                 } else {
-                    0.0
+                    (0.0, 0.0)
                 };
                 let ok = r.lower <= opt && opt <= r.upper;
                 eprintln!(
-                    "  OPT={}  UB/OPT={:.2}x  {}",
+                    "  OPT={}  LB/OPT={:.2}  UB/OPT={:.2}x  {}",
                     opt,
-                    gap,
+                    lb_ratio,
+                    ub_ratio,
                     if ok { "✓" } else { "✗ VIOLATION" }
                 );
             }
@@ -191,6 +218,7 @@ fn run_single(
 
 struct BatchStats {
     times: Vec<f64>,
+    lb_ratios: Vec<f64>,
     gaps: Vec<f64>,
     violations: Vec<(String, usize, usize, usize)>, // (digest, LB, UB, OPT)
     errors: usize,
@@ -207,6 +235,7 @@ fn run_batch(
     let mut stats: Vec<BatchStats> = (0..algos.len())
         .map(|_| BatchStats {
             times: Vec::new(),
+            lb_ratios: Vec::new(),
             gaps: Vec::new(),
             violations: Vec::new(),
             errors: 0,
@@ -232,10 +261,13 @@ fn run_batch(
         "n",
         "OPT",
         hdr.iter()
-            .map(|s| format!("{} {:<5} {:<5} {:<5} {:<5}", s, "LB", "UB", "gap", "ms"))
+            .map(|s| format!(
+                "{} {:<5} {:<5} {:<6} {:<6} {:<5}",
+                s, "LB", "UB", "LB/OPT", "UB/OPT", "ms"
+            ))
             .collect::<Vec<_>>()
             .join(" | "),
-        if algos.len() > 1 { "best-gap" } else { "" }
+        if algos.len() > 1 { "best-lb" } else { "" }
     );
     eprintln!("{}", "-".repeat(180));
 
@@ -261,7 +293,7 @@ fn run_batch(
         );
 
         eprint!(" |");
-        let mut best_gap = f64::MAX;
+        let mut best_lb_ratio = 0.0f64;
         let mut all_ok = true;
 
         for (i, &algo) in algos.iter().enumerate() {
@@ -269,12 +301,13 @@ fn run_batch(
             if let Some(ref e) = r.err {
                 stats[i].errors += 1;
                 eprint!(
-                    " {:>col_w$} {:>5} {:>5} {:>5} {:>5}",
+                    " {:>col_w$} {:>5} {:>5} {:>6} {:>6} {:>5}",
                     format!(
                         "{:>width$}",
                         e.split_whitespace().next().unwrap_or("ERR"),
                         width = col_w
                     ),
+                    "-",
                     "-",
                     "-",
                     "-",
@@ -285,12 +318,14 @@ fn run_batch(
 
             stats[i].times.push(r.ms);
 
-            let gap_str = if let Some(opt) = opt {
+            let (lb_ratio_str, ub_ratio_str) = if let Some(opt) = opt {
                 if opt > 0 {
-                    let g = r.upper as f64 / opt as f64;
-                    stats[i].gaps.push(g);
-                    if g < best_gap {
-                        best_gap = g;
+                    let lb_ratio = r.lower as f64 / opt as f64;
+                    let ub_ratio = r.upper as f64 / opt as f64;
+                    stats[i].lb_ratios.push(lb_ratio);
+                    stats[i].gaps.push(ub_ratio);
+                    if lb_ratio > best_lb_ratio {
+                        best_lb_ratio = lb_ratio;
                     }
                     let ok = r.lower <= opt && opt <= r.upper;
                     if !ok {
@@ -299,30 +334,31 @@ fn run_batch(
                             .violations
                             .push((entry.digest.clone(), r.lower, r.upper, opt));
                     }
-                    format!("{:.2}x", g)
+                    (format!("{:.2}", lb_ratio), format!("{:.2}x", ub_ratio))
                 } else {
-                    "-".into()
+                    ("-".into(), "-".into())
                 }
             } else {
-                "-".into()
+                ("-".into(), "-".into())
             };
 
             eprint!(
-                " {:>col_w$} {:>5} {:>5} {:>5} {:>5.1}",
+                " {:>col_w$} {:>5} {:>5} {:>6} {:>6} {:>5.1}",
                 format!("{:>width$}", algo.display(), width = col_w),
                 r.lower,
                 r.upper,
-                gap_str,
+                lb_ratio_str,
+                ub_ratio_str,
                 r.ms
             );
         }
 
-        // Best gap column
+        // Best lower-bound ratio column.
         if algos.len() > 1 {
             eprint!(
                 " | {:>8}",
-                if best_gap < f64::MAX {
-                    format!("{:.2}x", best_gap)
+                if best_lb_ratio > 0.0 {
+                    format!("{:.2}", best_lb_ratio)
                 } else {
                     "-".into()
                 }
@@ -375,6 +411,16 @@ fn run_batch(
         }
 
         if !s.gaps.is_empty() {
+            let mut lbs = s.lb_ratios.clone();
+            lbs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+            let n_lb = lbs.len();
+            let avg_lb = lbs.iter().sum::<f64>() / n_lb as f64;
+            let (min_lb, max_lb) = (lbs[0], lbs[n_lb - 1]);
+            eprintln!(
+                "    LB/OPT  avg={:>5.2}   min={:>5.2}   max={:>5.2}",
+                avg_lb, min_lb, max_lb
+            );
+
             let mut gs = s.gaps.clone();
             gs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
             let n_g = gs.len();

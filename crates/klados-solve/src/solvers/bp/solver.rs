@@ -14,7 +14,8 @@ use std::time::Instant;
 use fixedbitset::FixedBitSet;
 use klados_core::af_validator::validate_agreement_forest;
 use klados_core::lower_bound::{
-    best_randomized_partition, discordant_triple_packing_lower_bound, pairwise_refine_ub,
+    best_randomized_partition, discordant_triple_packing_lower_bound,
+    discordant_triple_sorted_packing_lower_bound, pairwise_refine_ub,
 };
 use klados_core::{Instance, Tree};
 use log::{debug, info};
@@ -33,6 +34,7 @@ use crate::solvers::bp::search::{
 use crate::solvers::chen_rspr::{chen_pair_agreement, chen_pair_bounds};
 
 const LOG_TARGET: &str = "klados::bp";
+const STATIC_TRIPLE_SORT_MAX_LEAVES: u32 = 250;
 
 thread_local! {
     static IN_OBSTRUCTION_PROBE: Cell<bool> = const { Cell::new(false) };
@@ -58,16 +60,22 @@ fn sampled_reference_indices(m: usize, limit: usize) -> Vec<usize> {
 
 /// Static combinatorial lower bound on the MAF component count.
 ///
-/// For m=2, keep Chen's fast 2-approximation lower bound. For m>=3, use the
-/// edge-disjoint discordant-triple packing bound as the sole static floor; LP
-/// bounds are still combined with it after column generation converges.
+/// For m=2, keep Chen's fast 2-approximation lower bound. For m>=3, use
+/// discordant-triple packing; on moderate reduced instances, also try the
+/// tighter shortest-region packing. LP bounds are still combined with this
+/// static floor after column generation converges.
 fn static_lower_bound(trees: &[Tree], no_chen_lb: bool) -> usize {
     let m = trees.len();
     if m < 2 {
         return 0;
     }
     if m >= 3 {
-        return discordant_triple_packing_lower_bound(trees);
+        let pack = discordant_triple_packing_lower_bound(trees);
+        return if trees[0].num_leaves <= STATIC_TRIPLE_SORT_MAX_LEAVES {
+            pack.max(discordant_triple_sorted_packing_lower_bound(trees))
+        } else {
+            pack
+        };
     }
     if no_chen_lb {
         return 0;
