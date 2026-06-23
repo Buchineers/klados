@@ -1274,17 +1274,6 @@ where
     None
 }
 
-/// Create a leaf set with a single label excluded.
-fn leaf_set_excluding(tree: &Tree, exclude: Label, cap: usize) -> FixedBitSet {
-    let mut s = FixedBitSet::with_capacity(cap + 1);
-    for lbl in tree.leaves() {
-        if lbl != exclude {
-            s.insert(lbl as usize);
-        }
-    }
-    s
-}
-
 /// Remove a single leaf from a tree, suppressing the resulting degree-1 node.
 fn strip_label(tree: &Tree, target: Label, new_num_leaves: u32) -> Tree {
     let n = new_num_leaves as usize;
@@ -1496,77 +1485,6 @@ fn replace_and_relabel(
 }
 
 // ---------------------------------------------------------------------------
-// Subtree replacement: build a copy of `tree` where the subtree rooted at
-// `target` is replaced by a single leaf labeled `placeholder`.
-// ---------------------------------------------------------------------------
-fn replace_subtree_with_leaf(
-    tree: &Tree,
-    target: NodeId,
-    placeholder: Label,
-    new_num_leaves: u32,
-) -> Tree {
-    let mut out = Tree::with_capacity(new_num_leaves);
-
-    fn build(
-        src: &Tree,
-        target: NodeId,
-        placeholder: Label,
-        out: &mut Tree,
-        node: NodeId,
-    ) -> Option<NodeId> {
-        if node == target {
-            // Emit single leaf labeled `placeholder`.
-            let id = out.parent.len() as NodeId;
-            out.parent.push(NONE);
-            out.left.push(NONE);
-            out.right.push(NONE);
-            out.label.push(placeholder);
-            out.label_to_node[placeholder as usize] = id;
-            return Some(id);
-        }
-        if src.is_leaf(node) {
-            let lbl = src.label[node as usize];
-            if lbl == 0 {
-                return None;
-            }
-            let id = out.parent.len() as NodeId;
-            out.parent.push(NONE);
-            out.left.push(NONE);
-            out.right.push(NONE);
-            out.label.push(lbl);
-            out.label_to_node[lbl as usize] = id;
-            return Some(id);
-        }
-        let (left, right) = src.children(node).unwrap();
-        let l = build(src, target, placeholder, out, left);
-        let r = build(src, target, placeholder, out, right);
-        match (l, r) {
-            (None, None) => None,
-            (Some(c), None) | (None, Some(c)) => Some(c),
-            (Some(lc), Some(rc)) => {
-                let id = out.parent.len() as NodeId;
-                out.parent.push(NONE);
-                out.left.push(lc);
-                out.right.push(rc);
-                out.label.push(0);
-                out.parent[lc as usize] = id;
-                out.parent[rc as usize] = id;
-                Some(id)
-            }
-        }
-    }
-
-    if tree.root != NONE
-        && let Some(root) = build(tree, target, placeholder, &mut out, tree.root)
-    {
-        out.root = root;
-        out.parent[root as usize] = NONE;
-    }
-    out.compute_metadata();
-    out
-}
-
-// ---------------------------------------------------------------------------
 // Fuse two component trees at corresponding leaves.
 //
 // `outer_comp` contains a leaf labeled `p_label`. `inner_comp` is a phylogeny
@@ -1675,17 +1593,6 @@ fn fuse_at_label(
     out
 }
 
-// Outer components other than the P-component contain only original labels
-// (1..=n) but their `num_leaves` is n+1. Reproject to label space n.
-fn reproject_outer(comp: &Tree, final_num_leaves: u32) -> Tree {
-    // Identity remap: labels stay the same; only num_leaves changes.
-    let mut map: Vec<Label> = vec![0; comp.num_leaves as usize + 1];
-    for lbl in 1..=comp.num_leaves {
-        map[lbl as usize] = lbl;
-    }
-    comp.relabel(&map, final_num_leaves)
-}
-
 /// Attach a ρ leaf as sibling of the root: creates a new root whose children
 /// are the old root and the new ρ leaf.
 fn attach_rho(tree: &Tree, rho_label: Label) -> Tree {
@@ -1756,53 +1663,6 @@ fn component_contains_label(tree: &Tree, label: Label) -> bool {
         return false;
     }
     tree.label_to_node[label as usize] != NONE
-}
-
-// ---------------------------------------------------------------------------
-// Cluster-point search.
-// ---------------------------------------------------------------------------
-
-fn debug_assert_valid_tree(tree: &Tree, name: &str) {
-    assert_ne!(tree.root, NONE, "{}: root is NONE", name);
-    assert!(
-        (tree.root as usize) < tree.parent.len(),
-        "{}: root {} out of range (len {})",
-        name,
-        tree.root,
-        tree.parent.len()
-    );
-    assert_eq!(
-        tree.parent[tree.root as usize], NONE,
-        "{}: root has parent",
-        name
-    );
-    let mut leaves_seen = 0u32;
-    for node in 0..tree.parent.len() as u32 {
-        if tree.is_leaf(node) && tree.label[node as usize] != 0 {
-            leaves_seen += 1;
-            let lbl = tree.label[node as usize];
-            assert!(
-                (lbl as usize) < tree.label_to_node.len(),
-                "{}: label {} out of label_to_node (len {})",
-                name,
-                lbl,
-                tree.label_to_node.len()
-            );
-            assert_eq!(
-                tree.label_to_node[lbl as usize], node,
-                "{}: label_to_node[{}] != node {}",
-                name, lbl, node
-            );
-        }
-    }
-    log::debug!(
-        "[whidden] {} ok: nodes={} leaves={} num_leaves_field={} root={}",
-        name,
-        tree.parent.len(),
-        leaves_seen,
-        tree.num_leaves,
-        tree.root
-    );
 }
 
 fn leaf_set_under(tree: &Tree, node: NodeId, n: usize) -> FixedBitSet {
@@ -1940,61 +1800,6 @@ fn collect_rspr_cluster_points(
         });
     }
     points
-}
-
-/// Pick the best cluster point: deepest valid (= smallest cluster) so that
-/// after one decomposition both pieces are substantially smaller than n.
-fn find_best_cluster_point(
-    t1: &Tree,
-    t2: &Tree,
-    leaf_sets_t1: &[FixedBitSet],
-    twin_t1_to_t2: &[NodeId],
-    twin_t2_to_t1: &[NodeId],
-    n: usize,
-) -> Option<NodeId> {
-    let mut best: Option<(NodeId, usize)> = None;
-
-    for node in t1.post_order() {
-        if t1.is_leaf(node) || t1.is_root(node) {
-            continue;
-        }
-        let size = leaf_sets_t1[node as usize].count_ones(..);
-        // Reject trivial clusters and trivial outers.
-        if size < 2 || size > n - 2 {
-            continue;
-        }
-
-        let twin_t2 = twin_t1_to_t2[node as usize];
-        if twin_t2 == NONE {
-            continue;
-        }
-        if t2.is_root(twin_t2) {
-            continue;
-        }
-        let round_trip = twin_t2_to_t1[twin_t2 as usize];
-        if round_trip == NONE {
-            continue;
-        }
-        // Strict cluster point: round-trip lands exactly back on `node`. This
-        // guarantees leaves(twin_in_t2) == leaves(node), so the inner /
-        // outer split is on the same leaf set in both trees.
-        if round_trip != node {
-            continue;
-        }
-        if children_are_rspr_cluster_candidates(t1, twin_t1_to_t2, twin_t2_to_t1, node) {
-            continue;
-        }
-
-        // Score: maximize min(size, n - size) — most balanced split.
-        let score = size.min(n - size);
-        match best {
-            None => best = Some((node, score)),
-            Some((_, s)) if score > s => best = Some((node, score)),
-            _ => {}
-        }
-    }
-
-    best.map(|(node, _)| node)
 }
 
 #[cfg(test)]
