@@ -216,13 +216,6 @@ impl Solver for MafSatOlverSolver {
     }
 }
 
-/// Solve a (typically 2-tree) instance with the SAT solver and return the component count.
-/// Used as a callback for pairwise lower bound computation.
-pub(crate) fn solve_pair_sat(instance: &Instance) -> Option<usize> {
-    let mut stats = SolverStats::default();
-    solve_sat(instance, &mut stats, &MafSatConfig::default()).map(|trees| trees.len())
-}
-
 struct NcaData {
     depths: Vec<Vec<Vec<u16>>>,
     m: usize,
