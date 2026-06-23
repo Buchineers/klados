@@ -1681,6 +1681,7 @@ fn embedding_descent(
 ///   `{K ∪ {e_1} | K ∈ C_1} ∪ {K ∪ {e_2} | K ∈ C_2}`.
 ///
 /// **Edge identification:** an edge is named by its child-side NodeId in T1.
+#[cfg(test)]
 pub(super) fn splitting_core(
     tf: &TwinForest,
     embedding_root: NodeId,

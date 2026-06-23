@@ -3180,10 +3180,6 @@ fn is_current_ancestor(parent: &[NodeId], ancestor: NodeId, mut node: NodeId) ->
     false
 }
 
-fn extract_components(tf: &TwinForest) -> Vec<Tree> {
-    extract_components_with_reference(tf, tf.num_leaves, &tree_from_original(tf))
-}
-
 fn extract_components_with_reference(
     tf: &TwinForest,
     output_n: u32,
@@ -3245,26 +3241,6 @@ fn collect_labels(tf: &TwinForest, node: NodeId, out: &mut Vec<Label>) {
     if rc != NONE {
         collect_labels(tf, rc, out);
     }
-}
-
-fn tree_from_original(tf: &TwinForest) -> Tree {
-    let mut tree = Tree::with_capacity(tf.num_leaves);
-    tree.parent = tf.orig_parent.clone();
-    tree.left = tf.orig_left.clone();
-    tree.right = tf.orig_right.clone();
-    tree.label = tf.orig_label.clone();
-    tree.label_to_node = vec![NONE; tf.num_leaves as usize + 1];
-    for node in 0..tf.num_nodes[T1] as NodeId {
-        let lbl = tf.orig_label[node as usize];
-        if lbl != 0 && tf.orig_left[node as usize] == NONE {
-            tree.label_to_node[lbl as usize] = node;
-        }
-    }
-    tree.num_leaves = tf.num_leaves;
-    tree.root = tf.root[T1];
-    tree.depth = vec![0; tf.num_nodes[T1]];
-    tree.subtree_size = vec![0; tf.num_nodes[T1]];
-    tree
 }
 
 // ── entry point ─────────────────────────────────────────────────────────────

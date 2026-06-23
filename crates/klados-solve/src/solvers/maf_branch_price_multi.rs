@@ -161,7 +161,6 @@ struct Dp2TreeCache {
     t1_active: Vec<bool>,
     t0_post_order: Vec<u32>,
     t1_post_order: Vec<u32>,
-    max_score_under: Vec<Vec<(f64, u32)>>,
 }
 
 impl Dp2TreeCache {
@@ -172,14 +171,12 @@ impl Dp2TreeCache {
         let mut t1_active = Vec::new();
         let t0_post_order = Vec::new();
         let t1_post_order = Vec::new();
-        let mut max_score_under = Vec::new();
 
         if trees.len() == 2 {
             dp_closed = vec![vec![DpClosed::default(); trees[1].num_nodes()]; trees[0].num_nodes()];
             dp_open = vec![vec![DpOpen::default(); trees[1].num_nodes()]; trees[0].num_nodes()];
             t0_active = vec![false; trees[0].num_nodes()];
             t1_active = vec![false; trees[1].num_nodes()];
-            max_score_under = vec![vec![(NEG_INF, 0); trees[1].num_nodes()]; 2];
         }
 
         Self {
@@ -189,7 +186,6 @@ impl Dp2TreeCache {
             t1_active,
             t0_post_order,
             t1_post_order,
-            max_score_under,
         }
     }
 }
@@ -204,7 +200,6 @@ struct ExactPricer2Tree<'a> {
     t0_post_order: &'a Vec<u32>,
     t1_post_order: &'a Vec<u32>,
     t0_active: &'a Vec<bool>,
-    max_score_under: &'a mut Vec<Vec<(f64, u32)>>,
 }
 
 impl<'a> ExactPricer2Tree<'a> {
@@ -264,7 +259,6 @@ impl<'a> ExactPricer2Tree<'a> {
             t0_post_order: &cache.t0_post_order,
             t1_post_order: &cache.t1_post_order,
             t0_active: &cache.t0_active,
-            max_score_under: &mut cache.max_score_under,
         }
     }
 
@@ -1941,11 +1935,6 @@ impl<'a> PairDpPricer<'a> {
     #[inline(always)]
     fn root_of(&self, ti: usize, a: usize, b: usize) -> u32 {
         self.roots[ti][self.pair_idx(a, b)]
-    }
-
-    #[inline(always)]
-    fn side_of(&self, ti: usize, a: usize, b: usize) -> u32 {
-        self.side_child[ti][self.pair_idx(a, b)]
     }
 
     fn collect_profitable_columns<F>(

@@ -25,7 +25,6 @@ pub(crate) struct PairDpCandidate {
 #[derive(Clone, Debug)]
 pub(crate) struct PairDpOutput {
     pub candidates: Vec<PairDpCandidate>,
-    pub max_allowed_closed: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -382,7 +381,6 @@ fn collect_candidates_above(
     if t0_post.is_empty() || t1_post.is_empty() {
         return PairDpOutput {
             candidates: Vec::new(),
-            max_allowed_closed: NEG_INF,
         };
     }
 
@@ -574,12 +572,10 @@ fn collect_candidates_above(
     if cancelled {
         return PairDpOutput {
             candidates: Vec::new(),
-            max_allowed_closed: NEG_INF,
         };
     }
 
     let mut results = Vec::new();
-    let mut max_allowed_closed = NEG_INF;
     for &u in &t0_post {
         if t0.is_leaf(u) {
             continue;
@@ -592,9 +588,6 @@ fn collect_candidates_above(
                 continue;
             }
             let score = dp_closed[idx(u as usize, v as usize)].score;
-            if score > max_allowed_closed {
-                max_allowed_closed = score;
-            }
             if score > threshold {
                 let mut labels = Vec::new();
                 extract_closed(u, v, t0, dp_closed, dp_open, stride, &mut labels);
@@ -620,7 +613,6 @@ fn collect_candidates_above(
     });
     PairDpOutput {
         candidates: results,
-        max_allowed_closed,
     }
 }
 
