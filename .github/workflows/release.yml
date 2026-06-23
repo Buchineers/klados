@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    tags: ["*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: build-submission · upload
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install native build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake build-essential clang llvm-dev libclang-dev
+
+      - name: Install zig
+        run: |
+          mkdir -p /tmp/zig
+          curl -L https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz | tar xJ -C /tmp/zig --strip-components=1
+          echo "/tmp/zig" >> "$GITHUB_PATH"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-zigbuild
+        run: pipx install cargo-zigbuild
+
+      - name: make build-submission
+        run: make build-submission
+
+      - name: Stage and Rename Binaries
+        run: |
+          mkdir -p dist
+          SHORT_SHA=$(git rev-parse --short HEAD)
+
+          find target/x86_64-unknown-linux-musl/release/ -maxdepth 1 -type f -name "klados*" ! -name "*.d" | while read -r file; do
+            filename=$(basename "$file")
+            cp "$file" "dist/${filename}-${GITHUB_REF_NAME}-${SHORT_SHA}"
+          done
+
+      - name: Create Release & Upload Assets
+        uses: softprops/action-gh-release@v3
+        with:
+          name: ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: dist/*
