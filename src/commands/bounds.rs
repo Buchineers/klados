@@ -8,7 +8,9 @@ use std::path::Path;
 use std::time::Instant;
 
 use klados_core::Instance;
-use klados_core::lower_bound::{maf_bounds, red_blue_approx_detailed};
+use klados_core::lower_bound::{
+    discordant_triple_packing_lower_bound, maf_bounds, red_blue_approx_detailed,
+};
 
 // ── Algorithm selection ────────────────────────────────────────────────────
 
@@ -22,6 +24,8 @@ pub enum BoundsAlgo {
     ChenApp1,
     #[value(name = "red-blue")]
     RedBlue,
+    #[value(name = "triple-pack")]
+    TriplePack,
 }
 
 impl BoundsAlgo {
@@ -31,6 +35,7 @@ impl BoundsAlgo {
             BoundsAlgo::ChenPair => "chen-pair",
             BoundsAlgo::ChenApp1 => "chen-app1",
             BoundsAlgo::RedBlue => "red-blue",
+            BoundsAlgo::TriplePack => "triple-pack",
         }
     }
 
@@ -40,6 +45,7 @@ impl BoundsAlgo {
             BoundsAlgo::ChenPair => "2-approx",
             BoundsAlgo::ChenApp1 => "2-approx",
             BoundsAlgo::RedBlue => "2-approx",
+            BoundsAlgo::TriplePack => "edge-disjoint triples",
         }
     }
 }
@@ -98,6 +104,10 @@ fn compute(algo: BoundsAlgo, instance: &Instance) -> AlgoResult {
             }
             let rb = red_blue_approx_detailed(&instance.trees[0], &instance.trees[1]);
             (rb.dual_lb + 1, rb.ub + 1)
+        }
+        BoundsAlgo::TriplePack => {
+            let lb = discordant_triple_packing_lower_bound(&instance.trees);
+            (lb, instance.num_leaves as usize)
         }
     };
 

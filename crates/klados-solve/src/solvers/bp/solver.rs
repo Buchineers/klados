@@ -13,7 +13,9 @@ use std::time::Instant;
 
 use fixedbitset::FixedBitSet;
 use klados_core::af_validator::validate_agreement_forest;
-use klados_core::lower_bound::{best_randomized_partition, pairwise_refine_ub};
+use klados_core::lower_bound::{
+    best_randomized_partition, discordant_triple_packing_lower_bound, pairwise_refine_ub,
+};
 use klados_core::{Instance, Tree};
 use log::{debug, info};
 
@@ -54,28 +56,24 @@ fn sampled_reference_indices(m: usize, limit: usize) -> Vec<usize> {
     out
 }
 
-/// A valid combinatorial lower bound on the MAF component count, from Chen's
-/// fast 2-approximation. For m=2 it is the pair's rSPR lower bound; for m≥3
-/// the maximum over **every** tree pair — the m-tree MAF must agree with each
-/// pair, so its component count is ≥ each pairwise MAF. Conservative on the
-/// rSPR-vs-component-count offset (no `+1`) so it can never over-bound.
-/// Cheap: each `chen_pair_bounds` is the fast 2-approx, not red-blue.
-fn chen_lower_bound(trees: &[Tree], no_chen_lb: bool) -> usize {
+/// Static combinatorial lower bound on the MAF component count.
+///
+/// For m=2, keep Chen's fast 2-approximation lower bound. For m>=3, use the
+/// edge-disjoint discordant-triple packing bound as the sole static floor; LP
+/// bounds are still combined with it after column generation converges.
+fn static_lower_bound(trees: &[Tree], no_chen_lb: bool) -> usize {
     let m = trees.len();
     if m < 2 {
         return 0;
     }
+    if m >= 3 {
+        return discordant_triple_packing_lower_bound(trees);
+    }
     if no_chen_lb {
         return 0;
     }
-    let mut lb = 0usize;
-    for i in 0..m {
-        for j in (i + 1)..m {
-            let (lo, _) = chen_pair_bounds(&trees[i], &trees[j]);
-            lb = lb.max(lo);
-        }
-    }
-    lb
+    let (lo, _) = chen_pair_bounds(&trees[0], &trees[1]);
+    lo
 }
 
 fn maybe_log_core_decomp_potential(reduced: &Instance, analyze: bool, min_leaves: usize) {
@@ -343,9 +341,9 @@ where
     }
     maybe_log_core_decomp_potential(reduced, cfg.core_decomp_analyze, cfg.core_decomp_min_leaves);
 
-    // Chen pairwise lower bound — a sound combinatorial floor on the
-    // component count, valid for every B&B node of this (sub)instance.
-    let chen_lb = chen_lower_bound(trees, cfg.no_chen_lb);
+    // Sound combinatorial floor on the component count, valid for every B&B
+    // node of this (sub)instance. m=2 uses Chen; m>=3 uses triple packing.
+    let static_lb = static_lower_bound(trees, cfg.no_chen_lb);
 
     // Seed singletons via a temporary builder; the runtime builder lives in
     // PricerScratch so all pricer tiers share it.
@@ -505,10 +503,10 @@ where
         } else {
             0
         };
-        // The Chen lower bound is a sound floor independent of the LP.
+        // The static lower bound is a sound floor independent of the LP.
         if allow_bound_prune
             && can_prune_by_bound(
-                inherited_lb.max(chen_lb),
+                inherited_lb.max(static_lb),
                 state.best_ub(),
                 cfg.disable_bound_prune,
             )
@@ -544,7 +542,7 @@ where
             &mut root_regions,
             allow_bound_prune,
             allow_rcvf,
-            chen_lb,
+            static_lb,
             cancel,
             cfg,
         );
@@ -630,7 +628,7 @@ fn solve_node<P: Pricer, S: BranchSelector>(
     root_regions: &mut Option<RootSupportRegions>,
     allow_bound_prune: bool,
     allow_rcvf: bool,
-    chen_lb: usize,
+    static_lb: usize,
     cancel: &crate::solvers::bp::Cancel,
     cfg: &crate::solvers::bp::BpConfig,
 ) -> NodeOutcome {
@@ -775,19 +773,19 @@ fn solve_node<P: Pricer, S: BranchSelector>(
 
     // The LP bound is a valid lower bound ONLY if CG genuinely converged
     // (`Improving` leaves the LP objective below the true node optimum). The
-    // Chen lower bound is a sound combinatorial floor that holds regardless.
+    // The static lower bound is a sound combinatorial floor that holds regardless.
     let lp_lb = (lp.objective - 1e-6).ceil() as usize;
     let lb = if node_converged {
-        lp_lb.max(chen_lb)
+        lp_lb.max(static_lb)
     } else {
-        chen_lb
+        static_lb
     };
 
     if allow_bound_prune && can_prune_by_bound(lb, state.best_ub(), cfg.disable_bound_prune) {
         debug!(
             target: LOG_TARGET,
-            "node pruned by bound: lb={} (lp={:.4} chen={}) ub={}",
-            lb, lp.objective, chen_lb, state.best_ub(),
+            "node pruned by bound: lb={} (lp={:.4} static={}) ub={}",
+            lb, lp.objective, static_lb, state.best_ub(),
         );
         tel.bound_prunes += 1;
         return NodeOutcome::Pruned;

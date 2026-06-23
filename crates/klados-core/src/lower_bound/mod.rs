@@ -10,6 +10,7 @@ mod feasibility;
 mod partition;
 mod red_blue;
 mod tree_data;
+mod triple_pack;
 
 use crate::tree::Tree;
 
@@ -18,6 +19,10 @@ pub use cherry::{
     greedy_multi_tree_ub_seeded, pairwise_refine_ub,
 };
 pub use red_blue::{RedBlueResult, red_blue_approx, red_blue_approx_detailed};
+pub use triple_pack::{
+    DiscordantTriplePackingResult, discordant_triple_packing_detailed,
+    discordant_triple_packing_lower_bound, discordant_triple_packing_with_reference,
+};
 
 pub struct MafBounds {
     pub lower: usize,
