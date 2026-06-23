@@ -509,6 +509,65 @@ impl<'a> Rec<'a> {
         (best, best_blocks)
     }
 
+    /// Solve, deepening `slack` until the search is provably exhaustive, then
+    /// `kmax` until no optimal block sits at the size cap. Returns
+    /// `(value, blocks, certified)`.
+    ///
+    /// The recursion only ever builds real forests, so its value is always a valid
+    /// LOWER bound on `mu*`, non-decreasing in `slack` and `kmax`. The old fixed
+    /// `slack = 1` was UNSOUND: its prune (`w + avail_classes + slack > best`) uses
+    /// a bound on the residual *matching*, not the residual `mu*`, so a residual
+    /// whose block-gap exceeded `slack` had a beneficial block skipped and `mu*`
+    /// under-reported (pub042: 20 vs ≥21).
+    ///
+    /// SOUND certificate: a completed solve at slack `s` returning `v` is
+    /// *exhaustive* (no prune ever fired) iff `s > v`. Every ≥3-leaf block has
+    /// `w ≥ 2`, so the prune term `w + av + s ≥ s + 2`; once `s > v ≥ best` it can
+    /// never reach `≤ best`, so nothing is pruned and `v` is the exact `mu*` for
+    /// blocks up to `kmax`. We deepen `slack` past the value to reach that state.
+    /// (Exactness is then modulo `kmax`: we bump `kmax` whenever an optimal block
+    /// sits at the cap; if none does, larger blocks are assumed unhelpful — the
+    /// one remaining heuristic, inherited from the original fixed `kmax`.)
+    ///
+    /// Exhaustive solves can be slow on large instances (the prune is what made
+    /// them fast); this is cheap precisely on small instances — which is what the
+    /// decomposition produces. The deadline bounds the cost: on timeout it returns
+    /// the best primal found with `certified = false`.
+    fn solve_fixpoint(&mut self, n: usize, words: usize) -> (usize, Vec<Block>, bool) {
+        let zero = vec![0u64; words];
+        let mut active = vec![false; n + 1];
+        let kmax_cap = self.kmax + 8;
+        let mut best_v = 0usize;
+        let mut best_blocks: Vec<Block> = Vec::new();
+        loop {
+            for l in 1..=n {
+                active[l] = true;
+            }
+            let (v, blocks) = self.solve(&mut active, &zero, 1);
+            if v >= best_v {
+                best_v = v;
+                best_blocks = blocks.clone();
+            }
+            if self.aborted.get() {
+                return (best_v, best_blocks, false); // deadline → best primal, uncertified
+            }
+            let used_kmax = blocks.iter().any(|b| b.len() >= self.kmax);
+            if used_kmax && self.kmax < kmax_cap {
+                self.kmax += 1; // an optimal block hit the cap; allow bigger blocks
+                continue;
+            }
+            // Exhaustive iff slack strictly exceeded the value: certify.
+            if self.slack > best_v as isize && !used_kmax {
+                return (best_v, best_blocks, true);
+            }
+            if self.kmax >= kmax_cap {
+                return (best_v, best_blocks, false); // give up the kmax-side proof
+            }
+            // Make the next solve exhaustive: push slack past the current value.
+            self.slack = best_v as isize + 1;
+        }
+    }
+
     /// DFS growth over agreement blocks seeded at `leaves[0] = min(B)`; recurses on
     /// promising blocks.
     fn grow(
@@ -859,6 +918,528 @@ fn build_forest(inst: &Instance, pairs: &[(u32, u32)], blocks: &[Block]) -> Vec<
     forest
 }
 
+/// DECOMPOSITION PROBE. Given a near-optimal forest (its ≥3 blocks + residual
+/// pairs; everything else is a singleton), measure for every clade of every input
+/// tree how many forest components straddle the clade boundary (the "interface" =
+/// the number of components that would have to be branched over to split the
+/// instance at that cut). Reports the minimum interface over all clades and over
+/// *balanced* clades (n/4 ≤ |clade| ≤ 3n/4), plus the interface histogram.
+///
+/// interface(clade C) = #{ component K : K ∩ C ≠ ∅ and K ⊄ C }.
+/// A clean cut (interface 0) that is not a common clade would give an exact,
+/// non-trivial recursive decomposition.
+fn interface_probe(
+    inst: &Instance,
+    nn: usize,
+    blocks: &[Block],
+    pairs: &[(u32, u32)],
+    value: usize,
+) {
+    let n = nn as u32;
+    // comp_of[leaf] = component id (0-based); singletons get unique ids.
+    let mut comp_of = vec![usize::MAX; nn + 1];
+    let mut next_id = 0usize;
+    let mut comp_size: Vec<usize> = Vec::new();
+    for b in blocks {
+        for &l in b {
+            comp_of[l as usize] = next_id;
+        }
+        comp_size.push(b.len());
+        next_id += 1;
+    }
+    for &(a, b) in pairs {
+        if comp_of[a as usize] != usize::MAX || comp_of[b as usize] != usize::MAX {
+            continue;
+        }
+        comp_of[a as usize] = next_id;
+        comp_of[b as usize] = next_id;
+        comp_size.push(2);
+        next_id += 1;
+    }
+    for l in 1..=nn {
+        if comp_of[l] == usize::MAX {
+            comp_of[l] = next_id;
+            comp_size.push(1);
+            next_id += 1;
+        }
+    }
+    let ncomp = next_id;
+
+    // For each tree, compute the leaf set (over labels 1..=n) under every node by
+    // walking each leaf up to the root.
+    let mut best_all = usize::MAX;
+    let mut best_bal = usize::MAX;
+    let mut best_bal_size = 0usize;
+    let mut hist = [0usize; 6]; // interface 0,1,2,3,4,>=5 over balanced clades
+    let mut n_balanced = 0usize;
+    // Best clean (interface-0) cut by mu* balance: maximize min(mu_in, mu_out).
+    let mut best_split = (0usize, value); // (min_side_merges, recorded as (lo,hi))
+    let mut best_split_score = -1i64;
+    let total_merges = value; // mu* = sum(size-1) over all comps
+
+    for tree in &inst.trees {
+        let nnodes = tree.num_nodes();
+        // leaves_under[node] as a Vec<bool> over labels.
+        let mut under: Vec<FixedBitSet> = vec![FixedBitSet::with_capacity(nn + 1); nnodes];
+        for lbl in 1..=n {
+            let leaf = tree.node_by_label(lbl);
+            let mut u = leaf;
+            loop {
+                under[u as usize].insert(lbl as usize);
+                if tree.is_root(u) {
+                    break;
+                }
+                u = tree.parent[u as usize];
+            }
+        }
+        for node in 0..nnodes as u32 {
+            if tree.is_leaf(node) || tree.is_root(node) {
+                continue; // trivial clades
+            }
+            let clade = &under[node as usize];
+            let csize = clade.count_ones(..);
+            if csize <= 1 || csize >= nn {
+                continue;
+            }
+            // count, per component, how many of its leaves are inside the clade
+            let mut inside_cnt: std::collections::HashMap<usize, usize> =
+                std::collections::HashMap::new();
+            for lbl in clade.ones() {
+                *inside_cnt.entry(comp_of[lbl]).or_insert(0) += 1;
+            }
+            let mut interface = 0usize;
+            let mut merges_in = 0usize; // sum(size-1) of comps fully inside C
+            for (&cid, &cnt) in &inside_cnt {
+                if cnt < comp_size[cid] {
+                    interface += 1; // component has leaves both in and out
+                } else {
+                    merges_in += comp_size[cid] - 1; // comp fully inside C
+                }
+            }
+            if interface < best_all {
+                best_all = interface;
+            }
+            if interface == 0 {
+                let merges_out = total_merges - merges_in;
+                let score = merges_in.min(merges_out) as i64;
+                if score > best_split_score {
+                    best_split_score = score;
+                    best_split = (merges_in.min(merges_out), merges_in.max(merges_out));
+                }
+            }
+            let balanced = csize >= nn / 4 && csize <= 3 * nn / 4;
+            if balanced {
+                n_balanced += 1;
+                hist[interface.min(5)] += 1;
+                if interface < best_bal {
+                    best_bal = interface;
+                    best_bal_size = csize;
+                }
+            }
+        }
+    }
+
+    debug!(
+        "[ncpack-INTERFACE] n={n} m={} mu*={value} ncomp={ncomp} \
+         min_interface_any_clade={best_all} \
+         min_interface_balanced={best_bal} (|clade|={best_bal_size}) \
+         balanced_clades={n_balanced} hist[0..5,>=5]={hist:?} \
+         best_clean_merge_split={best_split:?}/mu{total_merges}",
+        inst.num_trees(),
+    );
+}
+
+/// Find the leaf set of the best clean (interface-0) balanced tree-clade w.r.t.
+/// the ncpack forest, maximizing `min(merges_in, merges_out)`. Returns a
+/// 1-indexed `Vec<bool>` membership mask, or `None` if no clean balanced clade.
+fn best_clean_balanced_clade(
+    inst: &Instance,
+    nn: usize,
+    comp_of: &[usize],
+    comp_size: &[usize],
+    total_merges: usize,
+) -> Option<Vec<bool>> {
+    let n = nn as u32;
+    let mut best_in_c: Option<Vec<bool>> = None;
+    let mut best_score = -1i64;
+    for tree in &inst.trees {
+        let nnodes = tree.num_nodes();
+        let mut under: Vec<FixedBitSet> = vec![FixedBitSet::with_capacity(nn + 1); nnodes];
+        for lbl in 1..=n {
+            let mut u = tree.node_by_label(lbl);
+            loop {
+                under[u as usize].insert(lbl as usize);
+                if tree.is_root(u) {
+                    break;
+                }
+                u = tree.parent[u as usize];
+            }
+        }
+        for node in 0..nnodes as u32 {
+            if tree.is_leaf(node) || tree.is_root(node) {
+                continue;
+            }
+            let clade = &under[node as usize];
+            let csize = clade.count_ones(..);
+            if csize < nn / 4 || csize > 3 * nn / 4 {
+                continue;
+            }
+            let mut inside_cnt: std::collections::HashMap<usize, usize> =
+                std::collections::HashMap::new();
+            for lbl in clade.ones() {
+                *inside_cnt.entry(comp_of[lbl]).or_insert(0) += 1;
+            }
+            let mut interface = 0usize;
+            let mut merges_in = 0usize;
+            for (&cid, &cnt) in &inside_cnt {
+                if cnt < comp_size[cid] {
+                    interface += 1;
+                } else {
+                    merges_in += comp_size[cid] - 1;
+                }
+            }
+            if interface != 0 {
+                continue;
+            }
+            let merges_out = total_merges - merges_in;
+            let score = merges_in.min(merges_out) as i64;
+            if score > best_score {
+                best_score = score;
+                let mut mask = vec![false; nn + 1];
+                for lbl in clade.ones() {
+                    mask[lbl] = true;
+                }
+                best_in_c = Some(mask);
+            }
+        }
+    }
+    best_in_c
+}
+
+/// BOUNDARY-ADJACENCY PROBE (`KLADOS_NCPACK_BOUNDARY=1`). For the best clean
+/// balanced cut `C`, count how many active (non-singleton) components are
+/// "boundary-adjacent": their Steiner tree reaches the cut's mixed region in some
+/// tree. A component `K ⊆ C` can only conflict with a `Cᶜ`-component (the source
+/// of the coupling defect γ) if its LCA in some tree is a *mixed* node (subtree
+/// holds both a C- and a Cᶜ-leaf); a component buried in a monochromatic region
+/// can never cross to the other side. Conjecture 4: this count is a small
+/// constant on the wall, so γ = O(1). No recursion ⇒ runs on every instance.
+fn boundary_probe(inst: &Instance, nn: usize, blocks: &[Block], pairs: &[(u32, u32)]) {
+    let n = nn as u32;
+    // Active components (size ≥ 2) as leaf-label bitsets.
+    let mut comps: Vec<Vec<u32>> = blocks.to_vec();
+    for &(a, b) in pairs {
+        comps.push(vec![a, b]);
+    }
+    let ncomp_active = comps.len();
+    let mut comp_bits: Vec<FixedBitSet> = Vec::with_capacity(ncomp_active);
+    let mut comp_merge: Vec<usize> = Vec::with_capacity(ncomp_active);
+    for k in &comps {
+        let mut bs = FixedBitSet::with_capacity(nn + 1);
+        for &l in k {
+            bs.insert(l as usize);
+        }
+        comp_bits.push(bs);
+        comp_merge.push(k.len() - 1);
+    }
+    let total_merges: usize = comp_merge.iter().sum();
+
+    // Per (active comp, tree): the leaf set of the comp's LCA-clade in that tree
+    // (under the LCA of the comp's leaves). A comp is "boundary-adjacent" w.r.t a
+    // cut C iff one of its LCA-clades is bi-chromatic (holds a C- and a Cᶜ-leaf).
+    // These are cut-independent, so we precompute them once.
+    let m = inst.trees.len();
+    let mut lca_clade: Vec<Vec<FixedBitSet>> = vec![Vec::with_capacity(m); ncomp_active];
+    // Also collect all candidate clades (leaf sets under each internal node).
+    let mut clades: Vec<FixedBitSet> = Vec::new();
+    for tree in &inst.trees {
+        let nnodes = tree.num_nodes();
+        let mut under: Vec<FixedBitSet> = vec![FixedBitSet::with_capacity(nn + 1); nnodes];
+        for lbl in 1..=n {
+            let mut u = tree.node_by_label(lbl);
+            loop {
+                under[u as usize].insert(lbl as usize);
+                if tree.is_root(u) {
+                    break;
+                }
+                u = tree.parent[u as usize];
+            }
+        }
+        for (ci, k) in comps.iter().enumerate() {
+            let mut lca = tree.node_by_label(k[0]);
+            for &lbl in &k[1..] {
+                lca = tree.nearest_common_ancestor(lca, tree.node_by_label(lbl));
+            }
+            lca_clade[ci].push(under[lca as usize].clone());
+        }
+        for node in 0..nnodes as u32 {
+            if tree.is_leaf(node) || tree.is_root(node) {
+                continue;
+            }
+            let csize = under[node as usize].count_ones(..);
+            // All non-trivial clades (≥2 leaves each side); balance is judged later.
+            if csize >= 2 && csize <= nn - 2 {
+                clades.push(under[node as usize].clone());
+            }
+        }
+    }
+
+    // Scan clean clades (no active comp straddles). Track two minima of the
+    // boundary-adjacency (coupling) count:
+    //   - best_adj_bal: over LEAF-balanced cuts (|C| in [n/4, 3n/4]);
+    //   - best_adj_split: over any cut that MEANINGFULLY splits merges
+    //     (mu_in ≥ 2 and mu_out ≥ 2), i.e. a real decomposition (possibly
+    //     leaf-unbalanced peel).
+    let mut best_adj_bal = usize::MAX;
+    let mut best_split_bal = (0usize, 0usize);
+    let mut best_adj_split = usize::MAX;
+    let mut best_split_split = (0usize, 0usize);
+    let mut n_clean = 0usize;
+    let mut tmp = FixedBitSet::with_capacity(nn + 1);
+    for c in &clades {
+        // clean: every active comp ⊆ C or disjoint from C.
+        let mut clean = true;
+        let mut merges_in = 0usize;
+        for (ci, kb) in comp_bits.iter().enumerate() {
+            tmp.clone_from(kb);
+            tmp.intersect_with(c);
+            let inter = tmp.count_ones(..);
+            if inter == 0 {
+                continue; // disjoint → outside
+            }
+            if inter != kb.count_ones(..) {
+                clean = false;
+                break;
+            }
+            merges_in += comp_merge[ci]; // comp fully inside C
+        }
+        if !clean {
+            continue;
+        }
+        let merges_out = total_merges - merges_in;
+        let csize = c.count_ones(..);
+        let balanced = csize >= nn / 4 && csize <= 3 * nn / 4;
+        let meaningful = merges_in >= 2 && merges_out >= 2;
+        if !balanced && !meaningful {
+            continue;
+        }
+        n_clean += 1;
+        // boundary-adjacency: #active comps with a bi-chromatic LCA-clade.
+        let mut adj = 0usize;
+        for ci in 0..ncomp_active {
+            let mut is_adj = false;
+            for clade_kt in &lca_clade[ci] {
+                tmp.clone_from(clade_kt);
+                tmp.intersect_with(c);
+                let inter = tmp.count_ones(..);
+                let tot = clade_kt.count_ones(..);
+                if inter > 0 && inter < tot {
+                    is_adj = true;
+                    break;
+                }
+            }
+            if is_adj {
+                adj += 1;
+            }
+        }
+        let split = (merges_in.min(merges_out), merges_in.max(merges_out));
+        if balanced && adj < best_adj_bal {
+            best_adj_bal = adj;
+            best_split_bal = split;
+        }
+        if meaningful && adj < best_adj_split {
+            best_adj_split = adj;
+            best_split_split = split;
+        }
+    }
+
+    if n_clean == 0 {
+        debug!("[ncpack-BOUNDARY] n={nn} m={m} mu*={total_merges} no clean balanced clade");
+        return;
+    }
+    debug!(
+        "[ncpack-BOUNDARY] n={nn} m={m} mu*={total_merges} active_comps={ncomp_active} \
+         clean_cuts={n_clean} min_coupling_balanced={best_adj_bal}@{best_split_bal:?} \
+         min_coupling_anysplit={best_adj_split}@{best_split_split:?}",
+    );
+}
+
+/// COMBINE TEST (`KLADOS_NCPACK_COMBINE=1`). Pick a clean balanced clade `C`
+/// w.r.t. the ncpack forest, solve `L|C` and `L|Cᶜ` INDEPENDENTLY with the exact
+/// recursion (activating only one side's leaves), union the two sub-forests, and
+/// check (a) the union is a valid AF and (b) its merge count equals the ncpack
+/// value. This is the make-or-break check for independent clean-cut
+/// decomposition: if `mu*(C) + mu*(Cᶜ) == mu*(L)` and the union validates, the
+/// instance splits exactly; if not, independent solving over-merges and the
+/// sound form is sequential conditioning (solve Cᶜ with C's footprint forbidden).
+fn combine_test(
+    rec: &Rec,
+    inst: &Instance,
+    nn: usize,
+    words: usize,
+    blocks: &[Block],
+    pairs: &[(u32, u32)],
+    value: usize,
+) {
+    // comp_of / comp_size from the ncpack forest.
+    let mut comp_of = vec![usize::MAX; nn + 1];
+    let mut next_id = 0usize;
+    let mut comp_size: Vec<usize> = Vec::new();
+    for b in blocks {
+        for &l in b {
+            comp_of[l as usize] = next_id;
+        }
+        comp_size.push(b.len());
+        next_id += 1;
+    }
+    for &(a, b) in pairs {
+        if comp_of[a as usize] != usize::MAX || comp_of[b as usize] != usize::MAX {
+            continue;
+        }
+        comp_of[a as usize] = next_id;
+        comp_of[b as usize] = next_id;
+        comp_size.push(2);
+        next_id += 1;
+    }
+    for l in 1..=nn {
+        if comp_of[l] == usize::MAX {
+            comp_of[l] = next_id;
+            comp_size.push(1);
+            next_id += 1;
+        }
+    }
+
+    let Some(in_c) = best_clean_balanced_clade(inst, nn, &comp_of, &comp_size, value) else {
+        debug!("[ncpack-COMBINE] no clean balanced clade found");
+        return;
+    };
+
+    // Solve one side (leaves with in_c[l]==want) exactly, forbidding `extra`
+    // (the other side's footprint, for sequential conditioning; `&[]`-zero for
+    // the independent solve). Returns (mu, ≥3-blocks, residual pairs).
+    let solve_side = |want: bool, extra: &[u64]| -> (usize, Vec<Block>, Vec<(u32, u32)>) {
+        let mut active = vec![false; nn + 1];
+        for l in 1..=nn {
+            active[l] = in_c[l] == want;
+        }
+        let (mu, blks) = rec.solve(&mut active, extra, 1);
+        let mut forbidden = extra.to_vec();
+        let mut scratch = Vec::new();
+        for b in &blks {
+            let bm = rec.block_mask(b, &mut scratch);
+            for k in 0..words {
+                forbidden[k] |= bm[k];
+            }
+            for &l in b {
+                active[l as usize] = false;
+            }
+        }
+        let prs = rec.matching_pairs(&active, &forbidden);
+        (mu, blks, prs)
+    };
+
+    // Full footprint (concatenated Steiner mask over all trees) of a side's forest.
+    let side_fp = |blks: &[Block], prs: &[(u32, u32)]| -> Vec<u64> {
+        let mut fp = vec![0u64; words];
+        let mut scratch = Vec::new();
+        for b in blks {
+            let bm = rec.block_mask(b, &mut scratch);
+            for k in 0..words {
+                fp[k] |= bm[k];
+            }
+        }
+        for &(a, b) in prs {
+            let bm = rec.block_mask(&[a, b], &mut scratch);
+            for k in 0..words {
+                fp[k] |= bm[k];
+            }
+        }
+        fp
+    };
+
+    let zero = vec![0u64; words];
+    // Timing: whole-instance recursion vs the two half-solves. This is the
+    // make-or-break for decomposition — halves must be much faster than the whole.
+    let t0 = Instant::now();
+    {
+        let mut all_active = vec![false; nn + 1];
+        for l in 1..=nn {
+            all_active[l] = true;
+        }
+        let _ = rec.solve(&mut all_active, &zero, 1);
+    }
+    let t_whole = t0.elapsed();
+
+    // Independent solve (timed).
+    let tc = Instant::now();
+    let (mu_c, blocks_c, pairs_c) = solve_side(true, &zero);
+    let t_c = tc.elapsed();
+    let tcc = Instant::now();
+    let (mu_cc, blocks_cc, pairs_cc) = solve_side(false, &zero);
+    let t_cc = tcc.elapsed();
+    let sum = mu_c + mu_cc;
+    debug!(
+        "[ncpack-DECOMPTIME] mu*={value} t_whole={:.1}ms t_C={:.1}ms t_Cc={:.1}ms \
+         t_halves={:.1}ms speedup={:.1}x",
+        t_whole.as_secs_f64() * 1e3,
+        t_c.as_secs_f64() * 1e3,
+        t_cc.as_secs_f64() * 1e3,
+        (t_c + t_cc).as_secs_f64() * 1e3,
+        t_whole.as_secs_f64() / (t_c + t_cc).as_secs_f64().max(1e-9),
+    );
+
+    let mut all_blocks = blocks_c.clone();
+    all_blocks.extend(blocks_cc.iter().cloned());
+    let mut all_pairs = pairs_c.clone();
+    all_pairs.extend(pairs_cc.iter().cloned());
+    let forest = build_forest(inst, &all_pairs, &all_blocks);
+    let valid = matches!(validate_agreement_forest(inst, &forest), AfValidation::Ok);
+
+    // Sequential conditioning: commit one side, forbid its footprint, solve the
+    // other. seq1 = C first, seq2 = Cᶜ first. Build + validate each combined
+    // forest so we can distinguish a sound forest (proves mu* >= seq) from a
+    // footprint bug (invalid forest).
+    let build_validate = |b1: &[Block], p1: &[(u32, u32)], b2: &[Block], p2: &[(u32, u32)]| -> bool {
+        let mut bb = b1.to_vec();
+        bb.extend(b2.iter().cloned());
+        let mut pp = p1.to_vec();
+        pp.extend(p2.iter().cloned());
+        let f = build_forest(inst, &pp, &bb);
+        matches!(validate_agreement_forest(inst, &f), AfValidation::Ok)
+    };
+
+    let fp_c = side_fp(&blocks_c, &pairs_c);
+    let (mu_cc_cond, b_cc_cond, p_cc_cond) = solve_side(false, &fp_c);
+    let seq1 = mu_c + mu_cc_cond;
+    let seq1_valid = build_validate(&blocks_c, &pairs_c, &b_cc_cond, &p_cc_cond);
+
+    let fp_cc = side_fp(&blocks_cc, &pairs_cc);
+    let (mu_c_cond, b_c_cond, p_c_cond) = solve_side(true, &fp_cc);
+    let seq2 = mu_cc + mu_c_cond;
+    let seq2_valid = build_validate(&blocks_cc, &pairs_cc, &b_c_cond, &p_c_cond);
+
+    // Best VALID forest merge count we can construct (a sound lower bound on the
+    // true mu*). The coupling defect γ = indep_sum − true_mu* ≤ indep_sum − best_valid.
+    let mut best_valid = value; // the ncpack forest is always valid
+    if valid {
+        best_valid = best_valid.max(sum);
+    }
+    if seq1_valid {
+        best_valid = best_valid.max(seq1);
+    }
+    if seq2_valid {
+        best_valid = best_valid.max(seq2);
+    }
+    let coupling_ub = sum as isize - best_valid as isize;
+
+    let nc = in_c[1..=nn].iter().filter(|&&b| b).count();
+    debug!(
+        "[ncpack-COMBINE] n={nn} |C|={nc} mu_L={value} mu_C={mu_c} mu_Cc={mu_cc} \
+         indep_sum={sum} indep_valid={valid} seq1={seq1}(v={seq1_valid}) \
+         seq2={seq2}(v={seq2_valid}) best_valid={best_valid} coupling_defect<={coupling_ub}",
+    );
+}
+
 /// Certified `mu*` (merge count; `OPT = n - mu*`) via the anchored
 /// canonical-block recursion. Returns `Some(value)` iff the recursion completed
 /// (no budget/deadline hit).
@@ -884,14 +1465,11 @@ pub(crate) fn certified_mu_star(
     }
     let g = PairGraph::build(inst);
     let cover = dsatur_cover(&g);
-    let rec = Rec::new(&g, inst, &cover, kmax, slack, node_budget, deadline);
+    let mut rec = Rec::new(&g, inst, &cover, kmax, slack, node_budget, deadline);
     let words = g.masks.first().map(|m| m.len()).unwrap_or(0);
-    let mut active = vec![false; n + 1];
-    for l in 1..=n {
-        active[l] = true;
-    }
-    let (value, _blocks) = rec.solve(&mut active, &vec![0u64; words], 1);
-    if rec.aborted.get() { None } else { Some(value) }
+    // Deepen slack/kmax to a fixed point; only return a value when it certifies.
+    let (value, _blocks, certified) = rec.solve_fixpoint(n, words);
+    if certified { Some(value) } else { None }
 }
 
 /// Fast pair-only non-crossing packing, exposed as a safe incumbent generator
@@ -1015,7 +1593,7 @@ impl Solver for NcpackSolver {
         let ncov = cover.len();
 
         // 3. Recursive exact engine: anchored canonical-block recursion.
-        let rec = Rec::new(
+        let mut rec = Rec::new(
             &g,
             inst,
             &cover,
@@ -1029,23 +1607,40 @@ impl Solver for NcpackSolver {
         for l in 1..=n {
             active[l] = true;
         }
-        // Direct Hall-surplus certificate (single + pair, no recursion) by
-        // default; falls back to the anchored recursion when ncov > 64 or when
+        // Fast direct primal (single + 2-block Hall lifts, no recursion) by
+        // default; falls back to the anchored recursion when `ncov > 64` or when
         // explicitly disabled (`KLADOS_NCPACK_DIRECT=0`).
-        let use_direct = std::env::var("KLADOS_NCPACK_DIRECT").as_deref() != Ok("0");
-        let (value, blocks) = if use_direct {
+        //
+        // NOTE: `direct_certify` only enumerates Hall witnesses of ≤2 big blocks.
+        // That "witness ≤ 2" conjecture is FALSE off the high-tree wall: e.g.
+        // pub042 (m=3, n=44) has mu*=20 via a 4-block witness, but direct returns
+        // 19. So the direct value can UNDERSHOOT mu* — it is a sound primal (the
+        // forest exists ⇒ OPT ≤ n − value is a valid upper bound) but NOT an
+        // exact certificate. Only the exhaustive recursion may certify mu*.
+        // The Exact track needs a certificate, which the direct primal cannot
+        // provide, so it defaults to the (exhaustive) recursion. The Heuristic
+        // track wants a fast valid forest, so it takes the direct primal.
+        // `KLADOS_NCPACK_DIRECT=1` force-enables the direct primal even on the
+        // Exact track (for probes); this stays sound because the direct path
+        // always reports `certified=false`, so no certificate is emitted.
+        let use_direct = match std::env::var("KLADOS_NCPACK_DIRECT").as_deref() {
+            Ok("1") => true,
+            Ok("0") => false,
+            _ => cfg.track != Track::Exact,
+        };
+        let (value, blocks, certified) = if use_direct {
             match rec.direct_certify(&mut active) {
-                Some(r) => r,
-                None => rec.solve(&mut active, &vec![0u64; words], 1),
+                Some((v, b)) => (v, b, false),
+                None => rec.solve_fixpoint(n, words),
             }
         } else {
-            rec.solve(&mut active, &vec![0u64; words], 1)
+            // Exact track: deepen slack/kmax to a fixed point for a sound value.
+            rec.solve_fixpoint(n, words)
         };
-        let complete = !rec.aborted.get();
 
         debug!(
             "[ncpack] n={n} m={} ncov={ncov} value={value} \
-             blocks={} matchings={} complete={complete}",
+             blocks={} matchings={} certified={certified}",
             inst.num_trees(),
             blocks.len(),
             rec.matchings.get(),
@@ -1068,6 +1663,21 @@ impl Solver for NcpackSolver {
             }
         }
         let residual_pairs = rec.matching_pairs(&act, &forbidden);
+
+        // DECOMPOSITION PROBE (KLADOS_NCPACK_INTERFACE=1): measure, on this
+        // near-optimal forest, the minimum number of components crossing any
+        // tree-clade cut. Tests whether good (low-interface) decomposition cuts
+        // exist on the wall.
+        if std::env::var("KLADOS_NCPACK_INTERFACE").as_deref() == Ok("1") {
+            interface_probe(inst, n, &blocks, &residual_pairs, value);
+        }
+        if std::env::var("KLADOS_NCPACK_COMBINE").as_deref() == Ok("1") {
+            combine_test(&rec, inst, n, words, &blocks, &residual_pairs, value);
+        }
+        if std::env::var("KLADOS_NCPACK_BOUNDARY").as_deref() == Ok("1") {
+            boundary_probe(inst, n, &blocks, &residual_pairs);
+        }
+
         let forest = build_forest(inst, &residual_pairs, &blocks);
 
         // Never emit an invalid forest.
@@ -1083,11 +1693,12 @@ impl Solver for NcpackSolver {
         match cfg.track {
             Track::Heuristic => Some(forest),
             Track::Exact => {
-                // The recursion is exhaustive, so completing it proves `mu*` =
-                // `value` — provided every residual gap ≤ `slack` (the only
-                // assumption; default slack=1, gap ≤ 1 on the wall). Gated until
-                // that bound is made fully rigorous.
-                if complete && ncfg.trust_cert {
+                // Only the exhaustive recursion certifies `mu*`; the direct
+                // primal can undershoot it (witness ≤ 2 is false off the wall),
+                // so `certified` is false on that path. Even when the recursion
+                // closes, the proof still assumes every residual gap ≤ `slack`
+                // (default 1), so emission stays gated behind `trust_cert`.
+                if certified && ncfg.trust_cert {
                     self.stats.lower_bound = opt;
                     Some(forest)
                 } else {
