@@ -260,13 +260,13 @@ mod tests {
     }
 
     // A trivial solver to observe which route fires without running real engines.
-    struct Tag(&'static str, SolverStats);
+    struct Tag(SolverStats);
     impl ErasedSolver for Tag {
         fn solve(&mut self, _: &Instance, _: Track, _: Option<Duration>) -> Option<Vec<Tree>> {
             None
         }
         fn stats(&self) -> &SolverStats {
-            &self.1
+            &self.0
         }
         fn supported_tracks(&self) -> &'static [Track] {
             &[Track::Exact]
@@ -277,13 +277,13 @@ mod tests {
     }
 
     fn tag_dispatch() -> Dispatch {
-        fn tag(name: &'static str) -> Box<dyn ErasedSolver> {
-            Box::new(Tag(name, SolverStats::default()))
+        fn tag() -> Box<dyn ErasedSolver> {
+            Box::new(Tag(SolverStats::default()))
         }
         Dispatch::with_routes(vec![
-            Route::new("m2", |f| f.m == 2, || tag("m2")),
-            Route::new("largen", |f| f.n > 150, || tag("largen")),
-            Route::new("fallback", |_| true, || tag("fallback")),
+            Route::new("m2", |f| f.m == 2, tag),
+            Route::new("largen", |f| f.n > 150, tag),
+            Route::new("fallback", |_| true, tag),
         ])
     }
 
