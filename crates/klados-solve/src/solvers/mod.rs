@@ -23,3 +23,6 @@ pub mod partition;
 
 // ── lower-bound track racer ──────────────────────────────────────────────────
 pub mod lower;
+
+// ── feature-based dispatch (portfolio-by-selection) ──────────────────────────
+pub mod dispatch;
