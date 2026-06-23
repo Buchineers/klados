@@ -18,6 +18,11 @@ pub fn catalog() -> &'static [SolverInfo] {
     use crate::solvers::*;
     &[
         SolverInfo {
+            name: "dispatch",
+            description: "Feature-based portfolio: routes each instance to bp or sat by (m, n)",
+            run: dispatch::main,
+        },
+        SolverInfo {
             name: "bp",
             description: "Branch & Price for multi-tree MAF (exact)",
             run: bp::main,
