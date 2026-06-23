@@ -9,40 +9,42 @@
 
 .ONESHELL:
 SHELL := /bin/bash
+.SHELLFLAGS := -euo pipefail -c
+.SILENT:
 
 .PHONY: build build-submission check test fmt
 
 # Pick a musl builder (prefer cargo-zigbuild, fall back to cargo with a local
 # musl toolchain) and point the C/C++ compilers at musl so native crates
 # (highs-sys, rustsat-cadical) cross-compile correctly.
-MUSL_SETUP := set -euo pipefail; \
-	if command -v cargo-zigbuild >/dev/null 2>&1; then builder="cargo-zigbuild"; \
-	elif [ -x "$$HOME/.cargo/bin/cargo-zigbuild" ]; then builder="$$HOME/.cargo/bin/cargo-zigbuild"; \
-	else builder="cargo"; echo "cargo-zigbuild not found; falling back to cargo (needs local musl)" >&2; fi; \
-	export CC="zig cc -target x86_64-linux-musl"; \
-	export CXX="zig c++ -target x86_64-linux-musl"
+define run_musl_build
+	if command -v cargo-zigbuild >/dev/null 2>&1; then
+		builder="cargo-zigbuild"
+	elif [ -x "$$HOME/.cargo/bin/cargo-zigbuild" ]; then
+		builder="$$HOME/.cargo/bin/cargo-zigbuild"
+	else
+		builder="cargo"
+		echo "cargo-zigbuild not found; falling back to cargo (needs local musl)" >&2
+	fi
+
+	if [ "$$builder" = "cargo" ]; then
+		"$$builder" build --release --target x86_64-unknown-linux-musl $(1)
+	else
+		export CC="zig cc -target x86_64-linux-musl"
+		export CXX="zig c++ -target x86_64-linux-musl"
+		"$$builder" zigbuild --release --target x86_64-unknown-linux-musl $(1)
+	fi
+endef
 
 build:
-	$(MUSL_SETUP)
-	if [ "$$builder" = "cargo-zigbuild" ] || [ "$$builder" = "$$HOME/.cargo/bin/cargo-zigbuild" ]; then
-		"$$builder" zigbuild --release --target x86_64-unknown-linux-musl --bin klados
-	else
-		"$$builder" build --release --target x86_64-unknown-linux-musl --bin klados
-	fi
+	$(call run_musl_build,--bin klados)
 
 build-submission:
-	$(MUSL_SETUP)
-	if [ "$$builder" = "cargo-zigbuild" ] || [ "$$builder" = "$$HOME/.cargo/bin/cargo-zigbuild" ]; then
-		"$$builder" zigbuild --release --target x86_64-unknown-linux-musl --bins
-	else
-		"$$builder" build --release --target x86_64-unknown-linux-musl --bins
-	fi
+	$(call run_musl_build,--bins)
 
 check:
-	set -euo pipefail
-	cargo check --all-targets --workspace
-	cargo clippy --all-targets --workspace -- -D clippy::all
 	cargo fmt --check
+	cargo clippy --all-targets --workspace -- -D warnings
 
 test:
 	cargo test --workspace
