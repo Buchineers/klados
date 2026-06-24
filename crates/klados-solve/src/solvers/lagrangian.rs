@@ -874,6 +874,8 @@ impl LagrangianSolver {
                     branchings: &branchings,
                     terminate: self.terminate.as_ref(),
                     deadline: None,
+                    restrict_side: None,
+                    clean_cut: None,
                 };
                 for col in scratch.drain_reserve(&ctx, 64) {
                     new_cols.push(col.labels().to_vec());
@@ -962,6 +964,8 @@ impl LagrangianSolver {
                             branchings: &branchings,
                             terminate: self.terminate.as_ref(),
                             deadline: None,
+                            restrict_side: None,
+                            clean_cut: None,
                         };
                         let mut g = Vec::new();
                         for col in w.scratch.drain_reserve(&ctx, 64) {
@@ -1351,6 +1355,8 @@ impl LagrangianSolver {
                         branchings: &br,
                         terminate: self.terminate.as_ref(),
                         deadline: None,
+                        restrict_side: None,
+                        clean_cut: None,
                     };
                     let mut got: Vec<Vec<u32>> = Vec::new();
                     if let PricingResult::Found(cols) = pricer.price(&ctx, &mut scratch) {
@@ -1650,6 +1656,8 @@ impl LagrangianSolver {
                     branchings,
                     terminate: self.terminate.as_ref(),
                     deadline: None,
+                    restrict_side: None,
+                    clean_cut: None,
                 };
                 for col in scratch.drain_reserve(&ctx, 64) {
                     newc.push(col.labels().to_vec());
@@ -1903,6 +1911,8 @@ impl LagrangianSolver {
                 branchings: &branchings,
                 terminate: self.terminate.as_ref(),
                 deadline: None,
+                restrict_side: None,
+                clean_cut: None,
             };
             for col in scratch.drain_reserve(&ctx, 64) {
                 newc.push(col.labels().to_vec());
@@ -2815,6 +2825,8 @@ impl LagrangianSolver {
                     branchings: &branchings,
                     terminate: self.terminate.as_ref(),
                     deadline: None,
+                    restrict_side: None,
+                    clean_cut: None,
                 };
                 let mut new_cols: Vec<AfColumn> = scratch.drain_reserve(&ctx, 64);
                 if let PricingResult::Found(cols) = pricer.price(&ctx, &mut scratch) {
@@ -2869,6 +2881,8 @@ impl LagrangianSolver {
                             branchings: &branchings,
                             terminate: self.terminate.as_ref(),
                             deadline: None,
+                            restrict_side: None,
+                            clean_cut: None,
                         };
                         let mut g = Vec::new();
                         for col in w.scratch.drain_reserve(&ctx, 64) {
@@ -3055,6 +3069,8 @@ impl LagrangianSolver {
                     branchings,
                     terminate: self.terminate.as_ref(),
                     deadline: None,
+                    restrict_side: None,
+                    clean_cut: None,
                 };
                 let mut new_cols: Vec<AfColumn> = scratch.drain_reserve(&ctx, 64);
                 let r = pricer.price(&ctx, scratch);

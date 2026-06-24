@@ -151,6 +151,25 @@ pub struct LeafPairDpPricer {
     /// Reusable scratch for `solve_side`'s phase-1 candidate collection.
     /// Avoids a Vec allocation per call (~2500 per CG iter on Class B).
     solve_side_candidates: Vec<(u32, u32)>,
+
+    // ── Clean-cut "sided" DP (only allocated/used when a cut is active; the
+    //    cut-absent production path never touches any of this) ──
+    /// `leaf_pat[active_idx]` = 1 if the active leaf is in `C`, 2 if in `Cᶜ`.
+    /// Built per call from the cut. Empty when no cut.
+    leaf_pat: Vec<u8>,
+    /// Best score per touch-pattern, indexed `[pair_idx][pattern]` where pattern
+    /// is a 2-bit set (bit0 = touches C, bit1 = touches Cᶜ): 1=C-only, 2=Cᶜ-only,
+    /// 3=straddle. Index 0 is unused.
+    memo_pair_sided: Vec<[f64; 4]>,
+    memo_side_sided: Vec<[f64; 4]>,
+    /// Reconstruction: per pattern, the side's chosen extension (`SPLIT_LEAF_ONLY`
+    /// or an active index).
+    memo_side_split_sided: Vec<[u32; 4]>,
+    /// Reconstruction: per pattern, the `(left_pattern, right_pattern)` split.
+    memo_pair_split_sided: Vec<[(u8, u8); 4]>,
+    /// Cycle-break / memo state: 0 = unvisited, 1 = in-progress, 2 = done.
+    sided_pair_state: Vec<u8>,
+    sided_side_state: Vec<u8>,
 }
 
 impl LeafPairDpPricer {
@@ -284,6 +303,13 @@ impl LeafPairDpPricer {
             cannot_dirty: Vec::new(),
             has_cannot: Vec::new(),
             solve_side_candidates: Vec::new(),
+            leaf_pat: Vec::new(),
+            memo_pair_sided: Vec::new(),
+            memo_side_sided: Vec::new(),
+            memo_side_split_sided: Vec::new(),
+            memo_pair_split_sided: Vec::new(),
+            sided_pair_state: Vec::new(),
+            sided_side_state: Vec::new(),
         }
     }
 
@@ -295,6 +321,12 @@ impl LeafPairDpPricer {
         for v in self.label_to_active_idx.iter_mut() {
             *v = u32::MAX;
         }
+        // Clean-cut side restriction: when set, a label is eligible only if it
+        // lies in the restricted side. This confines generated columns to one
+        // side (the no-straddle solve). `None` ⇒ every label eligible ⇒ exact
+        // current behavior.
+        let side = ctx.restrict_side;
+        let eligible = |label: u32| side.is_none_or(|s| s.contains(label as usize));
         let activate = |me: &mut Self, label: u32| {
             if me.active_mask.contains(label as usize) {
                 return;
@@ -304,19 +336,37 @@ impl LeafPairDpPricer {
             me.active_labels.push(label);
         };
         for label in 1..=self.num_leaves as u32 {
-            if alpha[label as usize] > 1.0e-12 {
+            // Without rank rows, the usual α>0 filter is sound: any improving
+            // column can drop non-positive-α leaves without reducing score.
+            //
+            // With clean-cut rank rows, a non-positive-α leaf can still be
+            // useful because it may be the only leaf that earns a positive
+            // side-touch dual γ.  Therefore, while a γ-side is active, keep
+            // every eligible leaf on that side in the DP universe.  This is
+            // the load-bearing fix that makes the sided pricer a real
+            // certifier instead of an α-filtered generator.
+            let rank_touch_active = ctx.clean_cut.is_some_and(|cut| {
+                if cut.side_c.contains(label as usize) {
+                    cut.gamma_c > 1.0e-12
+                } else {
+                    cut.gamma_cc > 1.0e-12
+                }
+            });
+            if (alpha[label as usize] > 1.0e-12 || rank_touch_active) && eligible(label) {
                 activate(self, label);
             }
         }
         // Must-linked leaves stay active even with alpha <= 0: a must-link
         // constraint can force such a leaf into an improving column. Excluding
         // it would make the pricer unable to build that column and falsely
-        // report convergence — an unsound LP bound.
+        // report convergence — an unsound LP bound. Under a side restriction a
+        // must-link partner outside the side cannot appear in any (single-side)
+        // column, so it stays inactive — consistent with the restricted space.
         for pair in ctx.branchings.must_link() {
-            if (pair.a as usize) <= self.num_leaves {
+            if (pair.a as usize) <= self.num_leaves && eligible(pair.a) {
                 activate(self, pair.a);
             }
-            if (pair.b as usize) <= self.num_leaves {
+            if (pair.b as usize) <= self.num_leaves && eligible(pair.b) {
                 activate(self, pair.b);
             }
         }
@@ -722,6 +772,193 @@ impl LeafPairDpPricer {
         best_score
     }
 
+    // ───────────────────────── Sided DP (clean-cut) ─────────────────────────
+    //
+    // A parallel recurrence that tracks, per pair/side, the best score for each
+    // touch-pattern p ∈ {1=C-only, 2=Cᶜ-only, 3=straddle}. This lets pricing
+    // optimize the EFFECTIVE reduced cost `1 − score − bonus(p)` exactly, where
+    // `bonus(p) = γ_C·[p touches C] + γ_Cᶜ·[p touches Cᶜ]`. Only invoked when a
+    // clean cut is active; the scalar path above is byte-for-byte unchanged.
+    //
+    // The recurrence mirrors `solve_pair`/`solve_side` exactly (same column
+    // space, same penalties), so `max_p sided[p]` equals the scalar
+    // `solve_pair`. Candidate pruning is intentionally dropped here (the scalar
+    // dynamic `best_score` filter is unsound per-pattern), so it enumerates the
+    // full candidate set — correctness over speed for the gated path.
+
+    /// Prepare the sided tables for a call with cut side `C` (`side_c` is
+    /// 1-indexed membership). Builds `leaf_pat` and resets the sided memos.
+    fn setup_sided(&mut self, side_c: &FixedBitSet) {
+        let p = self.active_labels.len();
+        self.leaf_pat.clear();
+        self.leaf_pat.resize(p, 0);
+        for a in 0..p {
+            let label = self.active_labels[a] as usize;
+            self.leaf_pat[a] = if side_c.contains(label) { 1 } else { 2 };
+        }
+        let pc = p * p;
+        self.memo_pair_sided.clear();
+        self.memo_pair_sided.resize(pc, [NEG_INF; 4]);
+        self.memo_side_sided.clear();
+        self.memo_side_sided.resize(pc, [NEG_INF; 4]);
+        self.memo_side_split_sided.clear();
+        self.memo_side_split_sided.resize(pc, [SPLIT_LEAF_ONLY; 4]);
+        self.memo_pair_split_sided.clear();
+        self.memo_pair_split_sided.resize(pc, [(0u8, 0u8); 4]);
+        self.sided_pair_state.clear();
+        self.sided_pair_state.resize(pc, 0);
+        self.sided_side_state.clear();
+        self.sided_side_state.resize(pc, 0);
+    }
+
+    fn solve_pair_sided(&mut self, a: usize, b: usize, alpha: &[f64], beta: &[Vec<f64>]) -> [f64; 4] {
+        debug_assert!(a != b);
+        let idx = self.pair_idx(a, b);
+        match self.sided_pair_state[idx] {
+            2 => return self.memo_pair_sided[idx],
+            1 => return [NEG_INF; 4], // recursion cycle — this path can't complete
+            _ => {}
+        }
+        self.sided_pair_state[idx] = 1;
+        let left = self.solve_side_sided(a, b, alpha, beta);
+        let right = self.solve_side_sided(b, a, alpha, beta);
+        let rp = self.root_penalty(a, b, beta);
+        let mut res = [NEG_INF; 4];
+        let mut split = [(0u8, 0u8); 4];
+        for pl in 1..4usize {
+            if left[pl] <= NEG_INF / 2.0 {
+                continue;
+            }
+            for pr in 1..4usize {
+                if right[pr] <= NEG_INF / 2.0 {
+                    continue;
+                }
+                let p = pl | pr; // union of touched sides
+                let val = -rp + left[pl] + right[pr];
+                if val > res[p] {
+                    res[p] = val;
+                    split[p] = (pl as u8, pr as u8);
+                }
+            }
+        }
+        self.memo_pair_sided[idx] = res;
+        self.memo_pair_split_sided[idx] = split;
+        self.sided_pair_state[idx] = 2;
+        res
+    }
+
+    fn solve_side_sided(&mut self, a: usize, b: usize, alpha: &[f64], beta: &[Vec<f64>]) -> [f64; 4] {
+        debug_assert!(a != b);
+        let idx = self.pair_idx(a, b);
+        match self.sided_side_state[idx] {
+            2 => return self.memo_side_sided[idx],
+            1 => return [NEG_INF; 4],
+            _ => {}
+        }
+        self.sided_side_state[idx] = 1;
+
+        let p = self.active_labels.len();
+        let la = self.active_labels[a] as usize;
+        let pat_a = self.leaf_pat[a] as usize;
+        let mut res = [NEG_INF; 4];
+        let mut split = [SPLIT_LEAF_ONLY; 4];
+        // Leaf-only option: the side is just `a`, pattern = a's own side.
+        res[pat_a] = alpha[la] - self.pair_singleton_penalty[idx];
+
+        let b_penalty_sum: f64 = (0..self.num_trees)
+            .map(|ti| self.pair_side_parent_prefix_beta[ti][idx])
+            .sum();
+        let candidates = self.collect_sided_candidates(a, b);
+        for c in candidates {
+            let idx_c = a * p + c;
+            let pen = self.pair_penalty[idx_c] - b_penalty_sum;
+            let child = self.solve_pair_sided(a, c, alpha, beta);
+            for q in 1..4usize {
+                if child[q] <= NEG_INF / 2.0 {
+                    continue;
+                }
+                let cand = child[q] - pen;
+                if cand > res[q] {
+                    res[q] = cand;
+                    split[q] = c as u32;
+                }
+            }
+        }
+        self.memo_side_sided[idx] = res;
+        self.memo_side_split_sided[idx] = split;
+        self.sided_side_state[idx] = 2;
+        res
+    }
+
+    /// Candidate extensions for `solve_side_sided(a, b)`: descendants of the
+    /// a-side child of LCA(a,b) in EVERY tree, intersected with the active mask,
+    /// excluding `a`, `b`, and `a`'s cannot-partners. Mirrors the scalar phase-1
+    /// enumeration (without the per-pattern-unsound dynamic score filter).
+    fn collect_sided_candidates(&self, a: usize, b: usize) -> Vec<usize> {
+        const BLOCK_BITS: usize = std::mem::size_of::<usize>() * 8;
+        const BLOCK_SHIFT: usize = BLOCK_BITS.trailing_zeros() as usize;
+        const BLOCK_MASK: usize = BLOCK_BITS - 1;
+        let idx = self.pair_idx(a, b);
+        let la = self.active_labels[a] as usize;
+        let lb = self.active_labels[b] as usize;
+        let la_w = la >> BLOCK_SHIFT;
+        let la_m = 1usize << (la & BLOCK_MASK);
+        let lb_w = lb >> BLOCK_SHIFT;
+        let lb_m = 1usize << (lb & BLOCK_MASK);
+        let cannot_a_blocks: &[usize] = if self.has_cannot[la] {
+            self.cannot_sets[la].as_slice()
+        } else {
+            &[]
+        };
+        let active_mask_slice = self.active_mask.as_slice();
+        let mut out = Vec::new();
+        let n_blocks = self.descendant_leaves[0][self.pair_side_child[0][idx] as usize]
+            .as_slice()
+            .len();
+        for wi in 0..n_blocks {
+            let mut w = active_mask_slice[wi];
+            for ti in 0..self.num_trees {
+                let node = self.pair_side_child[ti][idx] as usize;
+                w &= self.descendant_leaves[ti][node].as_slice()[wi];
+            }
+            if wi == la_w {
+                w &= !la_m;
+            }
+            if wi == lb_w {
+                w &= !lb_m;
+            }
+            if let Some(&cb) = cannot_a_blocks.get(wi) {
+                w &= !cb;
+            }
+            while w != 0 {
+                let bit = w.trailing_zeros() as usize;
+                w &= w - 1;
+                let c_label = (wi << BLOCK_SHIFT) + bit;
+                out.push(self.label_to_active_idx[c_label] as usize);
+            }
+        }
+        out
+    }
+
+    /// Reconstruct the leaf set of the best column at pair `(a, b)` with touch
+    /// pattern `pat`. Mirrors `collect_pair`/`collect_side` along the per-pattern
+    /// split choices recorded by the sided DP.
+    fn collect_pair_sided(&self, a: usize, b: usize, pat: usize, out: &mut Vec<u32>) {
+        let (pl, pr) = self.memo_pair_split_sided[self.pair_idx(a, b)][pat];
+        self.collect_side_sided(a, b, pl as usize, out);
+        self.collect_side_sided(b, a, pr as usize, out);
+    }
+
+    fn collect_side_sided(&self, a: usize, b: usize, pat: usize, out: &mut Vec<u32>) {
+        let idx = self.pair_idx(a, b);
+        let choice = self.memo_side_split_sided[idx][pat];
+        if choice == SPLIT_LEAF_ONLY {
+            out.push(self.active_labels[a]);
+        } else {
+            self.collect_pair_sided(a, choice as usize, pat, out);
+        }
+    }
+
     fn collect_pair(
         &mut self,
         a: usize,
@@ -950,6 +1187,166 @@ impl LeafPairDpPricer {
             completed,
         }
     }
+
+    /// Sided counterpart of [`Self::collect_from_order`]: certifies/generates
+    /// against the EFFECTIVE reduced cost under the clean-cut rank rows. For each
+    /// anchor it evaluates the per-pattern best `solve_pair_sided` and adds the
+    /// pattern's `bonus`; `global_max` is the max effective score (the sound
+    /// `Converged` certificate when `≤ 1+ε` and the scan completed). Emission
+    /// reconstructs the winning pattern's column, repairs it, and re-checks the
+    /// EXACT effective reduced cost (`pricing_score + bonus(actual sides)`).
+    fn collect_from_order_sided(
+        &mut self,
+        order: &[(f64, usize, usize)],
+        trial_limit: usize,
+        target: usize,
+        ctx: &PricingContext,
+        scratch: &mut PricerScratch,
+    ) -> CollectResult {
+        let cut = ctx.clean_cut.expect("collect_from_order_sided requires a cut");
+        let side_c = cut.side_c;
+        let bonus = [0.0, cut.gamma_c, cut.gamma_cc, cut.gamma_c + cut.gamma_cc];
+        // Skip-widening uses max(0,γ) per side (sound upper bound on the bonus);
+        // the per-pattern `bonus` above uses the actual duals for exact scoring.
+        let gamma_total = cut.gamma_c.max(0.0) + cut.gamma_cc.max(0.0);
+        let tau = 1.0 + PRICING_EPS;
+        let p = self.active_labels.len();
+
+        let mut found: Vec<(f64, AfColumn)> = Vec::new();
+        let mut global_max: f64 = NEG_INF;
+        let repair_cert = std::env::var("KLADOS_BP_REPAIR_CERT").as_deref() == Ok("1");
+        let scan = order.len().min(trial_limit);
+        let mut completed = scan == order.len();
+
+        let mut labels_buf: Vec<u32> = Vec::new();
+        for &(_, a, b) in order.iter().take(scan) {
+            if found.len() >= target {
+                completed = false;
+                break;
+            }
+            // Per-anchor skip: `pair_ub` upper-bounds the score, so the effective
+            // score is ≤ pair_ub + Γ; if that is ≤ τ no improving column exists
+            // here. (Stricter than the scalar `≤ τ` skip — scans more anchors.)
+            if self.pair_ub[a * p + b] + gamma_total <= tau {
+                continue;
+            }
+            let sided = self.solve_pair_sided(a, b, ctx.alpha, ctx.beta);
+            // Invariant: the sided DP partitions the SAME column space by touch
+            // pattern, so the best over patterns must equal the scalar score.
+            #[cfg(debug_assertions)]
+            {
+                let scalar = self.solve_pair(a, b, ctx.alpha, ctx.beta);
+                let smax = sided.iter().copied().fold(NEG_INF, f64::max);
+                if scalar > NEG_INF / 2.0 {
+                    debug_assert!(
+                        (smax - scalar).abs() < 1.0e-6,
+                        "sided/scalar mismatch at ({a},{b}): sided_max={smax} scalar={scalar}"
+                    );
+                }
+                // STRONGER: each finite pattern's reconstructed column must (1)
+                // actually have that touch pattern and (2) re-score to sided[pat].
+                for pp in 1..4usize {
+                    if sided[pp] <= NEG_INF / 2.0 {
+                        continue;
+                    }
+                    let mut lb: Vec<u32> = Vec::new();
+                    self.collect_pair_sided(a, b, pp, &mut lb);
+                    lb.sort_unstable();
+                    lb.dedup();
+                    if lb.len() < 2 {
+                        continue;
+                    }
+                    let tc = lb.iter().any(|&l| ctx.clean_cut.unwrap().side_c.contains(l as usize));
+                    let tcc = lb.iter().any(|&l| !ctx.clean_cut.unwrap().side_c.contains(l as usize));
+                    let actual_pat = (tc as usize) | ((tcc as usize) << 1);
+                    let col = scratch.builder.build_unchecked(lb.clone(), ctx.trees);
+                    let sc = col.pricing_score(ctx.alpha, ctx.beta);
+                    debug_assert!(
+                        actual_pat == pp,
+                        "PATTERN MISLABEL at ({a},{b}) pat={pp}: reconstructed labels {lb:?} have actual_pat={actual_pat} score sided={} recon={sc}",
+                        sided[pp]
+                    );
+                    debug_assert!(
+                        sc >= sided[pp] - 1.0e-6,
+                        "SCORE UNDERFLOW at ({a},{b}) pat={pp}: sided={} but reconstructed col scores {sc}",
+                        sided[pp]
+                    );
+                }
+            }
+            for pat in 1..4usize {
+                if sided[pat] <= NEG_INF / 2.0 {
+                    continue;
+                }
+                let eff = sided[pat] + bonus[pat];
+                if !repair_cert && eff > global_max {
+                    global_max = eff;
+                }
+                if eff <= tau {
+                    if repair_cert && eff > global_max {
+                        global_max = eff;
+                    }
+                    continue;
+                }
+                // Improving under pattern `pat`: reconstruct, repair, re-score.
+                labels_buf.clear();
+                self.collect_pair_sided(a, b, pat, &mut labels_buf);
+                labels_buf.sort_unstable();
+                labels_buf.dedup();
+                if labels_buf.len() < 2 {
+                    continue;
+                }
+                let repaired = match repair_to_valid(&labels_buf, ctx.branchings, ctx.alpha) {
+                    Some(l) => l,
+                    None => {
+                        if !repair_cert && eff > global_max {
+                            global_max = eff;
+                        }
+                        continue;
+                    }
+                };
+                if ctx.seen.contains(&repaired) {
+                    if !repair_cert && eff > global_max {
+                        global_max = eff;
+                    }
+                    continue;
+                }
+                let column = scratch.builder.build_unchecked(repaired.clone(), ctx.trees);
+                if ctx.branchings.forbids(&column) {
+                    if !repair_cert && eff > global_max {
+                        global_max = eff;
+                    }
+                    continue;
+                }
+                // Exact effective reduced cost on the (possibly repaired) column:
+                // bonus from the actual sides its labels touch.
+                let touches_c = repaired.iter().any(|&l| side_c.contains(l as usize));
+                let touches_cc = repaired.iter().any(|&l| !side_c.contains(l as usize));
+                let bonus_actual = if touches_c { cut.gamma_c } else { 0.0 }
+                    + if touches_cc { cut.gamma_cc } else { 0.0 };
+                let eff_score = column.pricing_score(ctx.alpha, ctx.beta) + bonus_actual;
+                if repair_cert && eff_score > global_max {
+                    global_max = eff_score;
+                }
+                if eff_score > tau {
+                    found.push((eff_score, column));
+                }
+            }
+        }
+
+        if std::env::var("KLADOS_CLEAN_LB_TRACE").as_deref() == Ok("1") && found.is_empty() {
+            log::info!(
+                target: "klados::bp",
+                "sided-converge: global_max={:.6} tau={:.6} (margin {:.2e}) gc={:.6} gcc={:.6} completed={} scanned={}/{}",
+                global_max, tau, tau - global_max, cut.gamma_c, cut.gamma_cc, completed, scan, order.len(),
+            );
+        }
+
+        CollectResult {
+            found,
+            global_max,
+            completed,
+        }
+    }
 }
 
 /// Drop leaves from `labels` (sorted) until the set satisfies every branch
@@ -1034,6 +1431,17 @@ impl Pricer for LeafPairDpPricer {
         self.refresh_dual_tables(ctx.trees, ctx.alpha, ctx.beta);
         self.reset_memos();
 
+        // --- Clean-cut sided DP setup (only when a rank-row cut is active) ---
+        // `gamma_total = max(0,γ_C) + max(0,γ_Cᶜ)` widens the anchor-skip
+        // thresholds (a sound upper bound on the per-pattern bonus) so no anchor
+        // with an improving column is dropped. Zero when no cut → thresholds
+        // identical to production.
+        let gamma_total =
+            ctx.clean_cut.map_or(0.0, |c| c.gamma_c.max(0.0) + c.gamma_cc.max(0.0));
+        if let Some(c) = ctx.clean_cut.as_ref() {
+            self.setup_sided(c.side_c);
+        }
+
         // --- Anchor cache (cached-positive reuse) ---
         // Gated by `BpConfig.use_anchor_cache`. Lazy-init; allocate label-pair storage once.
         // Indexing is by leaf label, so structural data is invariant
@@ -1099,7 +1507,10 @@ impl Pricer for LeafPairDpPricer {
                 if tight > max_bound {
                     max_bound = tight;
                 }
-                if tight <= 1.0 + PRICING_EPS {
+                // Under a clean cut the effective score is ≤ tight + Γ, so an
+                // anchor can be dropped only when tight + Γ ≤ 1+ε. `gamma_total`
+                // is 0 with no cut → identical to production.
+                if tight + gamma_total <= 1.0 + PRICING_EPS {
                     continue;
                 }
                 let q = self.quick_proxy(a, b, ctx.alpha, ctx.beta);
@@ -1135,7 +1546,12 @@ impl Pricer for LeafPairDpPricer {
             });
         }
 
-        let mut result = self.collect_from_order(&order, trial_limit, target, ctx, scratch);
+        let cut_active = ctx.clean_cut.is_some();
+        let mut result = if cut_active {
+            self.collect_from_order_sided(&order, trial_limit, target, ctx, scratch)
+        } else {
+            self.collect_from_order(&order, trial_limit, target, ctx, scratch)
+        };
 
         // §3: the trial-limited pass is a fast *generation* shortcut. If it
         // emitted nothing, the full all-anchor scan must run before pricing
@@ -1144,7 +1560,11 @@ impl Pricer for LeafPairDpPricer {
             order.sort_unstable_by(|l, r| {
                 r.0.partial_cmp(&l.0).unwrap_or(std::cmp::Ordering::Equal)
             });
-            result = self.collect_from_order(&order, order.len(), target, ctx, scratch);
+            result = if cut_active {
+                self.collect_from_order_sided(&order, order.len(), target, ctx, scratch)
+            } else {
+                self.collect_from_order(&order, order.len(), target, ctx, scratch)
+            };
         }
 
         // Optional anchor-cache stats logging.

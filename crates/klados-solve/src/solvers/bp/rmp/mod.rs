@@ -42,6 +42,24 @@ pub struct RmpSolution {
     /// `0.0` for nodes whose row is not materialised (i.e. constraint isn't
     /// in the LP, so its dual contribution is zero).
     pub node_duals: Vec<Vec<f64>>,
+    /// Dual of each clean-cut rank row (`Σ_{c touches side} x_c ≥ OPT(side)`),
+    /// in the order the rows were installed by [`Rmp::add_rank_rows`]. Each is
+    /// `γ ≥ 0`; a column touching that side has its reduced cost lowered by `γ`,
+    /// so the pricer MUST subtract it (see `clean-cut-lower-bound-spec.md`).
+    /// Empty when no rank rows are installed — production unchanged.
+    pub rank_duals: Vec<f64>,
+}
+
+/// A persistent clean-cut rank row: `Σ_{c : labels(c) ∩ side ≠ ∅} x_c ≥ rhs`.
+/// Unlike the `add_diagnostic_*` rows, this one is tracked so subsequent
+/// [`Rmp::add_column`] calls keep its coefficient column up to date — the row
+/// stays valid as column generation grows the pool. The dual is surfaced in
+/// [`RmpSolution::rank_duals`] for the pricer.
+struct RankRow {
+    /// HiGHS row index (rows are append-only, so this is stable).
+    row_idx: usize,
+    /// 1-indexed leaf membership of the side this row sums over.
+    side: FixedBitSet,
 }
 
 pub struct Rmp {
@@ -79,6 +97,9 @@ pub struct Rmp {
     /// is popped and the column is unfixed. Root fixings (depth=0) are
     /// **never** placed on the trail — they hold globally.
     rcvf_trail: Vec<(usize, usize)>,
+    /// Persistent clean-cut rank rows (empty in production). Tracked so
+    /// `add_column` keeps their coefficient columns current.
+    rank_rows: Vec<RankRow>,
 }
 
 struct RootLp {
@@ -132,6 +153,7 @@ impl Rmp {
             rcvf_zero: Vec::new(),
             root_lp: None,
             rcvf_trail: Vec::new(),
+            rank_rows: Vec::new(),
         };
         for c in initial {
             rmp.add_column(c);
@@ -158,6 +180,18 @@ impl Rmp {
                 if let Some(ri) = self.node_row_idx[ti][v] {
                     row_indices.push(ri as i32);
                 }
+            }
+        }
+        // Persistent clean-cut rank rows: a new column gets coefficient 1 in
+        // every rank row whose side it touches, so the `Σ_{touches side} x ≥ rhs`
+        // constraint stays exact as the pool grows.
+        for rr in &self.rank_rows {
+            if column
+                .labels()
+                .iter()
+                .any(|&l| rr.side.contains(l as usize))
+            {
+                row_indices.push(rr.row_idx as i32);
             }
         }
         let values = vec![1.0_f64; row_indices.len()];
@@ -353,6 +387,78 @@ impl Rmp {
         }
         self.node_row_idx[ti][v] = Some(self.num_rows);
         self.num_rows += 1;
+    }
+
+    /// Install the two persistent clean-cut rank rows for the cut `(C, Cᶜ)`:
+    ///
+    /// ```text
+    ///   Σ_{c : labels(c) ∩ C  ≠ ∅} x_c ≥ opt_c
+    ///   Σ_{c : labels(c) ∩ Cᶜ ≠ ∅} x_c ≥ opt_cc
+    /// ```
+    ///
+    /// Both are **valid inequalities for the full MAF ILP** — every agreement
+    /// forest's components touching `C`, restricted to `C`, form an AF of `L|C`
+    /// (≥ `OPT(C)` of them); a straddling component counts in both rows. See
+    /// `papers/ours/clean-cut-lower-bound-spec.md`.
+    ///
+    /// Unlike the `add_diagnostic_*` rows these are tracked, so later
+    /// [`Self::add_column`] keeps their coefficients exact as the pool grows.
+    ///
+    /// SOUNDNESS CONTRACT:
+    /// - `opt_c`/`opt_cc` MUST be **proven** sub-optima (an exact sub-B&P, not a
+    ///   timed-out heuristic). A too-large rhs is an invalid cut → wrong optimum.
+    /// - The rows' duals (`γ ≥ 0`) are surfaced in [`RmpSolution::rank_duals`] and
+    ///   MUST be consumed by the pricer for every side-touching column, or column
+    ///   generation can converge early on a missed improving column and the LP
+    ///   bound becomes invalid.
+    pub fn add_rank_rows(
+        &mut self,
+        columns: &[AfColumn],
+        side_c: &FixedBitSet,
+        opt_c: usize,
+        side_cc: &FixedBitSet,
+        opt_cc: usize,
+    ) {
+        for (side, rhs) in [(side_c, opt_c), (side_cc, opt_cc)] {
+            if rhs == 0 {
+                continue;
+            }
+            let indices: Vec<i32> = columns
+                .iter()
+                .enumerate()
+                .filter(|(_, col)| {
+                    col.labels()
+                        .iter()
+                        .any(|&l| side.contains(l as usize))
+                })
+                .map(|(ci, _)| self.col_handle[ci])
+                .collect();
+            if indices.is_empty() {
+                continue;
+            }
+            let values = vec![1.0_f64; indices.len()];
+            let ptr = self.model.as_mut().expect("model present").as_mut_ptr();
+            unsafe {
+                highs_sys::Highs_addRow(
+                    ptr,
+                    rhs as f64,
+                    f64::INFINITY,
+                    indices.len() as i32,
+                    indices.as_ptr(),
+                    values.as_ptr(),
+                );
+            }
+            self.rank_rows.push(RankRow {
+                row_idx: self.num_rows,
+                side: side.clone(),
+            });
+            self.num_rows += 1;
+        }
+    }
+
+    /// Whether any persistent rank row is installed (production: always false).
+    pub fn has_rank_rows(&self) -> bool {
+        !self.rank_rows.is_empty()
     }
 
     /// Scan the current LP support for violated `≤1` node constraints.
@@ -589,6 +695,14 @@ impl Rmp {
                     .collect()
             })
             .collect();
+        // Clean-cut rank-row duals (γ ≥ 0). Extracted with the same sign
+        // convention as leaf duals: the pricer adds `+γ` to a side-touching
+        // column's dual contribution (i.e. lowers its reduced cost by γ).
+        let rank_duals: Vec<f64> = self
+            .rank_rows
+            .iter()
+            .map(|rr| clean_dual(dual_rows[rr.row_idx]))
+            .collect();
         let objective = solved.objective_value();
         self.model = Some(Model::from(solved));
         Ok(RmpSolution {
@@ -596,6 +710,7 @@ impl Rmp {
             column_values,
             leaf_duals,
             node_duals,
+            rank_duals,
         })
     }
 
@@ -669,6 +784,7 @@ impl Rmp {
             column_values,
             leaf_duals: Vec::new(),
             node_duals: Vec::new(),
+            rank_duals: Vec::new(),
         }))
     }
 

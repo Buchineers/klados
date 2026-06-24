@@ -61,6 +61,30 @@ pub struct PricingContext<'a> {
     /// run for a long time so capped exact solves do not wait until pricing
     /// returns before noticing that their budget expired.
     pub deadline: Option<Instant>,
+    /// Clean-cut side restriction (clean-cut-lower-bound-spec.md). When `Some`,
+    /// the pricer only builds columns whose labels lie ENTIRELY within this side
+    /// (the active mask is intersected with it). `None` in production → no
+    /// restriction, exact current behavior. SOUND: restricting the mask only
+    /// shrinks the search space; with `None` it is a literal no-op.
+    pub restrict_side: Option<&'a fixedbitset::FixedBitSet>,
+    /// Clean-cut rank-row pricing (clean-cut-lower-bound-spec.md). When `Some`,
+    /// the two rank rows `Σ_{touch C} x ≥ OPT(C)`, `Σ_{touch Cᶜ} x ≥ OPT(Cᶜ)` are
+    /// active in the master, with duals `γ`. The pricer must then price the
+    /// EFFECTIVE reduced cost `1 − score − γ_C·[touches C] − γ_Cᶜ·[touches Cᶜ]`,
+    /// which it does via the side-touch ("sided") DP so it optimizes
+    /// `score + bonus` exactly. `None` in production → exact current scalar path.
+    pub clean_cut: Option<CleanCutPricing<'a>>,
+}
+
+/// Clean-cut rank-row pricing parameters (see [`PricingContext::clean_cut`]).
+#[derive(Clone, Copy)]
+pub struct CleanCutPricing<'a> {
+    /// 1-indexed membership of side `C` (a leaf is in `Cᶜ` iff not in `side_c`).
+    pub side_c: &'a fixedbitset::FixedBitSet,
+    /// Dual of the `C` rank row, `γ_C ≥ 0`.
+    pub gamma_c: f64,
+    /// Dual of the `Cᶜ` rank row, `γ_Cᶜ ≥ 0`.
+    pub gamma_cc: f64,
 }
 
 impl<'a> PricingContext<'a> {

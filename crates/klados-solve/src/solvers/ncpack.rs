@@ -1116,6 +1116,51 @@ fn best_clean_balanced_clade(
     best_in_c
 }
 
+/// Find the leaf set `C` of the best clean (interface-0) balanced tree-clade
+/// w.r.t. ncpack's near-optimal pair-matching forest, as a 1-indexed
+/// [`FixedBitSet`]. `None` when there's no clean balanced clade (or the forest
+/// can't be built within `node_budget`).
+///
+/// This is the cut feeding the clean-cut lower-bound rank rows
+/// (`clean-cut-lower-bound-spec.md`). The theorem `|F| ≥ OPT(C)+OPT(Cᶜ) − s`
+/// holds for ANY cut, so soundness never depends on the cut's quality — a
+/// "clean" (low-interface) balanced cut just yields a tighter bound.
+pub(crate) fn clean_cut_leaves(inst: &Instance, node_budget: u64) -> Option<FixedBitSet> {
+    let nn = inst.num_leaves as usize;
+    let forest = pair_matching_forest(inst, nn, node_budget)?;
+    // comp_of / comp_size / total_merges (mu*) from the forest components.
+    let mut comp_of = vec![usize::MAX; nn + 1];
+    let mut comp_size: Vec<usize> = Vec::with_capacity(forest.len());
+    let mut total_merges = 0usize;
+    for comp in &forest {
+        let leaves: Vec<u32> = comp.leaves().collect();
+        if leaves.is_empty() {
+            continue;
+        }
+        let cid = comp_size.len();
+        for &l in &leaves {
+            comp_of[l as usize] = cid;
+        }
+        comp_size.push(leaves.len());
+        total_merges += leaves.len() - 1;
+    }
+    // Any leaf the forest didn't cover becomes its own singleton (robustness).
+    for l in 1..=nn {
+        if comp_of[l] == usize::MAX {
+            comp_of[l] = comp_size.len();
+            comp_size.push(1);
+        }
+    }
+    let in_c = best_clean_balanced_clade(inst, nn, &comp_of, &comp_size, total_merges)?;
+    let mut bits = FixedBitSet::with_capacity(nn + 1);
+    for l in 1..=nn {
+        if in_c[l] {
+            bits.insert(l);
+        }
+    }
+    Some(bits)
+}
+
 /// BOUNDARY-ADJACENCY PROBE (`KLADOS_NCPACK_BOUNDARY=1`). For the best clean
 /// balanced cut `C`, count how many active (non-singleton) components are
 /// "boundary-adjacent": their Steiner tree reaches the cut's mixed region in some

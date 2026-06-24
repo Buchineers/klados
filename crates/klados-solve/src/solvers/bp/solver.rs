@@ -22,9 +22,9 @@ use crate::decomp::whidden_cluster::{
 };
 use crate::solvers::bp::column::{AfColumn, ColumnBuilder};
 use crate::solvers::bp::pricer::{
-    Pricer, PricerScratch, PricingContext, PricingResult, dispatch_by_m,
+    CleanCutPricing, Pricer, PricerScratch, PricingContext, PricingResult, dispatch_by_m,
 };
-use crate::solvers::bp::rmp::Rmp;
+use crate::solvers::bp::rmp::{Rmp, RmpSolution};
 use crate::solvers::bp::search::{
     BranchSelector, Branchings, Incumbent, SearchState, SelectionContext, Telemetry,
 };
@@ -268,7 +268,13 @@ enum NodeOutcome {
     /// 2-element Vec is classic must/cannot pair split; longer Vec is
     /// k-way (e.g. 4-way cluster branching on a fractional triple).
     Branch {
-        lp_obj: f64,
+        /// Certified lower bound inherited by each child.  This must be the
+        /// true/certified node LP objective, not merely the current restricted
+        /// master objective: when pricing stops with `Improving`, or when an
+        /// experimental cut's pricer is not trusted at this node, the RMP
+        /// objective is not a valid lower bound and propagating it can prune
+        /// the branch containing the true incumbent.
+        inherited_bound: f64,
         children: Vec<Branchings>,
     },
 }
@@ -342,6 +348,13 @@ where
     if n <= 1 {
         return Some(trees[0..1].to_vec());
     }
+    info!(
+        target: LOG_TARGET,
+        "solve_inner entry: n={} m={} clean_lb={}",
+        reduced.num_leaves,
+        trees.len(),
+        cfg.clean_lb,
+    );
     maybe_log_core_decomp_potential(reduced, cfg.core_decomp_analyze, cfg.core_decomp_min_leaves);
 
     // Chen pairwise lower bound — a sound combinatorial floor on the
@@ -547,7 +560,29 @@ where
     let mut stack: Vec<(Branchings, f64)> = vec![(Branchings::default(), f64::NEG_INFINITY)];
     let mut last_progress_log = std::time::Instant::now();
     let allow_bound_prune = use_bound_prune_shortcuts(reduced, trees);
-    let allow_rcvf = use_rcvf_shortcuts(reduced, trees, cfg.no_rcvf, cfg.tiny_rcvf);
+    let mut allow_rcvf = use_rcvf_shortcuts(reduced, trees, cfg.no_rcvf, cfg.tiny_rcvf);
+
+    // Clean-cut lower-bound rank rows (m≥3, n≥threshold). GATED OFF by default;
+    // enable with `KLADOS_BP_CLEAN_LB=1`.
+    //
+    // Soundness requires two things:
+    // - The pricer must price the rank-row duals exactly, including columns
+    //   whose only gain is a positive side-touch γ (so the α>0 active filter is
+    //   widened in the sided pricer).
+    // - Search may propagate/prune only certified LP bounds.  If pricing stops
+    //   with `Improving`, the raw RMP objective is not inherited by children.
+    let clean_cut_side: Option<FixedBitSet> = if cfg.clean_lb
+        && trees.len() >= 3
+        && reduced.num_leaves as usize >= CLEAN_LB_MIN_LEAVES
+    {
+        maybe_install_clean_lb_rank_rows(reduced, &state, &mut rmp, cfg, cancel)
+    } else {
+        None
+    };
+    if clean_cut_side.is_some() {
+        allow_rcvf = false;
+    }
+
     while let Some((b, parent_lp_bound)) = stack.pop() {
         // Periodic progress log so we can see telemetry on timeouts, not
         // just on successful completion. Every 5 seconds is rare enough
@@ -632,6 +667,7 @@ where
             chen_lb,
             cancel,
             cfg,
+            clean_cut_side.as_ref(),
         );
         match outcome {
             NodeOutcome::Pruned => {}
@@ -658,14 +694,17 @@ where
                     // RCVF replay happens at the top of the next solve_node.
                 }
             }
-            NodeOutcome::Branch { lp_obj, children } => {
+            NodeOutcome::Branch {
+                inherited_bound,
+                children,
+            } => {
                 // Push children in reverse so the first one is popped
                 // next — matches the prior 2-way DFS ordering where
                 // `left` (the must-link side) was explored before
                 // `right` (cannot-link). For k-way branching, the
                 // selector's natural child ordering is preserved.
                 for child in children.into_iter().rev() {
-                    stack.push((child, lp_obj));
+                    stack.push((child, inherited_bound));
                 }
             }
         }
@@ -702,6 +741,157 @@ where
     Some(components)
 }
 
+/// Below this leaf count the clean-cut lower-bound rank rows aren't worth their
+/// sub-B&P side solves — the instance is already cheap.
+const CLEAN_LB_MIN_LEAVES: usize = 34;
+
+/// Clean-cut lower-bound rank rows (KLADOS_BP_CLEAN_LB=1, m≥3, gated).
+///
+/// Installs the two valid rank rows `Σ_{touch C} x ≥ OPT(C)`, `Σ_{touch Cᶜ} x ≥
+/// OPT(Cᶜ)` (clean-cut-lower-bound-spec.md) into `rmp`, returning the `C` side so
+/// the caller can feed it (with the rows' duals) to the γ-aware sided pricer.
+///
+/// SOUNDNESS: the rank-row rhs must be ≤ the true `OPT(side)`, so each side is
+/// solved to a **proven** optimum (an uncapped exact sub-B&P; a SIGTERM-aborted
+/// sub-solve is detected via the cancel flag and the row is skipped — a too-large
+/// rhs would be an invalid cut). Returns `None` (no rows installed → behavior
+/// unchanged) when there's no clean balanced cut or a side can't be proven.
+fn maybe_install_clean_lb_rank_rows(
+    reduced: &Instance,
+    state: &SearchState,
+    rmp: &mut Rmp,
+    cfg: &crate::solvers::bp::BpConfig,
+    cancel: &crate::solvers::bp::Cancel,
+) -> Option<FixedBitSet> {
+    let n = reduced.num_leaves as usize;
+    let side_c = crate::solvers::ncpack::clean_cut_leaves(reduced, 5_000_000)?;
+    let nc = side_c.count_ones(..);
+    if nc < 2 || nc > n - 2 {
+        return None; // degenerate cut — no real split
+    }
+    let mut side_cc = FixedBitSet::with_capacity(n + 1);
+    for l in 1..=n {
+        if !side_c.contains(l) {
+            side_cc.insert(l);
+        }
+    }
+    let t = Instant::now();
+    // Side RHS proofs may themselves use clean-LB recursively.  This is safe
+    // (each side is a smaller exact instance, and rows are added only after a
+    // proven side optimum) and is required for the hard wall wins: without the
+    // recursive bound the side proof can time out before the top-level rows are
+    // ever installed.
+    let opt_c = prove_side_opt(reduced, &side_c, cfg, cancel)?;
+    let opt_cc = prove_side_opt(reduced, &side_cc, cfg, cancel)?;
+    rmp.add_rank_rows(state.columns(), &side_c, opt_c, &side_cc, opt_cc);
+    info!(
+        target: LOG_TARGET,
+        "clean-lb: rank rows installed OPT(C)={} OPT(Cc)={} floor={} |C|={} n={} ({:.1}ms)",
+        opt_c, opt_cc, opt_c + opt_cc, nc, n,
+        t.elapsed().as_secs_f64() * 1000.0,
+    );
+    Some(side_c)
+}
+
+/// Prove `OPT(side)` exactly via a sub-B&P on the side-restricted instance.
+/// Returns `Some(opt)` only when the sub-solve completed (not cancelled) and its
+/// forest validates — otherwise `None`, so the caller installs no (possibly
+/// invalid) rank row for that side.
+fn prove_side_opt(
+    reduced: &Instance,
+    side: &FixedBitSet,
+    cfg: &crate::solvers::bp::BpConfig,
+    cancel: &crate::solvers::bp::Cancel,
+) -> Option<usize> {
+    let (core, _) = klados_core::kernelize::restrict_instance_simple(reduced, side);
+    let sub_cancel = cancel.clone();
+    let forest = crate::solvers::bp::solve_subinstance(&core, cfg, &sub_cancel)?;
+    if sub_cancel.is_cancelled() {
+        return None; // aborted → not a proven optimum
+    }
+    if !validate_agreement_forest(&core, &forest).is_ok() {
+        return None; // belt-and-suspenders: never trust an invalid forest's size
+    }
+    Some(forest.len())
+}
+
+fn price_node<P: Pricer>(
+    pricer: &mut P,
+    scratch: &mut PricerScratch,
+    trees: &[Tree],
+    state: &SearchState,
+    branchings: &Branchings,
+    cancel: &crate::solvers::bp::Cancel,
+    lp: &RmpSolution,
+    clean_cut_side: Option<&FixedBitSet>,
+) -> PricingResult {
+    let mut call = |restrict_side: Option<&FixedBitSet>,
+                    clean_cut: Option<CleanCutPricing<'_>>|
+     -> PricingResult {
+        pricer.price(
+            &PricingContext {
+                trees,
+                num_leaves: state.num_leaves(),
+                alpha: &lp.leaf_duals,
+                beta: &lp.node_duals,
+                columns: state.columns(),
+                seen: state.seen(),
+                branchings,
+                terminate: cancel.flag(),
+                deadline: cancel.deadline(),
+                restrict_side,
+                clean_cut,
+            },
+            scratch,
+        )
+    };
+
+    let Some(side_c) = clean_cut_side else {
+        return call(None, None);
+    };
+    if lp.rank_duals.len() != 2 {
+        return call(None, None);
+    }
+
+    let cut = CleanCutPricing {
+        side_c,
+        gamma_c: lp.rank_duals[0],
+        gamma_cc: lp.rank_duals[1],
+    };
+    let mut side_cc = FixedBitSet::with_capacity(state.num_leaves() + 1);
+    for l in 1..=state.num_leaves() {
+        if !side_c.contains(l) {
+            side_cc.insert(l);
+        }
+    }
+
+    // Clean-cut rank rows need pricing over all three side-touch classes.  We
+    // run the two side-restricted passes first because those are exactly the
+    // no-straddle faces the clean floor is meant to close; if either pass emits
+    // columns, CG will re-solve and revisit straddles under fresh duals.
+    let mut found = Vec::new();
+    let mut all_converged = true;
+    for restrict in [Some(side_c), Some(&side_cc)] {
+        match call(restrict, Some(cut)) {
+            PricingResult::Found(cols) => {
+                found.extend(cols);
+                all_converged = false;
+            }
+            PricingResult::Converged => {}
+            PricingResult::Improving => all_converged = false,
+        }
+    }
+    if !found.is_empty() {
+        return PricingResult::Found(found);
+    }
+
+    match call(None, Some(cut)) {
+        PricingResult::Found(cols) => PricingResult::Found(cols),
+        PricingResult::Converged if all_converged => PricingResult::Converged,
+        PricingResult::Converged | PricingResult::Improving => PricingResult::Improving,
+    }
+}
+
 fn solve_node<P: Pricer, S: BranchSelector>(
     state: &mut SearchState,
     branchings: &Branchings,
@@ -718,6 +908,7 @@ fn solve_node<P: Pricer, S: BranchSelector>(
     chen_lb: usize,
     cancel: &crate::solvers::bp::Cancel,
     cfg: &crate::solvers::bp::BpConfig,
+    clean_cut_side: Option<&FixedBitSet>,
 ) -> NodeOutcome {
     tel.nodes_explored += 1;
 
@@ -784,19 +975,15 @@ fn solve_node<P: Pricer, S: BranchSelector>(
         }
 
         let t0 = Instant::now();
-        let result = pricer.price(
-            &PricingContext {
-                trees,
-                num_leaves: state.num_leaves(),
-                alpha: &lp.leaf_duals,
-                beta: &lp.node_duals,
-                columns: state.columns(),
-                seen: state.seen(),
-                branchings,
-                terminate: cancel.flag(),
-                deadline: cancel.deadline(),
-            },
+        let result = price_node(
+            pricer,
             scratch,
+            trees,
+            state,
+            branchings,
+            cancel,
+            &lp,
+            clean_cut_side,
         );
         tel.timings.pricing += t0.elapsed();
         let pt = t0.elapsed();
@@ -862,11 +1049,23 @@ fn solve_node<P: Pricer, S: BranchSelector>(
     // (`Improving` leaves the LP objective below the true node optimum). The
     // Chen lower bound is a sound combinatorial floor that holds regardless.
     let lp_lb = (lp.objective - 1e-6).ceil() as usize;
-    let lb = if node_converged {
+    let trust_lp = node_converged;
+    let lb = if trust_lp {
         lp_lb.max(chen_lb)
     } else {
         chen_lb
     };
+    if clean_cut_side.is_some()
+        && std::env::var("KLADOS_CLEAN_LB_TRACE").as_deref() == Ok("1")
+    {
+        info!(
+            target: LOG_TARGET,
+            "clean-lb node: depth={} ml={} cl={} converged={} lp={:.4} lp_lb={} chen={} lb={} ub={} rank_duals={:?}",
+            branchings.depth(), branchings.must_link().len(), branchings.cannot_link().len(),
+            node_converged, lp.objective, lp_lb, chen_lb, lb,
+            state.best_ub(), lp.rank_duals,
+        );
+    }
 
     if allow_bound_prune && can_prune_by_bound(lb, state.best_ub(), cfg.disable_bound_prune) {
         debug!(
@@ -1171,10 +1370,17 @@ fn solve_node<P: Pricer, S: BranchSelector>(
     );
     tel.timings.branching += t0.elapsed();
     match children {
-        Some(children) if !children.is_empty() => NodeOutcome::Branch {
-            lp_obj: lp.objective,
-            children,
-        },
+        Some(children) if !children.is_empty() => {
+            let inherited_bound = if trust_lp {
+                lp.objective
+            } else {
+                f64::NEG_INFINITY
+            };
+            NodeOutcome::Branch {
+                inherited_bound,
+                children,
+            }
+        }
         _ => {
             debug!(target: LOG_TARGET, "selector returned no children, but not integral. Pruning fractional solution!");
             NodeOutcome::Pruned

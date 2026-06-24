@@ -130,6 +130,11 @@ pub struct BpConfig {
     pub ncpack_lb: bool,
     pub ncpack_lb_kmax: usize,
     pub ncpack_lb_budget_secs: u64,
+    /// Experimental clean-cut rank-row lower bound.  Kept in config (rather
+    /// than read directly in the solver) so recursive side proofs can disable
+    /// it; otherwise proving OPT(C) can recursively install more clean cuts and
+    /// turn a cheap root bound into a large nested B&P search.
+    pub clean_lb: bool,
 }
 
 impl Default for BpConfig {
@@ -178,6 +183,7 @@ impl Default for BpConfig {
             ncpack_lb: false,
             ncpack_lb_kmax: 6,
             ncpack_lb_budget_secs: 60,
+            clean_lb: false,
         }
     }
 }
@@ -196,6 +202,12 @@ impl BpConfig {
 
     pub fn from_env() -> Self {
         let mut cfg = Self::default();
+        if std::env::var("KLADOS_BP_NO_DECOMP").as_deref() == Ok("1") {
+            cfg.cluster_algo = ClusterAlgo::None;
+        }
+        if std::env::var("KLADOS_BP_NO_KERNEL").as_deref() == Ok("1") {
+            cfg.kernelize = false;
+        }
         if std::env::var("KLADOS_BP_OBSTRUCTION_PROBE").as_deref() == Ok("1") {
             cfg.obstruction_probe = true;
         }
@@ -263,6 +275,9 @@ impl BpConfig {
         if std::env::var("KLADOS_BP_NCPACK_LB").as_deref() == Ok("1") {
             cfg.ncpack_lb = true;
         }
+        if std::env::var("KLADOS_BP_CLEAN_LB").as_deref() == Ok("1") {
+            cfg.clean_lb = true;
+        }
         if let Ok(raw) = std::env::var("KLADOS_BP_NCPACK_LB_BUDGET_SECS")
             && let Ok(value) = raw.parse::<u64>()
         {
@@ -308,6 +323,13 @@ impl Solver for BpSolver {
 
     fn solve(&mut self, instance: &Instance, cfg: &RunConfig<Self::Config>) -> Option<Vec<Tree>> {
         let t_total = Instant::now();
+        log::info!(
+            target: LOG_TARGET,
+            "bp config: kernelize={} cluster_algo={:?} clean_lb={}",
+            cfg.specific.kernelize,
+            cfg.specific.cluster_algo,
+            cfg.specific.clean_lb,
+        );
         let memo = Rc::new(RefCell::new(SubinstanceMemo::default()));
         let cancel = Cancel::new(Arc::clone(&self.terminated));
         let mut components = solve_recursive_memo(instance, &cfg.specific, &memo, &cancel)?;
@@ -614,6 +636,24 @@ fn solve_recursive_memo(
             );
             return Some(expanded);
         }
+    }
+
+    if matches!(cfg.cluster_algo, ClusterAlgo::None) {
+        let cfg_inner = cfg.clone();
+        let memo_inner = Rc::clone(memo);
+        let reduced_components =
+            solver::solve_inner_with_subsolver(reduced, &cfg_inner, cancel, &mut |sub| {
+                solve_recursive_memo(sub, &cfg_inner, &memo_inner, cancel)
+            })?;
+        if let Some(view) = memo_view.as_ref() {
+            store_cached_solution(&mut memo.borrow_mut(), view, &reduced_components);
+        }
+        return Some(klados_core::kernelize::expand_solution(
+            reduced_components,
+            &kern,
+            &instance.trees[0],
+            instance.num_leaves,
+        ));
     }
 
     let pipeline_cfg = SolveConfig {

@@ -935,6 +935,8 @@ mod tests {
             branchings: &branchings,
             terminate: &crate::solvers::bp::pricer::NEVER_TERMINATE,
             deadline: None,
+            restrict_side: None,
+            clean_cut: None,
         };
 
         let mut existing_cache = ExactPairDpCache::new(n0, n1, nl);
