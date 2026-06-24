@@ -1192,7 +1192,10 @@ fn solve_node<P: Pricer, S: BranchSelector>(
         // LP mass currently paid inside it, then the missing proof object is a
         // global obstruction cut rather than another local branch.
         if root_regions.is_none()
-            && (cfg.obstruction_probe || cfg.bridge_probe || cfg.root_support_incumbent)
+            && (cfg.obstruction_probe
+                || cfg.bridge_probe
+                || cfg.root_support_incumbent
+                || cfg.support_rank_resolve)
         {
             *root_regions = build_root_support_regions(state, &lp);
         }
@@ -1215,6 +1218,9 @@ fn solve_node<P: Pricer, S: BranchSelector>(
             }
         }
         maybe_probe_root_obstruction(reduced, state, &lp, root_regions.as_ref(), cfg);
+        maybe_probe_support_rank_resolve(reduced, state, rmp, &lp, root_regions.as_ref(), cfg, cancel);
+        maybe_probe_merge_order(state, rmp, &lp, branchings, cfg);
+        maybe_probe_mwis_finish(reduced, state, &lp, branchings, cfg);
         maybe_probe_root_rank_cuts(state, &lp, cfg);
         maybe_probe_residual_completion_cuts(reduced, state, &lp, cfg);
         maybe_log_bridge_footprint(
@@ -1637,6 +1643,53 @@ fn probe_root_obstruction_impl(
         );
     }
 
+    // Diagnostic: dump every support column's value + sorted leaf labels,
+    // grouped by support component, to the file named by KLADOS_BP_SUPPORT_DUMP.
+    // Append mode (one block per probe firing) so decomposed sub-cores all land
+    // in one file. Used for offline rotating-triple / spread-clique analysis.
+    if let Ok(path) = std::env::var("KLADOS_BP_SUPPORT_DUMP") {
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = writeln!(
+                f,
+                "# PROBE lp={:.6} support_cols={} components={}",
+                regions.lp_objective,
+                regions.comps.iter().map(|c| c.column_ids.len()).sum::<usize>(),
+                regions.comps.len(),
+            );
+            for (idx, comp) in regions.comps.iter().enumerate() {
+                let _ = writeln!(
+                    f,
+                    "# COMP {idx} cols={} leaves={} mass={:.6}",
+                    comp.column_ids.len(),
+                    comp.leaf_count(),
+                    comp.lp_mass,
+                );
+                for &ci in &comp.column_ids {
+                    let col = &state.columns()[ci];
+                    let mut labs: Vec<u32> = col.labels().iter().map(|&l| l as u32).collect();
+                    labs.sort_unstable();
+                    let labs_str: Vec<String> = labs.iter().map(|l| l.to_string()).collect();
+                    // Node coverage as `tree.node` tokens — lets offline analysis
+                    // reconstruct the true conflict graph H (share a leaf OR a node).
+                    let mut nodes_str: Vec<String> = Vec::new();
+                    for (ti, nodes) in col.coverage().iter_per_tree().enumerate() {
+                        for &v in nodes {
+                            nodes_str.push(format!("{ti}.{v}"));
+                        }
+                    }
+                    let _ = writeln!(
+                        f,
+                        "{idx}\t{:.6}\t{}\t{}",
+                        lp.column_values[ci],
+                        labs_str.join(","),
+                        nodes_str.join(",")
+                    );
+                }
+            }
+        }
+    }
+
     if cfg.root_support_mip {
         probe_root_support_mip(reduced, state, lp, regions);
     }
@@ -2017,6 +2070,332 @@ fn probe_all_region_exact_ranks(
         sum_rank as f64 - regions.lp_objective,
         details.join(","),
         t0.elapsed().as_secs_f64() * 1000.0,
+    );
+}
+
+/// Weighted max-weight independent set via branch-and-bound. `adj[i]` is the
+/// neighbour set of vertex `i`; `weights[i]` its weight. Returns the best weight
+/// found and whether the search exhausted (vs hit the node `budget`). The
+/// conflict graph here is dense (so independent sets are small), which makes the
+/// include-branch (removes v + all neighbours) collapse fast.
+fn solve_mwis_bb(
+    adj: &[FixedBitSet],
+    weights: &[usize],
+    budget: u64,
+) -> (usize, bool) {
+    let n = adj.len();
+    let mut best = 0usize;
+    let mut remaining = budget;
+    let mut active = FixedBitSet::with_capacity(n);
+    if n > 0 {
+        active.insert_range(..n);
+    }
+    let exhausted = mwis_rec(adj, weights, active, 0, &mut best, &mut remaining);
+    (best, exhausted)
+}
+
+/// Returns true if the subtree was fully explored (false = budget hit).
+fn mwis_rec(
+    adj: &[FixedBitSet],
+    weights: &[usize],
+    active: FixedBitSet,
+    acc: usize,
+    best: &mut usize,
+    budget: &mut u64,
+) -> bool {
+    if *budget == 0 {
+        return false;
+    }
+    *budget -= 1;
+    if acc > *best {
+        *best = acc;
+    }
+    // Upper bound: acc + total weight of still-active vertices.
+    let rem: usize = active.ones().map(|v| weights[v]).sum();
+    if acc + rem <= *best {
+        return true;
+    }
+    // Branch on the highest-degree active vertex (most constraining → include
+    // removes the most, exclude is rare).
+    let branch = active
+        .ones()
+        .max_by_key(|&v| adj[v].intersection(&active).count());
+    let Some(v) = branch else {
+        return true;
+    };
+    // Include v: remove v and all its neighbours.
+    let mut inc = active.clone();
+    inc.set(v, false);
+    inc.difference_with(&adj[v]);
+    if !mwis_rec(adj, weights, inc, acc + weights[v], best, budget) {
+        return false;
+    }
+    // Exclude v.
+    let mut exc = active;
+    exc.set(v, false);
+    mwis_rec(adj, weights, exc, acc, best, budget)
+}
+
+/// Prototype core-finisher (KLADOS_BP_MWIS_FINISH=1). At a stuck core root, build
+/// the candidate-merge conflict graph over the pool's multi-leaf columns and
+/// solve MWIS directly, reporting the combinatorial opt vs the LP bound and time.
+///
+/// `comb_opt = core_leaves − MWIS(merges)`. If the candidate set is complete
+/// (every agreement component on the core is in the pool) and the search
+/// exhausted, this is the *proven* core optimum — the discrete refutation that
+/// replaces the LP cannot-link tree. Completeness is the open soundness item;
+/// for these converged cores the pool empirically matched the exact sub-solve.
+fn maybe_probe_mwis_finish(
+    reduced: &Instance,
+    state: &SearchState,
+    lp: &crate::solvers::bp::rmp::RmpSolution,
+    branchings: &Branchings,
+    cfg: &crate::solvers::bp::BpConfig,
+) {
+    if !cfg.mwis_finish || branchings.depth() != 0 {
+        return;
+    }
+    let t0 = Instant::now();
+    let cols = state.columns();
+    // Candidate merges = multi-leaf columns (singletons have weight 0).
+    let cand: Vec<usize> = (0..cols.len())
+        .filter(|&i| cols[i].labels().len() >= 2)
+        .collect();
+    let m = cand.len();
+    let weights: Vec<usize> = cand.iter().map(|&i| cols[i].labels().len() - 1).collect();
+    // Conflict graph: two merges conflict iff they share a leaf or a tree node.
+    use fxhash::FxHashMap;
+    let mut by_leaf: FxHashMap<u32, Vec<usize>> = FxHashMap::default();
+    let mut by_node: FxHashMap<(usize, usize), Vec<usize>> = FxHashMap::default();
+    for (li, &ci) in cand.iter().enumerate() {
+        for &l in cols[ci].labels() {
+            by_leaf.entry(l).or_default().push(li);
+        }
+        for (ti, nodes) in cols[ci].coverage().iter_per_tree().enumerate() {
+            for &v in nodes {
+                by_node.entry((ti, v)).or_default().push(li);
+            }
+        }
+    }
+    let mut adj = vec![FixedBitSet::with_capacity(m); m];
+    for grp in by_leaf.values().chain(by_node.values()) {
+        for a in 0..grp.len() {
+            for b in (a + 1)..grp.len() {
+                adj[grp[a]].insert(grp[b]);
+                adj[grp[b]].insert(grp[a]);
+            }
+        }
+    }
+    let build_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let t1 = Instant::now();
+    let (mwis, exhausted) = solve_mwis_bb(&adj, &weights, 100_000_000);
+    let comb_opt = reduced.num_leaves as usize - mwis;
+    info!(
+        target: LOG_TARGET,
+        "mwis-finish: core_leaves={} cand_merges={} mwis_merges={} comb_opt={} lp={:.3} lp_lb={} ub={} exhausted={} build_ms={:.2} mwis_ms={:.2}",
+        reduced.num_leaves, m, mwis, comb_opt,
+        lp.objective, (lp.objective - 1.0e-6).ceil() as usize, state.best_ub(),
+        exhausted, build_ms, t1.elapsed().as_secs_f64() * 1000.0,
+    );
+}
+
+/// Pair together-mass `Σ_{c ⊇ {a,b}} x_c` for every leaf pair, from the LP
+/// solution. Returns a map keyed by the canonical pair `(min,max)`.
+fn pair_together_mass(
+    state: &SearchState,
+    column_values: &[f64],
+) -> fxhash::FxHashMap<(u32, u32), f64> {
+    let mut mass: fxhash::FxHashMap<(u32, u32), f64> = fxhash::FxHashMap::default();
+    for (ci, &x) in column_values.iter().enumerate() {
+        if x <= 1.0e-9 || ci >= state.columns().len() {
+            continue;
+        }
+        let labs = state.columns()[ci].labels();
+        for i in 0..labs.len() {
+            for j in (i + 1)..labs.len() {
+                let (a, b) = (labs[i], labs[j]);
+                let key = if a < b { (a, b) } else { (b, a) };
+                *mass.entry(key).or_insert(0.0) += x;
+            }
+        }
+    }
+    mass
+}
+
+fn count_fractional_pairs(state: &SearchState, column_values: &[f64]) -> usize {
+    pair_together_mass(state, column_values)
+        .values()
+        .filter(|&&m| m > 1.0e-6 && m < 1.0 - 1.0e-6)
+        .count()
+}
+
+/// Diagnostic (KLADOS_BP_MERGE_ORDER_PROBE=1): at the root, dump the LP
+/// fractional merges and, for the top few (closest to 0.5), simulate committing
+/// them (must-link and cannot-link) over the current pool to measure ΔLP and how
+/// far the fractional support collapses. Answers: does the LP usefully ORDER
+/// which merge to commit, or is the fractional support noise?
+///
+/// Simulations are pool-only (no re-pricing) — exactly the right lens for "what
+/// does committing this merge do to the current fractional support". Restores
+/// the RMP to the node's branchings on exit.
+fn maybe_probe_merge_order(
+    state: &SearchState,
+    rmp: &mut Rmp,
+    lp: &crate::solvers::bp::rmp::RmpSolution,
+    branchings: &Branchings,
+    cfg: &crate::solvers::bp::BpConfig,
+) {
+    if !cfg.merge_order_probe || branchings.depth() != 0 {
+        return;
+    }
+    let lp0 = lp.objective;
+    let mass = pair_together_mass(state, &lp.column_values);
+    let mut frac: Vec<((u32, u32), f64)> = mass
+        .iter()
+        .filter(|(_, m)| **m > 1.0e-6 && **m < 1.0 - 1.0e-6)
+        .map(|(&k, &m)| (k, m))
+        .collect();
+    frac.sort_by(|a, b| {
+        (a.1 - 0.5)
+            .abs()
+            .partial_cmp(&(b.1 - 0.5).abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let frac_before = frac.len();
+    info!(
+        target: LOG_TARGET,
+        "merge-order-probe: root lp={:.4} pairs_with_mass={} fractional_merges={}",
+        lp0, mass.len(), frac_before,
+    );
+    let k = frac.len().min(12);
+    for (rank, &(pair, m)) in frac.iter().take(k).enumerate() {
+        let lpair = crate::solvers::bp::search::branchings::LeafPair::new(pair.0, pair.1);
+        // must-link
+        let mut child = branchings.clone();
+        child.push_must_link(lpair);
+        rmp.apply_bounds(state.columns(), &child);
+        let (lp_ml, frac_ml) = match rmp.solve() {
+            Ok(sol) => {
+                let fc = count_fractional_pairs(state, &sol.column_values);
+                (sol.objective, fc as i64)
+            }
+            Err(_) => (f64::INFINITY, -1),
+        };
+        // cannot-link
+        let mut child2 = branchings.clone();
+        child2.push_cannot_link(lpair);
+        rmp.apply_bounds(state.columns(), &child2);
+        let lp_cl = rmp.solve().map(|s| s.objective).unwrap_or(f64::INFINITY);
+        info!(
+            target: LOG_TARGET,
+            "merge-order-probe: #{rank} pair=({},{}) mass={:.3} dLP_must={:.4} dLP_cannot={:.4} min_dLP={:.4} frac_after_must={} (was {})",
+            pair.0, pair.1, m,
+            lp_ml - lp0, lp_cl - lp0,
+            (lp_ml - lp0).min(lp_cl - lp0),
+            frac_ml, frac_before,
+        );
+    }
+    // Restore the node's bounds.
+    rmp.apply_bounds(state.columns(), branchings);
+}
+
+/// Gate probe for the support-region rank cut (KLADOS_BP_SUPPORT_RANK_RESOLVE=1).
+///
+/// At root convergence, prove the exact MAF rank of each support region and
+/// install `Σ_{c : labels(c) ∩ region ≠ ∅} x_c ≥ exact_rank` as a (diagnostic,
+/// untracked) row, then re-solve the LP over the EXISTING pool and log the lift.
+///
+/// The re-solved value is an **upper bound** on the true rank-augmented root LP
+/// (no re-pricing is done, so columns that the new duals would generate are
+/// missing — those could only lower the LP). Therefore:
+///   - if even this pool-only LP can't reach `ceil(lp0)+1` (the stuck unit),
+///     the support-region rank cut provably cannot close the last unit, and the
+///     heavyweight N-region γ-pricer is not worth building;
+///   - if it does reach it, the cut has the potential and the full pricer is
+///     justified.
+///
+/// MUTATES `rmp` with untracked rows — the caller must treat the search as
+/// invalid afterwards. Intended to run once, for measurement, then exit.
+fn maybe_probe_support_rank_resolve(
+    reduced: &Instance,
+    state: &SearchState,
+    rmp: &mut Rmp,
+    lp: &crate::solvers::bp::rmp::RmpSolution,
+    root_regions: Option<&RootSupportRegions>,
+    cfg: &crate::solvers::bp::BpConfig,
+    cancel: &crate::solvers::bp::Cancel,
+) {
+    if !cfg.support_rank_resolve {
+        return;
+    }
+    let Some(regions) = root_regions else {
+        info!(target: LOG_TARGET, "support-rank-resolve: no support regions");
+        return;
+    };
+    let lp0 = lp.objective;
+    let max_leaves = cfg.all_region_exact_max_leaves;
+    let mut installed = 0usize;
+    let mut sum_rank = 0usize;
+    let mut detail = Vec::new();
+    for (rid, region) in regions.comps.iter().enumerate() {
+        let leaves = region.leaf_count();
+        if leaves < 2 || leaves > max_leaves {
+            continue;
+        }
+        let (core, _) = klados_core::kernelize::restrict_instance_simple(reduced, &region.leaves);
+        let exact = crate::solvers::bp::solve_subinstance(
+            &core,
+            &crate::solvers::bp::BpConfig::default(),
+            cancel,
+        );
+        let Some(forest) = exact else {
+            detail.push(format!("{rid}:fail"));
+            continue;
+        };
+        let rank = forest.len();
+        sum_rank += rank;
+        // alpha_w = max merges within region = |region| - OPT(region).
+        let alpha_w = leaves.saturating_sub(rank);
+        // LP merge mass actually paid inside the region (sum over region-contained
+        // columns of (|c|-1)*x).
+        let lp_merge: f64 = region
+            .column_ids
+            .iter()
+            .map(|&ci| {
+                let labs = state.columns()[ci].labels();
+                if labs.len() >= 2 && labs.iter().all(|&l| region.leaves.contains(l as usize)) {
+                    (labs.len() - 1) as f64 * lp.column_values[ci]
+                } else {
+                    0.0
+                }
+            })
+            .sum();
+        if lp_merge > alpha_w as f64 + 1.0e-6 {
+            rmp.add_diagnostic_merge_cap_row(state.columns(), &region.leaves, alpha_w);
+            installed += 1;
+            detail.push(format!(
+                "{rid}:aw{alpha_w}|lpm{:.3}|v{:.3}",
+                lp_merge,
+                lp_merge - alpha_w as f64
+            ));
+        } else {
+            detail.push(format!("{rid}:aw{alpha_w}|tight"));
+        }
+    }
+    let lp1 = match rmp.solve() {
+        Ok(sol) => sol.objective,
+        Err(e) => {
+            info!(target: LOG_TARGET, "support-rank-resolve: re-solve failed: {e}");
+            return;
+        }
+    };
+    info!(
+        target: LOG_TARGET,
+        "support-rank-resolve: lp0={:.4} lp1={:.4} lift={:.4} ceil0={} ceil1={} rows_installed={} sum_region_rank={} detail=[{}]",
+        lp0, lp1, lp1 - lp0,
+        (lp0 - 1.0e-6).ceil() as i64,
+        (lp1 - 1.0e-6).ceil() as i64,
+        installed, sum_rank, detail.join(","),
     );
 }
 

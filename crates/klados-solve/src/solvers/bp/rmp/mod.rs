@@ -542,6 +542,56 @@ impl Rmp {
         self.num_rows += 1;
     }
 
+    /// Diagnostic-only **merge-cap** row (the strong MWIS rank inequality):
+    ///
+    /// ```text
+    /// sum_{c : labels(c) ⊆ region} (|c|-1) x_c <= alpha_w
+    /// ```
+    ///
+    /// where `alpha_w = max merges achievable within `region` = MWIS weight of
+    /// the region conflict graph = |region| - OPT(region). Valid for the full MAF
+    /// ILP: any agreement forest's region-contained components form an
+    /// independent set of the region conflict graph, so their total merge weight
+    /// `Σ(|c|-1)` is ≤ `alpha_w`. Unlike the `≥`-form rank row this caps merges
+    /// directly and cannot be satisfied by shifting mass onto straddling columns
+    /// (they are excluded from the sum).
+    ///
+    /// Untracked — temporary restricted-pool experiments only.
+    pub fn add_diagnostic_merge_cap_row(
+        &mut self,
+        columns: &[AfColumn],
+        region: &FixedBitSet,
+        alpha_w: usize,
+    ) {
+        let mut indices = Vec::new();
+        let mut values = Vec::new();
+        for (ci, col) in columns.iter().enumerate() {
+            let labs = col.labels();
+            if labs.len() < 2 {
+                continue; // singletons have weight 0
+            }
+            if labs.iter().all(|&l| region.contains(l as usize)) {
+                indices.push(self.col_handle[ci]);
+                values.push((labs.len() - 1) as f64);
+            }
+        }
+        if indices.is_empty() {
+            return;
+        }
+        let ptr = self.model.as_mut().expect("model present").as_mut_ptr();
+        unsafe {
+            highs_sys::Highs_addRow(
+                ptr,
+                f64::NEG_INFINITY,
+                alpha_w as f64,
+                indices.len() as i32,
+                indices.as_ptr(),
+                values.as_ptr(),
+            );
+        }
+        self.num_rows += 1;
+    }
+
     /// Diagnostic-only residual-completion row:
     ///
     /// ```text

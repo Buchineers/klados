@@ -75,11 +75,55 @@ impl Branchings {
         (left, right)
     }
 
-    /// True if there is no leafset satisfying every constraint — implied
-    /// when must-link and cannot-link conflict on the same pair.
+    /// True if there is no leafset satisfying every constraint.
+    ///
+    /// Must-link is an equivalence relation: `must(a,b) ∧ must(b,c)` forces
+    /// `a,b,c` into one component (transitivity). A node is infeasible when any
+    /// `cannot_link(x,y)` falls inside a single must-link class — including the
+    /// transitive case `must(a,b) ∧ must(b,c) ∧ cannot(a,c)`, which the old
+    /// same-pair check missed. Detecting it here prunes the branch in
+    /// microseconds instead of paying a full LP solve to discover the empty
+    /// node. Union-find over the leaves touched by must-links.
     pub fn is_inconsistent(&self) -> bool {
+        if self.must_link.is_empty() {
+            return false;
+        }
+        // Compact the touched leaves so the DSU is sized by participation, not
+        // by the (possibly large) global leaf count.
+        let mut ids: Vec<u32> = Vec::with_capacity(self.must_link.len() * 2);
         for ml in &self.must_link {
-            if self.cannot_link.contains(ml) {
+            ids.push(ml.a);
+            ids.push(ml.b);
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        let index = |x: u32| ids.binary_search(&x).expect("leaf in must-link set");
+        let mut parent: Vec<usize> = (0..ids.len()).collect();
+        fn find(parent: &mut [usize], x: usize) -> usize {
+            let mut r = x;
+            while parent[r] != r {
+                r = parent[r];
+            }
+            let mut c = x;
+            while parent[c] != r {
+                let next = parent[c];
+                parent[c] = r;
+                c = next;
+            }
+            r
+        }
+        for ml in &self.must_link {
+            let (ra, rb) = (find(&mut parent, index(ml.a)), find(&mut parent, index(ml.b)));
+            if ra != rb {
+                parent[ra] = rb;
+            }
+        }
+        for cl in &self.cannot_link {
+            // A cannot-link both of whose endpoints are in the must-link DSU and
+            // share a root is a transitive contradiction.
+            if let (Ok(ia), Ok(ib)) = (ids.binary_search(&cl.a), ids.binary_search(&cl.b))
+                && find(&mut parent, ia) == find(&mut parent, ib)
+            {
                 return true;
             }
         }

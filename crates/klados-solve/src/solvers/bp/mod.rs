@@ -112,6 +112,21 @@ pub struct BpConfig {
     pub all_region_support_mip: bool,
     pub all_region_exact_rank: bool,
     pub all_region_exact_max_leaves: usize,
+    /// Diagnostic: at the root, dump the LP fractional merges (leaf pairs with
+    /// fractional together-mass) and, for the top few, simulate committing them
+    /// (must/cannot-link) to measure ΔLP and how much the fractional support
+    /// collapses — i.e. whether the LP usefully ORDERS which merge to commit.
+    pub merge_order_probe: bool,
+    /// Prototype: at a stuck core root, solve the candidate-merge MWIS directly
+    /// (combinatorial), reporting the exact core opt vs the LP bound and time —
+    /// the "core-finisher" that replaces the LP cannot-link tree.
+    pub mwis_finish: bool,
+    /// Gate probe: at root convergence, install Σ_{touch region} x ≥ exact_rank
+    /// rank rows for every support region and re-solve the LP over the existing
+    /// pool, logging the lift. An UPPER bound on the achievable rank-cut closure
+    /// (no re-pricing) — if even this can't reach the integer optimum, the
+    /// support-region rank cut cannot close the last unit. Diagnostic only.
+    pub support_rank_resolve: bool,
     pub tree_side_exact_rank: bool,
     pub tree_laminar_exact_rank: bool,
     pub tree_side_exact_max_leaves: usize,
@@ -167,6 +182,9 @@ impl Default for BpConfig {
             all_region_support_mip: false,
             all_region_exact_rank: false,
             all_region_exact_max_leaves: 48,
+            support_rank_resolve: false,
+            merge_order_probe: false,
+            mwis_finish: false,
             tree_side_exact_rank: false,
             tree_laminar_exact_rank: false,
             tree_side_exact_max_leaves: 48,
@@ -234,6 +252,15 @@ impl BpConfig {
         }
         if std::env::var("KLADOS_BP_ALL_REGION_EXACT_RANK").as_deref() == Ok("1") {
             cfg.all_region_exact_rank = true;
+        }
+        if std::env::var("KLADOS_BP_SUPPORT_RANK_RESOLVE").as_deref() == Ok("1") {
+            cfg.support_rank_resolve = true;
+        }
+        if std::env::var("KLADOS_BP_MERGE_ORDER_PROBE").as_deref() == Ok("1") {
+            cfg.merge_order_probe = true;
+        }
+        if std::env::var("KLADOS_BP_MWIS_FINISH").as_deref() == Ok("1") {
+            cfg.mwis_finish = true;
         }
         if let Ok(raw) = std::env::var("KLADOS_BP_ALL_REGION_EXACT_MAX_LEAVES")
             && let Ok(value) = raw.parse::<usize>()
