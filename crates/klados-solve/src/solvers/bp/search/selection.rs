@@ -5,6 +5,7 @@ use crate::solvers::bp::column::AfColumn;
 use crate::solvers::bp::rmp::Rmp;
 use crate::solvers::bp::search::Branchings;
 use crate::solvers::bp::search::branchings::LeafPair;
+use fixedbitset::FixedBitSet;
 
 pub struct SelectionContext<'a> {
     pub columns: &'a [AfColumn],
@@ -12,6 +13,7 @@ pub struct SelectionContext<'a> {
     pub num_leaves: usize,
     pub branchings: &'a Branchings,
     pub current_lp_obj: f64,
+    pub clean_cut_side: Option<&'a FixedBitSet>,
 }
 
 pub trait BranchSelector {
@@ -105,11 +107,142 @@ pub struct MostFractionalPair;
 impl BranchSelector for MostFractionalPair {
     fn select(&mut self, ctx: &SelectionContext, _rmp: &mut Rmp) -> Option<Vec<Branchings>> {
         let (together, support) = pair_mass_and_support(ctx.columns, ctx.values, ctx.num_leaves);
+        if let Some(side) = ctx.clean_cut_side
+            && let Ok(raw_k) = std::env::var("KLADOS_BP_CROSS_BATCH")
+            && let Ok(k) = raw_k.parse::<usize>()
+            && k > 0
+        {
+            let pairs = top_cross_cut_pairs(&together, &support, ctx.num_leaves, side, k);
+            if !pairs.is_empty() {
+                let children = build_cross_batch_children(ctx.branchings, &pairs);
+                if !children.is_empty() {
+                    return Some(children);
+                }
+            }
+        }
+        if let Some(side) = ctx.clean_cut_side
+            && std::env::var("KLADOS_BP_CROSS_BRANCH").as_deref() == Ok("1")
+            && let Some(pair) = best_cross_cut_pair(&together, &support, ctx.num_leaves, side)
+        {
+            let (must, cannot) = ctx.branchings.split_on(pair);
+            // Explore cannot-link first: it moves toward the no-straddle face
+            // where the clean-cut rank floor is strongest.  The must-link child
+            // (explicit straddle) remains on the stack, so this is a pure search
+            // ordering/branch-choice heuristic, not a restriction.
+            return Some(vec![cannot, must]);
+        }
         let pairs = fractional_pairs(&together, &support, ctx.num_leaves);
         let pair = pairs.into_iter().next().map(|(p, _, _)| p)?;
         let (left, right) = ctx.branchings.split_on(pair);
         Some(vec![left, right])
     }
+}
+
+fn best_cross_cut_pair(
+    together: &[f64],
+    support: &[usize],
+    num_leaves: usize,
+    side: &FixedBitSet,
+) -> Option<LeafPair> {
+    let stride = num_leaves + 1;
+    let mut best: Option<(LeafPair, f64, usize, f64)> = None;
+    for a in 1..=num_leaves {
+        let a_in = side.contains(a);
+        for b in (a + 1)..=num_leaves {
+            if a_in == side.contains(b) {
+                continue;
+            }
+            let idx = a * stride + b;
+            let mass = together[idx];
+            if mass <= FRACTIONAL_EPS || mass >= 1.0 - FRACTIONAL_EPS {
+                continue;
+            }
+            let closeness = (mass - 0.5).abs();
+            let supp = support[idx];
+            // Primary: most fractional. Secondary: more support. Tertiary:
+            // larger cross mass (more immediate straddle pressure).
+            let cand = (LeafPair::new(a as u32, b as u32), closeness, supp, mass);
+            let better = best.is_none_or(|(_, bc, bs, bm)| {
+                closeness < bc - 1.0e-12
+                    || ((closeness - bc).abs() <= 1.0e-12
+                        && (supp > bs || (supp == bs && mass > bm)))
+            });
+            if better {
+                best = Some(cand);
+            }
+        }
+    }
+    best.map(|(p, _, _, _)| p)
+}
+
+fn top_cross_cut_pairs(
+    together: &[f64],
+    support: &[usize],
+    num_leaves: usize,
+    side: &FixedBitSet,
+    limit: usize,
+) -> Vec<LeafPair> {
+    let stride = num_leaves + 1;
+    let mut pairs: Vec<(LeafPair, f64, usize, f64)> = Vec::new();
+    for a in 1..=num_leaves {
+        let a_in = side.contains(a);
+        for b in (a + 1)..=num_leaves {
+            if a_in == side.contains(b) {
+                continue;
+            }
+            let idx = a * stride + b;
+            let mass = together[idx];
+            if mass <= FRACTIONAL_EPS || mass >= 1.0 - FRACTIONAL_EPS {
+                continue;
+            }
+            pairs.push((
+                LeafPair::new(a as u32, b as u32),
+                (mass - 0.5).abs(),
+                support[idx],
+                mass,
+            ));
+        }
+    }
+    pairs.sort_by(|a, b| {
+        a.1.partial_cmp(&b.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    pairs.into_iter().take(limit).map(|(p, _, _, _)| p).collect()
+}
+
+/// Exhaustive partition over an ordered set of cross-cut pairs P:
+/// - child 0: no pair in P is together
+/// - child i: pairs 0..i are not together, pair i is together
+///
+/// Any integer forest either contains no selected cross pair or has a first
+/// selected cross pair that is together, so no solution is lost.  Exploring
+/// child 0 first pushes the search toward the no-straddle face where clean-LB
+/// is strongest.
+fn build_cross_batch_children(parent: &Branchings, pairs: &[LeafPair]) -> Vec<Branchings> {
+    let mut children = Vec::with_capacity(pairs.len() + 1);
+
+    let mut no_selected = parent.clone();
+    for &p in pairs {
+        no_selected.push_cannot_link(p);
+    }
+    if !no_selected.is_inconsistent() {
+        children.push(no_selected);
+    }
+
+    for i in 0..pairs.len() {
+        let mut child = parent.clone();
+        for &p in &pairs[..i] {
+            child.push_cannot_link(p);
+        }
+        child.push_must_link(pairs[i]);
+        if !child.is_inconsistent() {
+            children.push(child);
+        }
+    }
+
+    children
 }
 
 /// Strong branching: take the top-K most-fractional pairs as candidates;

@@ -1214,7 +1214,7 @@ impl LeafPairDpPricer {
 
         let mut found: Vec<(f64, AfColumn)> = Vec::new();
         let mut global_max: f64 = NEG_INF;
-        let repair_cert = std::env::var("KLADOS_BP_REPAIR_CERT").as_deref() == Ok("1");
+        let repair_cert = std::env::var("KLADOS_BP_REPAIR_CERT").as_deref() != Ok("0");
         let scan = order.len().min(trial_limit);
         let mut completed = scan == order.len();
 

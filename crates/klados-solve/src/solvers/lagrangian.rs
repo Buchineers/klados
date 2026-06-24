@@ -3195,6 +3195,7 @@ impl LagrangianSolver {
                 num_leaves: nl,
                 branchings: &br,
                 current_lp_obj: lp,
+                clean_cut_side: None,
             };
             if let Some(children) = selector.select(&ctx, rmp) {
                 for child in children.into_iter().rev() {

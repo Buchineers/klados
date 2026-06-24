@@ -348,13 +348,6 @@ where
     if n <= 1 {
         return Some(trees[0..1].to_vec());
     }
-    info!(
-        target: LOG_TARGET,
-        "solve_inner entry: n={} m={} clean_lb={}",
-        reduced.num_leaves,
-        trees.len(),
-        cfg.clean_lb,
-    );
     maybe_log_core_decomp_potential(reduced, cfg.core_decomp_analyze, cfg.core_decomp_min_leaves);
 
     // Chen pairwise lower bound — a sound combinatorial floor on the
@@ -562,8 +555,8 @@ where
     let allow_bound_prune = use_bound_prune_shortcuts(reduced, trees);
     let mut allow_rcvf = use_rcvf_shortcuts(reduced, trees, cfg.no_rcvf, cfg.tiny_rcvf);
 
-    // Clean-cut lower-bound rank rows (m≥3, n≥threshold). GATED OFF by default;
-    // enable with `KLADOS_BP_CLEAN_LB=1`.
+    // Clean-cut lower-bound rank rows (m≥3, n≥threshold). Enabled by default;
+    // disable with `KLADOS_BP_CLEAN_LB=0` for an A/B baseline.
     //
     // Soundness requires two things:
     // - The pricer must price the rank-row duals exactly, including columns
@@ -575,7 +568,14 @@ where
         && trees.len() >= 3
         && reduced.num_leaves as usize >= CLEAN_LB_MIN_LEAVES
     {
-        maybe_install_clean_lb_rank_rows(reduced, &state, &mut rmp, cfg, cancel)
+        maybe_install_clean_lb_rank_rows(
+            reduced,
+            &mut state,
+            &mut rmp,
+            &mut seed_builder,
+            cfg,
+            cancel,
+        )
     } else {
         None
     };
@@ -758,8 +758,9 @@ const CLEAN_LB_MIN_LEAVES: usize = 34;
 /// unchanged) when there's no clean balanced cut or a side can't be proven.
 fn maybe_install_clean_lb_rank_rows(
     reduced: &Instance,
-    state: &SearchState,
+    state: &mut SearchState,
     rmp: &mut Rmp,
+    builder: &mut ColumnBuilder,
     cfg: &crate::solvers::bp::BpConfig,
     cancel: &crate::solvers::bp::Cancel,
 ) -> Option<FixedBitSet> {
@@ -781,9 +782,31 @@ fn maybe_install_clean_lb_rank_rows(
     // proven side optimum) and is required for the hard wall wins: without the
     // recursive bound the side proof can time out before the top-level rows are
     // ever installed.
-    let opt_c = prove_side_opt(reduced, &side_c, cfg, cancel)?;
-    let opt_cc = prove_side_opt(reduced, &side_cc, cfg, cancel)?;
+    let proof_c = prove_side_opt(reduced, &side_c, cfg, cancel)?;
+    let proof_cc = prove_side_opt(reduced, &side_cc, cfg, cancel)?;
+    let opt_c = proof_c.forest.len();
+    let opt_cc = proof_cc.forest.len();
     rmp.add_rank_rows(state.columns(), &side_c, opt_c, &side_cc, opt_cc);
+
+    // The two proven side forests also give a valid no-straddle full forest:
+    // the clean cut separates the label sets in every input tree, and each side
+    // forest is valid on its restricted instance.  Installing it as an incumbent
+    // is especially useful in the bridge-free case where floor=OPT: the rank
+    // rows provide the matching lower bound, while this forest provides the
+    // matching upper bound without waiting for the RMP support to turn integral.
+    if let Some(forest) = lift_clean_side_forests(reduced, proof_c, proof_cc)
+        && forest.len() < state.best_ub()
+        && validate_agreement_forest(reduced, &forest).is_ok()
+    {
+        install_incumbent(
+            state,
+            rmp,
+            &reduced.trees,
+            builder,
+            forest,
+            "clean-cut no-straddle",
+        );
+    }
     info!(
         target: LOG_TARGET,
         "clean-lb: rank rows installed OPT(C)={} OPT(Cc)={} floor={} |C|={} n={} ({:.1}ms)",
@@ -791,6 +814,11 @@ fn maybe_install_clean_lb_rank_rows(
         t.elapsed().as_secs_f64() * 1000.0,
     );
     Some(side_c)
+}
+
+struct SideProof {
+    forest: Vec<Tree>,
+    reverse_map: Vec<u32>,
 }
 
 /// Prove `OPT(side)` exactly via a sub-B&P on the side-restricted instance.
@@ -802,8 +830,8 @@ fn prove_side_opt(
     side: &FixedBitSet,
     cfg: &crate::solvers::bp::BpConfig,
     cancel: &crate::solvers::bp::Cancel,
-) -> Option<usize> {
-    let (core, _) = klados_core::kernelize::restrict_instance_simple(reduced, side);
+) -> Option<SideProof> {
+    let (core, reverse_map) = klados_core::kernelize::restrict_instance_simple(reduced, side);
     let sub_cancel = cancel.clone();
     let forest = crate::solvers::bp::solve_subinstance(&core, cfg, &sub_cancel)?;
     if sub_cancel.is_cancelled() {
@@ -812,7 +840,45 @@ fn prove_side_opt(
     if !validate_agreement_forest(&core, &forest).is_ok() {
         return None; // belt-and-suspenders: never trust an invalid forest's size
     }
-    Some(forest.len())
+    Some(SideProof {
+        forest,
+        reverse_map,
+    })
+}
+
+fn lift_clean_side_forests(
+    reduced: &Instance,
+    left: SideProof,
+    right: SideProof,
+) -> Option<Vec<Tree>> {
+    let n = reduced.num_leaves;
+    let mut out = Vec::with_capacity(left.forest.len() + right.forest.len());
+    for proof in [left, right] {
+        for component in proof.forest {
+            let mut leafset = FixedBitSet::with_capacity(n as usize + 1);
+            for local in component.leaves() {
+                let global = *proof.reverse_map.get(local as usize)?;
+                if global == 0 || global > n {
+                    return None;
+                }
+                leafset.insert(global as usize);
+            }
+            if leafset.count_ones(..) == 0 {
+                return None;
+            }
+            if leafset.count_ones(..) == 1 {
+                let label = leafset.ones().next()? as u32;
+                out.push(Tree::singleton(label, n));
+            } else {
+                out.push(Tree::component_from_leafset(
+                    &leafset,
+                    reduced.reference_tree(),
+                    n,
+                ));
+            }
+        }
+    }
+    Some(out)
 }
 
 fn price_node<P: Pricer>(
@@ -1365,6 +1431,7 @@ fn solve_node<P: Pricer, S: BranchSelector>(
             num_leaves: state.num_leaves(),
             branchings,
             current_lp_obj: lp.objective,
+            clean_cut_side,
         },
         rmp,
     );
