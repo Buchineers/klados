@@ -43,12 +43,15 @@ use std::time::Instant;
 
 use crate::solvers::bp::column::{AfColumn, ColumnSet};
 use crate::solvers::bp::search::Branchings;
+use fixedbitset::FixedBitSet;
 
 pub struct PricingContext<'a> {
     pub trees: &'a [Tree],
     pub num_leaves: usize,
     pub alpha: &'a [f64],
     pub beta: &'a [Vec<f64>],
+    pub rank_cut_groups: &'a [Vec<FixedBitSet>],
+    pub rank_cut_duals: &'a [f64],
     pub columns: &'a [AfColumn],
     pub seen: &'a ColumnSet,
     pub branchings: &'a Branchings,
@@ -69,6 +72,46 @@ impl<'a> PricingContext<'a> {
         self.terminate.load(core::sync::atomic::Ordering::Relaxed)
             || self.deadline.is_some_and(|d| Instant::now() >= d)
     }
+
+    #[inline]
+    pub fn rank_bonus(&self, column: &AfColumn) -> f64 {
+        rank_bonus_for_labels(column.labels(), self.rank_cut_groups, self.rank_cut_duals)
+    }
+
+    #[inline]
+    pub fn pricing_score(&self, column: &AfColumn) -> f64 {
+        column.pricing_score(self.alpha, self.beta) + self.rank_bonus(column)
+    }
+
+    #[inline]
+    pub fn max_rank_bonus(&self) -> f64 {
+        self.rank_cut_duals
+            .iter()
+            .copied()
+            .zip(self.rank_cut_groups.iter())
+            .filter(|(dual, _)| *dual > 0.0)
+            .map(|(dual, group)| dual * group.len() as f64)
+            .sum()
+    }
+}
+
+pub fn rank_bonus_for_labels(
+    labels: &[u32],
+    rank_cut_groups: &[Vec<FixedBitSet>],
+    rank_cut_duals: &[f64],
+) -> f64 {
+    rank_cut_groups
+        .iter()
+        .zip(rank_cut_duals.iter().copied())
+        .filter(|(_, dual)| *dual > 0.0)
+        .map(|(group, dual)| {
+            let coeff = group
+                .iter()
+                .filter(|cut| labels.iter().any(|&label| cut.contains(label as usize)))
+                .count() as f64;
+            coeff * dual
+        })
+        .sum()
 }
 
 /// Never-set cancellation flag for pricing callers that don't supply their own.

@@ -850,7 +850,7 @@ impl LeafPairDpPricer {
                             if !ctx.branchings.forbids(&column) {
                                 // Re-score via the canonical column coverage as
                                 // a final exact guard before returning.
-                                let full_score = column.pricing_score(ctx.alpha, ctx.beta);
+                                let full_score = ctx.pricing_score(&column);
                                 if full_score > 1.0 + PRICING_EPS {
                                     found.push((full_score, column));
                                     continue;
@@ -871,7 +871,7 @@ impl LeafPairDpPricer {
             // only below, to emission.
             let score = self.solve_pair(a, b, ctx.alpha, ctx.beta);
             global_max = global_max.max(score);
-            if score <= 1.0 + PRICING_EPS {
+            if score + ctx.max_rank_bonus() <= 1.0 + PRICING_EPS {
                 continue;
             }
             // An improving column exists at this anchor. The DP builds it
@@ -897,7 +897,7 @@ impl LeafPairDpPricer {
             let column = scratch.builder.build_unchecked(labels, ctx.trees);
             // Repair drops leaves, so the score changes — re-score exactly and
             // re-check that the repaired column is still improving.
-            let score = column.pricing_score(ctx.alpha, ctx.beta);
+            let score = ctx.pricing_score(&column);
             if score <= 1.0 + PRICING_EPS {
                 continue;
             }
@@ -1095,7 +1095,7 @@ impl Pricer for LeafPairDpPricer {
                 let idx = a * p + b;
                 let ub = self.pair_ub[idx];
                 let rp = self.root_penalty(a, b, ctx.beta);
-                let tight = ub - rp;
+                let tight = ub - rp + ctx.max_rank_bonus();
                 if tight > max_bound {
                     max_bound = tight;
                 }
@@ -1176,7 +1176,7 @@ impl Pricer for LeafPairDpPricer {
 
         // No emittable column. Decide between a proven `Converged` and an
         // uncertified `Improving`.
-        if result.completed && result.global_max <= 1.0 + PRICING_EPS {
+        if result.completed && result.global_max + ctx.max_rank_bonus() <= 1.0 + PRICING_EPS {
             // The full all-anchor scan completed and the constraint-blind max
             // anchor score is ≤ 1+ε: `solve_pair` dominates every column at
             // its anchor (§3), so no improving column exists anywhere.

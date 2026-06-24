@@ -108,7 +108,7 @@ impl PricerScratch {
                 self.pricing_stats.reserve_discarded += 1;
                 continue;
             }
-            let score = col.pricing_score(ctx.alpha, ctx.beta);
+            let score = ctx.pricing_score(col);
             if score > 1.0 + PRICING_EPS {
                 scored.push((score, i));
             } else {
@@ -155,8 +155,8 @@ impl PricerScratch {
         limit: usize,
     ) -> Vec<AfColumn> {
         cols.sort_unstable_by(|a, b| {
-            let sa = a.pricing_score(ctx.alpha, ctx.beta);
-            let sb = b.pricing_score(ctx.alpha, ctx.beta);
+            let sa = ctx.pricing_score(a);
+            let sb = ctx.pricing_score(b);
             sb.total_cmp(&sa)
                 .then_with(|| b.size().cmp(&a.size()))
                 .then_with(|| a.labels().cmp(b.labels()))

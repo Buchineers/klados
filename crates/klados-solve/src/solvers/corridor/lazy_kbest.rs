@@ -930,6 +930,8 @@ mod tests {
             num_leaves: nl,
             alpha: &alpha,
             beta: &beta,
+            rank_cut_groups: &[],
+            rank_cut_duals: &[],
             columns: &columns,
             seen: &seen,
             branchings: &branchings,

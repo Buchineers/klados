@@ -6,7 +6,7 @@
 //! the rationale.
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
@@ -448,6 +448,7 @@ where
     let mut selector = crate::solvers::bp::search::selection::MostFractionalPair;
     let mut tel = Telemetry::default();
     let mut root_regions: Option<RootSupportRegions> = None;
+    let mut pool_mip_guide: Option<Vec<u32>> = None;
 
     // DFS stack carrying parent LP bounds. We tried best-first (min-heap
     // by parent_lp) and it regressed badly (~2× on both easy and hard
@@ -542,6 +543,7 @@ where
             &mut selector,
             &mut tel,
             &mut root_regions,
+            &mut pool_mip_guide,
             allow_bound_prune,
             allow_rcvf,
             chen_lb,
@@ -628,6 +630,7 @@ fn solve_node<P: Pricer, S: BranchSelector>(
     selector: &mut S,
     tel: &mut Telemetry,
     root_regions: &mut Option<RootSupportRegions>,
+    pool_mip_guide: &mut Option<Vec<u32>>,
     allow_bound_prune: bool,
     allow_rcvf: bool,
     chen_lb: usize,
@@ -705,6 +708,8 @@ fn solve_node<P: Pricer, S: BranchSelector>(
                 num_leaves: state.num_leaves(),
                 alpha: &lp.leaf_duals,
                 beta: &lp.node_duals,
+                rank_cut_groups: rmp.rank_cut_groups(),
+                rank_cut_duals: &lp.rank_cut_duals,
                 columns: state.columns(),
                 seen: state.seen(),
                 branchings,
@@ -782,6 +787,23 @@ fn solve_node<P: Pricer, S: BranchSelector>(
     } else {
         chen_lb
     };
+
+    if branchings.depth() == 0 {
+        info!(
+            target: LOG_TARGET,
+            "bp root: n={} m={} chen_lb={} lp={:.4} lp_lb={} certified={} ub={} gap_to_ub={} cols={} cg_iters={}",
+            reduced.num_leaves,
+            trees.len(),
+            chen_lb,
+            lp.objective,
+            lp_lb,
+            node_converged,
+            state.best_ub(),
+            state.best_ub().saturating_sub(lb),
+            state.columns().len(),
+            tel.cg_iters,
+        );
+    }
 
     if allow_bound_prune && can_prune_by_bound(lb, state.best_ub(), cfg.disable_bound_prune) {
         debug!(
@@ -865,6 +887,35 @@ fn solve_node<P: Pricer, S: BranchSelector>(
             }
         }
         maybe_probe_root_obstruction(reduced, state, &lp, root_regions.as_ref(), cfg);
+        if (cfg.root_pool_mip_probe || cfg.root_pool_mip_incumbent || cfg.pool_mip_guided_branching)
+            && reduced.num_leaves >= cfg.root_pool_mip_min_leaves
+        {
+            if let Some(guide) = probe_root_pool_mip(reduced, state, &lp, rmp, tel, cfg) {
+                *pool_mip_guide = Some(guide);
+            }
+        }
+        if cfg.pool_triangle_cut_probe {
+            probe_pool_triangle_cuts(reduced, state, &lp, rmp, tel, cfg);
+        }
+        if cfg.pool_odd_cycle_cut_probe {
+            probe_pool_odd_cycle_cuts(reduced, state, &lp, rmp, tel, cfg);
+        }
+        if cfg.local_rank_online_top_k > 0 && reduced.num_leaves >= cfg.local_rank_online_min_leaves
+        {
+            probe_online_local_rank_cuts(
+                reduced,
+                state,
+                branchings,
+                &lp,
+                root_regions.as_ref(),
+                rmp,
+                pricer,
+                scratch,
+                tel,
+                cancel,
+                cfg,
+            );
+        }
         maybe_log_bridge_footprint(
             "root-incumbent",
             state.incumbent(),
@@ -1079,6 +1130,11 @@ fn solve_node<P: Pricer, S: BranchSelector>(
             num_leaves: state.num_leaves(),
             branchings,
             current_lp_obj: lp.objective,
+            guide_partition: cfg
+                .pool_mip_guided_branching
+                .then_some(pool_mip_guide.as_deref())
+                .flatten(),
+            guide_max_depth: cfg.pool_mip_guided_max_depth,
         },
         rmp,
     );
@@ -1280,6 +1336,9 @@ fn probe_root_obstruction_impl(
     if cfg.root_support_mip {
         probe_root_support_mip(reduced, state, lp, regions);
     }
+    if cfg.local_rank_probe {
+        probe_local_rank_cuts(reduced, state, lp, regions);
+    }
 
     let Some(largest) = regions.comps.first() else {
         return;
@@ -1359,6 +1418,912 @@ fn probe_root_obstruction_impl(
             t0.elapsed().as_secs_f64() * 1000.0,
         ),
     }
+}
+
+fn probe_root_pool_mip(
+    reduced: &Instance,
+    state: &mut SearchState,
+    lp: &crate::solvers::bp::rmp::RmpSolution,
+    rmp: &mut Rmp,
+    tel: &mut Telemetry,
+    cfg: &crate::solvers::bp::BpConfig,
+) -> Option<Vec<u32>> {
+    let t_all = Instant::now();
+    let mut attempts = 0usize;
+    let mut cuts_added = 0usize;
+    loop {
+        attempts += 1;
+        let t0 = Instant::now();
+        let mip = match rmp.solve_mip_with_time_limit(cfg.root_pool_mip_time_limit) {
+            Ok(Some(mip)) => mip,
+            Ok(None) => {
+                info!(
+                    target: LOG_TARGET,
+                    "root-pool-mip: n={} m={} root_lp={:.6} root_ceil={} ub={} cols={} attempts={} cuts={} status=no_solution_or_timeout total_ms={:.1}",
+                    reduced.num_leaves,
+                    reduced.num_trees(),
+                    lp.objective,
+                    (lp.objective - 1.0e-6).ceil() as usize,
+                    state.best_ub(),
+                    state.columns().len(),
+                    attempts,
+                    cuts_added,
+                    t_all.elapsed().as_secs_f64() * 1000.0,
+                );
+                return None;
+            }
+            Err(e) => {
+                info!(
+                    target: LOG_TARGET,
+                    "root-pool-mip: n={} m={} root_lp={:.6} root_ceil={} ub={} cols={} attempts={} cuts={} status=error error={} total_ms={:.1}",
+                    reduced.num_leaves,
+                    reduced.num_trees(),
+                    lp.objective,
+                    (lp.objective - 1.0e-6).ceil() as usize,
+                    state.best_ub(),
+                    state.columns().len(),
+                    attempts,
+                    cuts_added,
+                    e,
+                    t_all.elapsed().as_secs_f64() * 1000.0,
+                );
+                return None;
+            }
+        };
+        tel.timings.lp_solve += t0.elapsed();
+        let new_cuts = rmp.separate_and_add_cuts(state.columns(), &mip.column_values, 0.5);
+        if new_cuts > 0 && attempts < 8 {
+            cuts_added += new_cuts;
+            tel.cuts_added += new_cuts;
+            continue;
+        }
+        let ub_before = state.best_ub();
+        let mut guide = None;
+        let mut installed = false;
+        let inc = try_integral(state, &mip.column_values);
+        let integral_k = inc.as_ref().map(|inc| inc.k);
+        if let Some(inc) = inc {
+            if cfg.pool_mip_guided_branching {
+                guide = Some(guide_partition_from_incumbent(
+                    &inc,
+                    state.columns(),
+                    state.num_leaves(),
+                ));
+            }
+            if cfg.root_pool_mip_incumbent && inc.k < state.best_ub() && state.update_incumbent(inc)
+            {
+                installed = true;
+                tel.incumbent_updates += 1;
+                rmp.reapply_root_rcvf(state.columns(), state.best_ub());
+            }
+        }
+        info!(
+            target: LOG_TARGET,
+            "root-pool-mip: n={} m={} root_lp={:.6} root_ceil={} ub={} pool_ip={:.6} integral_k={:?} installed={} ip_gap_to_ceil={:.6} ub_gap_to_ip={:.6} cols={} attempts={} cuts={} status=optimal mip_ms={:.1} total_ms={:.1}",
+            reduced.num_leaves,
+            reduced.num_trees(),
+            lp.objective,
+            (lp.objective - 1.0e-6).ceil() as usize,
+            ub_before,
+            mip.objective,
+            integral_k,
+            installed,
+            mip.objective - (lp.objective - 1.0e-6).ceil(),
+            ub_before as f64 - mip.objective,
+            state.columns().len(),
+            attempts,
+            cuts_added + new_cuts,
+            t0.elapsed().as_secs_f64() * 1000.0,
+            t_all.elapsed().as_secs_f64() * 1000.0,
+        );
+        return guide;
+    }
+}
+
+fn guide_partition_from_incumbent(
+    inc: &Incumbent,
+    columns: &[AfColumn],
+    num_leaves: usize,
+) -> Vec<u32> {
+    let mut part = vec![u32::MAX; num_leaves + 1];
+    for (component_id, &ci) in inc.component_columns.iter().enumerate() {
+        for &label in columns[ci].labels() {
+            part[label as usize] = component_id as u32;
+        }
+    }
+    part
+}
+
+fn probe_pool_triangle_cuts(
+    reduced: &Instance,
+    state: &SearchState,
+    lp: &crate::solvers::bp::rmp::RmpSolution,
+    rmp: &mut Rmp,
+    tel: &mut Telemetry,
+    cfg: &crate::solvers::bp::BpConfig,
+) {
+    const MAX_FRAC_COLS: usize = 220;
+    let t_all = Instant::now();
+    let mut frac: Vec<usize> = lp
+        .column_values
+        .iter()
+        .enumerate()
+        .filter_map(|(ci, &v)| (v > 1.0e-6 && v < 1.0 - 1.0e-6).then_some(ci))
+        .collect();
+    frac.sort_by(|&a, &b| {
+        let va = lp.column_values[a];
+        let vb = lp.column_values[b];
+        vb.total_cmp(&va)
+            .then_with(|| state.columns()[b].size().cmp(&state.columns()[a].size()))
+    });
+    frac.truncate(MAX_FRAC_COLS);
+    let n = frac.len();
+    if n < 3 {
+        return;
+    }
+
+    let mut adj = vec![vec![false; n]; n];
+    let mut edge_count = 0usize;
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if columns_conflict(&state.columns()[frac[i]], &state.columns()[frac[j]]) {
+                adj[i][j] = true;
+                adj[j][i] = true;
+                edge_count += 1;
+            }
+        }
+    }
+
+    let mut triangles = Vec::new();
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if !adj[i][j] {
+                continue;
+            }
+            for k in (j + 1)..n {
+                if adj[i][k] && adj[j][k] {
+                    let sum = lp.column_values[frac[i]]
+                        + lp.column_values[frac[j]]
+                        + lp.column_values[frac[k]];
+                    let violation = sum - 1.0;
+                    if violation > 1.0e-6 {
+                        triangles.push((violation, [frac[i], frac[j], frac[k]]));
+                    }
+                }
+            }
+        }
+    }
+    triangles.sort_by(|a, b| b.0.total_cmp(&a.0));
+
+    let mut used = FixedBitSet::with_capacity(state.columns().len());
+    let mut selected = Vec::new();
+    for &(_, ids) in &triangles {
+        if ids.iter().any(|&ci| used.contains(ci)) {
+            continue;
+        }
+        for &ci in &ids {
+            used.insert(ci);
+        }
+        selected.push(ids);
+        if selected.len() >= cfg.pool_triangle_cut_limit {
+            break;
+        }
+    }
+
+    let baseline = lp.objective;
+    for ids in &selected {
+        rmp.add_pool_clique_cut(ids, 1);
+    }
+    let mut final_lp = baseline;
+    let mut status = "no_cuts";
+    if !selected.is_empty() {
+        let t0 = Instant::now();
+        match rmp.solve() {
+            Ok(cut_lp) => {
+                tel.timings.lp_solve += t0.elapsed();
+                final_lp = cut_lp.objective;
+                status = "resolved";
+            }
+            Err(_) => {
+                status = "lp_error";
+            }
+        }
+    }
+
+    info!(
+        target: LOG_TARGET,
+        "pool-triangle-cuts: n={} m={} frac_cols={} edges={} triangles={} selected={} best_violation={:.4} baseline_lp={:.6} final_lp={:.6} lp_lift={:.6} ceil_lift={} status={} ms={:.1}",
+        reduced.num_leaves,
+        reduced.num_trees(),
+        n,
+        edge_count,
+        triangles.len(),
+        selected.len(),
+        triangles.first().map(|t| t.0).unwrap_or(0.0),
+        baseline,
+        final_lp,
+        final_lp - baseline,
+        (final_lp - 1.0e-6).ceil() as isize - (baseline - 1.0e-6).ceil() as isize,
+        status,
+        t_all.elapsed().as_secs_f64() * 1000.0,
+    );
+}
+
+fn probe_pool_odd_cycle_cuts(
+    reduced: &Instance,
+    state: &SearchState,
+    lp: &crate::solvers::bp::rmp::RmpSolution,
+    rmp: &mut Rmp,
+    tel: &mut Telemetry,
+    cfg: &crate::solvers::bp::BpConfig,
+) {
+    const MAX_FRAC_COLS: usize = 220;
+
+    let t_all = Instant::now();
+    let mut frac: Vec<usize> = lp
+        .column_values
+        .iter()
+        .enumerate()
+        .filter_map(|(ci, &v)| (v > 1.0e-6 && v < 1.0 - 1.0e-6).then_some(ci))
+        .collect();
+    frac.sort_by(|&a, &b| {
+        let va = lp.column_values[a];
+        let vb = lp.column_values[b];
+        vb.total_cmp(&va)
+            .then_with(|| state.columns()[b].size().cmp(&state.columns()[a].size()))
+    });
+    frac.truncate(MAX_FRAC_COLS);
+    let n = frac.len();
+    if n < 5 {
+        return;
+    }
+
+    let mut adj = vec![Vec::<usize>::new(); n];
+    let mut edge_count = 0usize;
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if columns_conflict(&state.columns()[frac[i]], &state.columns()[frac[j]]) {
+                adj[i].push(j);
+                adj[j].push(i);
+                edge_count += 1;
+            }
+        }
+    }
+
+    let mut cycles = Vec::<(f64, Vec<usize>)>::new();
+    for cycle in find_odd_cycles_by_coloring(&adj) {
+        let k = cycle.len();
+        if k < 5 || k % 2 == 0 {
+            continue;
+        }
+        let sum: f64 = cycle.iter().map(|&idx| lp.column_values[frac[idx]]).sum();
+        let rhs = k / 2;
+        let violation = sum - rhs as f64;
+        if violation > 1.0e-6 {
+            cycles.push((violation, cycle.into_iter().map(|idx| frac[idx]).collect()));
+        }
+    }
+    cycles.sort_by(|a, b| b.0.total_cmp(&a.0));
+
+    let mut used = FixedBitSet::with_capacity(state.columns().len());
+    let mut selected = Vec::new();
+    for (_, ids) in &cycles {
+        if ids.iter().any(|&ci| used.contains(ci)) {
+            continue;
+        }
+        for &ci in ids {
+            used.insert(ci);
+        }
+        selected.push(ids.clone());
+        if selected.len() >= cfg.pool_odd_cycle_cut_limit {
+            break;
+        }
+    }
+
+    let baseline = lp.objective;
+    for ids in &selected {
+        rmp.add_pool_clique_cut(ids, ids.len() / 2);
+    }
+    let mut final_lp = baseline;
+    let mut status = "no_cuts";
+    if !selected.is_empty() {
+        let t0 = Instant::now();
+        match rmp.solve() {
+            Ok(cut_lp) => {
+                tel.timings.lp_solve += t0.elapsed();
+                final_lp = cut_lp.objective;
+                status = "resolved";
+            }
+            Err(_) => {
+                status = "lp_error";
+            }
+        }
+    }
+
+    info!(
+        target: LOG_TARGET,
+        "pool-odd-cycle-cuts: n={} m={} frac_cols={} edges={} cycles={} selected={} best_violation={:.4} baseline_lp={:.6} final_lp={:.6} lp_lift={:.6} ceil_lift={} status={} ms={:.1}",
+        reduced.num_leaves,
+        reduced.num_trees(),
+        n,
+        edge_count,
+        cycles.len(),
+        selected.len(),
+        cycles.first().map(|t| t.0).unwrap_or(0.0),
+        baseline,
+        final_lp,
+        final_lp - baseline,
+        (final_lp - 1.0e-6).ceil() as isize - (baseline - 1.0e-6).ceil() as isize,
+        status,
+        t_all.elapsed().as_secs_f64() * 1000.0,
+    );
+}
+
+fn find_odd_cycles_by_coloring(adj: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    let n = adj.len();
+    let mut color = vec![None::<u8>; n];
+    let mut parent = vec![usize::MAX; n];
+    let mut out = Vec::new();
+    for root in 0..n {
+        if color[root].is_some() {
+            continue;
+        }
+        color[root] = Some(0);
+        parent[root] = root;
+        let mut queue = VecDeque::new();
+        queue.push_back(root);
+        while let Some(u) = queue.pop_front() {
+            let cu = color[u].unwrap();
+            for &v in &adj[u] {
+                match color[v] {
+                    None => {
+                        color[v] = Some(1 - cu);
+                        parent[v] = u;
+                        queue.push_back(v);
+                    }
+                    Some(cv) if cv == cu => {
+                        if let Some(cycle) = reconstruct_odd_cycle(u, v, &parent) {
+                            out.push(cycle);
+                        }
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+    }
+    out
+}
+
+fn reconstruct_odd_cycle(u: usize, v: usize, parent: &[usize]) -> Option<Vec<usize>> {
+    let mut path_u = Vec::new();
+    let mut x = u;
+    loop {
+        path_u.push(x);
+        if parent[x] == x || parent[x] == usize::MAX {
+            break;
+        }
+        x = parent[x];
+    }
+    let mut pos = HashMap::new();
+    for (i, &node) in path_u.iter().enumerate() {
+        pos.insert(node, i);
+    }
+    let mut path_v = Vec::new();
+    let mut y = v;
+    loop {
+        if let Some(&i) = pos.get(&y) {
+            let mut cycle = path_u[..=i].to_vec();
+            path_v.reverse();
+            cycle.extend(path_v);
+            cycle.dedup();
+            return Some(cycle);
+        }
+        path_v.push(y);
+        if parent[y] == y || parent[y] == usize::MAX {
+            break;
+        }
+        y = parent[y];
+    }
+    None
+}
+
+fn columns_conflict(a: &AfColumn, b: &AfColumn) -> bool {
+    if sorted_slices_intersect(a.labels(), b.labels()) {
+        return true;
+    }
+    a.coverage()
+        .iter_per_tree()
+        .zip(b.coverage().iter_per_tree())
+        .any(|(x, y)| sorted_slices_intersect_usize(x, y))
+}
+
+fn sorted_slices_intersect(a: &[u32], b: &[u32]) -> bool {
+    let mut i = 0;
+    let mut j = 0;
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Equal => return true,
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+        }
+    }
+    false
+}
+
+fn sorted_slices_intersect_usize(a: &[usize], b: &[usize]) -> bool {
+    let mut i = 0;
+    let mut j = 0;
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Equal => return true,
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+        }
+    }
+    false
+}
+
+fn probe_local_rank_cuts(
+    reduced: &Instance,
+    state: &SearchState,
+    lp: &crate::solvers::bp::rmp::RmpSolution,
+    regions: &RootSupportRegions,
+) {
+    const MIN_LEAVES: usize = 8;
+    const MAX_LEAVES: usize = 25;
+    const MAX_CANDIDATES: usize = 32;
+    const MAX_MS_PER_CANDIDATE: u64 = 250;
+
+    let t_all = Instant::now();
+    let mut candidates = Vec::new();
+    for region in regions.comps.iter().take(8) {
+        add_local_rank_candidates(region, state, lp, &mut candidates);
+        if candidates.len() >= MAX_CANDIDATES {
+            break;
+        }
+    }
+
+    candidates.retain(|labels| labels.len() >= MIN_LEAVES && labels.len() <= MAX_LEAVES);
+    candidates.sort();
+    candidates.dedup();
+    candidates.truncate(MAX_CANDIDATES);
+
+    let mut checked = 0usize;
+    let mut solved = 0usize;
+    let mut skipped = 0usize;
+    let mut violations: Vec<(f64, usize, f64, f64, f64, usize, f64, Vec<u32>)> = Vec::new();
+    for labels in candidates {
+        checked += 1;
+        let mut keep = FixedBitSet::with_capacity(reduced.num_leaves as usize + 1);
+        for &label in &labels {
+            keep.insert(label as usize);
+        }
+        let (local_mass, subset_mass, crossing_mass) = support_mass_breakdown(state, lp, &keep);
+        let (core, _reverse_map) = klados_core::kernelize::restrict_instance_simple(reduced, &keep);
+        let deadline = Instant::now() + std::time::Duration::from_millis(MAX_MS_PER_CANDIDATE);
+        let cancel = crate::solvers::bp::Cancel::with_deadline(
+            Arc::new(AtomicBool::new(false)),
+            Some(deadline),
+        );
+        let t0 = Instant::now();
+        let exact = crate::solvers::bp::solve_subinstance(
+            &core,
+            &crate::solvers::bp::BpConfig::default(),
+            &cancel,
+        );
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let Some(forest) = exact else {
+            skipped += 1;
+            continue;
+        };
+        solved += 1;
+        let k = forest.len();
+        let violation = k as f64 - local_mass;
+        if violation > 1.0e-6 {
+            violations.push((
+                violation,
+                k,
+                local_mass,
+                subset_mass,
+                crossing_mass,
+                core.num_leaves as usize,
+                ms,
+                labels,
+            ));
+        }
+    }
+    violations.sort_by(|a, b| b.0.total_cmp(&a.0));
+
+    info!(
+        target: LOG_TARGET,
+        "local-rank-probe: candidates={} solved={} skipped={} violations={} best_violation={:.4} total_ms={:.1}",
+        checked,
+        solved,
+        skipped,
+        violations.len(),
+        violations.first().map(|v| v.0).unwrap_or(0.0),
+        t_all.elapsed().as_secs_f64() * 1000.0,
+    );
+    if !violations.is_empty() {
+        let total_mass: f64 = violations.iter().map(|v| v.2).sum();
+        let total_subset: f64 = violations.iter().map(|v| v.3).sum();
+        let total_crossing: f64 = violations.iter().map(|v| v.4).sum();
+        info!(
+            target: LOG_TARGET,
+            "local-rank-leakage: violations={} mass={:.4} subset={:.4} crossing={:.4} crossing_frac={:.4}",
+            violations.len(),
+            total_mass,
+            total_subset,
+            total_crossing,
+            total_crossing / total_mass.max(1.0e-9),
+        );
+    }
+    for (rank, (violation, k, mass, subset, crossing, n, ms, labels)) in
+        violations.iter().take(5).enumerate()
+    {
+        info!(
+            target: LOG_TARGET,
+            "local-rank-probe: violation#{} size={} exact_k={} mass={:.4} subset={:.4} crossing={:.4} crossing_frac={:.4} deficit={:.4} solve_ms={:.1} labels={:?}",
+            rank + 1,
+            n,
+            k,
+            mass,
+            subset,
+            crossing,
+            crossing / mass.max(1.0e-9),
+            violation,
+            ms,
+            labels,
+        );
+    }
+}
+
+fn add_local_rank_candidates(
+    region: &SupportComponentSummary,
+    state: &SearchState,
+    lp: &crate::solvers::bp::rmp::RmpSolution,
+    candidates: &mut Vec<Vec<u32>>,
+) {
+    const MAX_LEAVES: usize = 25;
+    let mut frac_cols: Vec<_> = region
+        .column_ids
+        .iter()
+        .copied()
+        .filter(|&ci| lp.column_values[ci] > 1.0e-6 && lp.column_values[ci] < 1.0 - 1.0e-6)
+        .collect();
+    frac_cols.sort_by(|&a, &b| {
+        let sa = (lp.column_values[a] - 0.5).abs();
+        let sb = (lp.column_values[b] - 0.5).abs();
+        sa.total_cmp(&sb)
+            .then_with(|| state.columns()[b].size().cmp(&state.columns()[a].size()))
+    });
+
+    for &seed in frac_cols.iter().take(24) {
+        let mut labels: Vec<u32> = state.columns()[seed].labels().to_vec();
+        if labels.len() > MAX_LEAVES {
+            labels.truncate(MAX_LEAVES);
+        }
+        for &ci in &frac_cols {
+            if ci == seed || labels.len() >= MAX_LEAVES {
+                continue;
+            }
+            let col_labels = state.columns()[ci].labels();
+            if !shares_label(&labels, col_labels) {
+                continue;
+            }
+            for &label in col_labels {
+                if labels.len() >= MAX_LEAVES {
+                    break;
+                }
+                if labels.binary_search(&label).is_err() {
+                    labels.push(label);
+                    labels.sort_unstable();
+                }
+            }
+        }
+        labels.sort_unstable();
+        labels.dedup();
+        candidates.push(labels);
+    }
+}
+
+fn shares_label(a: &[u32], b: &[u32]) -> bool {
+    let mut i = 0;
+    let mut j = 0;
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Equal => return true,
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+        }
+    }
+    false
+}
+
+fn intersecting_support_mass(
+    state: &SearchState,
+    lp: &crate::solvers::bp::rmp::RmpSolution,
+    keep: &FixedBitSet,
+) -> f64 {
+    lp.column_values
+        .iter()
+        .enumerate()
+        .filter(|&(_, &value)| value > 1.0e-9)
+        .filter(|(ci, _)| {
+            state.columns()[*ci]
+                .labels()
+                .iter()
+                .any(|&label| keep.contains(label as usize))
+        })
+        .map(|(_, &value)| value)
+        .sum()
+}
+
+fn support_mass_breakdown(
+    state: &SearchState,
+    lp: &crate::solvers::bp::rmp::RmpSolution,
+    keep: &FixedBitSet,
+) -> (f64, f64, f64) {
+    let mut intersecting = 0.0;
+    let mut subset = 0.0;
+    for (ci, &value) in lp.column_values.iter().enumerate() {
+        if value <= 1.0e-9 {
+            continue;
+        }
+        let labels = state.columns()[ci].labels();
+        let hits = labels.iter().any(|&label| keep.contains(label as usize));
+        if !hits {
+            continue;
+        }
+        intersecting += value;
+        if labels.iter().all(|&label| keep.contains(label as usize)) {
+            subset += value;
+        }
+    }
+    (intersecting, subset, intersecting - subset)
+}
+
+struct LocalRankCandidate {
+    bitset: FixedBitSet,
+    exact_k: usize,
+    deficit: f64,
+}
+
+fn collect_local_rank_candidates(
+    reduced: &Instance,
+    state: &SearchState,
+    lp: &crate::solvers::bp::rmp::RmpSolution,
+    regions: &RootSupportRegions,
+) -> Vec<LocalRankCandidate> {
+    const MIN_LEAVES: usize = 8;
+    const MAX_LEAVES: usize = 25;
+    const MAX_CANDIDATES: usize = 32;
+    const MAX_MS_PER_CANDIDATE: u64 = 250;
+
+    let mut labels_candidates = Vec::new();
+    for region in regions.comps.iter().take(8) {
+        add_local_rank_candidates(region, state, lp, &mut labels_candidates);
+        if labels_candidates.len() >= MAX_CANDIDATES {
+            break;
+        }
+    }
+    labels_candidates.retain(|labels| labels.len() >= MIN_LEAVES && labels.len() <= MAX_LEAVES);
+    labels_candidates.sort();
+    labels_candidates.dedup();
+    labels_candidates.truncate(MAX_CANDIDATES);
+
+    let mut out = Vec::new();
+    for labels in labels_candidates {
+        let mut bitset = FixedBitSet::with_capacity(reduced.num_leaves as usize + 1);
+        for &label in &labels {
+            bitset.insert(label as usize);
+        }
+        let mass = intersecting_support_mass(state, lp, &bitset);
+        let (core, _) = klados_core::kernelize::restrict_instance_simple(reduced, &bitset);
+        let deadline = Instant::now() + std::time::Duration::from_millis(MAX_MS_PER_CANDIDATE);
+        let cancel = crate::solvers::bp::Cancel::with_deadline(
+            Arc::new(AtomicBool::new(false)),
+            Some(deadline),
+        );
+        let Some(forest) = crate::solvers::bp::solve_subinstance(
+            &core,
+            &crate::solvers::bp::BpConfig::default(),
+            &cancel,
+        ) else {
+            continue;
+        };
+        let exact_k = forest.len();
+        let deficit = exact_k as f64 - mass;
+        if deficit > 1.0e-6 {
+            out.push(LocalRankCandidate {
+                bitset,
+                exact_k,
+                deficit,
+            });
+        }
+    }
+    out.sort_by(|a, b| b.deficit.total_cmp(&a.deficit));
+    out
+}
+
+fn select_local_rank_candidates(
+    candidates: Vec<LocalRankCandidate>,
+    top_k: usize,
+    disjoint: bool,
+    num_leaves: u32,
+) -> Vec<LocalRankCandidate> {
+    if !disjoint {
+        return candidates.into_iter().take(top_k).collect();
+    }
+    let mut used = FixedBitSet::with_capacity(num_leaves as usize + 1);
+    let mut out = Vec::new();
+    for candidate in candidates {
+        if candidate.bitset.ones().any(|leaf| used.contains(leaf)) {
+            continue;
+        }
+        for leaf in candidate.bitset.ones() {
+            used.insert(leaf);
+        }
+        out.push(candidate);
+        if out.len() >= top_k {
+            break;
+        }
+    }
+    out
+}
+
+fn probe_online_local_rank_cuts<P: Pricer>(
+    reduced: &Instance,
+    state: &mut SearchState,
+    branchings: &Branchings,
+    baseline_lp: &crate::solvers::bp::rmp::RmpSolution,
+    root_regions: Option<&RootSupportRegions>,
+    rmp: &mut Rmp,
+    pricer: &mut P,
+    scratch: &mut PricerScratch,
+    tel: &mut Telemetry,
+    cancel: &crate::solvers::bp::Cancel,
+    cfg: &crate::solvers::bp::BpConfig,
+) {
+    let Some(regions) = root_regions else {
+        return;
+    };
+    let t_all = Instant::now();
+    let candidates = collect_local_rank_candidates(reduced, state, baseline_lp, regions);
+    let candidate_count = candidates.len();
+    let selected = select_local_rank_candidates(
+        candidates,
+        cfg.local_rank_online_top_k,
+        cfg.local_rank_online_disjoint,
+        reduced.num_leaves,
+    );
+    if selected.is_empty() {
+        info!(
+            target: LOG_TARGET,
+            "local-rank-online: n={} m={} mode={}{}{} candidates={} selected=0 baseline_lp={:.6}",
+            reduced.num_leaves,
+            reduced.num_trees(),
+            cfg.local_rank_online_top_k,
+            if cfg.local_rank_online_disjoint { "d" } else { "" },
+            if cfg.local_rank_online_aggregate { "a" } else { "" },
+            candidate_count,
+            baseline_lp.objective,
+        );
+        return;
+    }
+
+    let sum_deficit: f64 = selected.iter().map(|c| c.deficit).sum();
+    let max_deficit = selected.iter().map(|c| c.deficit).fold(0.0, f64::max);
+    if cfg.local_rank_online_aggregate {
+        let rhs: usize = selected.iter().map(|c| c.exact_k).sum();
+        let group = selected.iter().map(|c| c.bitset.clone()).collect();
+        rmp.add_rank_cut_group(group, rhs, state.columns());
+    } else {
+        for candidate in &selected {
+            rmp.add_rank_cut(candidate.bitset.clone(), candidate.exact_k, state.columns());
+        }
+    }
+
+    let mut final_lp = baseline_lp.objective;
+    let mut final_ceil = (baseline_lp.objective - 1.0e-6).ceil() as isize;
+    let base_ceil = final_ceil;
+    let mut cg_rounds = 0usize;
+    let mut added_cols = 0usize;
+    let mut certified = false;
+    let mut improving = false;
+
+    for _ in 0..200 {
+        if cancel.is_cancelled() {
+            break;
+        }
+        let t0 = Instant::now();
+        let lp = match rmp.solve() {
+            Ok(lp) => lp,
+            Err(e) => {
+                info!(target: LOG_TARGET, "local-rank-online: LP error after cuts: {e}");
+                break;
+            }
+        };
+        tel.timings.lp_solve += t0.elapsed();
+        final_lp = lp.objective;
+        final_ceil = (lp.objective - 1.0e-6).ceil() as isize;
+        cg_rounds += 1;
+
+        let new_cuts = rmp.separate_and_add_cuts(state.columns(), &lp.column_values, 1.0e-6);
+        if new_cuts > 0 {
+            tel.cuts_added += new_cuts;
+            continue;
+        }
+
+        let t0 = Instant::now();
+        let result = pricer.price(
+            &PricingContext {
+                trees: &reduced.trees,
+                num_leaves: state.num_leaves(),
+                alpha: &lp.leaf_duals,
+                beta: &lp.node_duals,
+                rank_cut_groups: rmp.rank_cut_groups(),
+                rank_cut_duals: &lp.rank_cut_duals,
+                columns: state.columns(),
+                seen: state.seen(),
+                branchings,
+                terminate: cancel.flag(),
+                deadline: cancel.deadline(),
+            },
+            scratch,
+        );
+        tel.timings.pricing += t0.elapsed();
+        tel.cg_iters += 1;
+
+        match result {
+            PricingResult::Found(cols) => {
+                let mut added = 0usize;
+                for c in cols {
+                    if state.add_column(c).is_some() {
+                        rmp.add_column(state.columns().last().unwrap());
+                        added += 1;
+                    }
+                }
+                added_cols += added;
+                tel.columns_added += added;
+                if added == 0 {
+                    improving = true;
+                    break;
+                }
+            }
+            PricingResult::Converged => {
+                certified = true;
+                break;
+            }
+            PricingResult::Improving => {
+                improving = true;
+                break;
+            }
+        }
+    }
+
+    info!(
+        target: LOG_TARGET,
+        "local-rank-online: n={} m={} mode={}{}{} candidates={} selected={} sum_deficit={:.4} max_deficit={:.4} baseline_lp={:.6} final_lp={:.6} lp_lift={:.6} ceil_lift={} certified={} improving={} rounds={} added_cols={} ms={:.1}",
+        reduced.num_leaves,
+        reduced.num_trees(),
+        cfg.local_rank_online_top_k,
+        if cfg.local_rank_online_disjoint { "d" } else { "" },
+        if cfg.local_rank_online_aggregate { "a" } else { "" },
+        candidate_count,
+        selected.len(),
+        sum_deficit,
+        max_deficit,
+        baseline_lp.objective,
+        final_lp,
+        final_lp - baseline_lp.objective,
+        final_ceil - base_ceil,
+        certified,
+        improving,
+        cg_rounds,
+        added_cols,
+        t_all.elapsed().as_secs_f64() * 1000.0,
+    );
 }
 
 fn probe_root_support_mip(

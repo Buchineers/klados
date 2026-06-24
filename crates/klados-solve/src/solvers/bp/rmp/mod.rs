@@ -25,7 +25,8 @@
 
 pub mod bounds;
 
-use highs::{ColProblem, HighsModelStatus, Model};
+use fixedbitset::FixedBitSet;
+use highs::{ColProblem, HighsModelStatus, HighsSolutionStatus, Model};
 use klados_core::Tree;
 
 use crate::solvers::bp::column::AfColumn;
@@ -41,6 +42,7 @@ pub struct RmpSolution {
     /// `0.0` for nodes whose row is not materialised (i.e. constraint isn't
     /// in the LP, so its dual contribution is zero).
     pub node_duals: Vec<Vec<f64>>,
+    pub rank_cut_duals: Vec<f64>,
 }
 
 pub struct Rmp {
@@ -78,6 +80,8 @@ pub struct Rmp {
     /// is popped and the column is unfixed. Root fixings (depth=0) are
     /// **never** placed on the trail — they hold globally.
     rcvf_trail: Vec<(usize, usize)>,
+    rank_cut_groups: Vec<Vec<FixedBitSet>>,
+    rank_cut_row_idx: Vec<usize>,
 }
 
 struct RootLp {
@@ -131,6 +135,8 @@ impl Rmp {
             rcvf_zero: Vec::new(),
             root_lp: None,
             rcvf_trail: Vec::new(),
+            rank_cut_groups: Vec::new(),
+            rank_cut_row_idx: Vec::new(),
         };
         for c in initial {
             rmp.add_column(c);
@@ -144,11 +150,12 @@ impl Rmp {
 
     pub fn add_column(&mut self, column: &AfColumn) {
         let global_ci = self.col_handle.len();
-        let mut row_indices: Vec<i32> = column
-            .labels()
-            .iter()
-            .map(|&l| self.leaf_row_idx[l as usize] as i32)
-            .collect();
+        let mut row_indices: Vec<i32> = Vec::new();
+        let mut values: Vec<f64> = Vec::new();
+        for &label in column.labels() {
+            row_indices.push(self.leaf_row_idx[label as usize] as i32);
+            values.push(1.0);
+        }
         // For each (t, v) the column covers: always update the reverse index.
         // Add to row_indices only if the row is currently materialised.
         for (ti, nodes) in column.coverage().iter_per_tree().enumerate() {
@@ -156,10 +163,17 @@ impl Rmp {
                 self.node_to_cols[ti][v].push(global_ci);
                 if let Some(ri) = self.node_row_idx[ti][v] {
                     row_indices.push(ri as i32);
+                    values.push(1.0);
                 }
             }
         }
-        let values = vec![1.0_f64; row_indices.len()];
+        for (cut_idx, cut_group) in self.rank_cut_groups.iter().enumerate() {
+            let coeff = rank_cut_coeff(column, cut_group);
+            if coeff > 0.0 {
+                row_indices.push(self.rank_cut_row_idx[cut_idx] as i32);
+                values.push(coeff);
+            }
+        }
         let ptr = self.model.as_mut().expect("model present").as_mut_ptr();
         unsafe {
             highs_sys::Highs_addCol(
@@ -176,6 +190,62 @@ impl Rmp {
         self.cur_lo.push(0.0);
         self.cur_hi.push(f64::INFINITY);
         self.rcvf_zero.push(false);
+    }
+
+    pub fn rank_cut_groups(&self) -> &[Vec<FixedBitSet>] {
+        &self.rank_cut_groups
+    }
+
+    pub fn add_rank_cut(&mut self, labels: FixedBitSet, rhs: usize, columns: &[AfColumn]) {
+        self.add_rank_cut_group(vec![labels], rhs, columns);
+    }
+
+    pub fn add_rank_cut_group(
+        &mut self,
+        group: Vec<FixedBitSet>,
+        rhs: usize,
+        columns: &[AfColumn],
+    ) {
+        let mut indices = Vec::new();
+        let mut values = Vec::new();
+        for (ci, column) in columns.iter().enumerate() {
+            let coeff = rank_cut_coeff(column, &group);
+            if coeff > 0.0 {
+                indices.push(self.col_handle[ci]);
+                values.push(coeff);
+            }
+        }
+        let ptr = self.model.as_mut().expect("model present").as_mut_ptr();
+        unsafe {
+            highs_sys::Highs_addRow(
+                ptr,
+                rhs as f64,
+                f64::INFINITY,
+                indices.len() as i32,
+                indices.as_ptr(),
+                values.as_ptr(),
+            );
+        }
+        self.rank_cut_groups.push(group);
+        self.rank_cut_row_idx.push(self.num_rows);
+        self.num_rows += 1;
+    }
+
+    pub fn add_pool_clique_cut(&mut self, column_ids: &[usize], rhs: usize) {
+        let indices: Vec<i32> = column_ids.iter().map(|&ci| self.col_handle[ci]).collect();
+        let values = vec![1.0_f64; indices.len()];
+        let ptr = self.model.as_mut().expect("model present").as_mut_ptr();
+        unsafe {
+            highs_sys::Highs_addRow(
+                ptr,
+                f64::NEG_INFINITY,
+                rhs as f64,
+                indices.len() as i32,
+                indices.as_ptr(),
+                values.as_ptr(),
+            );
+        }
+        self.num_rows += 1;
     }
 
     /// Reduced-Cost Variable Fixing.
@@ -444,6 +514,11 @@ impl Rmp {
                     .collect()
             })
             .collect();
+        let rank_cut_duals: Vec<f64> = self
+            .rank_cut_row_idx
+            .iter()
+            .map(|&ri| clean_dual(dual_rows[ri]))
+            .collect();
         let objective = solved.objective_value();
         self.model = Some(Model::from(solved));
         Ok(RmpSolution {
@@ -451,6 +526,7 @@ impl Rmp {
             column_values,
             leaf_duals,
             node_duals,
+            rank_cut_duals,
         })
     }
 
@@ -480,18 +556,14 @@ impl Rmp {
 
         let solved = model.solve();
         let status = solved.status();
-        let objective = if status == HighsModelStatus::Optimal {
-            solved.objective_value()
-        } else {
-            0.0
-        };
-
-        let (solution_cols, has_solution) = if status == HighsModelStatus::Optimal {
+        let has_primal = solved.primal_solution_status() == HighsSolutionStatus::Feasible;
+        let (solution_cols, has_solution) = if status == HighsModelStatus::Optimal || has_primal {
             let solution = solved.get_solution();
             (solution.columns().to_vec(), true)
         } else {
             (Vec::new(), false)
         };
+        let objective = solution_cols.iter().take(num_cols).sum::<f64>();
 
         let mut model = Model::from(solved);
         model.set_option("presolve", "off");
@@ -524,6 +596,7 @@ impl Rmp {
             column_values,
             leaf_duals: Vec::new(),
             node_duals: Vec::new(),
+            rank_cut_duals: Vec::new(),
         }))
     }
 
@@ -532,6 +605,20 @@ impl Rmp {
             || prev_hi.is_finite() != hi.is_finite()
             || (prev_hi.is_finite() && hi.is_finite() && (prev_hi - hi).abs() > 0.0)
     }
+}
+
+fn column_intersects(column: &AfColumn, labels: &FixedBitSet) -> bool {
+    column
+        .labels()
+        .iter()
+        .any(|&label| labels.contains(label as usize))
+}
+
+fn rank_cut_coeff(column: &AfColumn, group: &[FixedBitSet]) -> f64 {
+    group
+        .iter()
+        .filter(|labels| column_intersects(column, labels))
+        .count() as f64
 }
 
 fn clean_dual(value: f64) -> f64 {

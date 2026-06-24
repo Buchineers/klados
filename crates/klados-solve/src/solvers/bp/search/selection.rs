@@ -12,6 +12,8 @@ pub struct SelectionContext<'a> {
     pub num_leaves: usize,
     pub branchings: &'a Branchings,
     pub current_lp_obj: f64,
+    pub guide_partition: Option<&'a [u32]>,
+    pub guide_max_depth: usize,
 }
 
 pub trait BranchSelector {
@@ -108,8 +110,36 @@ impl BranchSelector for MostFractionalPair {
         let pairs = fractional_pairs(&together, &support, ctx.num_leaves);
         let pair = pairs.into_iter().next().map(|(p, _, _)| p)?;
         let (left, right) = ctx.branchings.split_on(pair);
-        Some(vec![left, right])
+        Some(
+            if guide_says_together(ctx, pair).is_some_and(|together| !together) {
+                vec![right, left]
+            } else {
+                vec![left, right]
+            },
+        )
     }
+}
+
+fn guide_says_together(ctx: &SelectionContext, pair: LeafPair) -> Option<bool> {
+    let guide = ctx.guide_partition?;
+    if ctx.branchings.depth() >= ctx.guide_max_depth || !guide_compatible(ctx.branchings, guide) {
+        return None;
+    }
+    Some(guide[pair.a as usize] == guide[pair.b as usize])
+}
+
+fn guide_compatible(branchings: &Branchings, guide: &[u32]) -> bool {
+    for pair in branchings.must_link() {
+        if guide[pair.a as usize] != guide[pair.b as usize] {
+            return false;
+        }
+    }
+    for pair in branchings.cannot_link() {
+        if guide[pair.a as usize] == guide[pair.b as usize] {
+            return false;
+        }
+    }
+    true
 }
 
 /// Strong branching: take the top-K most-fractional pairs as candidates;
