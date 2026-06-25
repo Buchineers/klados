@@ -443,7 +443,14 @@ impl<'a> Rec<'a> {
         let cs = self.candset(active, forbidden);
         let mut best = Vec::new();
         let mut nodes = 0u64;
-        expand(self.g, &mut Vec::new(), cs, &mut best, &mut nodes, self.node_budget);
+        expand(
+            self.g,
+            &mut Vec::new(),
+            cs,
+            &mut best,
+            &mut nodes,
+            self.node_budget,
+        );
         self.matchings.set(self.matchings.get() + 1);
         best.len()
     }
@@ -453,14 +460,27 @@ impl<'a> Rec<'a> {
         let cs = self.candset(active, forbidden);
         let mut best = Vec::new();
         let mut nodes = 0u64;
-        expand(self.g, &mut Vec::new(), cs, &mut best, &mut nodes, self.node_budget);
+        expand(
+            self.g,
+            &mut Vec::new(),
+            cs,
+            &mut best,
+            &mut nodes,
+            self.node_budget,
+        );
         best.iter().map(|&i| self.g.pairs[i]).collect()
     }
 
     /// Upper bound on the residual matching `M(active\B, forbidden∪mask(B))`:
     /// the number of top-cover classes that still contain an available residual
     /// pair (each class is a clique, contributing ≤ 1 to any matching).
-    fn avail_classes(&self, active: &[bool], forbidden: &[u64], bmask: &[u64], bleaves: &[u32]) -> usize {
+    fn avail_classes(
+        &self,
+        active: &[bool],
+        forbidden: &[u64],
+        bmask: &[u64],
+        bleaves: &[u32],
+    ) -> usize {
         let mut c = 0usize;
         for cls in &self.class_pidx {
             for &pi in cls {
@@ -499,7 +519,15 @@ impl<'a> Rec<'a> {
         for s in anchor..=n {
             if active[s as usize] {
                 leaves.push(s);
-                self.grow(active, forbidden, &mut leaves, s, &mut scratch, &mut best, &mut best_blocks);
+                self.grow(
+                    active,
+                    forbidden,
+                    &mut leaves,
+                    s,
+                    &mut scratch,
+                    &mut best,
+                    &mut best_blocks,
+                );
                 leaves.pop();
                 if self.aborted.get() {
                     break;
@@ -1444,14 +1472,15 @@ fn combine_test(
     // other. seq1 = C first, seq2 = Cᶜ first. Build + validate each combined
     // forest so we can distinguish a sound forest (proves mu* >= seq) from a
     // footprint bug (invalid forest).
-    let build_validate = |b1: &[Block], p1: &[(u32, u32)], b2: &[Block], p2: &[(u32, u32)]| -> bool {
-        let mut bb = b1.to_vec();
-        bb.extend(b2.iter().cloned());
-        let mut pp = p1.to_vec();
-        pp.extend(p2.iter().cloned());
-        let f = build_forest(inst, &pp, &bb);
-        matches!(validate_agreement_forest(inst, &f), AfValidation::Ok)
-    };
+    let build_validate =
+        |b1: &[Block], p1: &[(u32, u32)], b2: &[Block], p2: &[(u32, u32)]| -> bool {
+            let mut bb = b1.to_vec();
+            bb.extend(b2.iter().cloned());
+            let mut pp = p1.to_vec();
+            pp.extend(p2.iter().cloned());
+            let f = build_forest(inst, &pp, &bb);
+            matches!(validate_agreement_forest(inst, &f), AfValidation::Ok)
+        };
 
     let fp_c = side_fp(&blocks_c, &pairs_c);
     let (mu_cc_cond, b_cc_cond, p_cc_cond) = solve_side(false, &fp_c);

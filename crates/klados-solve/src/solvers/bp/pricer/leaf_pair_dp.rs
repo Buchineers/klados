@@ -811,7 +811,13 @@ impl LeafPairDpPricer {
         self.sided_side_state.resize(pc, 0);
     }
 
-    fn solve_pair_sided(&mut self, a: usize, b: usize, alpha: &[f64], beta: &[Vec<f64>]) -> [f64; 4] {
+    fn solve_pair_sided(
+        &mut self,
+        a: usize,
+        b: usize,
+        alpha: &[f64],
+        beta: &[Vec<f64>],
+    ) -> [f64; 4] {
         debug_assert!(a != b);
         let idx = self.pair_idx(a, b);
         match self.sided_pair_state[idx] {
@@ -847,7 +853,13 @@ impl LeafPairDpPricer {
         res
     }
 
-    fn solve_side_sided(&mut self, a: usize, b: usize, alpha: &[f64], beta: &[Vec<f64>]) -> [f64; 4] {
+    fn solve_side_sided(
+        &mut self,
+        a: usize,
+        b: usize,
+        alpha: &[f64],
+        beta: &[Vec<f64>],
+    ) -> [f64; 4] {
         debug_assert!(a != b);
         let idx = self.pair_idx(a, b);
         match self.sided_side_state[idx] {
@@ -1203,7 +1215,9 @@ impl LeafPairDpPricer {
         ctx: &PricingContext,
         scratch: &mut PricerScratch,
     ) -> CollectResult {
-        let cut = ctx.clean_cut.expect("collect_from_order_sided requires a cut");
+        let cut = ctx
+            .clean_cut
+            .expect("collect_from_order_sided requires a cut");
         let side_c = cut.side_c;
         let bonus = [0.0, cut.gamma_c, cut.gamma_cc, cut.gamma_c + cut.gamma_cc];
         // Skip-widening uses max(0,γ) per side (sound upper bound on the bonus);
@@ -1256,8 +1270,12 @@ impl LeafPairDpPricer {
                     if lb.len() < 2 {
                         continue;
                     }
-                    let tc = lb.iter().any(|&l| ctx.clean_cut.unwrap().side_c.contains(l as usize));
-                    let tcc = lb.iter().any(|&l| !ctx.clean_cut.unwrap().side_c.contains(l as usize));
+                    let tc = lb
+                        .iter()
+                        .any(|&l| ctx.clean_cut.unwrap().side_c.contains(l as usize));
+                    let tcc = lb
+                        .iter()
+                        .any(|&l| !ctx.clean_cut.unwrap().side_c.contains(l as usize));
                     let actual_pat = (tc as usize) | ((tcc as usize) << 1);
                     let col = scratch.builder.build_unchecked(lb.clone(), ctx.trees);
                     let sc = col.pricing_score(ctx.alpha, ctx.beta);
@@ -1436,8 +1454,9 @@ impl Pricer for LeafPairDpPricer {
         // thresholds (a sound upper bound on the per-pattern bonus) so no anchor
         // with an improving column is dropped. Zero when no cut → thresholds
         // identical to production.
-        let gamma_total =
-            ctx.clean_cut.map_or(0.0, |c| c.gamma_c.max(0.0) + c.gamma_cc.max(0.0));
+        let gamma_total = ctx
+            .clean_cut
+            .map_or(0.0, |c| c.gamma_c.max(0.0) + c.gamma_cc.max(0.0));
         if let Some(c) = ctx.clean_cut.as_ref() {
             self.setup_sided(c.side_c);
         }

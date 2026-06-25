@@ -209,7 +209,11 @@ fn top_cross_cut_pairs(
             .then_with(|| b.2.cmp(&a.2))
             .then_with(|| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal))
     });
-    pairs.into_iter().take(limit).map(|(p, _, _, _)| p).collect()
+    pairs
+        .into_iter()
+        .take(limit)
+        .map(|(p, _, _, _)| p)
+        .collect()
 }
 
 /// Exhaustive partition over an ordered set of cross-cut pairs P:

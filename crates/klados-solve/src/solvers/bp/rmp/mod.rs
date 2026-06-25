@@ -25,8 +25,8 @@
 
 pub mod bounds;
 
-use highs::{ColProblem, HighsModelStatus, Model};
 use fixedbitset::FixedBitSet;
+use highs::{ColProblem, HighsModelStatus, Model};
 use klados_core::Tree;
 
 use crate::solvers::bp::column::AfColumn;
@@ -426,11 +426,7 @@ impl Rmp {
             let indices: Vec<i32> = columns
                 .iter()
                 .enumerate()
-                .filter(|(_, col)| {
-                    col.labels()
-                        .iter()
-                        .any(|&l| side.contains(l as usize))
-                })
+                .filter(|(_, col)| col.labels().iter().any(|&l| side.contains(l as usize)))
                 .map(|(ci, _)| self.col_handle[ci])
                 .collect();
             if indices.is_empty() {
@@ -669,7 +665,7 @@ impl Rmp {
         }
         let mut compact_indices = Vec::with_capacity(indices.len());
         let mut compact_values = Vec::with_capacity(values.len());
-        for (idx, value) in indices.into_iter().zip(values.into_iter()) {
+        for (idx, value) in indices.into_iter().zip(values) {
             if value.abs() > 1.0e-12 {
                 compact_indices.push(idx);
                 compact_values.push(value);

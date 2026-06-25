@@ -113,7 +113,10 @@ impl Branchings {
             r
         }
         for ml in &self.must_link {
-            let (ra, rb) = (find(&mut parent, index(ml.a)), find(&mut parent, index(ml.b)));
+            let (ra, rb) = (
+                find(&mut parent, index(ml.a)),
+                find(&mut parent, index(ml.b)),
+            );
             if ra != rb {
                 parent[ra] = rb;
             }

@@ -20,7 +20,7 @@ use log::{debug, info};
 use crate::decomp::whidden_cluster::{
     analyze_whidden_decomp_potential, try_whidden_relaxed_incumbent_2tree,
 };
-use crate::solvers::bp::column::{AfColumn, ColumnBuilder};
+use crate::solvers::bp::column::{AfColumn, ColumnBuilder, is_valid_af_component};
 use crate::solvers::bp::pricer::{
     CleanCutPricing, Pricer, PricerScratch, PricingContext, PricingResult, dispatch_by_m,
 };
@@ -418,13 +418,9 @@ where
     // It happens to equal mu* on the high-frag wall (pub134/pub101), giving a real
     // speedup there, but that rests on the unproven single-block-sufficiency
     // conjecture. Kept only as a research artifact; DO NOT enable for correctness.
-    if cfg.ncpack_lb
-        && trees.len() >= cfg.ncpack_min_trees
-        && n <= cfg.ncpack_max_leaves
-    {
+    if cfg.ncpack_lb && trees.len() >= cfg.ncpack_min_trees && n <= cfg.ncpack_max_leaves {
         let nc_t = Instant::now();
-        let deadline =
-            Instant::now() + std::time::Duration::from_secs(cfg.ncpack_lb_budget_secs);
+        let deadline = Instant::now() + std::time::Duration::from_secs(cfg.ncpack_lb_budget_secs);
         if let Some(mu) = crate::solvers::ncpack::certified_mu_star(
             reduced,
             0,
@@ -564,21 +560,19 @@ where
     //   widened in the sided pricer).
     // - Search may propagate/prune only certified LP bounds.  If pricing stops
     //   with `Improving`, the raw RMP objective is not inherited by children.
-    let clean_cut_side: Option<FixedBitSet> = if cfg.clean_lb
-        && trees.len() >= 3
-        && reduced.num_leaves as usize >= CLEAN_LB_MIN_LEAVES
-    {
-        maybe_install_clean_lb_rank_rows(
-            reduced,
-            &mut state,
-            &mut rmp,
-            &mut seed_builder,
-            cfg,
-            cancel,
-        )
-    } else {
-        None
-    };
+    let clean_cut_side: Option<FixedBitSet> =
+        if cfg.clean_lb && trees.len() >= 3 && reduced.num_leaves as usize >= CLEAN_LB_MIN_LEAVES {
+            maybe_install_clean_lb_rank_rows(
+                reduced,
+                &mut state,
+                &mut rmp,
+                &mut seed_builder,
+                cfg,
+                cancel,
+            )
+        } else {
+            None
+        };
     if clean_cut_side.is_some() {
         allow_rcvf = false;
     }
@@ -1121,9 +1115,7 @@ fn solve_node<P: Pricer, S: BranchSelector>(
     } else {
         chen_lb
     };
-    if clean_cut_side.is_some()
-        && std::env::var("KLADOS_CLEAN_LB_TRACE").as_deref() == Ok("1")
-    {
+    if clean_cut_side.is_some() && std::env::var("KLADOS_CLEAN_LB_TRACE").as_deref() == Ok("1") {
         info!(
             target: LOG_TARGET,
             "clean-lb node: depth={} ml={} cl={} converged={} lp={:.4} lp_lb={} chen={} lb={} ub={} rank_duals={:?}",
@@ -1141,6 +1133,26 @@ fn solve_node<P: Pricer, S: BranchSelector>(
         );
         tel.bound_prunes += 1;
         return NodeOutcome::Pruned;
+    }
+
+    // Core-finisher (KLADOS_BP_MWIS_FINISH=1): a self-contained combinatorial
+    // certificate (complete-enumeration MWIS), independent of the LP — so, unlike
+    // RCVF and the bound, it runs even when the high-m pricer can't certify the
+    // node (`node_converged == false`). That is exactly the residual-core regime
+    // where B&P stalls: it proves the core optimum and closes the whole node.
+    if branchings.depth() == 0
+        && let Some(inc) = try_mwis_finish(
+            reduced,
+            state,
+            trees,
+            &lp,
+            branchings,
+            lb,
+            &mut scratch.builder,
+            cfg,
+        )
+    {
+        return NodeOutcome::Integral(inc);
     }
 
     // Reduced-cost variable fixing. Standard B&P result: for every column c,
@@ -1218,9 +1230,16 @@ fn solve_node<P: Pricer, S: BranchSelector>(
             }
         }
         maybe_probe_root_obstruction(reduced, state, &lp, root_regions.as_ref(), cfg);
-        maybe_probe_support_rank_resolve(reduced, state, rmp, &lp, root_regions.as_ref(), cfg, cancel);
+        maybe_probe_support_rank_resolve(
+            reduced,
+            state,
+            rmp,
+            &lp,
+            root_regions.as_ref(),
+            cfg,
+            cancel,
+        );
         maybe_probe_merge_order(state, rmp, &lp, branchings, cfg);
-        maybe_probe_mwis_finish(reduced, state, &lp, branchings, cfg);
         maybe_probe_root_rank_cuts(state, &lp, cfg);
         maybe_probe_residual_completion_cuts(reduced, state, &lp, cfg);
         maybe_log_bridge_footprint(
@@ -1649,12 +1668,20 @@ fn probe_root_obstruction_impl(
     // in one file. Used for offline rotating-triple / spread-clique analysis.
     if let Ok(path) = std::env::var("KLADOS_BP_SUPPORT_DUMP") {
         use std::io::Write as _;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
             let _ = writeln!(
                 f,
                 "# PROBE lp={:.6} support_cols={} components={}",
                 regions.lp_objective,
-                regions.comps.iter().map(|c| c.column_ids.len()).sum::<usize>(),
+                regions
+                    .comps
+                    .iter()
+                    .map(|c| c.column_ids.len())
+                    .sum::<usize>(),
                 regions.comps.len(),
             );
             for (idx, comp) in regions.comps.iter().enumerate() {
@@ -1667,7 +1694,7 @@ fn probe_root_obstruction_impl(
                 );
                 for &ci in &comp.column_ids {
                     let col = &state.columns()[ci];
-                    let mut labs: Vec<u32> = col.labels().iter().map(|&l| l as u32).collect();
+                    let mut labs: Vec<u32> = col.labels().to_vec();
                     labs.sort_unstable();
                     let labs_str: Vec<String> = labs.iter().map(|l| l.to_string()).collect();
                     // Node coverage as `tree.node` tokens — lets offline analysis
@@ -2073,130 +2100,515 @@ fn probe_all_region_exact_ranks(
     );
 }
 
-/// Weighted max-weight independent set via branch-and-bound. `adj[i]` is the
-/// neighbour set of vertex `i`; `weights[i]` its weight. Returns the best weight
-/// found and whether the search exhausted (vs hit the node `budget`). The
-/// conflict graph here is dense (so independent sets are small), which makes the
-/// include-branch (removes v + all neighbours) collapse fast.
+/// Greedy clique cover of the conflict graph as a **partition** of `0..m`.
+///
+/// Every `group` (the components sharing one leaf or one tree node) is a clique:
+/// its members pairwise share that element, hence pairwise conflict. We greedily
+/// carve disjoint cliques by repeatedly taking the group covering the most
+/// still-unassigned vertices. Each vertex lands in exactly one clique (the
+/// leftover loop guarantees coverage). Used for the MWIS clique-cover bound:
+/// an independent set takes ≤1 vertex per clique, so `Σ max-weight-per-clique`
+/// is a valid — and, on this dense graph, tight — upper bound.
+fn greedy_clique_cover(m: usize, groups: &[&Vec<usize>]) -> Vec<Vec<usize>> {
+    let mut assigned = vec![false; m];
+    let mut remaining = m;
+    let mut cliques: Vec<Vec<usize>> = Vec::new();
+    while remaining > 0 {
+        // Group covering the most unassigned vertices.
+        let mut best_gi = usize::MAX;
+        let mut best_count = 0usize;
+        for (gi, g) in groups.iter().enumerate() {
+            let c = g.iter().filter(|&&v| !assigned[v]).count();
+            if c > best_count {
+                best_count = c;
+                best_gi = gi;
+            }
+        }
+        if best_gi == usize::MAX {
+            // Any vertex covered by no group becomes its own singleton clique.
+            for (v, a) in assigned.iter_mut().enumerate() {
+                if !*a {
+                    *a = true;
+                    cliques.push(vec![v]);
+                }
+            }
+            break;
+        }
+        let clique: Vec<usize> = groups[best_gi]
+            .iter()
+            .copied()
+            .filter(|&v| !assigned[v])
+            .collect();
+        for &v in &clique {
+            assigned[v] = true;
+        }
+        remaining -= clique.len();
+        cliques.push(clique);
+    }
+    cliques
+}
+
+/// Weighted max-weight independent set via branch-and-bound.
+///
+/// The conflict graph is **never materialised** (its `Σ group²` adjacency blows
+/// up when a leaf/node is shared by thousands of components). Instead it is given
+/// implicitly: `elem_groups[e]` is the component-set sharing element `e`
+/// (each such set is a clique), and `comp_elems[c]` lists the elements of
+/// component `c`. The neighbourhood of `c` is `⋃_{e∈comp_elems[c]} elem_groups[e]`,
+/// computed on the fly by bitset subtraction in the include-branch. `cliques` is
+/// a clique **partition** of the vertices for the clique-cover bound. Returns the
+/// best weight, its witness vertices, and whether the search exhausted (vs hit
+/// the node/time `budget`).
 fn solve_mwis_bb(
-    adj: &[FixedBitSet],
+    elem_groups: &[FixedBitSet],
+    comp_elems: &[Vec<u32>],
     weights: &[usize],
+    cliques: &[Vec<usize>],
     budget: u64,
-) -> (usize, bool) {
-    let n = adj.len();
+    t0: Instant,
+) -> (usize, Vec<usize>, bool) {
+    let n = comp_elems.len();
     let mut best = 0usize;
+    let mut best_set: Vec<usize> = Vec::new();
+    let mut cur: Vec<usize> = Vec::new();
     let mut remaining = budget;
     let mut active = FixedBitSet::with_capacity(n);
     if n > 0 {
         active.insert_range(..n);
     }
-    let exhausted = mwis_rec(adj, weights, active, 0, &mut best, &mut remaining);
-    (best, exhausted)
+    let exhausted = mwis_rec(
+        elem_groups,
+        comp_elems,
+        weights,
+        cliques,
+        active,
+        0,
+        &mut cur,
+        &mut best,
+        &mut best_set,
+        &mut remaining,
+        t0,
+    );
+    (best, best_set, exhausted)
 }
 
-/// Returns true if the subtree was fully explored (false = budget hit).
+/// Returns true if the subtree was fully explored (false = budget/time hit).
+#[allow(clippy::too_many_arguments)]
 fn mwis_rec(
-    adj: &[FixedBitSet],
+    elem_groups: &[FixedBitSet],
+    comp_elems: &[Vec<u32>],
     weights: &[usize],
+    cliques: &[Vec<usize>],
     active: FixedBitSet,
     acc: usize,
+    cur: &mut Vec<usize>,
     best: &mut usize,
+    best_set: &mut Vec<usize>,
     budget: &mut u64,
+    t0: Instant,
 ) -> bool {
     if *budget == 0 {
+        return false;
+    }
+    // Sample the wall-clock deadline often (every 1024 nodes) — a coarser stride
+    // lets a slow core overrun the budget many-fold.
+    if *budget & 0x3FF == 0 && t0.elapsed().as_millis() > MWIS_FINISH_BUDGET_MS {
         return false;
     }
     *budget -= 1;
     if acc > *best {
         *best = acc;
+        best_set.clone_from(cur);
     }
-    // Upper bound: acc + total weight of still-active vertices.
-    let rem: usize = active.ones().map(|v| weights[v]).sum();
-    if acc + rem <= *best {
+    // Clique-cover upper bound: an independent set takes ≤1 vertex per clique, so
+    // `acc + Σ_clique max-active-weight` bounds any completion. Far tighter than
+    // the sum of all active weights on this dense graph. The same pass picks the
+    // max-weight active vertex as the branch pivot (O(m), no O(m²) degree scan).
+    let mut bound = 0usize;
+    let mut pivot = usize::MAX;
+    let mut pivot_w = 0usize;
+    for clique in cliques {
+        let mut cmax = 0usize;
+        let mut cmax_v = usize::MAX;
+        for &v in clique {
+            if active.contains(v) && weights[v] > cmax {
+                cmax = weights[v];
+                cmax_v = v;
+            }
+        }
+        bound += cmax;
+        if cmax > pivot_w {
+            pivot_w = cmax;
+            pivot = cmax_v;
+        }
+    }
+    if acc + bound <= *best {
         return true;
     }
-    // Branch on the highest-degree active vertex (most constraining → include
-    // removes the most, exclude is rare).
-    let branch = active
-        .ones()
-        .max_by_key(|&v| adj[v].intersection(&active).count());
-    let Some(v) = branch else {
+    let v = if pivot != usize::MAX {
+        pivot
+    } else {
+        // No positive-weight active vertex left; nothing more to gain.
         return true;
     };
-    // Include v: remove v and all its neighbours.
+    // Include v: remove v and all its neighbours (every component sharing one of
+    // v's elements), by subtracting v's element-groups from the active set.
     let mut inc = active.clone();
-    inc.set(v, false);
-    inc.difference_with(&adj[v]);
-    if !mwis_rec(adj, weights, inc, acc + weights[v], best, budget) {
+    for &e in &comp_elems[v] {
+        inc.difference_with(&elem_groups[e as usize]);
+    }
+    cur.push(v);
+    let ok = mwis_rec(
+        elem_groups,
+        comp_elems,
+        weights,
+        cliques,
+        inc,
+        acc + weights[v],
+        cur,
+        best,
+        best_set,
+        budget,
+        t0,
+    );
+    cur.pop();
+    if !ok {
         return false;
     }
     // Exclude v.
     let mut exc = active;
     exc.set(v, false);
-    mwis_rec(adj, weights, exc, acc, best, budget)
+    mwis_rec(
+        elem_groups,
+        comp_elems,
+        weights,
+        cliques,
+        exc,
+        acc,
+        cur,
+        best,
+        best_set,
+        budget,
+        t0,
+    )
 }
 
-/// Prototype core-finisher (KLADOS_BP_MWIS_FINISH=1). At a stuck core root, build
-/// the candidate-merge conflict graph over the pool's multi-leaf columns and
-/// solve MWIS directly, reporting the combinatorial opt vs the LP bound and time.
+/// Above this core leaf count the complete agreement-component enumeration is
+/// not attempted — fall back to ordinary B&P. The finisher's proven domain is
+/// the discordant cores with up to ~2000 components (≤~40 leaves observed); this
+/// leaves headroom while cheaply skipping the explosive large-agreement residuals
+/// (e.g. pub101's n=75 / 6550 components) whose MWIS doesn't exhaust even in 30 s
+/// — those need MWIS kernelization / core-shrinking decomposition, not a bigger
+/// budget.
+const MWIS_FINISH_MAX_LEAVES: usize = 64;
+/// Hard cap on the number of valid agreement components enumerated. If exceeded
+/// the enumeration is incomplete, so the certificate is invalid → fall back.
+/// Discordant cores (the target) have ~`C(n,2)` + a few; a core that blows past
+/// this has large agreement blocks (every subset is valid) and either is B&P's
+/// job or beyond complete-enumeration MWIS. The explosion case bails *during
+/// enumeration*, before the conflict-graph build.
+const MWIS_FINISH_MAX_COMPONENTS: usize = 4_000;
+/// Node budget for the MWIS branch-and-bound. Exhaustion is required for a
+/// proof; hitting the budget → fall back.
+const MWIS_FINISH_BB_BUDGET: u64 = 200_000_000;
+/// Wall-clock budget for the entire finisher (enumeration + graph + MWIS). The
+/// finisher only pays off when it proves the core faster than B&P would solve
+/// it; a core whose MWIS doesn't exhaust in this window is handed back to B&P
+/// (which closes the easy fractional cores in milliseconds). Sized above the
+/// observed ~0.9 s legit worst case so we don't abandon a real certificate.
+const MWIS_FINISH_BUDGET_MS: u128 = 2000;
+
+/// Enumerate **every** valid agreement component (leafset that induces the same
+/// rooted topology in all trees) over `1..=num_leaves`, by apriori growth.
 ///
-/// `comb_opt = core_leaves − MWIS(merges)`. If the candidate set is complete
-/// (every agreement component on the core is in the pool) and the search
-/// exhausted, this is the *proven* core optimum — the discrete refutation that
-/// replaces the LP cannot-link tree. Completeness is the open soundness item;
-/// for these converged cores the pool empirically matched the exact sub-solve.
-fn maybe_probe_mwis_finish(
+/// Validity is downward-closed (every subset of a same-topology block is itself
+/// same-topology), so: level 2 = all `C(n,2)` pairs (always valid); level k+1 =
+/// extend each valid k-block `B` by a leaf `l > max(B)`, keep iff every k-subset
+/// of `B∪{l}` is already known valid (apriori prune) and `B∪{l}` validates.
+///
+/// Generating each block from its largest element makes the enumeration
+/// **complete**: any valid (k+1)-block `S` is produced exactly once from `S \
+/// {max S}`, which is a valid k-block with smaller max. Returns `None` if the
+/// component count exceeds `MWIS_FINISH_MAX_COMPONENTS` (enumeration would be
+/// incomplete — caller must not treat the result as a certificate).
+fn enumerate_all_components(
+    num_leaves: usize,
+    trees: &[Tree],
+    builder: &mut ColumnBuilder,
+    t0: Instant,
+) -> Option<Vec<AfColumn>> {
+    use fxhash::FxHashSet;
+    let mut out: Vec<AfColumn> = Vec::new();
+    // Valid k-blocks at the current level, as sorted label vectors, plus a set
+    // for O(1) subset-membership checks during apriori candidate generation.
+    let mut level: Vec<Vec<u32>> = Vec::new();
+    let mut level_set: FxHashSet<Vec<u32>> = FxHashSet::default();
+    // Time check is cheap but not free; sample it rather than call per-candidate.
+    let mut since_check: u32 = 0;
+
+    // Level 2: all pairs are trivially valid agreement components.
+    for a in 1..=num_leaves as u32 {
+        for b in (a + 1)..=num_leaves as u32 {
+            let block = vec![a, b];
+            out.push(builder.build_unchecked(block.clone(), trees));
+            level_set.insert(block.clone());
+            level.push(block);
+            if out.len() > MWIS_FINISH_MAX_COMPONENTS {
+                return None;
+            }
+        }
+    }
+
+    // Levels 3..n: apriori extension.
+    while !level.is_empty() {
+        let mut next: Vec<Vec<u32>> = Vec::new();
+        let mut next_set: FxHashSet<Vec<u32>> = FxHashSet::default();
+        for block in &level {
+            let max = *block.last().unwrap();
+            for l in (max + 1)..=num_leaves as u32 {
+                since_check += 1;
+                if since_check >= 4096 {
+                    since_check = 0;
+                    if t0.elapsed().as_millis() > MWIS_FINISH_BUDGET_MS {
+                        return None;
+                    }
+                }
+                // Candidate cand = block ∪ {l}, already sorted (l > max).
+                let mut cand = block.clone();
+                cand.push(l);
+                // Apriori prune: every k-subset of cand must be a valid k-block.
+                // cand\{l} = block is valid by construction; check the rest.
+                let mut all_subsets_valid = true;
+                for drop in 0..block.len() {
+                    let mut sub: Vec<u32> = Vec::with_capacity(block.len());
+                    for (i, &x) in cand.iter().enumerate() {
+                        if i != drop {
+                            sub.push(x);
+                        }
+                    }
+                    if !level_set.contains(&sub) {
+                        all_subsets_valid = false;
+                        break;
+                    }
+                }
+                if !all_subsets_valid {
+                    continue;
+                }
+                if is_valid_af_component(&cand, trees) {
+                    out.push(builder.build_unchecked(cand.clone(), trees));
+                    next_set.insert(cand.clone());
+                    next.push(cand);
+                    if out.len() > MWIS_FINISH_MAX_COMPONENTS {
+                        return None;
+                    }
+                }
+            }
+        }
+        level = next;
+        level_set = next_set;
+    }
+    Some(out)
+}
+
+/// Core-finisher (KLADOS_BP_MWIS_FINISH=1). At a stuck high-m core root, prove
+/// the core optimum directly by reducing MAF to a max-weight independent set.
+///
+/// **Soundness (the whole point):** `comb_opt = core_leaves − α_w(H)` is the
+/// *proven* core optimum only when the candidate set is **complete** (every
+/// valid agreement component is a vertex) and the MWIS search **exhausts**. The
+/// pool-based prototype was a primal because the pool can miss components; here
+/// we enumerate the complete component set via [`enumerate_all_components`], so
+/// the result is a certificate. The conflict graph uses the same leaf+node
+/// relation as the master, so pairwise compatibility ⟹ mutual compatibility ⟹
+/// the optimal independent set is a valid agreement forest of size `comb_opt`.
+///
+/// Returns `Some(incumbent)` realising the proven optimum (the caller closes the
+/// node with it); `None` to fall back to ordinary B&P (gate off, core too large,
+/// enumeration or MWIS over budget).
+fn try_mwis_finish(
     reduced: &Instance,
-    state: &SearchState,
+    state: &mut SearchState,
+    trees: &[Tree],
     lp: &crate::solvers::bp::rmp::RmpSolution,
     branchings: &Branchings,
+    lb: usize,
+    builder: &mut ColumnBuilder,
     cfg: &crate::solvers::bp::BpConfig,
-) {
-    if !cfg.mwis_finish || branchings.depth() != 0 {
-        return;
+) -> Option<Incumbent> {
+    // Gating: only the hard regime, only at a stuck root.
+    let num_leaves = reduced.num_leaves as usize;
+    if !cfg.mwis_finish
+        || branchings.depth() != 0
+        || trees.len() < 3
+        || num_leaves > MWIS_FINISH_MAX_LEAVES
+        || lb >= state.best_ub()
+    {
+        return None;
     }
+    // Only fire when the root LP is genuinely stuck: a fractional support is the
+    // signature of the hard cores (the LP hedges ~1 merge across many candidates
+    // — see merge-order-probe). A core whose root LP is integral is solved
+    // trivially by ordinary B&P; running the finisher there only burns the
+    // enumeration budget. This is what keeps the finisher off the easy cores
+    // that decomposition produces in bulk.
+    let frac_pairs = count_fractional_pairs(state, &lp.column_values);
+    debug!(
+        target: LOG_TARGET,
+        "mwis-finish: gate-in core_leaves={} m={} lb={} ub={} frac_pairs={}",
+        num_leaves, trees.len(), lb, state.best_ub(), frac_pairs,
+    );
+    if frac_pairs == 0 {
+        return None;
+    }
+
     let t0 = Instant::now();
-    let cols = state.columns();
-    // Candidate merges = multi-leaf columns (singletons have weight 0).
-    let cand: Vec<usize> = (0..cols.len())
-        .filter(|&i| cols[i].labels().len() >= 2)
-        .collect();
-    let m = cand.len();
-    let weights: Vec<usize> = cand.iter().map(|&i| cols[i].labels().len() - 1).collect();
-    // Conflict graph: two merges conflict iff they share a leaf or a tree node.
-    use fxhash::FxHashMap;
-    let mut by_leaf: FxHashMap<u32, Vec<usize>> = FxHashMap::default();
-    let mut by_node: FxHashMap<(usize, usize), Vec<usize>> = FxHashMap::default();
-    for (li, &ci) in cand.iter().enumerate() {
-        for &l in cols[ci].labels() {
-            by_leaf.entry(l).or_default().push(li);
-        }
-        for (ti, nodes) in cols[ci].coverage().iter_per_tree().enumerate() {
-            for &v in nodes {
-                by_node.entry((ti, v)).or_default().push(li);
-            }
-        }
-    }
-    let mut adj = vec![FixedBitSet::with_capacity(m); m];
-    for grp in by_leaf.values().chain(by_node.values()) {
-        for a in 0..grp.len() {
-            for b in (a + 1)..grp.len() {
-                adj[grp[a]].insert(grp[b]);
-                adj[grp[b]].insert(grp[a]);
-            }
-        }
-    }
+    let Some(comps) = enumerate_all_components(num_leaves, trees, builder, t0) else {
+        debug!(
+            target: LOG_TARGET,
+            "mwis-finish: bail (enumeration over budget) core_leaves={} enum_ms={:.1}",
+            num_leaves, t0.elapsed().as_secs_f64() * 1000.0,
+        );
+        return None;
+    };
     let build_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    // Conflict graph H over the complete component set: two components conflict
+    // iff they share a leaf OR share a tree node.
+    let m = comps.len();
+    let weights: Vec<usize> = comps.iter().map(|c| c.labels().len() - 1).collect();
+    // Implicit conflict graph: one element-id per distinct leaf and per distinct
+    // (tree, node); `elem_members[e]` = components sharing element `e` (a clique),
+    // `comp_elems[c]` = element-ids of component `c`. Built in O(incidences) — no
+    // `Σ group²` adjacency. The 6.5k-component residual cores (pub101 n=75) make
+    // the explicit adjacency the bottleneck; this sidesteps it entirely.
+    use fxhash::FxHashMap;
+    let mut elem_id: FxHashMap<(usize, usize), usize> = FxHashMap::default();
+    let mut elem_members: Vec<Vec<usize>> = Vec::new();
+    let mut comp_elems: Vec<Vec<u32>> = vec![Vec::new(); m];
+    // Leaves use tree-slot usize::MAX so they can't collide with (tree,node).
+    let intern = |key: (usize, usize),
+                  members: &mut Vec<Vec<usize>>,
+                  map: &mut FxHashMap<(usize, usize), usize>|
+     -> usize {
+        *map.entry(key).or_insert_with(|| {
+            members.push(Vec::new());
+            members.len() - 1
+        })
+    };
+    for (ci, col) in comps.iter().enumerate() {
+        for &l in col.labels() {
+            let e = intern((usize::MAX, l as usize), &mut elem_members, &mut elem_id);
+            elem_members[e].push(ci);
+            comp_elems[ci].push(e as u32);
+        }
+        for (ti, nodes) in col.coverage().iter_per_tree().enumerate() {
+            for &v in nodes {
+                let e = intern((ti, v), &mut elem_members, &mut elem_id);
+                elem_members[e].push(ci);
+                comp_elems[ci].push(e as u32);
+            }
+        }
+    }
+    // Materialise each element-group as a component bitset for fast subtraction.
+    let mut elem_groups: Vec<FixedBitSet> = Vec::with_capacity(elem_members.len());
+    for members in &elem_members {
+        let mut bs = FixedBitSet::with_capacity(m);
+        for &c in members {
+            bs.insert(c);
+        }
+        elem_groups.push(bs);
+    }
+    // Clique cover (a partition) for the MWIS clique-cover bound. Every
+    // element-group is a clique; greedily carve disjoint ones.
+    let group_refs: Vec<&Vec<usize>> = elem_members.iter().collect();
+    let cliques = greedy_clique_cover(m, &group_refs);
+    let graph_ms = t0.elapsed().as_secs_f64() * 1000.0 - build_ms;
+    if t0.elapsed().as_millis() > MWIS_FINISH_BUDGET_MS {
+        debug!(target: LOG_TARGET, "mwis-finish: bail (graph build over budget) core_leaves={} components={} ms={:.1}", num_leaves, m, t0.elapsed().as_secs_f64()*1000.0);
+        return None;
+    }
+
     let t1 = Instant::now();
-    let (mwis, exhausted) = solve_mwis_bb(&adj, &weights, 100_000_000);
-    let comb_opt = reduced.num_leaves as usize - mwis;
+    let (mwis, witness, exhausted) = solve_mwis_bb(
+        &elem_groups,
+        &comp_elems,
+        &weights,
+        &cliques,
+        MWIS_FINISH_BB_BUDGET,
+        t0,
+    );
+    let mwis_ms = t1.elapsed().as_secs_f64() * 1000.0;
+    let comb_opt = num_leaves - mwis;
+
     info!(
         target: LOG_TARGET,
-        "mwis-finish: core_leaves={} cand_merges={} mwis_merges={} comb_opt={} lp={:.3} lp_lb={} ub={} exhausted={} build_ms={:.2} mwis_ms={:.2}",
-        reduced.num_leaves, m, mwis, comb_opt,
+        "mwis-finish: core_leaves={} components={} mwis_merges={} comb_opt={} lp={:.3} lp_lb={} ub={} exhausted={} enum_ms={:.2} graph_ms={:.2} mwis_ms={:.2}",
+        num_leaves, m, mwis, comb_opt,
         lp.objective, (lp.objective - 1.0e-6).ceil() as usize, state.best_ub(),
-        exhausted, build_ms, t1.elapsed().as_secs_f64() * 1000.0,
+        exhausted, build_ms, graph_ms, mwis_ms,
     );
+
+    if !exhausted {
+        // MWIS hit the node budget — `comb_opt` is only an upper bound on the
+        // weight, hence a lower bound on the forest size; not a certificate.
+        return None;
+    }
+
+    // Materialise the witness forest as an incumbent. The MWIS independent set
+    // is a set of pairwise-compatible components; uncovered leaves become
+    // singletons. Add the chosen multi-leaf components to the pool to obtain
+    // column ids (or reuse an existing id if already present).
+    let mut covered = vec![false; num_leaves + 1];
+    let mut chosen: Vec<usize> = Vec::with_capacity(comb_opt);
+    for &vi in &witness {
+        let labels = comps[vi].labels().to_vec();
+        for &l in &labels {
+            covered[l as usize] = true;
+        }
+        let col = builder.build_unchecked(labels.clone(), trees);
+        let id = match state.add_column(col) {
+            Some(id) => id,
+            None => state
+                .columns()
+                .iter()
+                .position(|c| c.labels() == labels.as_slice())?,
+        };
+        chosen.push(id);
+    }
+    // Backfill singletons for uncovered leaves (seeded first: id = label-1).
+    for label in 1..=num_leaves {
+        if !covered[label] {
+            let singleton_ci = label - 1;
+            if singleton_ci < state.columns().len()
+                && state.columns()[singleton_ci].labels() == [label as u32]
+            {
+                chosen.push(singleton_ci);
+            } else {
+                let pos = state
+                    .columns()
+                    .iter()
+                    .position(|c| c.labels() == [label as u32])?;
+                chosen.push(pos);
+            }
+        }
+    }
+    debug_assert_eq!(chosen.len(), comb_opt);
+
+    // Validate the reconstructed forest before trusting the certificate. This is
+    // cheap insurance against any soundness gap in the conflict-graph relation.
+    let inc = Incumbent {
+        component_columns: chosen,
+        k: comb_opt,
+    };
+    let forest = reconstruct_components(&inc, state.columns(), reduced);
+    if !validate_agreement_forest(reduced, &forest).is_ok() {
+        debug!(
+            target: LOG_TARGET,
+            "mwis-finish: reconstructed forest failed validation — falling back"
+        );
+        return None;
+    }
+    Some(inc)
 }
 
 /// Pair together-mass `Σ_{c ⊇ {a,b}} x_c` for every leaf pair, from the LP
@@ -2786,8 +3198,7 @@ fn select_marginal_tree_side_cuts(
         for idx in 0..remaining.len() {
             let mut trial = selected.clone();
             trial.push(remaining[idx].clone());
-            let Some(result) =
-                evaluate_restricted_pool_with_tree_side_cuts(reduced, state, &trial)
+            let Some(result) = evaluate_restricted_pool_with_tree_side_cuts(reduced, state, &trial)
             else {
                 continue;
             };
@@ -2848,7 +3259,11 @@ fn maybe_probe_residual_completion_cuts(
     candidates.sort_by(|(ai, av), (bi, bv)| {
         bv.partial_cmp(av)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| state.columns()[*bi].size().cmp(&state.columns()[*ai].size()))
+            .then_with(|| {
+                state.columns()[*bi]
+                    .size()
+                    .cmp(&state.columns()[*ai].size())
+            })
             .then_with(|| ai.cmp(bi))
     });
 
@@ -2996,9 +3411,7 @@ fn compatible_columns_for_anchor(columns: &[AfColumn], anchor_col: usize) -> Vec
     columns
         .iter()
         .enumerate()
-        .filter_map(|(ci, col)| {
-            (ci != anchor_col && !columns_conflict(anchor, col)).then_some(ci)
-        })
+        .filter_map(|(ci, col)| (ci != anchor_col && !columns_conflict(anchor, col)).then_some(ci))
         .collect()
 }
 
@@ -3529,9 +3942,9 @@ fn maybe_probe_root_rank_cuts(
         by_root.entry(root).or_default().push(local);
     }
     let mut comps = by_root.into_values().collect::<Vec<_>>();
-    comps.sort_by(|a, b| b.len().cmp(&a.len()));
+    comps.sort_by_key(|b| std::cmp::Reverse(b.len()));
 
-    let max_cols = cfg.rank_cut_probe_max_cols.min(96).max(8);
+    let max_cols = cfg.rank_cut_probe_max_cols.clamp(8, 96);
     let mut tested = 0usize;
     let mut skipped_large = 0usize;
     let mut best: Option<RankCutProbeBest> = None;
