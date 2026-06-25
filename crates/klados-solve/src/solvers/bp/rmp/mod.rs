@@ -689,6 +689,30 @@ impl Rmp {
         self.num_rows += 1;
     }
 
+    /// Diagnostic only: solve the LP with `branchings` applied AND every column
+    /// in `forbid` additionally pinned to 0. Does NOT restore — the caller must
+    /// re-apply bounds afterward (`apply_bounds(columns, branchings)`). Used by
+    /// the node-branch probe to measure the `y=0` (forbid-coverage) ΔLP.
+    pub fn probe_lp_forbidding_cols(
+        &mut self,
+        columns: &[AfColumn],
+        branchings: &Branchings,
+        forbid: &[usize],
+    ) -> Option<f64> {
+        self.apply_bounds(columns, branchings);
+        let ptr = self.model.as_mut()?.as_mut_ptr();
+        for &ci in forbid {
+            if ci < self.col_handle.len() {
+                unsafe {
+                    highs_sys::Highs_changeColBounds(ptr, self.col_handle[ci], 0.0, 0.0);
+                }
+                self.cur_lo[ci] = 0.0;
+                self.cur_hi[ci] = 0.0;
+            }
+        }
+        self.solve().ok().map(|s| s.objective)
+    }
+
     /// Apply per-column bounds derived from `branchings`. RCVF-fixed columns
     /// stay pinned at zero regardless of the branching state.
     pub fn apply_bounds(&mut self, columns: &[AfColumn], branchings: &Branchings) {

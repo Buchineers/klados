@@ -117,6 +117,11 @@ pub struct BpConfig {
     /// (must/cannot-link) to measure ΔLP and how much the fractional support
     /// collapses — i.e. whether the LP usefully ORDERS which merge to commit.
     pub merge_order_probe: bool,
+    /// Diagnostic: at the root, for each fractional tree-node activity
+    /// `y_{t,v} = Σ_{c covers (t,v)} x_c`, simulate the `y=0` branch (forbid all
+    /// columns covering that node) and measure ΔLP — the embedding-branching
+    /// analog of cannot-link, to test whether it moves the LP or redistributes.
+    pub node_branch_probe: bool,
     /// Prototype: at a stuck core root, solve the candidate-merge MWIS directly
     /// (combinatorial), reporting the exact core opt vs the LP bound and time —
     /// the "core-finisher" that replaces the LP cannot-link tree.
@@ -184,6 +189,7 @@ impl Default for BpConfig {
             all_region_exact_max_leaves: 48,
             support_rank_resolve: false,
             merge_order_probe: false,
+            node_branch_probe: false,
             mwis_finish: false,
             tree_side_exact_rank: false,
             tree_laminar_exact_rank: false,
@@ -258,6 +264,9 @@ impl BpConfig {
         }
         if std::env::var("KLADOS_BP_MERGE_ORDER_PROBE").as_deref() == Ok("1") {
             cfg.merge_order_probe = true;
+        }
+        if std::env::var("KLADOS_BP_NODE_BRANCH_PROBE").as_deref() == Ok("1") {
+            cfg.node_branch_probe = true;
         }
         if std::env::var("KLADOS_BP_MWIS_FINISH").as_deref() == Ok("1") {
             cfg.mwis_finish = true;

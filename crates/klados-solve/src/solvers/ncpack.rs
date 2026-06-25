@@ -1337,6 +1337,694 @@ fn boundary_probe(inst: &Instance, nn: usize, blocks: &[Block], pairs: &[(u32, u
     );
 }
 
+/// Per-node analysis for the hierarchy probe: build the near-optimal forest,
+/// report local μ* and (if one exists) the min-coupling clean cut that
+/// MEANINGFULLY splits merges (both sides keep ≥1 merge ⇒ μ* strictly drops).
+/// Returns `(mu_star, Some((cut_leaves, coupling_width)))`, or `..None` if the
+/// node cannot be cleanly split (the DP would solve it directly at cost exp(μ*)).
+fn hier_analyze(inst: &Instance, node_budget: u64) -> Option<(usize, Option<(FixedBitSet, usize)>)> {
+    let nn = inst.num_leaves as usize;
+    let n = nn as u32;
+    let forest = pair_matching_forest(inst, nn, node_budget)?;
+
+    let mut comps: Vec<Vec<u32>> = Vec::new();
+    for comp in &forest {
+        let leaves: Vec<u32> = comp.leaves().collect();
+        if leaves.len() >= 2 {
+            comps.push(leaves);
+        }
+    }
+    let total_merges: usize = comps.iter().map(|k| k.len() - 1).sum();
+    if total_merges == 0 {
+        return Some((0, None));
+    }
+    let ncomp = comps.len();
+    let mut comp_bits: Vec<FixedBitSet> = Vec::with_capacity(ncomp);
+    let mut comp_merge: Vec<usize> = Vec::with_capacity(ncomp);
+    for k in &comps {
+        let mut bs = FixedBitSet::with_capacity(nn + 1);
+        for &l in k {
+            bs.insert(l as usize);
+        }
+        comp_bits.push(bs);
+        comp_merge.push(k.len() - 1);
+    }
+
+    let m = inst.trees.len();
+    let mut lca_clade: Vec<Vec<FixedBitSet>> = vec![Vec::with_capacity(m); ncomp];
+    let mut clades: Vec<FixedBitSet> = Vec::new();
+    for tree in &inst.trees {
+        let nnodes = tree.num_nodes();
+        let mut under: Vec<FixedBitSet> = vec![FixedBitSet::with_capacity(nn + 1); nnodes];
+        for lbl in 1..=n {
+            let mut u = tree.node_by_label(lbl);
+            loop {
+                under[u as usize].insert(lbl as usize);
+                if tree.is_root(u) {
+                    break;
+                }
+                u = tree.parent[u as usize];
+            }
+        }
+        for (ci, k) in comps.iter().enumerate() {
+            let mut lca = tree.node_by_label(k[0]);
+            for &lbl in &k[1..] {
+                lca = tree.nearest_common_ancestor(lca, tree.node_by_label(lbl));
+            }
+            lca_clade[ci].push(under[lca as usize].clone());
+        }
+        for node in 0..nnodes as u32 {
+            if tree.is_leaf(node) || tree.is_root(node) {
+                continue;
+            }
+            let csize = under[node as usize].count_ones(..);
+            if csize >= 2 && csize <= nn - 2 {
+                clades.push(under[node as usize].clone());
+            }
+        }
+    }
+
+    let mut best: Option<(FixedBitSet, usize)> = None;
+    let mut tmp = FixedBitSet::with_capacity(nn + 1);
+    for c in &clades {
+        let mut clean = true;
+        let mut merges_in = 0usize;
+        for (ci, kb) in comp_bits.iter().enumerate() {
+            tmp.clone_from(kb);
+            tmp.intersect_with(c);
+            let inter = tmp.count_ones(..);
+            if inter == 0 {
+                continue;
+            }
+            if inter != kb.count_ones(..) {
+                clean = false;
+                break;
+            }
+            merges_in += comp_merge[ci];
+        }
+        if !clean {
+            continue;
+        }
+        let merges_out = total_merges - merges_in;
+        if merges_in < 1 || merges_out < 1 {
+            continue; // not a meaningful merge-split
+        }
+        let mut adj = 0usize;
+        for ci in 0..ncomp {
+            let mut is_adj = false;
+            for clade_kt in &lca_clade[ci] {
+                tmp.clone_from(clade_kt);
+                tmp.intersect_with(c);
+                let inter = tmp.count_ones(..);
+                let tot = clade_kt.count_ones(..);
+                if inter > 0 && inter < tot {
+                    is_adj = true;
+                    break;
+                }
+            }
+            if is_adj {
+                adj += 1;
+            }
+        }
+        match &best {
+            None => best = Some((c.clone(), adj)),
+            Some((_, bw)) if adj < *bw => best = Some((c.clone(), adj)),
+            _ => {}
+        }
+    }
+    Some((total_merges, best))
+}
+
+/// HIERARCHY PROBE (`KLADOS_NCPACK_HIERARCHY=1`). The make-or-break measurement
+/// for the coupling-width DP. The boundary probe measured only the TOP cut; the
+/// DP needs coupling bounded along the WHOLE branch decomposition. This bisects
+/// recursively by min-coupling clean merge-splits and reports, over every node:
+/// the max coupling width at split nodes and the max residual μ* at "stuck"
+/// nodes (μ* > BASE_MU but no clean split). The DP is feasible on an instance
+/// iff BOTH stay small (table ~ exp(coupling); base cost ~ exp(stuck μ*)).
+fn hierarchy_probe(inst: &Instance, node_budget: u64) {
+    const BASE_MU: usize = 4; // exp(BASE_MU) solved directly ⇒ cheap base case
+    const MAX_NODES: usize = 4_000;
+
+    let mut max_coupling = 0usize;
+    let mut max_stuck_mu = 0usize;
+    let mut couplings: Vec<usize> = Vec::new();
+    let mut stuck_mus: Vec<usize> = Vec::new();
+    let (mut n_split, mut n_base, mut n_stuck, mut max_depth, mut total_nodes) =
+        (0usize, 0usize, 0usize, 0usize, 0usize);
+
+    // Cap the per-node clique budget hard: the probe only needs a near-optimal
+    // forest to define the cut/coupling, not the global best matching. A tiny
+    // budget bounds each call so no single node can blow the wall-clock.
+    let probe_budget = node_budget.min(20_000);
+    let start = Instant::now();
+    let mut truncated = false;
+    let mut stack: Vec<(Instance, usize)> = vec![(inst.clone(), 0)];
+    while let Some((cur, depth)) = stack.pop() {
+        total_nodes += 1;
+        if total_nodes > MAX_NODES || start.elapsed() > Duration::from_secs(45) {
+            truncated = true;
+            break;
+        }
+        max_depth = max_depth.max(depth);
+        let nn = cur.num_leaves as usize;
+        if nn < 4 {
+            n_base += 1;
+            continue;
+        }
+        let Some((mu, best)) = hier_analyze(&cur, probe_budget) else {
+            n_base += 1;
+            continue;
+        };
+        if mu <= BASE_MU {
+            n_base += 1;
+            continue;
+        }
+        let Some((cut, coupling)) = best else {
+            n_stuck += 1;
+            max_stuck_mu = max_stuck_mu.max(mu);
+            stuck_mus.push(mu);
+            continue;
+        };
+        n_split += 1;
+        max_coupling = max_coupling.max(coupling);
+        couplings.push(coupling);
+        let (ci, _) = klados_core::kernelize::restrict_instance_simple(&cur, &cut);
+        let mut ccbits = FixedBitSet::with_capacity(nn + 1);
+        for l in 1..=nn {
+            if !cut.contains(l) {
+                ccbits.insert(l);
+            }
+        }
+        let (cci, _) = klados_core::kernelize::restrict_instance_simple(&cur, &ccbits);
+        stack.push((ci, depth + 1));
+        stack.push((cci, depth + 1));
+    }
+    couplings.sort_unstable();
+    stuck_mus.sort_unstable();
+    log::info!(
+        "[ncpack-HIERARCHY] n={} m={} nodes={}(split={} base={} stuck={}) depth={} \
+         MAX_COUPLING={} MAX_STUCK_MU={} elapsed_ms={} truncated={} | couplings={:?} stuck_mus={:?}",
+        inst.num_leaves,
+        inst.trees.len(),
+        total_nodes,
+        n_split,
+        n_base,
+        n_stuck,
+        max_depth,
+        max_coupling,
+        max_stuck_mu,
+        start.elapsed().as_millis(),
+        truncated,
+        couplings,
+        stuck_mus,
+    );
+}
+
+/// T0-HIERARCHY PROBE (`KLADOS_NCPACK_T0HIER=1`). Measures the coupling width of
+/// the *actual* fixed-reference-tree DP (every `C_u` a clade of `T_0`, so Lemma
+/// 2.1 gives ≤1 open block). For each candidate reference tree `T_0`, over every
+/// internal-node clade `C_u`, count boundary-active CLOSED blocks (footprint
+/// nonempty but not straddling) = `W_dp`; report the min over reference-tree
+/// choices. This is the parameter that bounds the DP table; the adaptive
+/// hierarchy probe was only a proxy (its `X∖C` side is not a clade).
+fn t0_hierarchy_probe(inst: &Instance, nn: usize) {
+    let n = nn as u32;
+    let Some(forest) = pair_matching_forest(inst, nn, 20_000) else {
+        log::info!("[ncpack-T0HIER] n={nn}: no forest");
+        return;
+    };
+    let mut comps: Vec<Vec<u32>> = Vec::new();
+    for c in &forest {
+        let l: Vec<u32> = c.leaves().collect();
+        if l.len() >= 2 {
+            comps.push(l);
+        }
+    }
+    let total_merges: usize = comps.iter().map(|k| k.len() - 1).sum();
+    let ncomp = comps.len();
+    if ncomp == 0 {
+        log::info!("[ncpack-T0HIER] n={nn} mu*=0 trivial");
+        return;
+    }
+    let mut comp_bits: Vec<FixedBitSet> = Vec::with_capacity(ncomp);
+    for k in &comps {
+        let mut b = FixedBitSet::with_capacity(nn + 1);
+        for &l in k {
+            b.insert(l as usize);
+        }
+        comp_bits.push(b);
+    }
+    let m = inst.trees.len();
+    let mut lca_clade: Vec<Vec<FixedBitSet>> = vec![Vec::with_capacity(m); ncomp];
+    let mut under_per_tree: Vec<Vec<FixedBitSet>> = Vec::with_capacity(m);
+    for tree in &inst.trees {
+        let nnodes = tree.num_nodes();
+        let mut under = vec![FixedBitSet::with_capacity(nn + 1); nnodes];
+        for lbl in 1..=n {
+            let mut u = tree.node_by_label(lbl);
+            loop {
+                under[u as usize].insert(lbl as usize);
+                if tree.is_root(u) {
+                    break;
+                }
+                u = tree.parent[u as usize];
+            }
+        }
+        for (ci, k) in comps.iter().enumerate() {
+            let mut lca = tree.node_by_label(k[0]);
+            for &lbl in &k[1..] {
+                lca = tree.nearest_common_ancestor(lca, tree.node_by_label(lbl));
+            }
+            lca_clade[ci].push(under[lca as usize].clone());
+        }
+        under_per_tree.push(under);
+    }
+    let mut tmp = FixedBitSet::with_capacity(nn + 1);
+    let mut per_t_w: Vec<usize> = Vec::with_capacity(m);
+    let mut max_interface = 0usize;
+    for (ti, tree) in inst.trees.iter().enumerate() {
+        let under = &under_per_tree[ti];
+        let mut maxw = 0usize;
+        for node in 0..tree.num_nodes() as u32 {
+            if tree.is_leaf(node) || tree.is_root(node) {
+                continue;
+            }
+            let c = &under[node as usize];
+            let csize = c.count_ones(..);
+            if csize < 2 || csize > nn - 2 {
+                continue;
+            }
+            let mut interface = 0usize;
+            for kb in &comp_bits {
+                tmp.clone_from(kb);
+                tmp.intersect_with(c);
+                let i = tmp.count_ones(..);
+                if i > 0 && i < kb.count_ones(..) {
+                    interface += 1;
+                }
+            }
+            max_interface = max_interface.max(interface);
+            let mut adj = 0usize;
+            for ci in 0..ncomp {
+                let mut is = false;
+                for ck in &lca_clade[ci] {
+                    tmp.clone_from(ck);
+                    tmp.intersect_with(c);
+                    let it = tmp.count_ones(..);
+                    let tot = ck.count_ones(..);
+                    if it > 0 && it < tot {
+                        is = true;
+                        break;
+                    }
+                }
+                if is {
+                    adj += 1;
+                }
+            }
+            // Exclude the ≤1 straddler (the open block, tracked separately).
+            maxw = maxw.max(adj.saturating_sub(interface));
+        }
+        per_t_w.push(maxw);
+    }
+    let best_w = per_t_w.iter().copied().min().unwrap_or(usize::MAX);
+    let worst_w = per_t_w.iter().copied().max().unwrap_or(0);
+    log::info!(
+        "[ncpack-T0HIER] n={nn} m={m} mu*={total_merges} ncomp={ncomp} \
+         BEST_T0_W_dp={best_w} worst_T0_W={worst_w} max_interface(should_be<=1)={max_interface} \
+         per_tree_W={per_t_w:?}",
+    );
+}
+
+// ── Coupling-width DP state-counter (KLADOS_NCPACK_DPCOUNT=1) ─────────────────
+// Faithful enumeration of the DP's reachable states, keyed by block leaf-sets
+// (finer than footprints ⇒ an UPPER BOUND on the real table). If this stays
+// small, the footprint-keyed DP table is ≤ it ⇒ the speed risk does not break
+// the idea. Validated by checking the DP returns the true μ*.
+
+fn dpc_steiner(tree: &Tree, leaves: &[u32]) -> FixedBitSet {
+    let mut lca = tree.node_by_label(leaves[0]);
+    for &l in &leaves[1..] {
+        lca = tree.nearest_common_ancestor(lca, tree.node_by_label(l));
+    }
+    let mut bs = FixedBitSet::with_capacity(tree.num_nodes());
+    for &l in leaves {
+        let mut c = tree.node_by_label(l);
+        loop {
+            bs.insert(c as usize);
+            if c == lca {
+                break;
+            }
+            c = tree.parent[c as usize];
+        }
+    }
+    bs
+}
+
+fn dpc_agrees(inst: &Instance, block: &[u32]) -> bool {
+    if block.len() <= 2 {
+        return true;
+    }
+    let set: std::collections::HashSet<u32> = block.iter().copied().collect();
+    fn sig(tree: &Tree, set: &std::collections::HashSet<u32>, node: u32) -> Option<String> {
+        if tree.is_leaf(node) {
+            let l = tree.label[node as usize];
+            return set.contains(&l).then(|| l.to_string());
+        }
+        let (a, b) = tree.children(node).unwrap();
+        match (sig(tree, set, a), sig(tree, set, b)) {
+            (None, None) => None,
+            (Some(x), None) | (None, Some(x)) => Some(x),
+            (Some(x), Some(y)) => Some(if x <= y { format!("({x},{y})") } else { format!("({y},{x})") }),
+        }
+    }
+    let s0 = sig(&inst.trees[0], &set, inst.trees[0].root);
+    inst.trees[1..].iter().all(|t| sig(t, &set, t.root) == s0)
+}
+
+fn dpc_noncross(inst: &Instance, blocks: &[&Vec<u32>]) -> bool {
+    if blocks.len() < 2 {
+        return true;
+    }
+    for tree in &inst.trees {
+        let sts: Vec<FixedBitSet> = blocks.iter().map(|b| dpc_steiner(tree, b)).collect();
+        for i in 0..sts.len() {
+            for j in (i + 1)..sts.len() {
+                if sts[i].intersection(&sts[j]).next().is_some() {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Will the open block `open`, growing upward through pure-`C_u` ancestors,
+/// cross block `b`? If so `b` cannot be retired (Lemma 6.1 only separates `b`
+/// from blocks OUTSIDE `C_u`; the open block is inside `C_u` and its upward
+/// growth traverses pure-`C_u` vertices that may lie on `b`'s Steiner tree).
+fn dpc_open_ray_crosses(
+    inst: &Instance,
+    b: &[u32],
+    open: &[u32],
+    cu: &FixedBitSet,
+    under: &[Vec<FixedBitSet>],
+) -> bool {
+    for (q, tree) in inst.trees.iter().enumerate() {
+        let mut lca = tree.node_by_label(open[0]);
+        for &l in &open[1..] {
+            lca = tree.nearest_common_ancestor(lca, tree.node_by_label(l));
+        }
+        let stb = dpc_steiner(tree, b);
+        let mut a = lca;
+        loop {
+            let clade = &under[q][a as usize];
+            // stop once we leave the pure-C_u region (a is mixed or outside)
+            if clade.intersection(cu).count() != clade.count_ones(..) {
+                break;
+            }
+            if stb.contains(a as usize) {
+                return true;
+            }
+            if tree.is_root(a) {
+                break;
+            }
+            a = tree.parent[a as usize];
+        }
+    }
+    false
+}
+
+fn dpc_boundary_active(inst: &Instance, block: &[u32], cu: &FixedBitSet, under: &[Vec<FixedBitSet>]) -> bool {
+    for (q, tree) in inst.trees.iter().enumerate() {
+        let mut lca = tree.node_by_label(block[0]);
+        for &l in &block[1..] {
+            lca = tree.nearest_common_ancestor(lca, tree.node_by_label(l));
+        }
+        let clade = &under[q][lca as usize];
+        let inter = clade.intersection(cu).count();
+        let csz = clade.count_ones(..);
+        if inter > 0 && inter < csz {
+            return true;
+        }
+    }
+    false
+}
+
+type DpcKey = (Vec<u32>, Vec<Vec<u32>>); // (open-or-empty, sorted closed-active)
+
+/// Run the DP over reference tree `t0_idx`, counting states. Returns
+/// `(max_table_size, mu_star)` or `None` if a table exceeds `cap` (RISK).
+fn dpc_run_t0(
+    inst: &Instance,
+    t0_idx: usize,
+    under: &[Vec<FixedBitSet>],
+    cap: usize,
+    deadline: Instant,
+) -> Option<(usize, usize, usize)> {
+    let t0 = &inst.trees[t0_idx];
+    let mut tables: Vec<std::collections::HashMap<DpcKey, usize>> =
+        vec![std::collections::HashMap::new(); t0.num_nodes()];
+    let mut max_table = 0usize;
+    let mut max_fp = 0usize;
+
+    for node in t0.post_order() {
+        if Instant::now() > deadline {
+            return None;
+        }
+        if t0.is_leaf(node) {
+            let x = t0.label[node as usize];
+            let tbl = &mut tables[node as usize];
+            tbl.insert((vec![x], vec![]), 0); // x open (will merge)
+            tbl.insert((vec![], vec![]), 0); // x final singleton
+            continue;
+        }
+        let (v, w) = t0.children(node).unwrap();
+        let cu = &under[t0_idx][node as usize];
+        // move children tables out
+        let tv = std::mem::take(&mut tables[v as usize]);
+        let tw = std::mem::take(&mut tables[w as usize]);
+        let mut out: std::collections::HashMap<DpcKey, usize> = std::collections::HashMap::new();
+
+        for ((ov, cv), &rv) in &tv {
+            for ((ow, cw), &rw) in &tw {
+                if Instant::now() > deadline {
+                    return None;
+                }
+                let base_ret = rv + rw;
+                // carried committed blocks
+                let mut base_closed: Vec<Vec<u32>> = Vec::with_capacity(cv.len() + cw.len());
+                base_closed.extend(cv.iter().cloned());
+                base_closed.extend(cw.iter().cloned());
+
+                // seam: (new_open, extra_committed)
+                let ov_some = !ov.is_empty();
+                let ow_some = !ow.is_empty();
+                let mut candidates: Vec<(Vec<u32>, Vec<Vec<u32>>)> = Vec::new();
+                if !ov_some && !ow_some {
+                    candidates.push((vec![], vec![]));
+                } else if ov_some && !ow_some {
+                    candidates.push((ov.clone(), vec![]));
+                } else if !ov_some && ow_some {
+                    candidates.push((ow.clone(), vec![]));
+                } else {
+                    // both open ⇒ must merge (Lemma 2.1)
+                    let mut b: Vec<u32> = ov.clone();
+                    b.extend_from_slice(ow);
+                    b.sort_unstable();
+                    if dpc_agrees(inst, &b) {
+                        candidates.push((b.clone(), vec![])); // B continues open
+                        candidates.push((vec![], vec![b])); // B commits
+                    }
+                }
+
+                for (new_open, extra) in candidates {
+                    // all live blocks for the non-crossing check
+                    let mut refs: Vec<&Vec<u32>> = base_closed.iter().chain(extra.iter()).collect();
+                    if !new_open.is_empty() {
+                        refs.push(&new_open);
+                    }
+                    if !dpc_noncross(inst, &refs) {
+                        continue;
+                    }
+                    // retire committed blocks that can no longer interact:
+                    // not boundary-active (Lemma 6.1, vs outside blocks) AND not
+                    // on the open block's upward pure-C_u growth ray.
+                    let mut ret = base_ret;
+                    let mut closed: Vec<Vec<u32>> = Vec::new();
+                    for b in base_closed.iter().chain(extra.iter()) {
+                        let keep = b.len() >= 2
+                            && (dpc_boundary_active(inst, b, cu, under)
+                                || (!new_open.is_empty()
+                                    && dpc_open_ray_crosses(inst, b, &new_open, cu, under)));
+                        if keep {
+                            closed.push(b.clone());
+                        } else {
+                            ret += b.len().saturating_sub(1);
+                        }
+                    }
+                    closed.sort();
+                    let key = (new_open, closed);
+                    let e = out.entry(key).or_insert(0);
+                    *e = (*e).max(ret);
+                }
+                if out.len() > cap {
+                    return None;
+                }
+            }
+        }
+        max_table = max_table.max(out.len());
+        // Footprint-keyed count: how far would the real (footprint) DP collapse
+        // the leaf-set table? A LOWER bound on the sound footprint+agreement table.
+        let clade = &under[t0_idx][node as usize];
+        let block_fp = |b: &[u32]| -> u64 {
+            let mut bh: u64 = 14695981039346656037;
+            for (q, tree) in inst.trees.iter().enumerate() {
+                for z in dpc_steiner(tree, b).ones() {
+                    let zc = &under[q][z];
+                    let inter = zc.intersection(clade).count();
+                    if inter > 0 && inter < zc.count_ones(..) {
+                        bh ^= (q as u64).wrapping_mul(1000003).wrapping_add(z as u64);
+                        bh = bh.wrapping_mul(1099511628211);
+                    }
+                }
+            }
+            bh
+        };
+        let mut fp_keys: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for (open, closed) in out.keys() {
+            let mut h: u64 = 1469598103934665603;
+            if !open.is_empty() {
+                h ^= block_fp(open).wrapping_add(0xABCD);
+                h = h.wrapping_mul(1099511628211);
+            }
+            let mut cs: Vec<u64> = closed.iter().map(|b| block_fp(b)).collect();
+            cs.sort_unstable();
+            for c in cs {
+                h ^= c;
+                h = h.wrapping_mul(1099511628211);
+            }
+            fp_keys.insert(h);
+        }
+        max_fp = max_fp.max(fp_keys.len());
+        tables[node as usize] = out;
+    }
+
+    // root: close any dangling open block; all blocks retire (C=X).
+    let root = t0.root as usize;
+    let mu = tables[root]
+        .iter()
+        .map(|((open, closed), &ret)| {
+            let open_m = open.len().saturating_sub(1);
+            let closed_m: usize = closed.iter().map(|b| b.len().saturating_sub(1)).sum();
+            ret + open_m + closed_m
+        })
+        .max()
+        .unwrap_or(0);
+    Some((max_table, max_fp, mu))
+}
+
+/// Test entry points for the primitive checks.
+pub fn dpc_agrees_pub(inst: &Instance, block: &[u32]) -> bool {
+    dpc_agrees(inst, block)
+}
+pub fn dpc_noncross_pub(inst: &Instance, blocks: &[&Vec<u32>]) -> bool {
+    dpc_noncross(inst, blocks)
+}
+
+/// Test entry point: build `under` and run the DP for one reference tree,
+/// returning `(max_table, mu_star)`.
+pub fn dpc_mu_for_t0(inst: &Instance, t0: usize, cap: usize) -> Option<(usize, usize, usize)> {
+    let nn = inst.num_leaves as usize;
+    let n = inst.num_leaves;
+    let mut under: Vec<Vec<FixedBitSet>> = Vec::with_capacity(inst.trees.len());
+    for tree in &inst.trees {
+        let mut u = vec![FixedBitSet::with_capacity(nn + 1); tree.num_nodes()];
+        for lbl in 1..=n {
+            let mut c = tree.node_by_label(lbl);
+            loop {
+                u[c as usize].insert(lbl as usize);
+                if tree.is_root(c) {
+                    break;
+                }
+                c = tree.parent[c as usize];
+            }
+        }
+        under.push(u);
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    dpc_run_t0(inst, t0, &under, cap, deadline)
+}
+
+/// DP STATE-COUNT PROBE (`KLADOS_NCPACK_DPCOUNT=1`).
+fn dpcount_probe(inst: &Instance, nn: usize) {
+    let n = nn as u32;
+    let cap: usize = std::env::var("KLADOS_NCPACK_DPCAP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200_000);
+    let deadline = Instant::now() + Duration::from_secs(120);
+    // precompute under[tree][node] = leaf bitset
+    let mut under: Vec<Vec<FixedBitSet>> = Vec::with_capacity(inst.trees.len());
+    for tree in &inst.trees {
+        let mut u = vec![FixedBitSet::with_capacity(nn + 1); tree.num_nodes()];
+        for lbl in 1..=n {
+            let mut c = tree.node_by_label(lbl);
+            loop {
+                u[c as usize].insert(lbl as usize);
+                if tree.is_root(c) {
+                    break;
+                }
+                c = tree.parent[c as usize];
+            }
+        }
+        under.push(u);
+    }
+
+    let mut best: Option<(usize, usize, usize)> = None; // (max_table, mu, t0)
+    let mut mus: Vec<usize> = Vec::new();
+    let mut completed = 0usize;
+    let mut best_fp: Option<(usize, usize)> = None; // (max_fp, t0)
+    for t0 in 0..inst.trees.len() {
+        match dpc_run_t0(inst, t0, &under, cap, deadline) {
+            Some((mt, mfp, mu)) => {
+                completed += 1;
+                mus.push(mu);
+                if best.is_none() || mt < best.unwrap().0 {
+                    best = Some((mt, mu, t0));
+                }
+                if best_fp.is_none() || mfp < best_fp.unwrap().0 {
+                    best_fp = Some((mfp, t0));
+                }
+            }
+            None => {}
+        }
+        if Instant::now() > deadline {
+            break;
+        }
+    }
+    let mu_consistent = mus.iter().all(|&x| Some(x) == mus.iter().max().copied());
+    {
+        let mut sorted = mus.clone();
+        sorted.sort_unstable();
+        log::info!("[ncpack-DPCOUNT-mus] n={nn} per_t0_mu={sorted:?}");
+    }
+    match best {
+        Some((mt, mu, t0)) => log::info!(
+            "[ncpack-DPCOUNT] n={nn} m={} completed={completed}/{} BEST_MAX_TABLE(leafset)={mt} \
+             BEST_MAX_FP_TABLE={} mu*={mu} (OPT={}) best_t0={t0} mu_consistent={mu_consistent} cap={cap}",
+            inst.trees.len(),
+            inst.trees.len(),
+            best_fp.map(|x| x.0).unwrap_or(0),
+            nn - mu,
+        ),
+        None => log::info!(
+            "[ncpack-DPCOUNT] n={nn} m={} ALL CAPPED (>{cap}) — RISK CONFIRMED",
+            inst.trees.len()
+        ),
+    }
+}
+
 /// COMBINE TEST (`KLADOS_NCPACK_COMBINE=1`). Pick a clean balanced clade `C`
 /// w.r.t. the ncpack forest, solve `L|C` and `L|Cᶜ` INDEPENDENTLY with the exact
 /// recursion (activating only one side's leaves), union the two sub-forests, and
@@ -1650,6 +2338,22 @@ impl Solver for NcpackSolver {
             .unwrap_or(250);
         if n > max_n {
             debug!("[ncpack] n={n} > max_n={max_n}; declining (not the right regime)");
+            return None;
+        }
+
+        // Hierarchy probe is a self-contained measurement (builds its own
+        // forests); run it BEFORE the expensive exhaustive certification, which
+        // times out on the wall, and decline (diagnostic-only run).
+        if std::env::var("KLADOS_NCPACK_HIERARCHY").as_deref() == Ok("1") {
+            hierarchy_probe(inst, ncfg.node_budget);
+            return None;
+        }
+        if std::env::var("KLADOS_NCPACK_T0HIER").as_deref() == Ok("1") {
+            t0_hierarchy_probe(inst, n);
+            return None;
+        }
+        if std::env::var("KLADOS_NCPACK_DPCOUNT").as_deref() == Ok("1") {
+            dpcount_probe(inst, n);
             return None;
         }
 

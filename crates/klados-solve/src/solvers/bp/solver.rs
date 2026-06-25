@@ -1196,6 +1196,11 @@ fn solve_node<P: Pricer, S: BranchSelector>(
             state.best_ub(),
         );
 
+        // Diagnostic only (KLADOS_BP_INERT_PROBE=1): measure how many leaves the
+        // root duals certify as inert (singleton in every optimum) via per-leaf
+        // reduced-cost aggregation. Read-only; nothing downstream depends on it.
+        maybe_probe_inert_leaves(reduced, state, &lp);
+
         // Diagnostic only: expose the global fractional support obstruction
         // before the ordinary branch tree starts.  The current Class-B
         // hypothesis is that almost the whole LP gap lives in one connected
@@ -1239,7 +1244,8 @@ fn solve_node<P: Pricer, S: BranchSelector>(
             cfg,
             cancel,
         );
-        maybe_probe_merge_order(state, rmp, &lp, branchings, cfg);
+        maybe_probe_merge_order(reduced, state, rmp, &lp, branchings, cfg);
+        maybe_probe_node_branch(reduced, state, rmp, &lp, branchings, cfg);
         maybe_probe_root_rank_cuts(state, &lp, cfg);
         maybe_probe_residual_completion_cuts(reduced, state, &lp, cfg);
         maybe_log_bridge_footprint(
@@ -1598,6 +1604,267 @@ fn build_root_support_regions(
         component_ceil_sum,
         lp_objective: lp.objective,
     })
+}
+
+/// Read-only inert-leaf probe (KLADOS_BP_INERT_PROBE=1).
+///
+/// Goal: test whether the *full m-tree* master duals can certify the
+/// `≤ 2μ*`-leaf support kernel (multitree-maf-theory §5–6, Open Problem 1) that
+/// the pairwise certifier could not.
+///
+/// Certification rule (sound under the stated assumptions). A column `c` (block)
+/// can appear in an integer solution of value `< z_LP + rc(c)` for no such
+/// solution; ceiling to integers, any solution using `c` has value
+/// `≥ ⌈z_LP + rc(c)⌉`. Hence `c` is excluded from *every optimum* iff
+/// `z_LP + rc(c) > OPT`. A leaf `a` is then **inert** (singleton in every
+/// optimum ⇒ deletable by Prop 5.3) iff *every* merge column (`size ≥ 2`)
+/// containing `a` is excluded.
+///
+/// Two honest caveats, both logged:
+///  (1) **Pool-only.** We see only generated columns. An un-generated low-rc
+///      merge column through `a` would keep `a` active, so `pool_inert` is an
+///      *optimistic upper bound* on the truly certifiable count. A sound version
+///      needs a per-leaf "min reduced cost over all merge columns ∋ a" pricing
+///      query; this probe first checks whether that's even worth building.
+///  (2) **OPT must be the true optimum.** The threshold uses `OPT`; pass it via
+///      `KLADOS_BP_INERT_OPT=<k>` (e.g. best-known) for a meaningful read. With
+///      only the running `best_ub` (≥ OPT) the threshold is too loose and the
+///      count is conservative (under-reports).
+fn maybe_probe_inert_leaves(
+    reduced: &Instance,
+    state: &SearchState,
+    lp: &crate::solvers::bp::rmp::RmpSolution,
+) {
+    if std::env::var("KLADOS_BP_INERT_PROBE").as_deref() != Ok("1") {
+        return;
+    }
+    let n = reduced.num_leaves as usize;
+    let z_lp = lp.objective;
+    let alpha = &lp.leaf_duals;
+    let beta = &lp.node_duals;
+    let columns = state.columns();
+
+    // OPT for the threshold: env override (true optimum) else the running UB.
+    let opt = std::env::var("KLADOS_BP_INERT_OPT")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or_else(|| state.best_ub());
+    // Exclude c from all optima iff z_lp + rc(c) > OPT.
+    let threshold = opt as f64 + 1.0e-6;
+
+    let mut merge_total = vec![0usize; n + 1];
+    let mut merge_surviving = vec![0usize; n + 1];
+    let mut cols_excluded = 0usize;
+    let mut merge_cols = 0usize;
+    for col in columns {
+        if col.size() < 2 {
+            continue;
+        }
+        merge_cols += 1;
+        let rc = 1.0 - col.pricing_score(alpha, beta);
+        let excluded = z_lp + rc > threshold;
+        if excluded {
+            cols_excluded += 1;
+        }
+        for &l in col.labels() {
+            let l = l as usize;
+            if l >= 1 && l <= n {
+                merge_total[l] += 1;
+                if !excluded {
+                    merge_surviving[l] += 1;
+                }
+            }
+        }
+    }
+
+    let mut pool_inert = 0usize; // ≥1 merge col, all excluded → certified-by-pool inert
+    let mut no_merge_col = 0usize; // 0 merge cols in pool → uncertifiable (pool gap)
+    let mut active = 0usize; // a surviving merge col → may be in an optimum
+    for l in 1..=n {
+        if merge_total[l] == 0 {
+            no_merge_col += 1;
+        } else if merge_surviving[l] == 0 {
+            pool_inert += 1;
+        } else {
+            active += 1;
+        }
+    }
+
+    let mu_star = n.saturating_sub(opt); // μ* = n − OPT
+    let target_inert = (2 * opt).saturating_sub(n); // n − 2μ*
+    info!(
+        target: LOG_TARGET,
+        "[inert-probe] n={n} OPT={opt} mu*={mu_star} z_lp={z_lp:.3} \
+         merge_cols={merge_cols} excluded={cols_excluded} | \
+         pool_inert={pool_inert} active={active} no_merge_col={no_merge_col} | \
+         target_inert(n-2mu*)={target_inert} 2mu*={}",
+        2 * mu_star,
+    );
+}
+
+/// Multi-tree 1-WL leaf-orbit approximation (trees treated as ordered).
+///
+/// Returns `classes[label]` = orbit class id. Two leaves share a class iff, in
+/// *every* tree, the sequence of sibling-subtree colors along their root path is
+/// identical at the color-refinement fixpoint. Same class ⇒ structurally
+/// interchangeable (an automorphism twin) under the standard 1-WL approximation
+/// — i.e. exactly the leaves orbital branching could fix as one group. (WL is a
+/// sufficient, not complete, orbit test; for rooted trees it is near-exact.)
+fn leaf_orbit_classes(inst: &Instance) -> Vec<u32> {
+    let n = inst.num_leaves as usize;
+    #[inline]
+    fn mix(a: u64, b: u64) -> u64 {
+        let mut h = a.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ b.wrapping_add(0x1656_67B1_9E37_79F9);
+        h ^= h >> 29;
+        h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        h ^= h >> 32;
+        h
+    }
+    #[inline]
+    fn hash_seq(seq: &[u64]) -> u64 {
+        let mut h = 0xCBF2_9CE4_8422_2325u64;
+        for &x in seq {
+            h = mix(h, x);
+        }
+        h
+    }
+    let mut color: Vec<u64> = vec![0x1234_5678; n + 1];
+    for _ in 0..n.min(10) {
+        let mut sig: Vec<Vec<u64>> = vec![Vec::with_capacity(inst.trees.len()); n + 1];
+        for tree in &inst.trees {
+            let mut node_color = vec![0u64; tree.num_nodes()];
+            for node in tree.post_order() {
+                let idx = node as usize;
+                if tree.is_leaf(node) {
+                    let lbl = tree.label[idx] as usize;
+                    node_color[idx] = if (1..=n).contains(&lbl) { color[lbl] } else { 0 };
+                } else {
+                    let (l, r) = tree.children_pair(node);
+                    let (ca, cb) = (node_color[l as usize], node_color[r as usize]);
+                    let (lo, hi) = if ca <= cb { (ca, cb) } else { (cb, ca) };
+                    node_color[idx] = mix(lo, hi);
+                }
+            }
+            for lbl in 1..=n {
+                let leaf = tree.node_by_label(lbl as klados_core::tree::Label);
+                if leaf == klados_core::tree::NONE {
+                    sig[lbl].push(0);
+                    continue;
+                }
+                let mut cur = leaf;
+                let mut path = Vec::new();
+                while !tree.is_root(cur) {
+                    let p = tree.parent[cur as usize];
+                    let (l, r) = tree.children_pair(p);
+                    let sib = if l == cur { r } else { l };
+                    path.push(node_color[sib as usize]);
+                    cur = p;
+                }
+                sig[lbl].push(hash_seq(&path));
+            }
+        }
+        let mut new_color = vec![0u64; n + 1];
+        for lbl in 1..=n {
+            new_color[lbl] = mix(color[lbl], hash_seq(&sig[lbl]));
+        }
+        if new_color[1..=n] == color[1..=n] {
+            break;
+        }
+        color = new_color;
+    }
+    let mut map: fxhash::FxHashMap<u64, u32> = fxhash::FxHashMap::default();
+    let mut classes = vec![0u32; n + 1];
+    let mut next = 0u32;
+    for lbl in 1..=n {
+        let id = *map.entry(color[lbl]).or_insert_with(|| {
+            let v = next;
+            next += 1;
+            v
+        });
+        classes[lbl] = id;
+    }
+    classes
+}
+
+/// Read-only structural classifier for the merge-order probe.
+///
+/// Decides whether the LP fractional-merge "redistribution" (cannot-link a pair,
+/// the mass slides to an equivalent merge — `project_merge_order_asymmetry`) is
+/// driven by **symmetry** (the equivalent partners are automorphism twins ⇒
+/// orbital branching collapses the whole orbit in one step) or by genuine
+/// **degeneracy** (partners are structurally distinct ⇒ orbital branching is
+/// useless, attack the embedding directly).
+fn classify_merge_symmetry(
+    reduced: &Instance,
+    state: &SearchState,
+    lp: &crate::solvers::bp::rmp::RmpSolution,
+) {
+    let n = reduced.num_leaves as usize;
+    let classes = leaf_orbit_classes(reduced);
+
+    let mut class_size: fxhash::FxHashMap<u32, usize> = fxhash::FxHashMap::default();
+    for lbl in 1..=n {
+        *class_size.entry(classes[lbl]).or_insert(0) += 1;
+    }
+    let nontrivial: Vec<(u32, usize)> = {
+        let mut v: Vec<(u32, usize)> =
+            class_size.iter().filter(|(_, s)| **s >= 2).map(|(c, s)| (*c, *s)).collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v
+    };
+    let leaves_in_nontrivial: usize = nontrivial.iter().map(|(_, s)| *s).sum();
+
+    // Fractional partners per leaf.
+    let mass = pair_together_mass(state, &lp.column_values);
+    let mut partners: fxhash::FxHashMap<u32, Vec<u32>> = fxhash::FxHashMap::default();
+    for (&(a, b), &m) in &mass {
+        if m > 1.0e-6 && m < 1.0 - 1.0e-6 {
+            partners.entry(a).or_default().push(b);
+            partners.entry(b).or_default().push(a);
+        }
+    }
+
+    // A leaf shows the symmetry signature if all its fractional partners live in
+    // a single orbit class of size ≥ 2 (interchangeable twins).
+    let mut twin_partnered = 0usize;
+    let mut distinct_partnered = 0usize;
+    for ps in partners.values() {
+        let pc: std::collections::HashSet<u32> = ps.iter().map(|&b| classes[b as usize]).collect();
+        let single_twin = pc.len() == 1
+            && pc
+                .iter()
+                .next()
+                .map(|c| class_size.get(c).copied().unwrap_or(0) >= 2)
+                .unwrap_or(false);
+        if single_twin {
+            twin_partnered += 1;
+        } else {
+            distinct_partnered += 1;
+        }
+    }
+    let stalled_leaves = twin_partnered + distinct_partnered;
+
+    let verdict = if stalled_leaves == 0 {
+        "NO-FRAC (root integral / no stalled merges)"
+    } else if leaves_in_nontrivial == 0 {
+        "DEGENERATE (no nontrivial orbits at all)"
+    } else if twin_partnered > distinct_partnered {
+        "SYMMETRY (orbital branching applicable)"
+    } else {
+        "DEGENERATE (redistribution spans distinct structures)"
+    };
+
+    let top: Vec<usize> = nontrivial.iter().take(6).map(|(_, s)| *s).collect();
+    info!(
+        target: LOG_TARGET,
+        "[merge-symmetry] n={n} orbit_classes={} nontrivial={} leaves_in_nontrivial={} top_sizes={:?} | \
+         stalled_leaves={stalled_leaves} twin_partnered={twin_partnered} distinct={distinct_partnered} \
+         => {verdict}",
+        class_size.len(),
+        nontrivial.len(),
+        leaves_in_nontrivial,
+        top,
+    );
 }
 
 fn maybe_probe_root_obstruction(
@@ -2641,6 +2908,96 @@ fn count_fractional_pairs(state: &SearchState, column_values: &[f64]) -> usize {
         .count()
 }
 
+/// Diagnostic (KLADOS_BP_NODE_BRANCH_PROBE=1): embedding-branching feasibility.
+///
+/// For each tree-node `(t,v)`, the activity `y_{t,v} = Σ_{c covers (t,v)} x_c`
+/// is integer in any integer solution (the packing row forces ≤ 1), so it's a
+/// valid branch variable. The open question is whether it's a *good* one. Pair
+/// branching is weak on cannot-link (ΔLP≈0.02: mass slides to an equivalent
+/// merge). The `y=0` branch (forbid every column covering `(t,v)`) is the
+/// analogous "remove an option" side — this probe measures its ΔLP over the
+/// pool to see whether it actually moves the LP or redistributes the same way.
+///
+/// Pool-only and read-only: simulates over generated columns and restores the
+/// node's bounds on exit (no re-pricing, exactly the right lens for "what does
+/// committing this do to the current fractional support").
+fn maybe_probe_node_branch(
+    _reduced: &Instance,
+    state: &SearchState,
+    rmp: &mut Rmp,
+    lp: &crate::solvers::bp::rmp::RmpSolution,
+    branchings: &Branchings,
+    cfg: &crate::solvers::bp::BpConfig,
+) {
+    if !cfg.node_branch_probe || branchings.depth() != 0 {
+        return;
+    }
+    let lp0 = lp.objective;
+    let cols = state.columns();
+
+    // Accumulate node activity y_{t,v} and covering column ids over the
+    // fractional support. Singletons cover no internal node, so size ≥ 2 only.
+    let mut acc: HashMap<(usize, usize), (f64, Vec<usize>)> = HashMap::new();
+    for (ci, &x) in lp.column_values.iter().enumerate() {
+        if x <= 1.0e-9 || ci >= cols.len() {
+            continue;
+        }
+        let col = &cols[ci];
+        if col.size() < 2 {
+            continue;
+        }
+        for (ti, nodes) in col.coverage().iter_per_tree().enumerate() {
+            for &v in nodes {
+                let e = acc.entry((ti, v)).or_insert((0.0, Vec::new()));
+                e.0 += x;
+                e.1.push(ci);
+            }
+        }
+    }
+
+    let mut frac: Vec<((usize, usize), f64, usize)> = acc
+        .iter()
+        .filter(|(_, (y, _))| *y > 1.0e-6 && *y < 1.0 - 1.0e-6)
+        .map(|(&k, (y, ids))| (k, *y, ids.len()))
+        .collect();
+    frac.sort_by(|a, b| {
+        (a.1 - 0.5)
+            .abs()
+            .partial_cmp(&(b.1 - 0.5).abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    info!(
+        target: LOG_TARGET,
+        "node-branch-probe: root lp={:.4} fractional_nodes={} (nodes_with_mass={})",
+        lp0, frac.len(), acc.len(),
+    );
+
+    let k = frac.len().min(12);
+    let mut best_d0 = 0.0f64;
+    for (rank, &(key, y, ncov)) in frac.iter().take(k).enumerate() {
+        let forbid = &acc[&key].1;
+        let d0 = match rmp.probe_lp_forbidding_cols(cols, branchings, forbid) {
+            Some(v) => v - lp0,
+            None => f64::INFINITY,
+        };
+        if d0.is_finite() && d0 > best_d0 {
+            best_d0 = d0;
+        }
+        info!(
+            target: LOG_TARGET,
+            "node-branch-probe: #{rank} (t{},v{}) y={:.3} covering_cols={} dLP_forbid_y0={:.4}",
+            key.0, key.1, y, ncov, d0,
+        );
+    }
+    // Restore the node's bounds.
+    rmp.apply_bounds(cols, branchings);
+    info!(
+        target: LOG_TARGET,
+        "node-branch-probe: best_dLP_y0={:.4} over top {} (compare to cannot-link ΔLP from merge-order-probe)",
+        best_d0, k,
+    );
+}
+
 /// Diagnostic (KLADOS_BP_MERGE_ORDER_PROBE=1): at the root, dump the LP
 /// fractional merges and, for the top few (closest to 0.5), simulate committing
 /// them (must-link and cannot-link) over the current pool to measure ΔLP and how
@@ -2651,6 +3008,7 @@ fn count_fractional_pairs(state: &SearchState, column_values: &[f64]) -> usize {
 /// does committing this merge do to the current fractional support". Restores
 /// the RMP to the node's branchings on exit.
 fn maybe_probe_merge_order(
+    reduced: &Instance,
     state: &SearchState,
     rmp: &mut Rmp,
     lp: &crate::solvers::bp::rmp::RmpSolution,
@@ -2660,6 +3018,10 @@ fn maybe_probe_merge_order(
     if !cfg.merge_order_probe || branchings.depth() != 0 {
         return;
     }
+    // Structural half of the probe: is the fractional-merge redistribution a
+    // symmetry orbit (⇒ orbital branching) or genuine degeneracy (⇒ embedding
+    // branching)? Runs before the LP simulations and does not touch the RMP.
+    classify_merge_symmetry(reduced, state, lp);
     let lp0 = lp.objective;
     let mass = pair_together_mass(state, &lp.column_values);
     let mut frac: Vec<((u32, u32), f64)> = mass
@@ -4433,4 +4795,68 @@ fn reconstruct_components(inc: &Incumbent, columns: &[AfColumn], reduced: &Insta
         }
     }
     out
+}
+
+#[cfg(test)]
+mod orbit_tests {
+    use super::leaf_orbit_classes;
+    use klados_core::tree::{Label, NONE, NodeId, Tree};
+    use klados_core::Instance;
+
+    enum S { L(u32), N(Box<S>, Box<S>) }
+
+    fn build(s: &S, t: &mut Tree) -> NodeId {
+        match s {
+            S::L(lbl) => {
+                let id = t.parent.len() as NodeId;
+                t.parent.push(NONE); t.left.push(NONE); t.right.push(NONE);
+                t.label.push(*lbl as Label); t.label_to_node[*lbl as usize] = id; id
+            }
+            S::N(a, b) => {
+                let l = build(a, t); let r = build(b, t);
+                let id = t.parent.len() as NodeId;
+                t.parent.push(NONE); t.left.push(l); t.right.push(r); t.label.push(0);
+                t.parent[l as usize] = id; t.parent[r as usize] = id; id
+            }
+        }
+    }
+    fn tree(s: S, n: u32) -> Tree {
+        let mut t = Tree::with_capacity(n);
+        let root = build(&s, &mut t);
+        t.root = root; t.parent[root as usize] = NONE; t.compute_metadata(); t
+    }
+    fn n(a: S, b: S) -> S { S::N(Box::new(a), Box::new(b)) }
+    fn l(x: u32) -> S { S::L(x) }
+
+    fn num_classes(classes: &[u32], n: usize) -> usize {
+        let mut s: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for i in 1..=n { s.insert(classes[i]); }
+        s.len()
+    }
+
+    #[test]
+    fn symmetric_instance_collapses_twins() {
+        // sigma = (1 4)(2 5)(3 6) is an automorphism of both trees.
+        // T1 = ((1,(2,3)),(4,(5,6)))  T2 = ((2,(1,3)),(5,(4,6)))
+        let t1 = tree(n(n(l(1), n(l(2), l(3))), n(l(4), n(l(5), l(6)))), 6);
+        let t2 = tree(n(n(l(2), n(l(1), l(3))), n(l(5), n(l(4), l(6)))), 6);
+        let inst = Instance::new(vec![t1, t2], 6);
+        let c = leaf_orbit_classes(&inst);
+        // twins must share a class
+        assert_eq!(c[1], c[4], "1,4 twins");
+        assert_eq!(c[2], c[5], "2,5 twins");
+        assert_eq!(c[3], c[6], "3,6 twins");
+        // strictly fewer than 6 classes (symmetry detected)
+        assert!(num_classes(&c, 6) < 6, "expected nontrivial orbits, got {}", num_classes(&c, 6));
+    }
+
+    #[test]
+    fn asymmetric_instance_all_singletons() {
+        // Caterpillars with no automorphism: every leaf structurally unique.
+        let t1 = tree(n(l(1), n(l(2), n(l(3), n(l(4), n(l(5), l(6)))))), 6);
+        let t2 = tree(n(l(3), n(l(1), n(l(5), n(l(2), n(l(6), l(4)))))), 6);
+        let inst = Instance::new(vec![t1, t2], 6);
+        let c = leaf_orbit_classes(&inst);
+        assert_eq!(num_classes(&c, 6), 6, "expected all singletons");
+    }
 }
