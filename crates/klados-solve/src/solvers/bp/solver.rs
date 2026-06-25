@@ -20,7 +20,7 @@ use log::{debug, info};
 use crate::decomp::whidden_cluster::{
     analyze_whidden_decomp_potential, try_whidden_relaxed_incumbent_2tree,
 };
-use crate::solvers::bp::column::{AfColumn, ColumnBuilder};
+use crate::solvers::bp::column::{AfColumn, ColumnBuilder, is_valid_af_component};
 use crate::solvers::bp::pricer::{
     Pricer, PricerScratch, PricingContext, PricingResult, dispatch_by_m,
 };
@@ -286,6 +286,60 @@ fn can_prune_by_bound(lb: usize, best_ub: usize, disable_bound_prune: bool) -> b
         return false;
     }
     lb >= best_ub
+}
+
+fn must_link_branch_is_infeasible(
+    branchings: &Branchings,
+    trees: &[Tree],
+    num_leaves: usize,
+) -> bool {
+    if branchings.must_link().is_empty() {
+        return false;
+    }
+
+    let mut parent: Vec<usize> = (0..=num_leaves).collect();
+
+    fn find(parent: &mut [usize], x: usize) -> usize {
+        if parent[x] != x {
+            let root = find(parent, parent[x]);
+            parent[x] = root;
+        }
+        parent[x]
+    }
+
+    fn union(parent: &mut [usize], a: usize, b: usize) {
+        let ra = find(parent, a);
+        let rb = find(parent, b);
+        if ra != rb {
+            parent[rb] = ra;
+        }
+    }
+
+    for pair in branchings.must_link() {
+        let a = pair.a as usize;
+        let b = pair.b as usize;
+        if a <= num_leaves && b <= num_leaves {
+            union(&mut parent, a, b);
+        }
+    }
+
+    for pair in branchings.cannot_link() {
+        let a = pair.a as usize;
+        let b = pair.b as usize;
+        if a <= num_leaves && b <= num_leaves && find(&mut parent, a) == find(&mut parent, b) {
+            return true;
+        }
+    }
+
+    let mut classes = vec![Vec::new(); num_leaves + 1];
+    for label in 1..=num_leaves {
+        let root = find(&mut parent, label);
+        classes[root].push(label as u32);
+    }
+
+    classes
+        .iter()
+        .any(|labels| labels.len() >= 3 && !is_valid_af_component(labels, trees))
 }
 
 fn is_tiny_two_tree_core(reduced: &Instance, trees: &[Tree]) -> bool {
@@ -635,6 +689,17 @@ fn solve_node<P: Pricer, S: BranchSelector>(
     cfg: &crate::solvers::bp::BpConfig,
 ) -> NodeOutcome {
     tel.nodes_explored += 1;
+
+    if branchings.depth() > 0
+        && must_link_branch_is_infeasible(branchings, trees, state.num_leaves())
+    {
+        debug!(
+            target: LOG_TARGET,
+            "node pruned: infeasible must-link class at depth={}",
+            branchings.depth(),
+        );
+        return NodeOutcome::Pruned;
+    }
 
     // Replay root-RCVF if the incumbent tightened since the last fixing.
     // No-op when untightened (or before root has been solved), so this is

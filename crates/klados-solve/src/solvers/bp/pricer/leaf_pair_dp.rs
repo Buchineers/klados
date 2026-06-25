@@ -56,7 +56,7 @@
 use fixedbitset::FixedBitSet;
 use klados_core::{NONE, Tree};
 
-use crate::solvers::bp::column::AfColumn;
+use crate::solvers::bp::column::{AfColumn, is_valid_af_component};
 
 use super::{Pricer, PricerScratch, PricingContext, PricingResult, adaptive_m2_batch_size};
 
@@ -799,6 +799,18 @@ impl LeafPairDpPricer {
             anchor_cache_enabled(scratch) && ctx.trees.len() == 2 && scratch.anchor_cache.is_some();
 
         let scan = order.len().min(trial_limit);
+        scratch.pricing_stats.leaf_pair_scanned = 0;
+        scratch.pricing_stats.leaf_pair_positive = 0;
+        scratch.pricing_stats.leaf_pair_found = 0;
+        scratch.pricing_stats.leaf_pair_seen = 0;
+        scratch.pricing_stats.leaf_pair_repair_failed = 0;
+        scratch.pricing_stats.leaf_pair_repair_nonprofitable = 0;
+        scratch.pricing_stats.leaf_pair_branch_blocked = 0;
+        scratch.pricing_stats.leaf_pair_blocked_must = 0;
+        scratch.pricing_stats.leaf_pair_blocked_cannot = 0;
+        scratch.pricing_stats.leaf_pair_completed = false;
+        scratch.pricing_stats.leaf_pair_trial_limited = scan < order.len();
+        scratch.pricing_stats.leaf_pair_global_max = NEG_INF;
         // `completed` ⇒ every pair in `order` had its `solve_pair` evaluated;
         // only then is `global_max` a valid convergence certificate.
         let mut completed = scan == order.len();
@@ -812,6 +824,7 @@ impl LeafPairDpPricer {
             }
             let la = self.active_labels[a];
             let lb = self.active_labels[b];
+            scratch.pricing_stats.leaf_pair_scanned += 1;
 
             // `pair_ub` may have tightened since we built the order (the
             // bound is recomputed each call). If it dropped to `≤ 1+ε` then
@@ -874,6 +887,7 @@ impl LeafPairDpPricer {
             if score <= 1.0 + PRICING_EPS {
                 continue;
             }
+            scratch.pricing_stats.leaf_pair_positive += 1;
             // An improving column exists at this anchor. The DP builds it
             // constraint-blind; `solve_side`'s cannot-masking already keeps it
             // node-valid along the recursion spine, but a cross-anchor
@@ -885,13 +899,29 @@ impl LeafPairDpPricer {
             // `Improving` residue and we skip it.
             let raw_labels = self.pair_labels(a, b, ctx.alpha, ctx.beta);
             if raw_labels.len() < 2 {
+                scratch.pricing_stats.leaf_pair_repair_failed += 1;
                 continue;
             }
-            let labels = match repair_to_valid(&raw_labels, ctx.branchings, ctx.alpha) {
-                Some(l) => l,
-                None => continue,
-            };
+            let raw_violations = branch_violation_kinds(&raw_labels, ctx.branchings);
+            if raw_violations.0 || raw_violations.1 {
+                scratch.pricing_stats.leaf_pair_branch_blocked += 1;
+                if raw_violations.0 {
+                    scratch.pricing_stats.leaf_pair_blocked_must += 1;
+                }
+                if raw_violations.1 {
+                    scratch.pricing_stats.leaf_pair_blocked_cannot += 1;
+                }
+            }
+            let labels =
+                match branch_feasible_labels(&raw_labels, ctx.branchings, ctx.alpha, ctx.trees) {
+                    Some(l) => l,
+                    None => {
+                        scratch.pricing_stats.leaf_pair_repair_failed += 1;
+                        continue;
+                    }
+                };
             if ctx.seen.contains(&labels) {
+                scratch.pricing_stats.leaf_pair_seen += 1;
                 continue;
             }
             let column = scratch.builder.build_unchecked(labels, ctx.trees);
@@ -899,11 +929,20 @@ impl LeafPairDpPricer {
             // re-check that the repaired column is still improving.
             let score = column.pricing_score(ctx.alpha, ctx.beta);
             if score <= 1.0 + PRICING_EPS {
+                scratch.pricing_stats.leaf_pair_repair_nonprofitable += 1;
                 continue;
             }
             // Guard: the repaired column must satisfy every branch constraint.
             debug_assert!(!ctx.branchings.forbids(&column));
             if ctx.branchings.forbids(&column) {
+                let violations = branch_violation_kinds(column.labels(), ctx.branchings);
+                scratch.pricing_stats.leaf_pair_branch_blocked += 1;
+                if violations.0 {
+                    scratch.pricing_stats.leaf_pair_blocked_must += 1;
+                }
+                if violations.1 {
+                    scratch.pricing_stats.leaf_pair_blocked_cannot += 1;
+                }
                 continue;
             }
 
@@ -942,7 +981,11 @@ impl LeafPairDpPricer {
             }
 
             found.push((score, column));
+            scratch.pricing_stats.leaf_pair_found += 1;
         }
+
+        scratch.pricing_stats.leaf_pair_completed = completed;
+        scratch.pricing_stats.leaf_pair_global_max = global_max;
 
         CollectResult {
             found,
@@ -950,6 +993,59 @@ impl LeafPairDpPricer {
             completed,
         }
     }
+}
+
+fn branch_feasible_labels(
+    raw_labels: &[u32],
+    branchings: &crate::solvers::bp::search::Branchings,
+    alpha: &[f64],
+    trees: &[Tree],
+) -> Option<Vec<u32>> {
+    if branchings.must_link().is_empty() {
+        return repair_to_valid(raw_labels, branchings, alpha);
+    }
+
+    let closed = must_link_closure(raw_labels, branchings);
+    if closed.len() >= 2
+        && is_valid_af_component(&closed, trees)
+        && let Some(labels) = repair_to_valid(&closed, branchings, alpha)
+    {
+        return Some(labels);
+    }
+
+    // Fall back to the old safe behavior. The raw DP candidate is valid by
+    // construction, and `repair_to_valid` only takes subsets of it.
+    repair_to_valid(raw_labels, branchings, alpha)
+}
+
+fn must_link_closure(
+    labels: &[u32],
+    branchings: &crate::solvers::bp::search::Branchings,
+) -> Vec<u32> {
+    let mut out = labels.to_vec();
+    if branchings.must_link().is_empty() {
+        return out;
+    }
+    loop {
+        let mut changed = false;
+        for pair in branchings.must_link() {
+            let has_a = out.binary_search(&pair.a).is_ok();
+            let has_b = out.binary_search(&pair.b).is_ok();
+            if has_a && !has_b {
+                out.push(pair.b);
+                changed = true;
+            } else if has_b && !has_a {
+                out.push(pair.a);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+        out.sort_unstable();
+        out.dedup();
+    }
+    out
 }
 
 /// Drop leaves from `labels` (sorted) until the set satisfies every branch
@@ -1006,6 +1102,30 @@ fn repair_to_valid(
         }
     }
     if out.len() < 2 { None } else { Some(out) }
+}
+
+/// Return `(must_link_violated, cannot_link_violated)` for a sorted label set.
+fn branch_violation_kinds(
+    labels: &[u32],
+    branchings: &crate::solvers::bp::search::Branchings,
+) -> (bool, bool) {
+    let mut must = false;
+    let mut cannot = false;
+    for p in branchings.must_link() {
+        let ha = labels.binary_search(&p.a).is_ok();
+        let hb = labels.binary_search(&p.b).is_ok();
+        if ha != hb {
+            must = true;
+            break;
+        }
+    }
+    for p in branchings.cannot_link() {
+        if labels.binary_search(&p.a).is_ok() && labels.binary_search(&p.b).is_ok() {
+            cannot = true;
+            break;
+        }
+    }
+    (must, cannot)
 }
 
 /// Result of a `collect_from_order` scan.
@@ -1166,6 +1286,26 @@ impl Pricer for LeafPairDpPricer {
         }
 
         if !result.found.is_empty() {
+            if ctx.branchings.depth() > 0 && scratch.pricing_stats.leaf_pair_branch_blocked > 0 {
+                let s = &scratch.pricing_stats;
+                log::debug!(
+                    target: "klados::bp",
+                    "leaf-pair branch stats depth={} outcome=found scanned={} positive={} found={} blocked={} must={} cannot={} seen={} repair_failed={} repair_nonprofit={} completed={} trial_limited={} global_max={:.4}",
+                    ctx.branchings.depth(),
+                    s.leaf_pair_scanned,
+                    s.leaf_pair_positive,
+                    s.leaf_pair_found,
+                    s.leaf_pair_branch_blocked,
+                    s.leaf_pair_blocked_must,
+                    s.leaf_pair_blocked_cannot,
+                    s.leaf_pair_seen,
+                    s.leaf_pair_repair_failed,
+                    s.leaf_pair_repair_nonprofitable,
+                    s.leaf_pair_completed,
+                    s.leaf_pair_trial_limited,
+                    s.leaf_pair_global_max,
+                );
+            }
             // Sort by RC descending, cap at 128 to prevent RMP flooding
             // while still returning far more columns than the old limit of 32.
             let mut found = result.found;
@@ -1180,13 +1320,137 @@ impl Pricer for LeafPairDpPricer {
             // The full all-anchor scan completed and the constraint-blind max
             // anchor score is ≤ 1+ε: `solve_pair` dominates every column at
             // its anchor (§3), so no improving column exists anywhere.
+            if ctx.branchings.depth() > 0 && scratch.pricing_stats.leaf_pair_positive > 0 {
+                let s = &scratch.pricing_stats;
+                log::debug!(
+                    target: "klados::bp",
+                    "leaf-pair branch stats depth={} outcome=converged scanned={} positive={} found={} blocked={} must={} cannot={} seen={} repair_failed={} repair_nonprofit={} completed={} trial_limited={} global_max={:.4}",
+                    ctx.branchings.depth(),
+                    s.leaf_pair_scanned,
+                    s.leaf_pair_positive,
+                    s.leaf_pair_found,
+                    s.leaf_pair_branch_blocked,
+                    s.leaf_pair_blocked_must,
+                    s.leaf_pair_blocked_cannot,
+                    s.leaf_pair_seen,
+                    s.leaf_pair_repair_failed,
+                    s.leaf_pair_repair_nonprofitable,
+                    s.leaf_pair_completed,
+                    s.leaf_pair_trial_limited,
+                    s.leaf_pair_global_max,
+                );
+            }
             PricingResult::Converged
         } else {
             // Either the scan was incomplete (trial-limited, no fallback), or
             // improving columns provably exist but every one is branch-blocked
             // or already pooled. The LP bound is NOT certified — the solver
             // must branch, never bound-prune.
+            if ctx.branchings.depth() > 0 {
+                let s = &scratch.pricing_stats;
+                log::debug!(
+                    target: "klados::bp",
+                    "leaf-pair branch stats depth={} outcome=improving scanned={} positive={} found={} blocked={} must={} cannot={} seen={} repair_failed={} repair_nonprofit={} completed={} trial_limited={} global_max={:.4}",
+                    ctx.branchings.depth(),
+                    s.leaf_pair_scanned,
+                    s.leaf_pair_positive,
+                    s.leaf_pair_found,
+                    s.leaf_pair_branch_blocked,
+                    s.leaf_pair_blocked_must,
+                    s.leaf_pair_blocked_cannot,
+                    s.leaf_pair_seen,
+                    s.leaf_pair_repair_failed,
+                    s.leaf_pair_repair_nonprofitable,
+                    s.leaf_pair_completed,
+                    s.leaf_pair_trial_limited,
+                    s.leaf_pair_global_max,
+                );
+            }
             PricingResult::Improving
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::solvers::bp::search::Branchings;
+    use crate::solvers::bp::search::branchings::LeafPair;
+    use klados_core::tree::{Label, NONE, NodeId};
+
+    fn parse(nw: &str, n: u32) -> Tree {
+        let mut t = Tree::with_capacity(n);
+        let b = nw.as_bytes();
+        let mut pos = 0usize;
+        fn rec(b: &[u8], pos: &mut usize, t: &mut Tree) -> NodeId {
+            if b[*pos] == b'(' {
+                *pos += 1;
+                let l = rec(b, pos, t);
+                assert_eq!(b[*pos], b',');
+                *pos += 1;
+                let r = rec(b, pos, t);
+                assert_eq!(b[*pos], b')');
+                *pos += 1;
+                let id = t.parent.len() as NodeId;
+                t.parent.push(NONE);
+                t.left.push(l);
+                t.right.push(r);
+                t.label.push(0);
+                t.parent[l as usize] = id;
+                t.parent[r as usize] = id;
+                id
+            } else {
+                let start = *pos;
+                while *pos < b.len() && b[*pos].is_ascii_digit() {
+                    *pos += 1;
+                }
+                let lbl: u32 = std::str::from_utf8(&b[start..*pos])
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                let id = t.parent.len() as NodeId;
+                t.parent.push(NONE);
+                t.left.push(NONE);
+                t.right.push(NONE);
+                t.label.push(lbl as Label);
+                t.label_to_node[lbl as usize] = id;
+                id
+            }
+        }
+        t.root = rec(b, &mut pos, &mut t);
+        t.compute_metadata();
+        t
+    }
+
+    #[test]
+    fn must_link_closure_is_transitive() {
+        let mut b = Branchings::default();
+        b.push_must_link(LeafPair::new(1, 2));
+        b.push_must_link(LeafPair::new(2, 3));
+
+        assert_eq!(must_link_closure(&[1], &b), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn branch_feasible_labels_prefers_valid_must_closure() {
+        let mut b = Branchings::default();
+        b.push_must_link(LeafPair::new(1, 2));
+        let trees = vec![parse("((1,2),3)", 3), parse("((1,2),3)", 3)];
+        let alpha = vec![0.0, 1.0, 1.0, 1.0];
+
+        assert_eq!(
+            branch_feasible_labels(&[1, 3], &b, &alpha, &trees),
+            Some(vec![1, 2, 3])
+        );
+    }
+
+    #[test]
+    fn repair_drops_whole_must_class_after_cannot_conflict() {
+        let mut b = Branchings::default();
+        b.push_must_link(LeafPair::new(1, 2));
+        b.push_cannot_link(LeafPair::new(2, 3));
+        let alpha = vec![0.0, 1.0, 1.0, 10.0];
+
+        assert_eq!(repair_to_valid(&[1, 2, 3], &b, &alpha), None);
     }
 }

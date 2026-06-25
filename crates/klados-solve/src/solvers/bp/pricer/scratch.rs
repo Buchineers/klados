@@ -38,6 +38,18 @@ pub struct PricingStats {
     pub dssr_alt_refs_tried: usize,
     pub small_cache_cols: usize,
     pub small_profitable: usize,
+    pub leaf_pair_scanned: usize,
+    pub leaf_pair_positive: usize,
+    pub leaf_pair_found: usize,
+    pub leaf_pair_seen: usize,
+    pub leaf_pair_repair_failed: usize,
+    pub leaf_pair_repair_nonprofitable: usize,
+    pub leaf_pair_branch_blocked: usize,
+    pub leaf_pair_blocked_must: usize,
+    pub leaf_pair_blocked_cannot: usize,
+    pub leaf_pair_completed: bool,
+    pub leaf_pair_trial_limited: bool,
+    pub leaf_pair_global_max: f64,
 }
 
 pub struct PricerScratch {
