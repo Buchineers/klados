@@ -151,6 +151,28 @@ pub struct LeafPairDpPricer {
     /// Reusable scratch for `solve_side`'s phase-1 candidate collection.
     /// Avoids a Vec allocation per call (~2500 per CG iter on Class B).
     solve_side_candidates: Vec<(u32, u32)>,
+    /// ── Branch-feasible certification (rebuilt each `price()` call) ──
+    /// `class_root[l]` = representative leaf of `l`'s transitive must-link
+    /// class (union-find over `branchings.must_link()`, flattened). A
+    /// singleton class is its own root.
+    class_root: Vec<u32>,
+    /// Unordered `(root, root)` pairs of must-link classes that are
+    /// cannot-link-conflicting: some leaf of one class cannot-links some leaf
+    /// of the other (or, when `root_a == root_b`, a cannot-link lies inside one
+    /// class — an inconsistent node). An anchor whose two leaves' class roots
+    /// form such a pair cannot appear in any branch-feasible column.
+    conflict_class_pairs: std::collections::HashSet<(u32, u32)>,
+    /// ── Lagrangian must-link certification ──
+    /// When set, a node that would otherwise exit `Improving` (completed scan,
+    /// must-link active, feasible bound > 1+ε) instead runs a subgradient loop
+    /// that relaxes the must-link equalities into the pricing objective and may
+    /// prove convergence. Sound for any multiplier (see
+    /// [`Self::lagrangian_must_certify`]); `μ = 0` reproduces the base bound.
+    lagrangian_certify_enabled: bool,
+    lagrangian_max_iters: usize,
+    /// Reusable buffers for the subgradient loop (avoid per-iter allocation).
+    lagrangian_mu: Vec<f64>,
+    lagrangian_alpha_buf: Vec<f64>,
 }
 
 impl LeafPairDpPricer {
@@ -284,7 +306,21 @@ impl LeafPairDpPricer {
             cannot_dirty: Vec::new(),
             has_cannot: Vec::new(),
             solve_side_candidates: Vec::new(),
+            class_root: Vec::new(),
+            conflict_class_pairs: std::collections::HashSet::new(),
+            lagrangian_certify_enabled: false,
+            lagrangian_max_iters: 0,
+            lagrangian_mu: Vec::new(),
+            lagrangian_alpha_buf: Vec::new(),
         }
+    }
+
+    /// Enable Lagrangian must-link certification with `iters` subgradient
+    /// steps (0 disables). See [`Self::lagrangian_must_certify`].
+    pub fn with_lagrangian_certify(mut self, iters: usize) -> Self {
+        self.lagrangian_certify_enabled = iters > 0;
+        self.lagrangian_max_iters = iters;
+        self
     }
 
     /// Collect active labels from alpha. Returns `true` if the set changed
@@ -459,6 +495,208 @@ impl LeafPairDpPricer {
 
     fn pair_idx(&self, a: usize, b: usize) -> usize {
         a * self.active_labels.len() + b
+    }
+
+    /// Rebuild the must-link-class union-find and the cannot-link-conflicting
+    /// class-pair set for the current branch state. O(n + |must| + |cannot|).
+    ///
+    /// This drives [`Self::anchor_feasible`], the branch-feasible certification
+    /// filter. With no branch constraints the conflict set is empty and every
+    /// anchor is feasible, so `feasible_global_max == global_max` and behaviour
+    /// is identical to the unconstrained pricer.
+    fn rebuild_branch_classes(&mut self, ctx: &PricingContext) {
+        let n = self.num_leaves;
+        if self.class_root.len() != n + 1 {
+            self.class_root = (0..=n as u32).collect();
+        } else {
+            for (i, r) in self.class_root.iter_mut().enumerate() {
+                *r = i as u32;
+            }
+        }
+        for pair in ctx.branchings.must_link() {
+            if (pair.a as usize) <= n && (pair.b as usize) <= n {
+                self.union(pair.a, pair.b);
+            }
+        }
+        // Flatten so `class_root[l]` is the ultimate representative.
+        for l in 1..=n as u32 {
+            let r = self.find(l);
+            self.class_root[l as usize] = r;
+        }
+        self.conflict_class_pairs.clear();
+        for pair in ctx.branchings.cannot_link() {
+            if (pair.a as usize) <= n && (pair.b as usize) <= n {
+                let ra = self.class_root[pair.a as usize];
+                let rb = self.class_root[pair.b as usize];
+                self.conflict_class_pairs
+                    .insert(if ra <= rb { (ra, rb) } else { (rb, ra) });
+            }
+        }
+    }
+
+    fn find(&mut self, mut x: u32) -> u32 {
+        while self.class_root[x as usize] != x {
+            // Path halving.
+            let gp = self.class_root[self.class_root[x as usize] as usize];
+            self.class_root[x as usize] = gp;
+            x = gp;
+        }
+        x
+    }
+
+    fn union(&mut self, a: u32, b: u32) {
+        let ra = self.find(a);
+        let rb = self.find(b);
+        if ra != rb {
+            self.class_root[ra as usize] = rb;
+        }
+    }
+
+    /// True iff leaves `la`, `lb` can co-occur in some branch-feasible AF
+    /// component, i.e. their must-link classes are not cannot-link-conflicting.
+    ///
+    /// Soundness of the certification rests on this being a *sufficient*
+    /// condition for infeasibility (it may return `true` for some pairs that
+    /// happen to be jointly infeasible for other reasons — that only loosens
+    /// the bound, never unsounds it). The key property used by the `Converged`
+    /// proof: for any branch-feasible column `C` and any two leaves
+    /// `la, lb ∈ C`, their whole classes lie in `C` (must-closure), so if those
+    /// classes were cannot-conflicting `C` would violate a cannot-link — hence
+    /// `anchor_feasible(la, lb)` holds for every leaf pair of every feasible
+    /// column.
+    fn anchor_feasible(&self, la: u32, lb: u32) -> bool {
+        if self.conflict_class_pairs.is_empty() {
+            return true;
+        }
+        let ra = self.class_root[la as usize];
+        let rb = self.class_root[lb as usize];
+        let key = if ra <= rb { (ra, rb) } else { (rb, ra) };
+        !self.conflict_class_pairs.contains(&key)
+    }
+
+    /// Recompute the branch-feasible certification bound under a (possibly
+    /// shifted) `alpha`, doing a **full** scan over all feasible anchors with
+    /// tight UB > 1+ε. Returns `(bound, argmax_anchor)` where `bound` is the
+    /// max of `solve_pair` over those anchors and `argmax_anchor` is the
+    /// `(a,b)` achieving it (active indices), or `None` if no feasible anchor
+    /// exceeds the threshold.
+    ///
+    /// The caller must have set `alpha` so the active-label *set* is unchanged
+    /// (the Lagrangian shift only touches force-activated must-linked leaves,
+    /// so it is). This lets us refresh the dual tables without an active-set
+    /// rebuild.
+    fn relaxed_feasible_cert(
+        &mut self,
+        ctx: &PricingContext,
+        alpha: &[f64],
+    ) -> (f64, Option<(usize, usize)>) {
+        self.refresh_dual_tables(ctx.trees, alpha, ctx.beta);
+        self.reset_memos();
+        let p = self.active_labels.len();
+        let mut best = NEG_INF;
+        let mut arg = None;
+        for a in 0..p {
+            for b in (a + 1)..p {
+                let idx = a * p + b;
+                let tight = self.pair_ub[idx] - self.root_penalty(a, b, ctx.beta);
+                if tight <= 1.0 + PRICING_EPS {
+                    continue;
+                }
+                let la = self.active_labels[a];
+                let lb = self.active_labels[b];
+                if !self.anchor_feasible(la, lb) {
+                    continue;
+                }
+                let s = self.solve_pair(a, b, alpha, ctx.beta);
+                if s > best {
+                    best = s;
+                    arg = Some((a, b));
+                }
+            }
+        }
+        (best, arg)
+    }
+
+    /// Lagrangian certification of must-link convergence.
+    ///
+    /// The branch-feasible pricing problem maximises `score(C)` over must-link-
+    /// closed, cannot-respecting valid AF components. Relax each must-link
+    /// equality `1_x = 1_y` with a multiplier `μ`:
+    ///
+    /// ```text
+    /// L(C, μ) = score(C) + Σ_{(x,y) ∈ must} μ_xy (1_x[C] − 1_y[C]).
+    /// ```
+    ///
+    /// For **any** `μ` and any must-closed `C` the added term is zero, so
+    /// `max_C L(C, μ) ≥ max_{must-closed C} score(C)`. The term is linear in the
+    /// leaf indicators, so `L` is just `score` with `α` shifted by
+    /// `Δ_l = Σ_{(l,·)} μ − Σ_{(·,l)} μ`; the relaxed max is therefore computed
+    /// by the existing DP on shifted duals ([`Self::relaxed_feasible_cert`]).
+    ///
+    /// Hence if the relaxed feasible bound is `≤ 1+ε` for *some* `μ`, no
+    /// must-closed feasible column is improving → convergence is certified.
+    /// This is sound for every `μ` (so it can never over-certify); the
+    /// subgradient steps only try to tighten the bound. Returns `true` iff
+    /// convergence is proven.
+    fn lagrangian_must_certify(&mut self, ctx: &PricingContext) -> bool {
+        const STEP0: f64 = 1.0;
+        let must = ctx.branchings.must_link();
+        if must.is_empty() {
+            return false;
+        }
+        let n = self.num_leaves;
+        self.lagrangian_mu.clear();
+        self.lagrangian_mu.resize(must.len(), 0.0);
+        let mut mu = std::mem::take(&mut self.lagrangian_mu);
+        let mut alpha = std::mem::take(&mut self.lagrangian_alpha_buf);
+
+        let mut certified = false;
+        for iter in 0..self.lagrangian_max_iters {
+            // Each iteration is a full DP scan; honour cancellation/deadline so
+            // the relaxation can never push a hard node past its time budget.
+            // Bailing early just yields `Improving` (never a false certificate).
+            if ctx.terminate.load(std::sync::atomic::Ordering::Relaxed)
+                || ctx.deadline.is_some_and(|d| std::time::Instant::now() >= d)
+            {
+                break;
+            }
+            // shifted α = base α + Δ(μ).
+            alpha.clear();
+            alpha.extend_from_slice(ctx.alpha);
+            if alpha.len() < n + 1 {
+                alpha.resize(n + 1, 0.0);
+            }
+            for (k, pair) in must.iter().enumerate() {
+                if (pair.a as usize) <= n {
+                    alpha[pair.a as usize] += mu[k];
+                }
+                if (pair.b as usize) <= n {
+                    alpha[pair.b as usize] -= mu[k];
+                }
+            }
+
+            let (bound, arg) = self.relaxed_feasible_cert(ctx, &alpha);
+            if bound <= 1.0 + PRICING_EPS {
+                certified = true;
+                break;
+            }
+            let Some((a, b)) = arg else {
+                break;
+            };
+            // Subgradient of `max_C L` w.r.t. μ is the must-link violation of the
+            // maximiser; step against it to *minimise* the bound.
+            let labels = self.pair_labels(a, b, &alpha, ctx.beta);
+            let step = STEP0 / (iter as f64 + 1.0);
+            for (k, pair) in must.iter().enumerate() {
+                let gx = i32::from(labels.binary_search(&pair.a).is_ok());
+                let gy = i32::from(labels.binary_search(&pair.b).is_ok());
+                mu[k] -= step * f64::from(gx - gy);
+            }
+        }
+
+        self.lagrangian_mu = mu;
+        self.lagrangian_alpha_buf = alpha;
+        certified
     }
 
     fn root_penalty(&self, a: usize, b: usize, beta: &[Vec<f64>]) -> f64 {
@@ -794,6 +1032,11 @@ impl LeafPairDpPricer {
         // anchor `(a,b)`, so once every order-pair is scanned and this max is
         // `≤ 1+ε`, no improving column exists anywhere → sound `Converged`.
         let mut global_max: f64 = NEG_INF;
+        // Branch-feasible certification quantity: the same max restricted to
+        // anchors that can co-occur in a branch-feasible column. Sound upper
+        // bound on `max_{C ∈ C(B)} score(C)` and `≤ global_max` — this is what
+        // gates `Converged` (see `anchor_feasible` and the `price()` gate).
+        let mut feasible_global_max: f64 = NEG_INF;
 
         let cache_active =
             anchor_cache_enabled(scratch) && ctx.trees.len() == 2 && scratch.anchor_cache.is_some();
@@ -808,9 +1051,15 @@ impl LeafPairDpPricer {
         scratch.pricing_stats.leaf_pair_branch_blocked = 0;
         scratch.pricing_stats.leaf_pair_blocked_must = 0;
         scratch.pricing_stats.leaf_pair_blocked_cannot = 0;
+        scratch.pricing_stats.must_closure_attempted = 0;
+        scratch.pricing_stats.must_closure_valid_positive = 0;
+        scratch.pricing_stats.must_closure_valid_nonprofitable = 0;
+        scratch.pricing_stats.must_closure_invalid = 0;
+        scratch.pricing_stats.must_closure_fallback = 0;
         scratch.pricing_stats.leaf_pair_completed = false;
         scratch.pricing_stats.leaf_pair_trial_limited = scan < order.len();
         scratch.pricing_stats.leaf_pair_global_max = NEG_INF;
+        scratch.pricing_stats.leaf_pair_feasible_global_max = NEG_INF;
         // `completed` ⇒ every pair in `order` had its `solve_pair` evaluated;
         // only then is `global_max` a valid convergence certificate.
         let mut completed = scan == order.len();
@@ -825,6 +1074,11 @@ impl LeafPairDpPricer {
             let la = self.active_labels[a];
             let lb = self.active_labels[b];
             scratch.pricing_stats.leaf_pair_scanned += 1;
+            // Whether this anchor can occur in any branch-feasible column. Only
+            // such anchors contribute to `feasible_global_max`, the quantity
+            // that gates `Converged`. Computed once and reused at both
+            // `solve_pair`/cache update sites below.
+            let anchor_feasible = self.anchor_feasible(la, lb);
 
             // `pair_ub` may have tightened since we built the order (the
             // bound is recomputed each call). If it dropped to `≤ 1+ε` then
@@ -846,6 +1100,9 @@ impl LeafPairDpPricer {
                         score: cached_score,
                     } => {
                         global_max = global_max.max(cached_score);
+                        if anchor_feasible {
+                            feasible_global_max = feasible_global_max.max(cached_score);
+                        }
                         // Rebuild column from cached leaves. If the cached
                         // column is already seen or blocked, do NOT skip this
                         // anchor: a different column at the same anchor may
@@ -884,6 +1141,9 @@ impl LeafPairDpPricer {
             // only below, to emission.
             let score = self.solve_pair(a, b, ctx.alpha, ctx.beta);
             global_max = global_max.max(score);
+            if anchor_feasible {
+                feasible_global_max = feasible_global_max.max(score);
+            }
             if score <= 1.0 + PRICING_EPS {
                 continue;
             }
@@ -912,14 +1172,31 @@ impl LeafPairDpPricer {
                     scratch.pricing_stats.leaf_pair_blocked_cannot += 1;
                 }
             }
-            let labels =
-                match branch_feasible_labels(&raw_labels, ctx.branchings, ctx.alpha, ctx.trees) {
-                    Some(l) => l,
-                    None => {
-                        scratch.pricing_stats.leaf_pair_repair_failed += 1;
-                        continue;
-                    }
-                };
+            let (labels_opt, closure_outcome) =
+                branch_feasible_labels(&raw_labels, ctx.branchings, ctx.alpha, ctx.trees);
+            match closure_outcome {
+                MustClosureOutcome::NotAttempted => {}
+                MustClosureOutcome::Used => {
+                    scratch.pricing_stats.must_closure_attempted += 1;
+                }
+                MustClosureOutcome::InvalidFallback => {
+                    scratch.pricing_stats.must_closure_attempted += 1;
+                    scratch.pricing_stats.must_closure_invalid += 1;
+                    scratch.pricing_stats.must_closure_fallback += 1;
+                }
+                MustClosureOutcome::RepairFallback => {
+                    scratch.pricing_stats.must_closure_attempted += 1;
+                    scratch.pricing_stats.must_closure_fallback += 1;
+                }
+            }
+            let from_closure = closure_outcome == MustClosureOutcome::Used;
+            let labels = match labels_opt {
+                Some(l) => l,
+                None => {
+                    scratch.pricing_stats.leaf_pair_repair_failed += 1;
+                    continue;
+                }
+            };
             if ctx.seen.contains(&labels) {
                 scratch.pricing_stats.leaf_pair_seen += 1;
                 continue;
@@ -930,6 +1207,9 @@ impl LeafPairDpPricer {
             let score = column.pricing_score(ctx.alpha, ctx.beta);
             if score <= 1.0 + PRICING_EPS {
                 scratch.pricing_stats.leaf_pair_repair_nonprofitable += 1;
+                if from_closure {
+                    scratch.pricing_stats.must_closure_valid_nonprofitable += 1;
+                }
                 continue;
             }
             // Guard: the repaired column must satisfy every branch constraint.
@@ -980,19 +1260,41 @@ impl LeafPairDpPricer {
                 );
             }
 
+            if from_closure {
+                scratch.pricing_stats.must_closure_valid_positive += 1;
+            }
             found.push((score, column));
             scratch.pricing_stats.leaf_pair_found += 1;
         }
 
         scratch.pricing_stats.leaf_pair_completed = completed;
         scratch.pricing_stats.leaf_pair_global_max = global_max;
+        scratch.pricing_stats.leaf_pair_feasible_global_max = feasible_global_max;
 
         CollectResult {
             found,
             global_max,
+            feasible_global_max,
             completed,
         }
     }
+}
+
+/// Which must-link-closure path produced the labels returned by
+/// [`branch_feasible_labels`]. Used purely for telemetry; the emitted labels
+/// are sound on every variant.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MustClosureOutcome {
+    /// No must-link constraints active — closure was not attempted.
+    NotAttempted,
+    /// Closure was a valid AF component and its repair succeeded; the returned
+    /// labels are the (repaired) closure.
+    Used,
+    /// Closure was not a valid AF component; fell back to raw-subset repair.
+    InvalidFallback,
+    /// Closure was a valid AF component but its repair stripped it below two
+    /// leaves; fell back to raw-subset repair.
+    RepairFallback,
 }
 
 fn branch_feasible_labels(
@@ -1000,22 +1302,34 @@ fn branch_feasible_labels(
     branchings: &crate::solvers::bp::search::Branchings,
     alpha: &[f64],
     trees: &[Tree],
-) -> Option<Vec<u32>> {
+) -> (Option<Vec<u32>>, MustClosureOutcome) {
     if branchings.must_link().is_empty() {
-        return repair_to_valid(raw_labels, branchings, alpha);
+        return (
+            repair_to_valid(raw_labels, branchings, alpha),
+            MustClosureOutcome::NotAttempted,
+        );
     }
 
     let closed = must_link_closure(raw_labels, branchings);
-    if closed.len() >= 2
-        && is_valid_af_component(&closed, trees)
-        && let Some(labels) = repair_to_valid(&closed, branchings, alpha)
-    {
-        return Some(labels);
+    if closed.len() >= 2 && is_valid_af_component(&closed, trees) {
+        if let Some(labels) = repair_to_valid(&closed, branchings, alpha) {
+            return (Some(labels), MustClosureOutcome::Used);
+        }
+        // Valid AF component, but repair dropped it below two leaves. Fall back
+        // to the raw DP candidate, which is valid by construction.
+        return (
+            repair_to_valid(raw_labels, branchings, alpha),
+            MustClosureOutcome::RepairFallback,
+        );
     }
 
-    // Fall back to the old safe behavior. The raw DP candidate is valid by
-    // construction, and `repair_to_valid` only takes subsets of it.
-    repair_to_valid(raw_labels, branchings, alpha)
+    // Closure is not a valid AF component. Fall back to the old safe behavior:
+    // the raw DP candidate is valid by construction, and `repair_to_valid`
+    // only takes subsets of it.
+    (
+        repair_to_valid(raw_labels, branchings, alpha),
+        MustClosureOutcome::InvalidFallback,
+    )
 }
 
 fn must_link_closure(
@@ -1133,8 +1447,13 @@ struct CollectResult {
     /// Emittable improving columns (constraint-valid, not already seen).
     found: Vec<(f64, AfColumn)>,
     /// Constraint-blind max of `solve_pair` over every anchor scanned. Valid
-    /// as a convergence certificate only when `completed` is true.
+    /// as an *unconstrained* convergence certificate only when `completed`.
     global_max: f64,
+    /// Branch-feasible max of `solve_pair`: the same max restricted to anchors
+    /// that can co-occur in a branch-feasible column. A sound upper bound on
+    /// `max_{C ∈ C(B)} score(C)` and `≤ global_max`. This is the quantity that
+    /// gates `Converged` — valid as a certificate only when `completed`.
+    feasible_global_max: f64,
     /// True ⇔ every pair in `order` was scanned (no trial-limit cut, no
     /// early `target` break).
     completed: bool,
@@ -1197,6 +1516,11 @@ impl Pricer for LeafPairDpPricer {
                 }
             }
         }
+
+        // --- Branch-feasible certification: must-link classes + conflicts ---
+        // Drives `anchor_feasible`, which restricts the certification max to
+        // anchors that can occur in a branch-feasible column.
+        self.rebuild_branch_classes(ctx);
 
         let p = self.active_labels.len();
         if p < 2 || p < self.min_active_labels {
@@ -1267,6 +1591,17 @@ impl Pricer for LeafPairDpPricer {
             result = self.collect_from_order(&order, order.len(), target, ctx, scratch);
         }
 
+        // Soundness invariant: the branch-feasible certification max never
+        // exceeds the constraint-blind max (it is a sub-max over fewer anchors).
+        // A violation would mean `feasible_global_max` saw an anchor the
+        // constraint-blind max did not — a bug that could over-certify.
+        debug_assert!(
+            result.feasible_global_max <= result.global_max + PRICING_EPS,
+            "feasible_global_max {} exceeds global_max {}",
+            result.feasible_global_max,
+            result.global_max
+        );
+
         // Optional anchor-cache stats logging.
         if anchor_cache_enabled(scratch)
             && let Some(cache) = scratch.anchor_cache.as_ref()
@@ -1290,7 +1625,7 @@ impl Pricer for LeafPairDpPricer {
                 let s = &scratch.pricing_stats;
                 log::debug!(
                     target: "klados::bp",
-                    "leaf-pair branch stats depth={} outcome=found scanned={} positive={} found={} blocked={} must={} cannot={} seen={} repair_failed={} repair_nonprofit={} completed={} trial_limited={} global_max={:.4}",
+                    "leaf-pair branch stats depth={} outcome=found scanned={} positive={} found={} blocked={} must={} cannot={} seen={} repair_failed={} repair_nonprofit={} mc_attempted={} mc_valid_pos={} mc_valid_nonprofit={} mc_invalid={} mc_fallback={} completed={} trial_limited={} global_max={:.4} feasible_global_max={:.4}",
                     ctx.branchings.depth(),
                     s.leaf_pair_scanned,
                     s.leaf_pair_positive,
@@ -1301,9 +1636,15 @@ impl Pricer for LeafPairDpPricer {
                     s.leaf_pair_seen,
                     s.leaf_pair_repair_failed,
                     s.leaf_pair_repair_nonprofitable,
+                    s.must_closure_attempted,
+                    s.must_closure_valid_positive,
+                    s.must_closure_valid_nonprofitable,
+                    s.must_closure_invalid,
+                    s.must_closure_fallback,
                     s.leaf_pair_completed,
                     s.leaf_pair_trial_limited,
                     s.leaf_pair_global_max,
+                    s.leaf_pair_feasible_global_max,
                 );
             }
             // Sort by RC descending, cap at 128 to prevent RMP flooding
@@ -1316,15 +1657,31 @@ impl Pricer for LeafPairDpPricer {
 
         // No emittable column. Decide between a proven `Converged` and an
         // uncertified `Improving`.
-        if result.completed && result.global_max <= 1.0 + PRICING_EPS {
-            // The full all-anchor scan completed and the constraint-blind max
-            // anchor score is ≤ 1+ε: `solve_pair` dominates every column at
-            // its anchor (§3), so no improving column exists anywhere.
+        //
+        // Certification gates on `feasible_global_max`, the max of `solve_pair`
+        // over anchors that can occur in a branch-feasible column. This is a
+        // sound upper bound on `max_{C ∈ C(B)} score(C)`:
+        //
+        //   * `solve_pair(a,b) ≥ score(C)` for every column `C ∋ a,b` (§3), so
+        //     the bound dominates every branch-feasible column;
+        //   * every branch-feasible `C` with `|C| ≥ 2` has a pair `(a,b) ⊆ C`
+        //     whose classes lie wholly in `C` (must-closure) and so cannot be
+        //     cannot-conflicting — hence `anchor_feasible(a,b)` holds, the pair
+        //     was scanned (its tight UB exceeds 1+ε since `solve_pair ≥
+        //     score(C) > 1+ε`), and it contributed to `feasible_global_max`.
+        //
+        // Therefore `completed ∧ feasible_global_max ≤ 1+ε` ⇒ no improving
+        // branch-feasible column exists ⇒ the branch-node LP bound is certified.
+        // `feasible_global_max ≤ global_max`, so this subsumes the old
+        // constraint-blind gate and only ever certifies more (never wrongly).
+        if result.completed && result.feasible_global_max <= 1.0 + PRICING_EPS {
+            // The full all-anchor scan completed and the branch-feasible max
+            // anchor score is ≤ 1+ε: no branch-feasible improving column exists.
             if ctx.branchings.depth() > 0 && scratch.pricing_stats.leaf_pair_positive > 0 {
                 let s = &scratch.pricing_stats;
                 log::debug!(
                     target: "klados::bp",
-                    "leaf-pair branch stats depth={} outcome=converged scanned={} positive={} found={} blocked={} must={} cannot={} seen={} repair_failed={} repair_nonprofit={} completed={} trial_limited={} global_max={:.4}",
+                    "leaf-pair branch stats depth={} outcome=converged scanned={} positive={} found={} blocked={} must={} cannot={} seen={} repair_failed={} repair_nonprofit={} mc_attempted={} mc_valid_pos={} mc_valid_nonprofit={} mc_invalid={} mc_fallback={} completed={} trial_limited={} global_max={:.4} feasible_global_max={:.4}",
                     ctx.branchings.depth(),
                     s.leaf_pair_scanned,
                     s.leaf_pair_positive,
@@ -1335,13 +1692,41 @@ impl Pricer for LeafPairDpPricer {
                     s.leaf_pair_seen,
                     s.leaf_pair_repair_failed,
                     s.leaf_pair_repair_nonprofitable,
+                    s.must_closure_attempted,
+                    s.must_closure_valid_positive,
+                    s.must_closure_valid_nonprofitable,
+                    s.must_closure_invalid,
+                    s.must_closure_fallback,
                     s.leaf_pair_completed,
                     s.leaf_pair_trial_limited,
                     s.leaf_pair_global_max,
+                    s.leaf_pair_feasible_global_max,
                 );
             }
             PricingResult::Converged
         } else {
+            // The constraint-blind/anchor-level bound did not certify. If the
+            // scan completed and must-link constraints are active, try the
+            // Lagrangian must-link relaxation: it can prove convergence on
+            // nodes whose residual is must-link-blocked (the dominant case),
+            // and is sound for any multiplier (`μ = 0` reproduces the bound
+            // just computed). Gated to completed scans because the relaxed
+            // bound, like the base one, only certifies after a full scan.
+            if self.lagrangian_certify_enabled
+                && result.completed
+                && ctx.branchings.depth() > 0
+                && !ctx.branchings.must_link().is_empty()
+                && self.lagrangian_must_certify(ctx)
+            {
+                log::debug!(
+                    target: "klados::bp",
+                    "leaf-pair branch stats depth={} outcome=converged-lagrangian global_max={:.4} feasible_global_max={:.4}",
+                    ctx.branchings.depth(),
+                    result.global_max,
+                    result.feasible_global_max,
+                );
+                return PricingResult::Converged;
+            }
             // Either the scan was incomplete (trial-limited, no fallback), or
             // improving columns provably exist but every one is branch-blocked
             // or already pooled. The LP bound is NOT certified — the solver
@@ -1350,8 +1735,9 @@ impl Pricer for LeafPairDpPricer {
                 let s = &scratch.pricing_stats;
                 log::debug!(
                     target: "klados::bp",
-                    "leaf-pair branch stats depth={} outcome=improving scanned={} positive={} found={} blocked={} must={} cannot={} seen={} repair_failed={} repair_nonprofit={} completed={} trial_limited={} global_max={:.4}",
+                    "leaf-pair branch stats depth={} active={} outcome=improving scanned={} positive={} found={} blocked={} must={} cannot={} seen={} repair_failed={} repair_nonprofit={} mc_attempted={} mc_valid_pos={} mc_valid_nonprofit={} mc_invalid={} mc_fallback={} completed={} trial_limited={} global_max={:.4} feasible_global_max={:.4}",
                     ctx.branchings.depth(),
+                    self.active_labels.len(),
                     s.leaf_pair_scanned,
                     s.leaf_pair_positive,
                     s.leaf_pair_found,
@@ -1361,9 +1747,15 @@ impl Pricer for LeafPairDpPricer {
                     s.leaf_pair_seen,
                     s.leaf_pair_repair_failed,
                     s.leaf_pair_repair_nonprofitable,
+                    s.must_closure_attempted,
+                    s.must_closure_valid_positive,
+                    s.must_closure_valid_nonprofitable,
+                    s.must_closure_invalid,
+                    s.must_closure_fallback,
                     s.leaf_pair_completed,
                     s.leaf_pair_trial_limited,
                     s.leaf_pair_global_max,
+                    s.leaf_pair_feasible_global_max,
                 );
             }
             PricingResult::Improving
@@ -1438,10 +1830,9 @@ mod tests {
         let trees = vec![parse("((1,2),3)", 3), parse("((1,2),3)", 3)];
         let alpha = vec![0.0, 1.0, 1.0, 1.0];
 
-        assert_eq!(
-            branch_feasible_labels(&[1, 3], &b, &alpha, &trees),
-            Some(vec![1, 2, 3])
-        );
+        let (labels, outcome) = branch_feasible_labels(&[1, 3], &b, &alpha, &trees);
+        assert_eq!(labels, Some(vec![1, 2, 3]));
+        assert_eq!(outcome, MustClosureOutcome::Used);
     }
 
     #[test]
@@ -1452,5 +1843,288 @@ mod tests {
         let alpha = vec![0.0, 1.0, 1.0, 10.0];
 
         assert_eq!(repair_to_valid(&[1, 2, 3], &b, &alpha), None);
+    }
+
+    /// `anchor_feasible` lifts cannot-link to whole must-link classes: an anchor
+    /// is infeasible if the two leaves' classes are cannot-conflicting, even
+    /// when the two anchor leaves are not themselves directly cannot-linked.
+    #[test]
+    fn anchor_feasibility_lifts_cannot_link_to_must_classes() {
+        use crate::solvers::bp::column::ColumnSet;
+        let trees = vec![parse("((1,2),(3,4))", 4), parse("((1,2),(3,4))", 4)];
+        let alpha = vec![0.0, 1.0, 1.0, 1.0, 1.0];
+        let beta: Vec<Vec<f64>> = trees.iter().map(|t| vec![0.0; t.num_nodes()]).collect();
+        let mut br = Branchings::default();
+        br.push_must_link(LeafPair::new(1, 2)); // class {1, 2}
+        br.push_cannot_link(LeafPair::new(2, 3)); // {1, 2} conflicts with {3}
+        let columns: Vec<AfColumn> = Vec::new();
+        let seen = ColumnSet::new();
+        let ctx = PricingContext {
+            trees: &trees,
+            num_leaves: 4,
+            alpha: &alpha,
+            beta: &beta,
+            columns: &columns,
+            seen: &seen,
+            branchings: &br,
+            terminate: &super::super::NEVER_TERMINATE,
+            deadline: None,
+        };
+        let mut pricer = LeafPairDpPricer::new(&trees);
+        pricer.rebuild_branch_classes(&ctx);
+
+        // (1,3): classes {1,2} and {3} conflict via cannot(2,3) — infeasible
+        // even though 1 and 3 are not directly cannot-linked.
+        assert!(!pricer.anchor_feasible(1, 3));
+        // (2,3): direct cannot-link — infeasible.
+        assert!(!pricer.anchor_feasible(2, 3));
+        // (1,2): same must-link class — always feasible.
+        assert!(pricer.anchor_feasible(1, 2));
+        // No conflict — feasible.
+        assert!(pricer.anchor_feasible(1, 4));
+        assert!(pricer.anchor_feasible(3, 4));
+    }
+
+    /// The Lagrangian must-link relaxation certifies a node that the
+    /// constraint-blind / anchor-level bound cannot. Construction: must-link
+    /// `(2,3)`, with `α = [_, 1, 1, −5]` and `β ≡ 0` on two copies of
+    /// `((1,2),3)`. The must-**violating** column `{1,2}` scores `2.0` at the
+    /// feasible anchor `(1,2)`, so the base bound is `2.0 > 1+ε` → `Improving`.
+    /// But every must-closed feasible column (`{2,3}`, `{1,3}`, `{1,2,3}`)
+    /// scores `≤ −3`, so the node is genuinely converged. Relaxing `1_2 = 1_3`
+    /// with `μ → −1` shifts `α₂ → 0`, pulling the relaxed bound to `1.0 ≤ 1+ε`
+    /// → `Converged`.
+    #[test]
+    fn lagrangian_certifies_must_blocked_node_base_bound_misses() {
+        use crate::solvers::bp::column::ColumnSet;
+        let trees = vec![parse("((1,2),3)", 3), parse("((1,2),3)", 3)];
+        let alpha = vec![0.0, 1.0, 1.0, -5.0];
+        let beta: Vec<Vec<f64>> = trees.iter().map(|t| vec![0.0; t.num_nodes()]).collect();
+        let mut br = Branchings::default();
+        br.push_must_link(LeafPair::new(2, 3));
+        let columns: Vec<AfColumn> = Vec::new();
+        let seen = ColumnSet::new();
+        let ctx = PricingContext {
+            trees: &trees,
+            num_leaves: 3,
+            alpha: &alpha,
+            beta: &beta,
+            columns: &columns,
+            seen: &seen,
+            branchings: &br,
+            terminate: &super::super::NEVER_TERMINATE,
+            deadline: None,
+        };
+
+        // Lagrangian OFF: base bound sees `{1,2}` at a feasible anchor → cannot
+        // certify → Improving.
+        let mut off = LeafPairDpPricer::new(&trees);
+        let mut sc = PricerScratch::new(&trees);
+        assert!(matches!(off.price(&ctx, &mut sc), PricingResult::Improving));
+
+        // Lagrangian ON: relaxing must(2,3) drives the bound to ≤ 1+ε.
+        let mut on = LeafPairDpPricer::new(&trees).with_lagrangian_certify(6);
+        let mut sc2 = PricerScratch::new(&trees);
+        assert!(matches!(on.price(&ctx, &mut sc2), PricingResult::Converged));
+    }
+
+    /// Exact-track soundness guard for branch-feasible certification.
+    ///
+    /// Over many random small instances, dual vectors, and consistent branch
+    /// states, brute-force the true branch-feasible column space `C(B)` and its
+    /// maximum pricing score, then run the pricer's full scan. Two properties
+    /// must hold:
+    ///
+    /// 1. **No over-certification.** If a branch-feasible improving column
+    ///    exists (`brute_max > 1+ε`), the pricer must never return `Converged`.
+    ///    This is the load-bearing exactness check: a violation would mean the
+    ///    LP bound is wrongly certified and the search could prune an optimum.
+    /// 2. **Bound dominance.** On a completed scan, `feasible_global_max`
+    ///    upper-bounds the true branch-feasible max.
+    #[test]
+    fn certification_never_over_certifies_vs_brute_force() {
+        use crate::solvers::bp::column::{ColumnBuilder, ColumnSet};
+
+        // Deterministic LCG so failures are reproducible from the seed.
+        fn next(rng: &mut u64) -> u64 {
+            *rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *rng >> 33
+        }
+        fn rrange(rng: &mut u64, lo: u64, hi: u64) -> u64 {
+            lo + next(rng) % (hi - lo)
+        }
+        fn random_tree(labels: &[u32], n_cap: u32, rng: &mut u64) -> Tree {
+            let mut t = Tree::with_capacity(n_cap);
+            let mut pool: Vec<NodeId> = Vec::new();
+            for &lbl in labels {
+                let id = t.parent.len() as NodeId;
+                t.parent.push(NONE);
+                t.left.push(NONE);
+                t.right.push(NONE);
+                t.label.push(lbl as Label);
+                t.label_to_node[lbl as usize] = id;
+                pool.push(id);
+            }
+            while pool.len() > 1 {
+                let i = (next(rng) % pool.len() as u64) as usize;
+                let a = pool.swap_remove(i);
+                let j = (next(rng) % pool.len() as u64) as usize;
+                let b = pool.swap_remove(j);
+                let id = t.parent.len() as NodeId;
+                t.parent.push(NONE);
+                t.left.push(a);
+                t.right.push(b);
+                t.label.push(0);
+                t.parent[a as usize] = id;
+                t.parent[b as usize] = id;
+                pool.push(id);
+            }
+            t.root = pool[0];
+            t.compute_metadata();
+            t
+        }
+
+        const EPS: f64 = PRICING_EPS;
+        let mut saw_converged = 0usize;
+        let mut saw_feasible_improving = 0usize;
+
+        for seed in 0..500u64 {
+            let mut rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+            let n = rrange(&mut rng, 4, 8) as u32; // 4..=7 leaves
+            let m = rrange(&mut rng, 2, 4) as usize; // 2 or 3 trees
+            let labels: Vec<u32> = (1..=n).collect();
+            let trees: Vec<Tree> = (0..m).map(|_| random_tree(&labels, n, &mut rng)).collect();
+
+            // Half the seeds use heavy penalties / small gains to exercise the
+            // `Converged` path; the rest keep many improving columns.
+            let heavy = seed % 2 == 0;
+            let mut alpha = vec![0.0f64; n as usize + 1];
+            for a in alpha.iter_mut().take(n as usize + 1).skip(1) {
+                *a = if heavy {
+                    0.3 + (rrange(&mut rng, 0, 60) as f64) / 100.0
+                } else {
+                    0.8 + (rrange(&mut rng, 0, 200) as f64) / 100.0
+                };
+            }
+            let beta: Vec<Vec<f64>> = trees
+                .iter()
+                .map(|t| {
+                    (0..t.num_nodes())
+                        .map(|v| {
+                            if t.is_leaf(v as NodeId) {
+                                0.0
+                            } else {
+                                let scale = if heavy { 120 } else { 40 };
+                                (rrange(&mut rng, 0, scale) as f64) / 100.0
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+
+            // Random consistent branchings.
+            let mut br = Branchings::default();
+            let rand_pair = |rng: &mut u64| -> LeafPair {
+                loop {
+                    let a = rrange(rng, 1, n as u64 + 1) as u32;
+                    let b = rrange(rng, 1, n as u64 + 1) as u32;
+                    if a != b {
+                        return LeafPair::new(a, b);
+                    }
+                }
+            };
+            for _ in 0..rrange(&mut rng, 0, 3) {
+                br.push_must_link(rand_pair(&mut rng));
+            }
+            for _ in 0..rrange(&mut rng, 0, 3) {
+                let p = rand_pair(&mut rng);
+                if !br.must_link().contains(&p) {
+                    br.push_cannot_link(p);
+                }
+            }
+
+            // Brute-force the branch-feasible max pricing score.
+            let mut builder = ColumnBuilder::new(&trees);
+            let feasible = |s: &[u32]| -> bool {
+                for ml in br.must_link() {
+                    if s.binary_search(&ml.a).is_ok() != s.binary_search(&ml.b).is_ok() {
+                        return false;
+                    }
+                }
+                for cl in br.cannot_link() {
+                    if s.binary_search(&cl.a).is_ok() && s.binary_search(&cl.b).is_ok() {
+                        return false;
+                    }
+                }
+                true
+            };
+            let mut brute_max = f64::NEG_INFINITY;
+            for mask in 0u32..(1u32 << n) {
+                let s: Vec<u32> = (1..=n).filter(|&l| mask & (1 << (l - 1)) != 0).collect();
+                if s.len() < 2 || !feasible(&s) || !is_valid_af_component(&s, &trees) {
+                    continue;
+                }
+                let col = builder.build_unchecked(s, &trees);
+                brute_max = brute_max.max(col.pricing_score(&alpha, &beta));
+            }
+
+            // Full-scan pricing with Lagrangian must-link certification on —
+            // this is the path that could over-certify if the relaxation were
+            // unsound, so the brute guard below must exercise it.
+            let mut pricer = LeafPairDpPricer::new(&trees).with_lagrangian_certify(6);
+            let mut scratch = PricerScratch::new(&trees);
+            let seen = ColumnSet::new();
+            let columns: Vec<AfColumn> = Vec::new();
+            let ctx = PricingContext {
+                trees: &trees,
+                num_leaves: n as usize,
+                alpha: &alpha,
+                beta: &beta,
+                columns: &columns,
+                seen: &seen,
+                branchings: &br,
+                terminate: &super::super::NEVER_TERMINATE,
+                deadline: None,
+            };
+            let result = pricer.price(&ctx, &mut scratch);
+            let fgm = scratch.pricing_stats.leaf_pair_feasible_global_max;
+            let gm = scratch.pricing_stats.leaf_pair_global_max;
+            let completed = scratch.pricing_stats.leaf_pair_completed;
+            let is_converged = matches!(result, PricingResult::Converged);
+            if is_converged {
+                saw_converged += 1;
+            }
+
+            assert!(
+                fgm <= gm + EPS,
+                "seed {seed}: feasible_max {fgm} > global_max {gm}"
+            );
+
+            if brute_max > 1.0 + EPS {
+                saw_feasible_improving += 1;
+                // (1) No over-certification.
+                assert!(
+                    !is_converged,
+                    "seed {seed}: over-certified Converged but a branch-feasible \
+                     improving column exists (brute_max={brute_max})"
+                );
+                // (2) Bound dominance on a completed scan.
+                if completed {
+                    assert!(
+                        fgm + 1e-6 >= brute_max,
+                        "seed {seed}: feasible_global_max {fgm} < brute feasible max {brute_max}"
+                    );
+                }
+            }
+        }
+
+        // Sanity: the corpus actually exercised both regimes.
+        assert!(saw_converged > 0, "no Converged outcomes — corpus too easy");
+        assert!(
+            saw_feasible_improving > 0,
+            "no feasible-improving cases — corpus too hard"
+        );
     }
 }

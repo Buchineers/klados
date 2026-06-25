@@ -50,6 +50,29 @@ pub struct PricingStats {
     pub leaf_pair_completed: bool,
     pub leaf_pair_trial_limited: bool,
     pub leaf_pair_global_max: f64,
+    /// Branch-feasible certification quantity: the max of `solve_pair` over the
+    /// scanned anchors `(a,b)` that can co-occur in some branch-feasible column
+    /// (their must-link classes are not cannot-link-conflicting). This is a
+    /// sound upper bound on `max_{C ∈ C(B)} score(C)` — see
+    /// `leaf_pair_dp::LeafPairDpPricer::anchor_feasible`. `≤ global_max` always.
+    pub leaf_pair_feasible_global_max: f64,
+    // ── Must-link-closure emission telemetry (multi-tree branch pricing) ──
+    /// Positive raw DP candidates for which must-link closure was attempted
+    /// (i.e. the branch state had at least one must-link constraint).
+    pub must_closure_attempted: usize,
+    /// Closure was a valid AF component, repaired, and the repaired column
+    /// emitted as an improving (profitable) branch-feasible column.
+    pub must_closure_valid_positive: usize,
+    /// Closure was a valid AF component and repaired, but the repaired column
+    /// scored at or below the 1+ε threshold and was dropped.
+    pub must_closure_valid_nonprofitable: usize,
+    /// Closure was not a valid AF component, so the raw-subset repair fallback
+    /// was used instead.
+    pub must_closure_invalid: usize,
+    /// The closure path did not yield the emitted labels and the old
+    /// raw-subset repair fallback was taken (invalid closure or
+    /// repair-stripped-below-2 closure).
+    pub must_closure_fallback: usize,
 }
 
 pub struct PricerScratch {

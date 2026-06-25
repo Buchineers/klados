@@ -40,7 +40,13 @@ impl MafPricer {
         let generator = LeafPairDpPricer::new(trees)
             .with_pair_trial_limit(if m == 2 { 64 } else { 256 })
             .with_fallback_full_when_empty(true)
-            .with_max_per_call(batch);
+            .with_max_per_call(batch)
+            // Lagrangian must-link certification (m≥3, where this DP is the
+            // certifier; for m=2 the exact DP certifies and this is ignored).
+            // Relaxes must-link into the pricing objective to certify nodes
+            // whose `Improving` residue is must-link-blocked. Sound for any
+            // multiplier; set iters=0 to disable for an A/B comparison.
+            .with_lagrangian_certify(6);
         let m2_certifier = if m == 2 {
             Some(ExactPairDpPricer::new(trees))
         } else {
