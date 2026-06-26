@@ -384,10 +384,8 @@ fn collect_candidates_above(
         };
     }
 
-    // Reset DP tables only for entries we will read (children of visited nodes).
-    // We start from defaults; nodes not visited remain NEG_INF.
-    best_l0.fill((NEG_INF, 0u32));
-    best_r0.fill((NEG_INF, 0u32));
+    let beta_ref = &ctx.beta[ref_tree_idx];
+    let beta_0 = &ctx.beta[0];
 
     let mut cancelled = false;
     for &u in &t0_post {
@@ -403,21 +401,20 @@ fn collect_candidates_above(
 
         if t0.is_leaf(u) {
             let lbl = t0.label[u_idx] as usize;
+            let u_offset = u_idx * stride;
             for &v in &t1_post {
-                let i = idx(u_idx, v as usize);
+                let i = u_offset + v as usize;
                 dp_closed[i] = DpClosed::default();
-                dp_open[i] = DpOpen::default();
+                dp_open[i] = DpOpen {
+                    score: NEG_INF,
+                    choice: 0,
+                };
             }
             if active_labels[lbl] {
                 let v = t1.node_by_label(lbl as u32);
-                dp_closed[idx(u_idx, v as usize)].score = ctx.alpha[lbl];
-            }
-            for &v in &t1_post {
-                let i = idx(u_idx, v as usize);
-                dp_open[i] = DpOpen {
-                    score: dp_closed[i].score,
-                    choice: 0,
-                };
+                let i = u_offset + v as usize;
+                dp_closed[i].score = ctx.alpha[lbl];
+                dp_open[i].score = ctx.alpha[lbl];
             }
             continue;
         }
@@ -427,124 +424,116 @@ fn collect_candidates_above(
         let r0_idx = r0 as usize;
         let l0_active = t0_active[l0_idx];
         let r0_active = t0_active[r0_idx];
+        let l0_offset = l0_idx * stride;
+        let r0_offset = r0_idx * stride;
+        let u_offset = u_idx * stride;
 
-        for &v in &t1_post {
-            dp_closed[idx(u_idx, v as usize)] = DpClosed::default();
-        }
+        let beta_0_l0 = beta_0[l0_idx];
+        let beta_0_r0 = beta_0[r0_idx];
+        let c_u = beta_0[u_idx] + beta_0_l0 + beta_0_r0;
 
         for &v in &t1_post {
             let v_idx = v as usize;
-            let mut max_s = if l0_active {
-                dp_open[idx(l0_idx, v_idx)].score
+            let is_leaf = t1.is_leaf(v);
+            let children = if !is_leaf { Some(t1.children_pair(v)) } else { None };
+
+            // Compute best_l0 bottom-up
+            let mut max_s_l = if l0_active {
+                dp_open[l0_offset + v_idx].score
             } else {
                 NEG_INF
             };
-            let mut best_v = v;
-            if !t1.is_leaf(v) {
-                let (l1, r1) = t1.children_pair(v);
-                let s_l = best_l0[l1 as usize].0 - ctx.beta[ref_tree_idx][l1 as usize];
-                if s_l > max_s {
-                    max_s = s_l;
-                    best_v = best_l0[l1 as usize].1;
+            let mut best_v_l = v;
+            if let Some((l1, r1)) = children {
+                let s_l = best_l0[l1 as usize].0 - beta_ref[l1 as usize];
+                if s_l > max_s_l {
+                    max_s_l = s_l;
+                    best_v_l = best_l0[l1 as usize].1;
                 }
-                let s_r = best_l0[r1 as usize].0 - ctx.beta[ref_tree_idx][r1 as usize];
-                if s_r > max_s {
-                    max_s = s_r;
-                    best_v = best_l0[r1 as usize].1;
+                let s_r = best_l0[r1 as usize].0 - beta_ref[r1 as usize];
+                if s_r > max_s_l {
+                    max_s_l = s_r;
+                    best_v_l = best_l0[r1 as usize].1;
                 }
             }
-            best_l0[v_idx] = (max_s, best_v);
-        }
+            best_l0[v_idx] = (max_s_l, best_v_l);
 
-        for &v in &t1_post {
-            let v_idx = v as usize;
-            let mut max_s = if r0_active {
-                dp_open[idx(r0_idx, v_idx)].score
+            // Compute best_r0 bottom-up
+            let mut max_s_r = if r0_active {
+                dp_open[r0_offset + v_idx].score
             } else {
                 NEG_INF
             };
-            let mut best_v = v;
-            if !t1.is_leaf(v) {
+            let mut best_v_r = v;
+            if let Some((l1, r1)) = children {
+                let s_l = best_r0[l1 as usize].0 - beta_ref[l1 as usize];
+                if s_l > max_s_r {
+                    max_s_r = s_l;
+                    best_v_r = best_r0[l1 as usize].1;
+                }
+                let s_r = best_r0[r1 as usize].0 - beta_ref[r1 as usize];
+                if s_r > max_s_r {
+                    max_s_r = s_r;
+                    best_v_r = best_r0[r1 as usize].1;
+                }
+            }
+            best_r0[v_idx] = (max_s_r, best_v_r);
+        }
+
+        for &v in &t1_post {
+            let v_idx = v as usize;
+            let i = u_offset + v_idx;
+
+            dp_closed[i] = DpClosed::default();
+
+            if !t1.is_leaf(v) && !is_forbidden(u, v) {
                 let (l1, r1) = t1.children_pair(v);
-                let s_l = best_r0[l1 as usize].0 - ctx.beta[ref_tree_idx][l1 as usize];
-                if s_l > max_s {
-                    max_s = s_l;
-                    best_v = best_r0[l1 as usize].1;
+
+                let mut best_c_score = NEG_INF;
+                let mut v_l = 0;
+                let mut v_r = 0;
+
+                let s_l0_l1 = best_l0[l1 as usize].0 - beta_ref[l1 as usize];
+                let s_r0_r1 = best_r0[r1 as usize].0 - beta_ref[r1 as usize];
+                if s_l0_l1 > NEG_INF / 2.0 && s_r0_r1 > NEG_INF / 2.0 {
+                    let s = s_l0_l1 + s_r0_r1 - c_u - beta_ref[v_idx];
+                    if s > best_c_score {
+                        best_c_score = s;
+                        v_l = best_l0[l1 as usize].1;
+                        v_r = best_r0[r1 as usize].1;
+                    }
                 }
-                let s_r = best_r0[r1 as usize].0 - ctx.beta[ref_tree_idx][r1 as usize];
-                if s_r > max_s {
-                    max_s = s_r;
-                    best_v = best_r0[r1 as usize].1;
+
+                let s_l0_r1 = best_l0[r1 as usize].0 - beta_ref[r1 as usize];
+                let s_r0_l1 = best_r0[l1 as usize].0 - beta_ref[l1 as usize];
+                if s_l0_r1 > NEG_INF / 2.0 && s_r0_l1 > NEG_INF / 2.0 {
+                    let s = s_l0_r1 + s_r0_l1 - c_u - beta_ref[v_idx];
+                    if s > best_c_score {
+                        best_c_score = s;
+                        v_l = best_l0[r1 as usize].1;
+                        v_r = best_r0[l1 as usize].1;
+                    }
                 }
-            }
-            best_r0[v_idx] = (max_s, best_v);
-        }
 
-        for &v in &t1_post {
-            if t1.is_leaf(v) {
-                continue;
-            }
-            if is_forbidden(u, v) {
-                continue;
-            }
-            let v_idx = v as usize;
-            let (l1, r1) = t1.children_pair(v);
-
-            let mut best_c_score = NEG_INF;
-            let mut v_l = 0;
-            let mut v_r = 0;
-
-            let s_l0_l1 = best_l0[l1 as usize].0 - ctx.beta[ref_tree_idx][l1 as usize];
-            let s_r0_r1 = best_r0[r1 as usize].0 - ctx.beta[ref_tree_idx][r1 as usize];
-            if s_l0_l1 > NEG_INF / 2.0 && s_r0_r1 > NEG_INF / 2.0 {
-                let s = s_l0_l1 + s_r0_r1
-                    - ctx.beta[0][u_idx]
-                    - ctx.beta[ref_tree_idx][v_idx]
-                    - ctx.beta[0][l0_idx]
-                    - ctx.beta[0][r0_idx];
-                if s > best_c_score {
-                    best_c_score = s;
-                    v_l = best_l0[l1 as usize].1;
-                    v_r = best_r0[r1 as usize].1;
+                if best_c_score > NEG_INF / 2.0 {
+                    dp_closed[i] = DpClosed {
+                        score: best_c_score,
+                        v_l,
+                        v_r,
+                    };
                 }
             }
 
-            let s_l0_r1 = best_l0[r1 as usize].0 - ctx.beta[ref_tree_idx][r1 as usize];
-            let s_r0_l1 = best_r0[l1 as usize].0 - ctx.beta[ref_tree_idx][l1 as usize];
-            if s_l0_r1 > NEG_INF / 2.0 && s_r0_l1 > NEG_INF / 2.0 {
-                let s = s_l0_r1 + s_r0_l1
-                    - ctx.beta[0][u_idx]
-                    - ctx.beta[ref_tree_idx][v_idx]
-                    - ctx.beta[0][l0_idx]
-                    - ctx.beta[0][r0_idx];
-                if s > best_c_score {
-                    best_c_score = s;
-                    v_l = best_l0[r1 as usize].1;
-                    v_r = best_r0[l1 as usize].1;
-                }
-            }
-
-            if best_c_score > NEG_INF / 2.0 {
-                dp_closed[idx(u_idx, v_idx)] = DpClosed {
-                    score: best_c_score,
-                    v_l,
-                    v_r,
-                };
-            }
-        }
-
-        for &v in &t1_post {
-            let v_idx = v as usize;
             let mut best_o_score = NEG_INF;
             let mut choice = 0;
 
-            let closed = dp_closed[idx(u_idx, v_idx)].score;
+            let closed = dp_closed[i].score;
             if closed > NEG_INF / 2.0 {
-                best_o_score = closed + ctx.beta[0][u_idx] + ctx.beta[ref_tree_idx][v_idx];
+                best_o_score = closed + beta_0[u_idx] + beta_ref[v_idx];
             }
 
             let s_l0 = if l0_active {
-                dp_open[idx(l0_idx, v_idx)].score - ctx.beta[0][l0_idx]
+                dp_open[l0_offset + v_idx].score - beta_0_l0
             } else {
                 NEG_INF
             };
@@ -554,7 +543,7 @@ fn collect_candidates_above(
             }
 
             let s_r0 = if r0_active {
-                dp_open[idx(r0_idx, v_idx)].score - ctx.beta[0][r0_idx]
+                dp_open[r0_offset + v_idx].score - beta_0_r0
             } else {
                 NEG_INF
             };
@@ -563,7 +552,7 @@ fn collect_candidates_above(
                 choice = 2;
             }
 
-            dp_open[idx(u_idx, v_idx)] = DpOpen {
+            dp_open[i] = DpOpen {
                 score: best_o_score,
                 choice,
             };

@@ -44,12 +44,13 @@ impl AfColumn {
     /// The pricer adds a column iff this exceeds `1 + ε`.
     pub fn pricing_score(&self, alpha: &[f64], beta: &[Vec<f64>]) -> f64 {
         let leaf_gain: f64 = self.labels.iter().map(|&l| alpha[l as usize]).sum();
-        let node_penalty: f64 = self
-            .coverage
-            .iter_per_tree()
-            .enumerate()
-            .map(|(ti, nodes)| nodes.iter().map(|&v| beta[ti][v]).sum::<f64>())
-            .sum();
+        let mut node_penalty = 0.0;
+        for (ti, nodes) in self.coverage.nodes_per_tree.iter().enumerate() {
+            let b_ti = &beta[ti];
+            for &v in nodes {
+                node_penalty += b_ti[v];
+            }
+        }
         leaf_gain - node_penalty
     }
 
