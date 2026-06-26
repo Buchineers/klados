@@ -78,6 +78,9 @@ pub struct Rmp {
     /// is popped and the column is unfixed. Root fixings (depth=0) are
     /// **never** placed on the trail — they hold globally.
     rcvf_trail: Vec<(usize, usize)>,
+    tally_scratch: Vec<f64>,
+    tally_dirty: Vec<(usize, usize)>,
+    max_nodes: usize,
 }
 
 struct RootLp {
@@ -119,6 +122,10 @@ impl Rmp {
             .map(|t| vec![Vec::new(); t.num_nodes()])
             .collect();
 
+        let max_nodes = trees.iter().map(|t| t.num_nodes()).max().unwrap_or(0);
+        let num_trees = trees.len();
+        let tally_scratch = vec![0.0; num_trees * max_nodes];
+
         let mut rmp = Self {
             model: Some(model),
             leaf_row_idx,
@@ -131,6 +138,9 @@ impl Rmp {
             rcvf_zero: Vec::new(),
             root_lp: None,
             rcvf_trail: Vec::new(),
+            tally_scratch,
+            tally_dirty: Vec::new(),
+            max_nodes,
         };
         for c in initial {
             rmp.add_column(c);
@@ -363,9 +373,7 @@ impl Rmp {
         column_values: &[f64],
         eps: f64,
     ) -> usize {
-        // Tally Σ x_c for each unmaterialised (t, v).
-        use fxhash::FxHashMap;
-        let mut tally: FxHashMap<(usize, usize), f64> = FxHashMap::default();
+        let max_nodes = self.max_nodes;
         for (ci, &v) in column_values.iter().enumerate() {
             if v <= 1.0e-9 {
                 continue;
@@ -374,21 +382,33 @@ impl Rmp {
                 continue;
             }
             let col = &columns[ci];
-            for (ti, nodes) in col.coverage().iter_per_tree().enumerate() {
+            for (ti, nodes) in col.coverage().nodes_per_tree.iter().enumerate() {
+                let offset = ti * max_nodes;
                 for &node in nodes {
                     if self.node_row_idx[ti][node].is_none() {
-                        *tally.entry((ti, node)).or_insert(0.0) += v;
+                        let idx = offset + node;
+                        if self.tally_scratch[idx] == 0.0 {
+                            self.tally_dirty.push((ti, node));
+                        }
+                        self.tally_scratch[idx] += v;
                     }
                 }
             }
         }
+
+        let mut dirty = std::mem::take(&mut self.tally_dirty);
         let mut added = 0usize;
-        for ((ti, node), sum) in tally {
+        for &(ti, node) in &dirty {
+            let idx = ti * max_nodes + node;
+            let sum = self.tally_scratch[idx];
             if sum > 1.0 + eps {
                 self.add_node_row_lazy(ti, node);
                 added += 1;
             }
+            self.tally_scratch[idx] = 0.0;
         }
+        dirty.clear();
+        self.tally_dirty = dirty;
         added
     }
 

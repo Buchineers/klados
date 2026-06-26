@@ -10,7 +10,7 @@ use klados_core::Tree;
 /// Per-tree LCA-path internal nodes. `nodes_per_tree[t]` is sorted, deduped.
 #[derive(Clone, Debug)]
 pub struct ColumnCoverage {
-    nodes_per_tree: Vec<Vec<usize>>,
+    pub(crate) nodes_per_tree: Vec<Vec<usize>>,
 }
 
 impl ColumnCoverage {

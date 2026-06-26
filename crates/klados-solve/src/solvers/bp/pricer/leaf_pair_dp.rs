@@ -457,15 +457,19 @@ impl LeafPairDpPricer {
         self.memo_pair_labels.resize(pair_count, None);
     }
 
+    #[inline]
     fn pair_idx(&self, a: usize, b: usize) -> usize {
         a * self.active_labels.len() + b
     }
 
-    fn root_penalty(&self, a: usize, b: usize, beta: &[Vec<f64>]) -> f64 {
+    #[inline]
+    fn root_penalty_idx(&self, idx: usize, beta: &[Vec<f64>]) -> f64 {
         (0..self.num_trees)
-            .map(|ti| beta[ti][self.pair_root[ti][self.pair_idx(a, b)] as usize])
+            .map(|ti| beta[ti][self.pair_root[ti][idx] as usize])
             .sum()
     }
+
+
 
     /// Diagnostic gap from the chosen side extensions to the leaf-only
     /// alternatives.
@@ -526,7 +530,7 @@ impl LeafPairDpPricer {
         let score = if left <= NEG_INF / 2.0 || right <= NEG_INF / 2.0 {
             NEG_INF
         } else {
-            -self.root_penalty(a, b, beta) + left + right
+            -self.root_penalty_idx(idx, beta) + left + right
         };
         self.memo_pair[idx] = score;
         score
@@ -772,10 +776,12 @@ impl LeafPairDpPricer {
         let la = self.active_labels[a] as usize;
         let lb = self.active_labels[b] as usize;
         let p = self.active_labels.len();
+        let idx_ab = a * p + b;
+        let idx_ba = b * p + a;
         alpha[la] + alpha[lb]
-            - self.root_penalty(a, b, beta)
-            - self.pair_singleton_penalty[a * p + b]
-            - self.pair_singleton_penalty[b * p + a]
+            - self.root_penalty_idx(idx_ab, beta)
+            - self.pair_singleton_penalty[idx_ab]
+            - self.pair_singleton_penalty[idx_ba]
     }
 
     fn collect_from_order(
@@ -1094,7 +1100,7 @@ impl Pricer for LeafPairDpPricer {
             for b in (a + 1)..p {
                 let idx = a * p + b;
                 let ub = self.pair_ub[idx];
-                let rp = self.root_penalty(a, b, ctx.beta);
+                let rp = self.root_penalty_idx(idx, ctx.beta);
                 let tight = ub - rp;
                 if tight > max_bound {
                     max_bound = tight;
