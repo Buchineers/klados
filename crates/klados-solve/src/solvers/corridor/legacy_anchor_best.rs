@@ -130,7 +130,7 @@ impl Solver for CorridorSolver {
         if instance.num_trees() <= 1 || instance.num_leaves <= 1 {
             return Some(instance.trees.clone());
         }
-        self.solve_m2(instance)
+        self.solve_m2(instance).map(|(forest, _)| forest)
     }
 
     fn stats(&self) -> &SolverStats {
@@ -139,7 +139,7 @@ impl Solver for CorridorSolver {
 }
 
 impl CorridorSolver {
-    fn solve_m2(&mut self, instance: &Instance) -> Option<Vec<Tree>> {
+    fn solve_m2(&mut self, instance: &Instance) -> Option<(Vec<Tree>, bool)> {
         // Standard kernelization first.
         let kern = if !self.config.no_kernel {
             kernelize_best(instance, &Default::default())
@@ -155,7 +155,8 @@ impl CorridorSolver {
         };
         let reduced = &kern.instance;
         if reduced.num_trees() != 2 || reduced.num_leaves <= 1 {
-            return Some(instance.trees.clone());
+            // Kernelization fully resolved the instance → certified.
+            return Some((instance.trees.clone(), true));
         }
 
         // Whidden strict cluster decomposition splits big 2-tree instances
@@ -165,12 +166,16 @@ impl CorridorSolver {
         // clusters.
         if reduced.num_leaves >= 20 {
             let mut sub_failed = false;
+            // The decomposed solve is a certified optimum only if EVERY
+            // sub-problem certified; one unproven sub poisons the whole.
+            let mut all_certified = true;
             let mut solve_sub = |sub: &Instance| {
                 let inner = CorridorSolver {
                     stats: SolverStats::default(),
                     config: self.config.clone(),
                 };
-                if let Some(comps) = inner.solve_m2_core(sub) {
+                if let Some((comps, cert)) = inner.solve_m2_core(sub) {
+                    all_certified &= cert;
                     Some(comps)
                 } else {
                     sub_failed = true;
@@ -191,11 +196,11 @@ impl CorridorSolver {
                 );
                 self.stats.upper_bound = Some(expanded.len());
                 self.stats.lower_bound = expanded.len();
-                return Some(expanded);
+                return Some((expanded, all_certified));
             }
         }
 
-        let reduced_forest = self.solve_m2_core(reduced)?;
+        let (reduced_forest, certified) = self.solve_m2_core(reduced)?;
         let expanded = expand_solution(
             reduced_forest,
             &kern,
@@ -204,13 +209,32 @@ impl CorridorSolver {
         );
         self.stats.upper_bound = Some(expanded.len());
         self.stats.lower_bound = expanded.len();
-        Some(expanded)
+        Some((expanded, certified))
+    }
+
+    /// Exact-track-safe 2-tree entry: returns the forest **only** when the
+    /// corridor closed and proved optimality (`lb >= ub`). Returns `None`
+    /// when corridor could only produce an unproven incumbent (which may be
+    /// suboptimal — e.g. pub012 returned 224 vs opt 223), so the caller must
+    /// fall back to another exact engine. This makes m=2 → corridor routing
+    /// sound for the Exact track.
+    pub fn solve_m2_certified(&mut self, instance: &Instance) -> Option<Vec<Tree>> {
+        if instance.num_trees() != 2 {
+            return None;
+        }
+        match self.solve_m2(instance) {
+            Some((forest, true)) => Some(forest),
+            _ => None,
+        }
     }
 
     /// Core corridor solve on a kernelized, undecomposable 2-tree
-    /// sub-instance. Returns the optimal AF if found, `None` if we
-    /// can't certify within the budget (the caller decides what to do).
-    fn solve_m2_core(&self, instance: &Instance) -> Option<Vec<Tree>> {
+    /// sub-instance. Returns `Some((forest, certified))` where `certified`
+    /// is `true` only when the LP lower bound met the incumbent (`lb >= ub`)
+    /// — a real optimality proof. When the corridor exhausts / aborts without
+    /// closing the gap, the forest is the best incumbent found but may be
+    /// suboptimal, so `certified` is `false`. `None` on setup failure.
+    fn solve_m2_core(&self, instance: &Instance) -> Option<(Vec<Tree>, bool)> {
         debug_assert_eq!(instance.num_trees(), 2);
         let started = Instant::now();
         let trees = &instance.trees;
@@ -265,7 +289,8 @@ impl CorridorSolver {
                     outer,
                     started.elapsed().as_secs_f64() * 1000.0,
                 );
-                return assemble_forest(instance, &best_cols);
+                // outer-cap (safety, runaway): incumbent unproven.
+                return assemble_forest(instance, &best_cols).map(|f| (f, false));
             }
             outer += 1;
 
@@ -290,7 +315,8 @@ impl CorridorSolver {
                     "[corridor] cg-not-converged outer={} lp={:.4} cg_iters={}",
                     outer, lp_obj, cg_iters,
                 );
-                return assemble_forest(instance, &best_cols);
+                // CG didn't converge: LP bound not valid, incumbent unproven.
+                return assemble_forest(instance, &best_cols).map(|f| (f, false));
             }
 
             // Update incumbent via LP rounding before computing γ —
@@ -317,7 +343,8 @@ impl CorridorSolver {
                     total_corridor_added,
                     started.elapsed().as_secs_f64() * 1000.0,
                 );
-                return assemble_forest(instance, &best_cols);
+                // Certified optimal: LP lower bound matches incumbent.
+                return assemble_forest(instance, &best_cols).map(|f| (f, true));
             }
 
             // Phase 2+3: corridor enumeration via iterated anchor-cutting,
@@ -475,7 +502,8 @@ impl CorridorSolver {
                 total_corridor_added,
                 columns.len(),
             );
-            return assemble_forest(instance, &best_cols);
+            // Corridor exhausted without closing the gap: incumbent unproven.
+            return assemble_forest(instance, &best_cols).map(|f| (f, false));
         }
     }
 }

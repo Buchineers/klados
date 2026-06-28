@@ -369,6 +369,24 @@ impl Solver for BpSolver {
     const SUPPORTED_TRACKS: &'static [Track] = &[Track::Exact, Track::Heuristic];
 
     fn solve(&mut self, instance: &Instance, cfg: &RunConfig<Self::Config>) -> Option<Vec<Tree>> {
+        // m=2 routing (Exact track): the corridor solver is the 2-tree-native
+        // exact engine and certifies optimality by closing its reduced-cost
+        // window. Use its result ONLY when it certifies (`lb >= ub`); an
+        // unproven corridor incumbent can be suboptimal (e.g. 224 vs opt 223),
+        // so on a non-certifying instance we fall through to B&P. B&P times out
+        // on the large 2-tree instances anyway, so this is pure upside.
+        // Default on; disable with `KLADOS_BP_M2_CORRIDOR=0`.
+        if cfg.track == Track::Exact
+            && instance.num_trees() == 2
+            && std::env::var("KLADOS_BP_M2_CORRIDOR").as_deref() != Ok("0")
+            && let Some(forest) =
+                crate::solvers::corridor::CorridorSolver::new().solve_m2_certified(instance)
+        {
+            self.stats.upper_bound = Some(forest.len());
+            self.stats.lower_bound = forest.len();
+            return Some(forest);
+        }
+
         let t_total = Instant::now();
         let memo = Rc::new(RefCell::new(SubinstanceMemo::default()));
         let cancel = Cancel::new(Arc::clone(&self.terminated));
