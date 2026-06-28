@@ -69,7 +69,7 @@ fn dpc_matches_brute_all_t0() {
                 trials += 1;
                 for t0 in 0..m {
                     match klados_solve::solvers::ncpack::dpc_mu_for_t0(&inst, t0, 5_000_000) {
-                        Some((_, _, mu)) => {
+                        Some((_, _, _, mu)) => {
                             if mu != true_mu {
                                 failures.push(format!(
                                     "n={n} m={m} seed={seed} t0={t0}: dp_mu={mu} true_mu={true_mu} (OPT brute={})",

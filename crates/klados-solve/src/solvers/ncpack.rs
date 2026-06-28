@@ -1781,12 +1781,13 @@ fn dpc_run_t0(
     under: &[Vec<FixedBitSet>],
     cap: usize,
     deadline: Instant,
-) -> Option<(usize, usize, usize)> {
+) -> Option<(usize, usize, usize, usize)> {
     let t0 = &inst.trees[t0_idx];
     let mut tables: Vec<std::collections::HashMap<DpcKey, usize>> =
         vec![std::collections::HashMap::new(); t0.num_nodes()];
     let mut max_table = 0usize;
     let mut max_fp = 0usize;
+    let mut max_sound = 0usize;
 
     for node in t0.post_order() {
         if Instant::now() > deadline {
@@ -1892,6 +1893,11 @@ fn dpc_run_t0(
             bh
         };
         let mut fp_keys: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        // SOUND key: open block by full leaves (it grows/merges → needs full info),
+        // closed blocks by footprint (they don't grow; footprint decides crossing
+        // & future retirement; merge counts are already folded into the value).
+        let mut sound_keys: std::collections::HashSet<(Vec<u32>, Vec<u64>)> =
+            std::collections::HashSet::new();
         for (open, closed) in out.keys() {
             let mut h: u64 = 1469598103934665603;
             if !open.is_empty() {
@@ -1900,13 +1906,15 @@ fn dpc_run_t0(
             }
             let mut cs: Vec<u64> = closed.iter().map(|b| block_fp(b)).collect();
             cs.sort_unstable();
-            for c in cs {
-                h ^= c;
+            for c in &cs {
+                h ^= *c;
                 h = h.wrapping_mul(1099511628211);
             }
             fp_keys.insert(h);
+            sound_keys.insert((open.clone(), cs));
         }
         max_fp = max_fp.max(fp_keys.len());
+        max_sound = max_sound.max(sound_keys.len());
         tables[node as usize] = out;
     }
 
@@ -1921,7 +1929,7 @@ fn dpc_run_t0(
         })
         .max()
         .unwrap_or(0);
-    Some((max_table, max_fp, mu))
+    Some((max_table, max_fp, max_sound, mu))
 }
 
 /// Test entry points for the primitive checks.
@@ -1934,7 +1942,7 @@ pub fn dpc_noncross_pub(inst: &Instance, blocks: &[&Vec<u32>]) -> bool {
 
 /// Test entry point: build `under` and run the DP for one reference tree,
 /// returning `(max_table, mu_star)`.
-pub fn dpc_mu_for_t0(inst: &Instance, t0: usize, cap: usize) -> Option<(usize, usize, usize)> {
+pub fn dpc_mu_for_t0(inst: &Instance, t0: usize, cap: usize) -> Option<(usize, usize, usize, usize)> {
     let nn = inst.num_leaves as usize;
     let n = inst.num_leaves;
     let mut under: Vec<Vec<FixedBitSet>> = Vec::with_capacity(inst.trees.len());
@@ -1984,18 +1992,18 @@ fn dpcount_probe(inst: &Instance, nn: usize) {
     let mut best: Option<(usize, usize, usize)> = None; // (max_table, mu, t0)
     let mut mus: Vec<usize> = Vec::new();
     let mut completed = 0usize;
-    let mut best_fp: Option<(usize, usize)> = None; // (max_fp, t0)
+    let mut best_fp: Option<usize> = None;
+    let mut best_sound: Option<usize> = None;
     for t0 in 0..inst.trees.len() {
         match dpc_run_t0(inst, t0, &under, cap, deadline) {
-            Some((mt, mfp, mu)) => {
+            Some((mt, mfp, msound, mu)) => {
                 completed += 1;
                 mus.push(mu);
                 if best.is_none() || mt < best.unwrap().0 {
                     best = Some((mt, mu, t0));
                 }
-                if best_fp.is_none() || mfp < best_fp.unwrap().0 {
-                    best_fp = Some((mfp, t0));
-                }
+                best_fp = Some(best_fp.map_or(mfp, |b| b.min(mfp)));
+                best_sound = Some(best_sound.map_or(msound, |b| b.min(msound)));
             }
             None => {}
         }
@@ -2011,11 +2019,13 @@ fn dpcount_probe(inst: &Instance, nn: usize) {
     }
     match best {
         Some((mt, mu, t0)) => log::info!(
-            "[ncpack-DPCOUNT] n={nn} m={} completed={completed}/{} BEST_MAX_TABLE(leafset)={mt} \
-             BEST_MAX_FP_TABLE={} mu*={mu} (OPT={}) best_t0={t0} mu_consistent={mu_consistent} cap={cap}",
+            "[ncpack-DPCOUNT] n={nn} m={} completed={completed}/{} leafset={mt} \
+             fp_only(unsound_lb)={} SOUND_TABLE={} mu*={mu} (OPT={}) best_t0={t0} \
+             mu_consistent={mu_consistent} cap={cap}",
             inst.trees.len(),
             inst.trees.len(),
-            best_fp.map(|x| x.0).unwrap_or(0),
+            best_fp.unwrap_or(0),
+            best_sound.unwrap_or(0),
             nn - mu,
         ),
         None => log::info!(

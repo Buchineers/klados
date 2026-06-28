@@ -190,7 +190,13 @@ impl Default for BpConfig {
             support_rank_resolve: false,
             merge_order_probe: false,
             node_branch_probe: false,
-            mwis_finish: false,
+            // Default ON: the kernelized complete-component MWIS finisher is the
+            // proven engine for the high-m wall (cracks pub101/107/122/134 — see
+            // memory). It is sound (validated 0 mismatches) and self-gating: it
+            // only fires on m≥3 cores under the leaf/component caps whose root LP
+            // is fractional, and falls back to B&P on any cap/budget miss.
+            // Disable with `KLADOS_BP_MWIS_FINISH=0`.
+            mwis_finish: true,
             tree_side_exact_rank: false,
             tree_laminar_exact_rank: false,
             tree_side_exact_max_leaves: 48,
@@ -268,8 +274,11 @@ impl BpConfig {
         if std::env::var("KLADOS_BP_NODE_BRANCH_PROBE").as_deref() == Ok("1") {
             cfg.node_branch_probe = true;
         }
-        if std::env::var("KLADOS_BP_MWIS_FINISH").as_deref() == Ok("1") {
-            cfg.mwis_finish = true;
+        // Default ON (set in `default()`); allow explicit opt-out for A/B.
+        match std::env::var("KLADOS_BP_MWIS_FINISH").as_deref() {
+            Ok("1") => cfg.mwis_finish = true,
+            Ok("0") => cfg.mwis_finish = false,
+            _ => {}
         }
         if let Ok(raw) = std::env::var("KLADOS_BP_ALL_REGION_EXACT_MAX_LEAVES")
             && let Ok(value) = raw.parse::<usize>()

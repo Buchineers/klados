@@ -407,6 +407,36 @@ where
         }
     }
 
+    // Prototype exact engine (`KLADOS_BP_MWIS_EARLY=1`): try the complete
+    // component-enumeration MWIS certificate before spending time on root CG.
+    // This is sound only when enumeration is complete and MWIS exhausts; on any
+    // cap/budget miss it falls through to ordinary B&P. The point is to test
+    // whether high-m sparse-merge roots can be solved as a pure combinatorial
+    // set-packing problem (ncpack/MWIS direction) instead of proving the same
+    // fact through a degenerate LP.
+    if cfg.mwis_finish && mwis_early_enabled() && trees.len() >= MWIS_EARLY_MIN_TREES {
+        let dummy_lp = crate::solvers::bp::rmp::RmpSolution {
+            objective: n as f64,
+            column_values: Vec::new(),
+            leaf_duals: Vec::new(),
+            node_duals: Vec::new(),
+            rank_duals: Vec::new(),
+        };
+        if let Some(inc) = try_mwis_finish(
+            reduced,
+            &mut state,
+            trees,
+            &dummy_lp,
+            &Branchings::default(),
+            chen_lb,
+            &mut seed_builder,
+            cfg,
+        ) {
+            let forest = reconstruct_components(&inc, state.columns(), reduced);
+            return Some(forest);
+        }
+    }
+
     // ncpack mu* floor (GATED, KLADOS_BP_NCPACK_LB=1, off by default, EXPERIMENTAL).
     //
     // ⚠ UNSOUND IN GENERAL. ncpack's `value` is an ACHIEVABLE packing, so
@@ -2432,11 +2462,18 @@ fn solve_mwis_bb(
     weights: &[usize],
     cliques: &[Vec<usize>],
     budget: u64,
+    budget_ms: u128,
     t0: Instant,
 ) -> (usize, Vec<usize>, bool) {
     let n = comp_elems.len();
-    let mut best = 0usize;
-    let mut best_set: Vec<usize> = Vec::new();
+    let (mut best, mut best_set) = if std::env::var("KLADOS_BP_MWIS_GREEDY_SEED")
+        .as_deref()
+        != Ok("0")
+    {
+        greedy_mwis_seed(elem_groups, comp_elems, weights)
+    } else {
+        (0usize, Vec::new())
+    };
     let mut cur: Vec<usize> = Vec::new();
     let mut remaining = budget;
     let mut active = FixedBitSet::with_capacity(n);
@@ -2454,9 +2491,576 @@ fn solve_mwis_bb(
         &mut best,
         &mut best_set,
         &mut remaining,
+        budget_ms,
         t0,
     );
     (best, best_set, exhausted)
+}
+
+fn solve_mwis_bb_with_reqs(
+    elem_groups: &[FixedBitSet],
+    comp_elems: &[Vec<u32>],
+    weights: &[usize],
+    req_masks: &[u128],
+    full_req_mask: u128,
+    initial_req_mask: u128,
+    cliques: &[Vec<usize>],
+    budget: u64,
+    budget_ms: u128,
+    t0: Instant,
+) -> (usize, Vec<usize>, bool) {
+    let n = comp_elems.len();
+    let (mut best, mut best_set) = if std::env::var("KLADOS_BP_MWIS_GREEDY_SEED")
+        .as_deref()
+        != Ok("0")
+    {
+        greedy_mwis_seed_with_reqs(
+            elem_groups,
+            comp_elems,
+            weights,
+            req_masks,
+            full_req_mask,
+            initial_req_mask,
+        )
+    } else if initial_req_mask == full_req_mask {
+        (0usize, Vec::new())
+    } else {
+        (usize::MAX, Vec::new())
+    };
+    let mut cur: Vec<usize> = Vec::new();
+    let mut remaining = budget;
+    let mut active = FixedBitSet::with_capacity(n);
+    if n > 0 {
+        active.insert_range(..n);
+    }
+    let exhausted = mwis_rec_with_reqs(
+        elem_groups,
+        comp_elems,
+        weights,
+        req_masks,
+        full_req_mask,
+        cliques,
+        active,
+        0,
+        initial_req_mask,
+        &mut cur,
+        &mut best,
+        &mut best_set,
+        &mut remaining,
+        budget_ms,
+        t0,
+    );
+    if best == usize::MAX {
+        (0, Vec::new(), exhausted)
+    } else {
+        (best, best_set, exhausted)
+    }
+}
+
+/// Fast feasible independent-set seed for MWIS B&B.
+///
+/// This is deliberately simple and sound: greedily include compatible vertices,
+/// using the same implicit leaf/node cliques as the exact search. It only
+/// improves the incumbent lower bound used for pruning; it never affects
+/// correctness. The old B&B started from weight 0 and had to *discover* the
+/// pair-packing-like incumbent during include-branching. On the high-m wall the
+/// optimum weight is tiny but spread over thousands of near-equivalent vertices,
+/// so a good seed is a cheap way to cut off vast exclude subtrees.
+fn greedy_mwis_seed(
+    elem_groups: &[FixedBitSet],
+    comp_elems: &[Vec<u32>],
+    weights: &[usize],
+) -> (usize, Vec<usize>) {
+    let n = comp_elems.len();
+    if n == 0 {
+        return (0, Vec::new());
+    }
+
+    let mut pressure = vec![0usize; n];
+    for (v, elems) in comp_elems.iter().enumerate() {
+        // Approximate closed-neighbourhood size. Double-counting is fine; this
+        // is only a tie-breaker.
+        pressure[v] = elems
+            .iter()
+            .map(|&e| elem_groups[e as usize].count_ones(..))
+            .sum();
+    }
+
+    let mut orders: Vec<Vec<usize>> = Vec::new();
+    let mut by_weight: Vec<usize> = (0..n).collect();
+    by_weight.sort_unstable_by_key(|&v| {
+        (
+            std::cmp::Reverse(weights[v]),
+            pressure[v],
+            comp_elems[v].len(),
+            v,
+        )
+    });
+    orders.push(by_weight);
+
+    let mut by_sparse: Vec<usize> = (0..n).collect();
+    by_sparse.sort_unstable_by_key(|&v| {
+        (
+            std::cmp::Reverse(weights[v] * 1024 / pressure[v].max(1)),
+            std::cmp::Reverse(weights[v]),
+            pressure[v],
+            v,
+        )
+    });
+    orders.push(by_sparse);
+
+    let mut by_pressure: Vec<usize> = (0..n).collect();
+    by_pressure.sort_unstable_by_key(|&v| {
+        (
+            std::cmp::Reverse(weights[v]),
+            std::cmp::Reverse(pressure[v]),
+            v,
+        )
+    });
+    orders.push(by_pressure);
+
+    let mut best_w = 0usize;
+    let mut best_set = Vec::new();
+    for order in orders {
+        let mut active = FixedBitSet::with_capacity(n);
+        active.insert_range(..n);
+        let mut chosen = Vec::new();
+        let mut total = 0usize;
+        for v in order {
+            if !active.contains(v) {
+                continue;
+            }
+            chosen.push(v);
+            total += weights[v];
+            for &e in &comp_elems[v] {
+                active.difference_with(&elem_groups[e as usize]);
+            }
+        }
+        if total > best_w {
+            best_w = total;
+            best_set = chosen;
+        }
+    }
+    (best_w, best_set)
+}
+
+fn greedy_mwis_seed_with_reqs(
+    elem_groups: &[FixedBitSet],
+    comp_elems: &[Vec<u32>],
+    weights: &[usize],
+    req_masks: &[u128],
+    full_req_mask: u128,
+    initial_req_mask: u128,
+) -> (usize, Vec<usize>) {
+    let n = comp_elems.len();
+    let mut pressure = vec![0usize; n];
+    for (v, elems) in comp_elems.iter().enumerate() {
+        pressure[v] = elems
+            .iter()
+            .map(|&e| elem_groups[e as usize].count_ones(..))
+            .sum();
+    }
+
+    let mut orders: Vec<Vec<usize>> = Vec::new();
+    let mut by_req_weight: Vec<usize> = (0..n).collect();
+    by_req_weight.sort_unstable_by_key(|&v| {
+        (
+            std::cmp::Reverse((req_masks[v] & !initial_req_mask).count_ones() as usize),
+            std::cmp::Reverse(weights[v]),
+            pressure[v],
+            v,
+        )
+    });
+    orders.push(by_req_weight);
+
+    let mut by_weight: Vec<usize> = (0..n).collect();
+    by_weight.sort_unstable_by_key(|&v| {
+        (
+            std::cmp::Reverse(weights[v]),
+            std::cmp::Reverse(req_masks[v].count_ones() as usize),
+            pressure[v],
+            v,
+        )
+    });
+    orders.push(by_weight);
+
+    let mut best_w = if initial_req_mask == full_req_mask {
+        0usize
+    } else {
+        usize::MAX
+    };
+    let mut best_set = Vec::new();
+    for order in orders {
+        let mut active = FixedBitSet::with_capacity(n);
+        active.insert_range(..n);
+        let mut chosen = Vec::new();
+        let mut total = 0usize;
+        let mut mask = initial_req_mask;
+        for v in order {
+            if !active.contains(v) {
+                continue;
+            }
+            chosen.push(v);
+            total += weights[v];
+            mask |= req_masks[v];
+            for &e in &comp_elems[v] {
+                active.difference_with(&elem_groups[e as usize]);
+            }
+        }
+        if mask == full_req_mask && (best_w == usize::MAX || total > best_w) {
+            best_w = total;
+            best_set = chosen;
+        }
+    }
+    (best_w, best_set)
+}
+
+struct MwisKernel {
+    elem_groups: Vec<FixedBitSet>,
+    comp_elems: Vec<Vec<u32>>,
+    weights: Vec<usize>,
+    req_masks: Vec<u128>,
+    lift: Vec<Vec<usize>>,
+    forced_weight: usize,
+    forced_vertices: Vec<usize>,
+    forced_req_mask: u128,
+    twin_merged: usize,
+    dominated: usize,
+    isolated: usize,
+    build_ms: f64,
+}
+
+fn bitset_hash(bs: &FixedBitSet) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    for i in bs.ones() {
+        h ^= i as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+fn closed_subset(v: usize, u: usize, adj: &[FixedBitSet], deleted: &[bool]) -> bool {
+    // Is N[v] ⊆ N[u]?  The caller only uses adjacent u/v, so v∈N[u].
+    // It remains to check every open neighbour of v is either u or also an
+    // open neighbour of u. The self vertex v is covered by adjacency to u.
+    for x in adj[v].ones() {
+        if !deleted[x] && x != u && !adj[u].contains(x) {
+            return false;
+        }
+    }
+    true
+}
+
+fn group_subset_active(group: &FixedBitSet, cover: &FixedBitSet, deleted: &[bool]) -> bool {
+    group.ones().all(|x| deleted[x] || cover.contains(x))
+}
+
+/// Exact MWIS kernel for the complete component conflict graph.
+///
+/// Enabled only by `KLADOS_BP_MWIS_KERNEL=1`. All rules are preserving:
+/// - equal open-neighbourhood non-adjacent twins are all selected together, so
+///   they become one weighted representative;
+/// - closed-neighbourhood dominance deletes vertices that can always be
+///   replaced by a no-worse neighbour;
+/// - vertices isolated in the residual graph are forced into the solution.
+fn kernelize_mwis(
+    elem_groups: &[FixedBitSet],
+    elem_members: &[Vec<usize>],
+    comp_elems: &[Vec<u32>],
+    weights: &[usize],
+    req_masks: &[u128],
+    t0: Instant,
+    budget_ms: u128,
+) -> Option<MwisKernel> {
+    if !mwis_kernel_enabled() {
+        return None;
+    }
+    let kt = Instant::now();
+    let n = comp_elems.len();
+    if n == 0 {
+        return None;
+    }
+
+    let mut deleted = vec![false; n];
+    let mut rep_payload: Vec<Vec<usize>> = (0..n).map(|v| vec![v]).collect();
+    let mut rep_weight = weights.to_vec();
+    let mut rep_req = req_masks.to_vec();
+    let mut twin_merged = 0usize;
+    let mut dominated = 0usize;
+
+    // Cheap exact dominance pre-pass, before materialising all open
+    // neighbourhood bitsets. In an intersection graph, `N[v] ⊆ N[u]` iff every
+    // element-clique touched by `v` is contained in the closed neighbourhood of
+    // `u`. The previous kernel first built every `N[*]`, which costs ~15s on the
+    // 70k-component pub122 side core even though almost every vertex is then
+    // dominated. This lazy test builds only `N[u]` and stops as soon as a
+    // dominating neighbour is found.
+    if std::env::var("KLADOS_BP_MWIS_FAST_DOM").as_deref() == Ok("1") {
+        let dom_pair_cap = env_u64_bp("KLADOS_BP_MWIS_FAST_DOM_PAIRS", 50_000_000);
+        let mut checked = 0u64;
+        'fast_dom: for u in 0..n {
+            if deleted[u] {
+                continue;
+            }
+            let mut cover = FixedBitSet::with_capacity(n);
+            for &e in &comp_elems[u] {
+                cover.union_with(&elem_groups[e as usize]);
+            }
+            for v in cover.ones() {
+                if v == u
+                    || deleted[v]
+                    || rep_weight[v] < rep_weight[u]
+                    || (rep_req[v] | rep_req[u]) != rep_req[v]
+                {
+                    continue;
+                }
+                checked += 1;
+                if checked > dom_pair_cap {
+                    break 'fast_dom;
+                }
+                if comp_elems[v]
+                    .iter()
+                    .all(|&e| group_subset_active(&elem_groups[e as usize], &cover, &deleted))
+                {
+                    deleted[u] = true;
+                    dominated += 1;
+                    break;
+                }
+            }
+            if u & 0x3f == 0 && t0.elapsed().as_millis() > budget_ms {
+                return None;
+            }
+        }
+    }
+
+    // Build explicit open neighbourhoods only after the cheap dominance pass.
+    // On the target wall instances this shrinks the expensive bitset universe by
+    // orders of magnitude before true-twin merging / residual dominance.
+    let mut deleted_bs = FixedBitSet::with_capacity(n);
+    for (v, &d) in deleted.iter().enumerate() {
+        if d {
+            deleted_bs.insert(v);
+        }
+    }
+    let mut adj: Vec<FixedBitSet> = Vec::with_capacity(n);
+    if std::env::var("KLADOS_BP_MWIS_SPARSE_ADJ").as_deref() == Ok("1") {
+        let mut stamp = vec![0u32; n];
+        let mut token = 1u32;
+        let mut touched: Vec<usize> = Vec::new();
+        for (v, elems) in comp_elems.iter().enumerate() {
+            let mut nb = FixedBitSet::with_capacity(n);
+            if !deleted[v] {
+                touched.clear();
+                token = token.wrapping_add(1);
+                if token == 0 {
+                    stamp.fill(0);
+                    token = 1;
+                }
+                for &e in elems {
+                    for &u in &elem_members[e as usize] {
+                        if stamp[u] != token {
+                            stamp[u] = token;
+                            touched.push(u);
+                        }
+                    }
+                }
+                for &u in &touched {
+                    if u != v && !deleted[u] {
+                        nb.insert(u);
+                    }
+                }
+            }
+            adj.push(nb);
+            if v & 0x3f == 0 && t0.elapsed().as_millis() > budget_ms {
+                return None;
+            }
+        }
+    } else {
+        for (v, elems) in comp_elems.iter().enumerate() {
+            let mut nb = FixedBitSet::with_capacity(n);
+            if !deleted[v] {
+                for &e in elems {
+                    nb.union_with(&elem_groups[e as usize]);
+                }
+                nb.difference_with(&deleted_bs);
+                nb.set(v, false);
+            }
+            adj.push(nb);
+            if v & 0x3f == 0 && t0.elapsed().as_millis() > budget_ms {
+                return None;
+            }
+        }
+    }
+
+    // Non-adjacent true twins: same open neighbourhood. Positive weights imply
+    // an optimum selects either all of them or none, so merge by summing weight.
+    use fxhash::FxHashMap;
+    let mut buckets: FxHashMap<(usize, u64), Vec<usize>> = FxHashMap::default();
+    for v in 0..n {
+        if deleted[v] {
+            continue;
+        }
+        buckets
+            .entry((adj[v].count_ones(..), bitset_hash(&adj[v])))
+            .or_default()
+            .push(v);
+    }
+    for bucket in buckets.values() {
+        let mut classes: Vec<Vec<usize>> = Vec::new();
+        'outer: for &v in bucket {
+            for class in &mut classes {
+                if adj[v] == adj[class[0]] {
+                    class.push(v);
+                    continue 'outer;
+                }
+            }
+            classes.push(vec![v]);
+        }
+        for class in classes {
+            if class.len() <= 1 {
+                continue;
+            }
+            let rep = class[0];
+            for &v in &class[1..] {
+                // Equal open neighbourhoods in a simple graph implies the
+                // vertices are non-adjacent; assert in debug, skip otherwise.
+                if adj[rep].contains(v) {
+                    continue;
+                }
+                deleted[v] = true;
+                deleted_bs.insert(v);
+                rep_weight[rep] += rep_weight[v];
+                rep_req[rep] |= rep_req[v];
+                let payload = std::mem::take(&mut rep_payload[v]);
+                rep_payload[rep].extend(payload);
+                twin_merged += 1;
+            }
+        }
+    }
+
+    // Closed-neighbourhood dominance. For u to be dominated by v, v must be in
+    // N(u); this lets us scan only neighbours rather than all pairs.
+    let dom_pair_cap = env_u64_bp("KLADOS_BP_MWIS_DOM_PAIRS", 20_000_000);
+    let mut checked = 0u64;
+    let degree: Vec<usize> = adj
+        .iter()
+        .enumerate()
+        .map(|(v, a)| {
+            if deleted[v] {
+                0
+            } else {
+                a.ones().filter(|&x| !deleted[x]).count() + 1
+            }
+        })
+        .collect();
+    for u in 0..n {
+        if deleted[u] {
+            continue;
+        }
+        for v in adj[u].ones() {
+            if deleted[v]
+                || rep_weight[v] < rep_weight[u]
+                || degree[v] > degree[u]
+                || (rep_req[v] | rep_req[u]) != rep_req[v]
+            {
+                continue;
+            }
+            checked += 1;
+            if checked > dom_pair_cap {
+                break;
+            }
+            if closed_subset(v, u, &adj, &deleted) {
+                deleted[u] = true;
+                deleted_bs.insert(u);
+                dominated += 1;
+                break;
+            }
+        }
+        if checked > dom_pair_cap || (u & 0x3f == 0 && t0.elapsed().as_millis() > budget_ms) {
+            break;
+        }
+    }
+
+    // Force residual isolated vertices.
+    let mut forced_vertices = Vec::new();
+    let mut forced_weight = 0usize;
+    let mut forced_req_mask = 0u128;
+    let mut isolated = 0usize;
+    for v in 0..n {
+        if deleted[v] {
+            continue;
+        }
+        let has_active_neighbour = adj[v].ones().any(|u| !deleted[u]);
+        if !has_active_neighbour {
+            deleted[v] = true;
+            forced_weight += rep_weight[v];
+            forced_req_mask |= rep_req[v];
+            forced_vertices.extend(rep_payload[v].iter().copied());
+            isolated += 1;
+        }
+    }
+
+    let mut lift: Vec<Vec<usize>> = Vec::new();
+    let mut new_weights = Vec::new();
+    let mut new_req_masks = Vec::new();
+    let mut old_to_new = vec![usize::MAX; n];
+    for v in 0..n {
+        if !deleted[v] {
+            old_to_new[v] = lift.len();
+            lift.push(rep_payload[v].clone());
+            new_weights.push(rep_weight[v]);
+            new_req_masks.push(rep_req[v]);
+        }
+    }
+
+    if lift.len() == n && forced_vertices.is_empty() {
+        return None;
+    }
+
+    // Rebuild the implicit element-clique representation over kept reps.
+    let mut elem_map: FxHashMap<u32, usize> = FxHashMap::default();
+    let mut elem_members: Vec<Vec<usize>> = Vec::new();
+    let mut new_comp_elems: Vec<Vec<u32>> = vec![Vec::new(); lift.len()];
+    for old in 0..n {
+        let new_v = old_to_new[old];
+        if new_v == usize::MAX {
+            continue;
+        }
+        // The representative's original element set gives exactly its conflict
+        // pattern against outside vertices. True-twin payload vertices have the
+        // same outside neighbourhood by construction.
+        for &old_e in &comp_elems[old] {
+            let new_e = *elem_map.entry(old_e).or_insert_with(|| {
+                elem_members.push(Vec::new());
+                elem_members.len() - 1
+            });
+            elem_members[new_e].push(new_v);
+            new_comp_elems[new_v].push(new_e as u32);
+        }
+    }
+    let mut new_elem_groups = Vec::with_capacity(elem_members.len());
+    for members in &elem_members {
+        let mut bs = FixedBitSet::with_capacity(lift.len());
+        for &v in members {
+            bs.insert(v);
+        }
+        new_elem_groups.push(bs);
+    }
+
+    Some(MwisKernel {
+        elem_groups: new_elem_groups,
+        comp_elems: new_comp_elems,
+        weights: new_weights,
+        req_masks: new_req_masks,
+        lift,
+        forced_weight,
+        forced_vertices,
+        forced_req_mask,
+        twin_merged,
+        dominated,
+        isolated,
+        build_ms: kt.elapsed().as_secs_f64() * 1000.0,
+    })
 }
 
 /// Returns true if the subtree was fully explored (false = budget/time hit).
@@ -2472,6 +3076,7 @@ fn mwis_rec(
     best: &mut usize,
     best_set: &mut Vec<usize>,
     budget: &mut u64,
+    budget_ms: u128,
     t0: Instant,
 ) -> bool {
     if *budget == 0 {
@@ -2479,7 +3084,7 @@ fn mwis_rec(
     }
     // Sample the wall-clock deadline often (every 1024 nodes) — a coarser stride
     // lets a slow core overrun the budget many-fold.
-    if *budget & 0x3FF == 0 && t0.elapsed().as_millis() > MWIS_FINISH_BUDGET_MS {
+    if *budget & 0x3FF == 0 && t0.elapsed().as_millis() > budget_ms {
         return false;
     }
     *budget -= 1;
@@ -2493,7 +3098,10 @@ fn mwis_rec(
     // max-weight active vertex as the branch pivot (O(m), no O(m²) degree scan).
     let mut bound = 0usize;
     let mut pivot = usize::MAX;
-    let mut pivot_w = 0usize;
+    let mut pivot_score = 0usize;
+    let pressure_pivot = std::env::var("KLADOS_BP_MWIS_PIVOT")
+        .map(|v| v == "pressure")
+        .unwrap_or(false);
     for clique in cliques {
         let mut cmax = 0usize;
         let mut cmax_v = usize::MAX;
@@ -2504,9 +3112,22 @@ fn mwis_rec(
             }
         }
         bound += cmax;
-        if cmax > pivot_w {
-            pivot_w = cmax;
-            pivot = cmax_v;
+        if cmax_v != usize::MAX {
+            let score = if pressure_pivot {
+                // Prefer a high-impact branch among positive-weight vertices.
+                // Double-counted pressure is good enough for pivoting.
+                weights[cmax_v] * 1_000_000
+                    + comp_elems[cmax_v]
+                        .iter()
+                        .map(|&e| elem_groups[e as usize].count_ones(..))
+                        .sum::<usize>()
+            } else {
+                weights[cmax_v]
+            };
+            if score > pivot_score {
+                pivot_score = score;
+                pivot = cmax_v;
+            }
         }
     }
     if acc + bound <= *best {
@@ -2536,6 +3157,7 @@ fn mwis_rec(
         best,
         best_set,
         budget,
+        budget_ms,
         t0,
     );
     cur.pop();
@@ -2556,6 +3178,116 @@ fn mwis_rec(
         best,
         best_set,
         budget,
+        budget_ms,
+        t0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mwis_rec_with_reqs(
+    elem_groups: &[FixedBitSet],
+    comp_elems: &[Vec<u32>],
+    weights: &[usize],
+    req_masks: &[u128],
+    full_req_mask: u128,
+    cliques: &[Vec<usize>],
+    active: FixedBitSet,
+    acc: usize,
+    req_mask: u128,
+    cur: &mut Vec<usize>,
+    best: &mut usize,
+    best_set: &mut Vec<usize>,
+    budget: &mut u64,
+    budget_ms: u128,
+    t0: Instant,
+) -> bool {
+    if *budget == 0 {
+        return false;
+    }
+    if *budget & 0x3FF == 0 && t0.elapsed().as_millis() > budget_ms {
+        return false;
+    }
+    *budget -= 1;
+    if req_mask == full_req_mask && (*best == usize::MAX || acc > *best) {
+        *best = acc;
+        best_set.clone_from(cur);
+    }
+
+    let mut bound = 0usize;
+    let mut pivot = usize::MAX;
+    let mut pivot_score = 0usize;
+    for clique in cliques {
+        let mut cmax = 0usize;
+        let mut cmax_v = usize::MAX;
+        for &v in clique {
+            if active.contains(v) && weights[v] > cmax {
+                cmax = weights[v];
+                cmax_v = v;
+            }
+        }
+        bound += cmax;
+        if cmax_v != usize::MAX {
+            let new_reqs = (req_masks[cmax_v] & !req_mask).count_ones() as usize;
+            let score = weights[cmax_v] * 1_000_000 + new_reqs * 10_000 + cmax;
+            if score > pivot_score {
+                pivot_score = score;
+                pivot = cmax_v;
+            }
+        }
+    }
+    if *best != usize::MAX && acc + bound <= *best {
+        return true;
+    }
+    let v = if pivot != usize::MAX {
+        pivot
+    } else {
+        return true;
+    };
+
+    let mut inc = active.clone();
+    for &e in &comp_elems[v] {
+        inc.difference_with(&elem_groups[e as usize]);
+    }
+    cur.push(v);
+    let ok = mwis_rec_with_reqs(
+        elem_groups,
+        comp_elems,
+        weights,
+        req_masks,
+        full_req_mask,
+        cliques,
+        inc,
+        acc + weights[v],
+        req_mask | req_masks[v],
+        cur,
+        best,
+        best_set,
+        budget,
+        budget_ms,
+        t0,
+    );
+    cur.pop();
+    if !ok {
+        return false;
+    }
+
+    let mut exc = active;
+    exc.set(v, false);
+    mwis_rec_with_reqs(
+        elem_groups,
+        comp_elems,
+        weights,
+        req_masks,
+        full_req_mask,
+        cliques,
+        exc,
+        acc,
+        req_mask,
+        cur,
+        best,
+        best_set,
+        budget,
+        budget_ms,
         t0,
     )
 }
@@ -2567,23 +3299,71 @@ fn mwis_rec(
 /// (e.g. pub101's n=75 / 6550 components) whose MWIS doesn't exhaust even in 30 s
 /// — those need MWIS kernelization / core-shrinking decomposition, not a bigger
 /// budget.
-const MWIS_FINISH_MAX_LEAVES: usize = 64;
+const MWIS_FINISH_MAX_LEAVES: usize = 130;
+/// `EARLY` (root pre-CG complete-MWIS attempt) only pays off on the high-m,
+/// high-fragmentation wall — there the top kernelized core IS the whole problem
+/// (pub101's 75-leaf/6550-component core solves in 232ms). On low-m instances
+/// ordinary B&P/decomposition is faster, and eager enumeration of large
+/// incidental sub-cores is pure overhead (m=5 230f2627: 58k–87k-component cores,
+/// 10–22s kernel builds each). Gate EARLY on `m ≥` this (matches the
+/// `ncpack_min_trees` default); the in-search finisher still runs for all
+/// `m ≥ 3`.
+const MWIS_EARLY_MIN_TREES: usize = 8;
 /// Hard cap on the number of valid agreement components enumerated. If exceeded
 /// the enumeration is incomplete, so the certificate is invalid → fall back.
 /// Discordant cores (the target) have ~`C(n,2)` + a few; a core that blows past
 /// this has large agreement blocks (every subset is valid) and either is B&P's
 /// job or beyond complete-enumeration MWIS. The explosion case bails *during
-/// enumeration*, before the conflict-graph build.
-const MWIS_FINISH_MAX_COMPONENTS: usize = 4_000;
+/// enumeration*, before the conflict-graph build. The kernel-on adaptive window
+/// (`≤55` leaves) raises this to 100k for the genuinely-stuck wall cores
+/// (pub122's 55-leaf/70k core); this base covers the larger-leaf moderate cores
+/// (pub101's 75-leaf/6550 core) that the adaptive window doesn't reach.
+const MWIS_FINISH_MAX_COMPONENTS: usize = 20_000;
 /// Node budget for the MWIS branch-and-bound. Exhaustion is required for a
 /// proof; hitting the budget → fall back.
-const MWIS_FINISH_BB_BUDGET: u64 = 200_000_000;
+const MWIS_FINISH_BB_BUDGET: u64 = 2_000_000_000;
 /// Wall-clock budget for the entire finisher (enumeration + graph + MWIS). The
 /// finisher only pays off when it proves the core faster than B&P would solve
 /// it; a core whose MWIS doesn't exhaust in this window is handed back to B&P
-/// (which closes the easy fractional cores in milliseconds). Sized above the
-/// observed ~0.9 s legit worst case so we don't abandon a real certificate.
-const MWIS_FINISH_BUDGET_MS: u128 = 2000;
+/// (which closes the easy fractional cores in milliseconds). The kernel-on
+/// adaptive window raises this to 30s for the `≤55`-leaf wall cores; this base
+/// gives larger-leaf moderate cores headroom while bounding wasted build time.
+const MWIS_FINISH_BUDGET_MS: u128 = 8000;
+
+/// `KLADOS_BP_MWIS_KERNEL`: closed-neighborhood dominance kernelization of the
+/// MWIS conflict graph. Default ON (the proven engine for the high-m wall); set
+/// `=0` to disable for an A/B baseline.
+fn mwis_kernel_enabled() -> bool {
+    std::env::var("KLADOS_BP_MWIS_KERNEL").as_deref() != Ok("0")
+}
+
+/// `KLADOS_BP_MWIS_EARLY`: attempt the complete-component MWIS certificate at the
+/// root before spending time on column generation. Default ON; set `=0` to
+/// disable.
+fn mwis_early_enabled() -> bool {
+    std::env::var("KLADOS_BP_MWIS_EARLY").as_deref() != Ok("0")
+}
+
+fn env_usize_bp(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+fn env_u64_bp(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn env_u128_bp(name: &str, default: u128) -> u128 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u128>().ok())
+        .unwrap_or(default)
+}
 
 /// Enumerate **every** valid agreement component (leafset that induces the same
 /// rooted topology in all trees) over `1..=num_leaves`, by apriori growth.
@@ -2602,6 +3382,8 @@ fn enumerate_all_components(
     num_leaves: usize,
     trees: &[Tree],
     builder: &mut ColumnBuilder,
+    max_components: usize,
+    budget_ms: u128,
     t0: Instant,
 ) -> Option<Vec<AfColumn>> {
     use fxhash::FxHashSet;
@@ -2620,7 +3402,7 @@ fn enumerate_all_components(
             out.push(builder.build_unchecked(block.clone(), trees));
             level_set.insert(block.clone());
             level.push(block);
-            if out.len() > MWIS_FINISH_MAX_COMPONENTS {
+            if out.len() > max_components {
                 return None;
             }
         }
@@ -2636,7 +3418,7 @@ fn enumerate_all_components(
                 since_check += 1;
                 if since_check >= 4096 {
                     since_check = 0;
-                    if t0.elapsed().as_millis() > MWIS_FINISH_BUDGET_MS {
+                    if t0.elapsed().as_millis() > budget_ms {
                         return None;
                     }
                 }
@@ -2665,7 +3447,7 @@ fn enumerate_all_components(
                     out.push(builder.build_unchecked(cand.clone(), trees));
                     next_set.insert(cand.clone());
                     next.push(cand);
-                    if out.len() > MWIS_FINISH_MAX_COMPONENTS {
+                    if out.len() > max_components {
                         return None;
                     }
                 }
@@ -2704,12 +3486,38 @@ fn try_mwis_finish(
 ) -> Option<Incumbent> {
     // Gating: only the hard regime, only at a stuck root.
     let num_leaves = reduced.num_leaves as usize;
+    let max_leaves = env_usize_bp("KLADOS_BP_MWIS_MAX_LEAVES", MWIS_FINISH_MAX_LEAVES);
+    let mut max_components = env_usize_bp(
+        "KLADOS_BP_MWIS_MAX_COMPONENTS",
+        MWIS_FINISH_MAX_COMPONENTS,
+    );
+    let bb_budget = env_u64_bp("KLADOS_BP_MWIS_BB_BUDGET", MWIS_FINISH_BB_BUDGET);
+    let mut budget_ms = env_u128_bp("KLADOS_BP_MWIS_BUDGET_MS", MWIS_FINISH_BUDGET_MS);
+    // Data-driven high-cap window: the kernelized finisher flips the observed
+    // clean-LB wall cases at 48 and 55 leaves (29k/70k components) in seconds,
+    // but a 64-leaf sibling still times out after paying the large kernel cost.
+    // Keep the default cheap cap except in this small-leaf, kernel-on regime.
+    if mwis_kernel_enabled() {
+        let big_leaves = env_usize_bp("KLADOS_BP_MWIS_BIG_LEAVES", 55);
+        if num_leaves <= big_leaves {
+            max_components =
+                max_components.max(env_usize_bp("KLADOS_BP_MWIS_BIG_COMPONENTS", 100_000));
+            budget_ms = budget_ms.max(env_u128_bp("KLADOS_BP_MWIS_BIG_BUDGET_MS", 30_000));
+        }
+    }
+    let branch_finish = std::env::var("KLADOS_BP_MWIS_BRANCH").as_deref() == Ok("1");
     if !cfg.mwis_finish
-        || branchings.depth() != 0
+        || (branchings.depth() != 0 && !branch_finish)
         || trees.len() < 3
-        || num_leaves > MWIS_FINISH_MAX_LEAVES
+        || num_leaves > max_leaves
         || lb >= state.best_ub()
     {
+        return None;
+    }
+    if branchings.depth() != 0 && lb + 1 < state.best_ub() {
+        return None;
+    }
+    if branchings.must_link().len() >= 128 {
         return None;
     }
     // Only fire when the root LP is genuinely stuck: a fractional support is the
@@ -2724,19 +3532,49 @@ fn try_mwis_finish(
         "mwis-finish: gate-in core_leaves={} m={} lb={} ub={} frac_pairs={}",
         num_leaves, trees.len(), lb, state.best_ub(), frac_pairs,
     );
-    if frac_pairs == 0 {
+    let early_mode = mwis_early_enabled() && lp.column_values.is_empty();
+    if frac_pairs == 0 && !early_mode && branchings.depth() == 0 {
         return None;
     }
 
     let t0 = Instant::now();
-    let Some(comps) = enumerate_all_components(num_leaves, trees, builder, t0) else {
+    let Some(mut comps) =
+        enumerate_all_components(num_leaves, trees, builder, max_components, budget_ms, t0)
+    else {
         debug!(
             target: LOG_TARGET,
-            "mwis-finish: bail (enumeration over budget) core_leaves={} enum_ms={:.1}",
-            num_leaves, t0.elapsed().as_secs_f64() * 1000.0,
+            "mwis-finish: bail (enumeration over budget/cap) core_leaves={} cap={} budget_ms={} enum_ms={:.1}",
+            num_leaves, max_components, budget_ms, t0.elapsed().as_secs_f64() * 1000.0,
         );
         return None;
     };
+    let all_components = comps.len();
+    if branchings.depth() != 0 {
+        comps.retain(|c| !branchings.forbids(c));
+        if comps.is_empty() {
+            return None;
+        }
+    }
+    let full_req_mask = if branchings.must_link().is_empty() {
+        0u128
+    } else {
+        (1u128 << branchings.must_link().len()) - 1
+    };
+    let req_masks: Vec<u128> = comps
+        .iter()
+        .map(|c| {
+            let mut mask = 0u128;
+            for (i, pair) in branchings.must_link().iter().enumerate() {
+                let has_a = c.labels().binary_search(&pair.a).is_ok();
+                let has_b = c.labels().binary_search(&pair.b).is_ok();
+                debug_assert_eq!(has_a, has_b);
+                if has_a && has_b {
+                    mask |= 1u128 << i;
+                }
+            }
+            mask
+        })
+        .collect();
     let build_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     // Conflict graph H over the complete component set: two components conflict
@@ -2785,37 +3623,109 @@ fn try_mwis_finish(
         }
         elem_groups.push(bs);
     }
+    let mut solve_elem_groups = elem_groups;
+    let mut solve_comp_elems = comp_elems;
+    let mut solve_weights = weights;
+    let mut solve_req_masks = req_masks;
+    let mut lift: Option<Vec<Vec<usize>>> = None;
+    let mut forced_vertices: Vec<usize> = Vec::new();
+    let mut forced_weight = 0usize;
+    let mut forced_req_mask = 0u128;
+    let mut kernel_log = String::from("off");
+    if let Some(kernel) = kernelize_mwis(
+        &solve_elem_groups,
+        &elem_members,
+        &solve_comp_elems,
+        &solve_weights,
+        &solve_req_masks,
+        t0,
+        budget_ms,
+    ) {
+        kernel_log = format!(
+            "on red_components={} forced_w={} forced_v={} twins={} dominated={} isolated={} kernel_ms={:.2}",
+            kernel.weights.len(),
+            kernel.forced_weight,
+            kernel.forced_vertices.len(),
+            kernel.twin_merged,
+            kernel.dominated,
+            kernel.isolated,
+            kernel.build_ms,
+        );
+        solve_elem_groups = kernel.elem_groups;
+        solve_comp_elems = kernel.comp_elems;
+        solve_weights = kernel.weights;
+        solve_req_masks = kernel.req_masks;
+        lift = Some(kernel.lift);
+        forced_weight = kernel.forced_weight;
+        forced_vertices = kernel.forced_vertices;
+        forced_req_mask = kernel.forced_req_mask;
+    }
+
     // Clique cover (a partition) for the MWIS clique-cover bound. Every
     // element-group is a clique; greedily carve disjoint ones.
-    let group_refs: Vec<&Vec<usize>> = elem_members.iter().collect();
-    let cliques = greedy_clique_cover(m, &group_refs);
+    let solve_elem_members: Vec<Vec<usize>> = solve_elem_groups
+        .iter()
+        .map(|bs| bs.ones().collect::<Vec<_>>())
+        .collect();
+    let group_refs: Vec<&Vec<usize>> = solve_elem_members.iter().collect();
+    let cliques = greedy_clique_cover(solve_weights.len(), &group_refs);
     let graph_ms = t0.elapsed().as_secs_f64() * 1000.0 - build_ms;
-    if t0.elapsed().as_millis() > MWIS_FINISH_BUDGET_MS {
+    if t0.elapsed().as_millis() > budget_ms {
         debug!(target: LOG_TARGET, "mwis-finish: bail (graph build over budget) core_leaves={} components={} ms={:.1}", num_leaves, m, t0.elapsed().as_secs_f64()*1000.0);
         return None;
     }
 
     let t1 = Instant::now();
-    let (mwis, witness, exhausted) = solve_mwis_bb(
-        &elem_groups,
-        &comp_elems,
-        &weights,
-        &cliques,
-        MWIS_FINISH_BB_BUDGET,
-        t0,
-    );
+    let (red_mwis, red_witness, exhausted) = if full_req_mask == 0 {
+        solve_mwis_bb(
+            &solve_elem_groups,
+            &solve_comp_elems,
+            &solve_weights,
+            &cliques,
+            bb_budget,
+            budget_ms,
+            t0,
+        )
+    } else {
+        solve_mwis_bb_with_reqs(
+            &solve_elem_groups,
+            &solve_comp_elems,
+            &solve_weights,
+            &solve_req_masks,
+            full_req_mask,
+            forced_req_mask,
+            &cliques,
+            bb_budget,
+            budget_ms,
+            t0,
+        )
+    };
+    let covered_req_mask = forced_req_mask
+        | red_witness
+            .iter()
+            .fold(0u128, |acc, &v| acc | solve_req_masks[v]);
+    let mwis = forced_weight + red_mwis;
+    let witness: Vec<usize> = if let Some(lift) = lift.as_ref() {
+        let mut out = forced_vertices;
+        for &rv in &red_witness {
+            out.extend(lift[rv].iter().copied());
+        }
+        out
+    } else {
+        red_witness
+    };
     let mwis_ms = t1.elapsed().as_secs_f64() * 1000.0;
     let comb_opt = num_leaves - mwis;
 
     info!(
         target: LOG_TARGET,
-        "mwis-finish: core_leaves={} components={} mwis_merges={} comb_opt={} lp={:.3} lp_lb={} ub={} exhausted={} enum_ms={:.2} graph_ms={:.2} mwis_ms={:.2}",
-        num_leaves, m, mwis, comb_opt,
+        "mwis-finish: core_leaves={} components={} feasible={} depth={} ml={} cl={} mwis_merges={} comb_opt={} lp={:.3} lp_lb={} ub={} exhausted={} enum_ms={:.2} graph_ms={:.2} mwis_ms={:.2} kernel={}",
+        num_leaves, all_components, m, branchings.depth(), branchings.must_link().len(), branchings.cannot_link().len(), mwis, comb_opt,
         lp.objective, (lp.objective - 1.0e-6).ceil() as usize, state.best_ub(),
-        exhausted, build_ms, graph_ms, mwis_ms,
+        exhausted, build_ms, graph_ms, mwis_ms, kernel_log,
     );
 
-    if !exhausted {
+    if !exhausted || (full_req_mask != 0 && covered_req_mask != full_req_mask) {
         // MWIS hit the node budget — `comb_opt` is only an upper bound on the
         // weight, hence a lower bound on the forest size; not a certificate.
         return None;
