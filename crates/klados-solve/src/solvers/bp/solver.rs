@@ -1767,7 +1767,11 @@ fn leaf_orbit_classes(inst: &Instance) -> Vec<u32> {
                 let idx = node as usize;
                 if tree.is_leaf(node) {
                     let lbl = tree.label[idx] as usize;
-                    node_color[idx] = if (1..=n).contains(&lbl) { color[lbl] } else { 0 };
+                    node_color[idx] = if (1..=n).contains(&lbl) {
+                        color[lbl]
+                    } else {
+                        0
+                    };
                 } else {
                     let (l, r) = tree.children_pair(node);
                     let (ca, cb) = (node_color[l as usize], node_color[r as usize]);
@@ -1837,8 +1841,11 @@ fn classify_merge_symmetry(
         *class_size.entry(classes[lbl]).or_insert(0) += 1;
     }
     let nontrivial: Vec<(u32, usize)> = {
-        let mut v: Vec<(u32, usize)> =
-            class_size.iter().filter(|(_, s)| **s >= 2).map(|(c, s)| (*c, *s)).collect();
+        let mut v: Vec<(u32, usize)> = class_size
+            .iter()
+            .filter(|(_, s)| **s >= 2)
+            .map(|(c, s)| (*c, *s))
+            .collect();
         v.sort_by(|a, b| b.1.cmp(&a.1));
         v
     };
@@ -2466,14 +2473,12 @@ fn solve_mwis_bb(
     t0: Instant,
 ) -> (usize, Vec<usize>, bool) {
     let n = comp_elems.len();
-    let (mut best, mut best_set) = if std::env::var("KLADOS_BP_MWIS_GREEDY_SEED")
-        .as_deref()
-        != Ok("0")
-    {
-        greedy_mwis_seed(elem_groups, comp_elems, weights)
-    } else {
-        (0usize, Vec::new())
-    };
+    let (mut best, mut best_set) =
+        if std::env::var("KLADOS_BP_MWIS_GREEDY_SEED").as_deref() != Ok("0") {
+            greedy_mwis_seed(elem_groups, comp_elems, weights)
+        } else {
+            (0usize, Vec::new())
+        };
     let mut cur: Vec<usize> = Vec::new();
     let mut remaining = budget;
     let mut active = FixedBitSet::with_capacity(n);
@@ -2510,23 +2515,21 @@ fn solve_mwis_bb_with_reqs(
     t0: Instant,
 ) -> (usize, Vec<usize>, bool) {
     let n = comp_elems.len();
-    let (mut best, mut best_set) = if std::env::var("KLADOS_BP_MWIS_GREEDY_SEED")
-        .as_deref()
-        != Ok("0")
-    {
-        greedy_mwis_seed_with_reqs(
-            elem_groups,
-            comp_elems,
-            weights,
-            req_masks,
-            full_req_mask,
-            initial_req_mask,
-        )
-    } else if initial_req_mask == full_req_mask {
-        (0usize, Vec::new())
-    } else {
-        (usize::MAX, Vec::new())
-    };
+    let (mut best, mut best_set) =
+        if std::env::var("KLADOS_BP_MWIS_GREEDY_SEED").as_deref() != Ok("0") {
+            greedy_mwis_seed_with_reqs(
+                elem_groups,
+                comp_elems,
+                weights,
+                req_masks,
+                full_req_mask,
+                initial_req_mask,
+            )
+        } else if initial_req_mask == full_req_mask {
+            (0usize, Vec::new())
+        } else {
+            (usize::MAX, Vec::new())
+        };
     let mut cur: Vec<usize> = Vec::new();
     let mut remaining = budget;
     let mut active = FixedBitSet::with_capacity(n);
@@ -3487,10 +3490,8 @@ fn try_mwis_finish(
     // Gating: only the hard regime, only at a stuck root.
     let num_leaves = reduced.num_leaves as usize;
     let max_leaves = env_usize_bp("KLADOS_BP_MWIS_MAX_LEAVES", MWIS_FINISH_MAX_LEAVES);
-    let mut max_components = env_usize_bp(
-        "KLADOS_BP_MWIS_MAX_COMPONENTS",
-        MWIS_FINISH_MAX_COMPONENTS,
-    );
+    let mut max_components =
+        env_usize_bp("KLADOS_BP_MWIS_MAX_COMPONENTS", MWIS_FINISH_MAX_COMPONENTS);
     let bb_budget = env_u64_bp("KLADOS_BP_MWIS_BB_BUDGET", MWIS_FINISH_BB_BUDGET);
     let mut budget_ms = env_u128_bp("KLADOS_BP_MWIS_BUDGET_MS", MWIS_FINISH_BUDGET_MS);
     // Data-driven high-cap window: the kernelized finisher flips the observed
@@ -5710,37 +5711,59 @@ fn reconstruct_components(inc: &Incumbent, columns: &[AfColumn], reduced: &Insta
 #[cfg(test)]
 mod orbit_tests {
     use super::leaf_orbit_classes;
-    use klados_core::tree::{Label, NONE, NodeId, Tree};
     use klados_core::Instance;
+    use klados_core::tree::{Label, NONE, NodeId, Tree};
 
-    enum S { L(u32), N(Box<S>, Box<S>) }
+    enum S {
+        L(u32),
+        N(Box<S>, Box<S>),
+    }
 
     fn build(s: &S, t: &mut Tree) -> NodeId {
         match s {
             S::L(lbl) => {
                 let id = t.parent.len() as NodeId;
-                t.parent.push(NONE); t.left.push(NONE); t.right.push(NONE);
-                t.label.push(*lbl as Label); t.label_to_node[*lbl as usize] = id; id
+                t.parent.push(NONE);
+                t.left.push(NONE);
+                t.right.push(NONE);
+                t.label.push(*lbl as Label);
+                t.label_to_node[*lbl as usize] = id;
+                id
             }
             S::N(a, b) => {
-                let l = build(a, t); let r = build(b, t);
+                let l = build(a, t);
+                let r = build(b, t);
                 let id = t.parent.len() as NodeId;
-                t.parent.push(NONE); t.left.push(l); t.right.push(r); t.label.push(0);
-                t.parent[l as usize] = id; t.parent[r as usize] = id; id
+                t.parent.push(NONE);
+                t.left.push(l);
+                t.right.push(r);
+                t.label.push(0);
+                t.parent[l as usize] = id;
+                t.parent[r as usize] = id;
+                id
             }
         }
     }
     fn tree(s: S, n: u32) -> Tree {
         let mut t = Tree::with_capacity(n);
         let root = build(&s, &mut t);
-        t.root = root; t.parent[root as usize] = NONE; t.compute_metadata(); t
+        t.root = root;
+        t.parent[root as usize] = NONE;
+        t.compute_metadata();
+        t
     }
-    fn n(a: S, b: S) -> S { S::N(Box::new(a), Box::new(b)) }
-    fn l(x: u32) -> S { S::L(x) }
+    fn n(a: S, b: S) -> S {
+        S::N(Box::new(a), Box::new(b))
+    }
+    fn l(x: u32) -> S {
+        S::L(x)
+    }
 
     fn num_classes(classes: &[u32], n: usize) -> usize {
         let mut s: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        for i in 1..=n { s.insert(classes[i]); }
+        for i in 1..=n {
+            s.insert(classes[i]);
+        }
         s.len()
     }
 
@@ -5757,7 +5780,11 @@ mod orbit_tests {
         assert_eq!(c[2], c[5], "2,5 twins");
         assert_eq!(c[3], c[6], "3,6 twins");
         // strictly fewer than 6 classes (symmetry detected)
-        assert!(num_classes(&c, 6) < 6, "expected nontrivial orbits, got {}", num_classes(&c, 6));
+        assert!(
+            num_classes(&c, 6) < 6,
+            "expected nontrivial orbits, got {}",
+            num_classes(&c, 6)
+        );
     }
 
     #[test]

@@ -1342,7 +1342,10 @@ fn boundary_probe(inst: &Instance, nn: usize, blocks: &[Block], pairs: &[(u32, u
 /// MEANINGFULLY splits merges (both sides keep ≥1 merge ⇒ μ* strictly drops).
 /// Returns `(mu_star, Some((cut_leaves, coupling_width)))`, or `..None` if the
 /// node cannot be cleanly split (the DP would solve it directly at cost exp(μ*)).
-fn hier_analyze(inst: &Instance, node_budget: u64) -> Option<(usize, Option<(FixedBitSet, usize)>)> {
+fn hier_analyze(
+    inst: &Instance,
+    node_budget: u64,
+) -> Option<(usize, Option<(FixedBitSet, usize)>)> {
     let nn = inst.num_leaves as usize;
     let n = nn as u32;
     let forest = pair_matching_forest(inst, nn, node_budget)?;
@@ -1695,7 +1698,11 @@ fn dpc_agrees(inst: &Instance, block: &[u32]) -> bool {
         match (sig(tree, set, a), sig(tree, set, b)) {
             (None, None) => None,
             (Some(x), None) | (None, Some(x)) => Some(x),
-            (Some(x), Some(y)) => Some(if x <= y { format!("({x},{y})") } else { format!("({y},{x})") }),
+            (Some(x), Some(y)) => Some(if x <= y {
+                format!("({x},{y})")
+            } else {
+                format!("({y},{x})")
+            }),
         }
     }
     let s0 = sig(&inst.trees[0], &set, inst.trees[0].root);
@@ -1755,7 +1762,12 @@ fn dpc_open_ray_crosses(
     false
 }
 
-fn dpc_boundary_active(inst: &Instance, block: &[u32], cu: &FixedBitSet, under: &[Vec<FixedBitSet>]) -> bool {
+fn dpc_boundary_active(
+    inst: &Instance,
+    block: &[u32],
+    cu: &FixedBitSet,
+    under: &[Vec<FixedBitSet>],
+) -> bool {
     for (q, tree) in inst.trees.iter().enumerate() {
         let mut lca = tree.node_by_label(block[0]);
         for &l in &block[1..] {
@@ -1942,7 +1954,11 @@ pub fn dpc_noncross_pub(inst: &Instance, blocks: &[&Vec<u32>]) -> bool {
 
 /// Test entry point: build `under` and run the DP for one reference tree,
 /// returning `(max_table, mu_star)`.
-pub fn dpc_mu_for_t0(inst: &Instance, t0: usize, cap: usize) -> Option<(usize, usize, usize, usize)> {
+pub fn dpc_mu_for_t0(
+    inst: &Instance,
+    t0: usize,
+    cap: usize,
+) -> Option<(usize, usize, usize, usize)> {
     let nn = inst.num_leaves as usize;
     let n = inst.num_leaves;
     let mut under: Vec<Vec<FixedBitSet>> = Vec::with_capacity(inst.trees.len());

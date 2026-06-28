@@ -7,6 +7,7 @@
 pub mod bp;
 pub mod chen_rspr;
 pub mod corridor;
+pub mod fpt_maf;
 pub mod maf_branch_price_multi;
 pub mod maf_ilp;
 pub mod maf_sat;

@@ -88,7 +88,12 @@ fn dpc_matches_brute_all_t0() {
             "{} / {} (instance,t0) mismatches:\n{}",
             failures.len(),
             trials * 2,
-            failures.iter().take(20).cloned().collect::<Vec<_>>().join("\n")
+            failures
+                .iter()
+                .take(20)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
         );
     }
 }
@@ -96,15 +101,25 @@ fn dpc_matches_brute_all_t0() {
 #[test]
 fn debug_seed21() {
     use klados_core::af_validator::canonical_newick;
-    let n = 6u32; let m = 2usize; let seed = 21u64;
+    let n = 6u32;
+    let m = 2usize;
+    let seed = 21u64;
     let mut rng = Lcg::new(0x515A_0000 ^ (n as u64) << 8 ^ (m as u64) << 4 ^ seed);
     let trees: Vec<Tree> = (0..m).map(|_| random_tree(n, &mut rng)).collect();
-    for (i,t) in trees.iter().enumerate() { eprintln!("T{i} = {}", canonical_newick(t)); }
+    for (i, t) in trees.iter().enumerate() {
+        eprintln!("T{i} = {}", canonical_newick(t));
+    }
     let inst = Instance::new(trees, n);
     let oracle = brute_force_maf(&inst).unwrap();
-    eprintln!("brute: components={} partition={:?}", oracle.num_components, oracle.partition);
+    eprintln!(
+        "brute: components={} partition={:?}",
+        oracle.num_components, oracle.partition
+    );
     for t0 in 0..m {
-        eprintln!("DP t0={t0}: {:?}", klados_solve::solvers::ncpack::dpc_mu_for_t0(&inst, t0, 5_000_000));
+        eprintln!(
+            "DP t0={t0}: {:?}",
+            klados_solve::solvers::ncpack::dpc_mu_for_t0(&inst, t0, 5_000_000)
+        );
     }
 }
 
@@ -112,39 +127,61 @@ fn debug_seed21() {
 fn partitions(n: u32) -> Vec<Vec<Vec<u32>>> {
     let mut res = vec![];
     fn go(cur: u32, n: u32, parts: &mut Vec<Vec<u32>>, res: &mut Vec<Vec<Vec<u32>>>) {
-        if cur > n { res.push(parts.clone()); return; }
-        for i in 0..parts.len() {
-            parts[i].push(cur); go(cur+1,n,parts,res); parts[i].pop();
+        if cur > n {
+            res.push(parts.clone());
+            return;
         }
-        parts.push(vec![cur]); go(cur+1,n,parts,res); parts.pop();
+        for i in 0..parts.len() {
+            parts[i].push(cur);
+            go(cur + 1, n, parts, res);
+            parts[i].pop();
+        }
+        parts.push(vec![cur]);
+        go(cur + 1, n, parts, res);
+        parts.pop();
     }
-    go(1,n,&mut vec![],&mut res); res
+    go(1, n, &mut vec![], &mut res);
+    res
 }
 
 #[test]
 fn checks_vs_validator() {
-    use klados_core::af_validator::{validate_agreement_forest, AfValidation};
-    let n=6u32; let m=2usize; let seed=21u64;
+    use klados_core::af_validator::{AfValidation, validate_agreement_forest};
+    let n = 6u32;
+    let m = 2usize;
+    let seed = 21u64;
     let mut rng = Lcg::new(0x515A_0000 ^ (n as u64) << 8 ^ (m as u64) << 4 ^ seed);
     let trees: Vec<Tree> = (0..m).map(|_| random_tree(n, &mut rng)).collect();
     let inst = Instance::new(trees.clone(), n);
-    let mut disagree=0;
+    let mut disagree = 0;
     for part in partitions(n) {
         // build component trees via prune
-        let comps: Vec<Tree> = part.iter().map(|b| {
-            let mut keep = fixedbitset::FixedBitSet::with_capacity(n as usize+1);
-            for &l in b { keep.insert(l as usize); }
-            inst.trees[0].prune_to_leafset(&keep)
-        }).collect();
-        let validator_ok = matches!(validate_agreement_forest(&inst,&comps), AfValidation::Ok);
+        let comps: Vec<Tree> = part
+            .iter()
+            .map(|b| {
+                let mut keep = fixedbitset::FixedBitSet::with_capacity(n as usize + 1);
+                for &l in b {
+                    keep.insert(l as usize);
+                }
+                inst.trees[0].prune_to_leafset(&keep)
+            })
+            .collect();
+        let validator_ok = matches!(validate_agreement_forest(&inst, &comps), AfValidation::Ok);
         // my checks
         let blocks: Vec<&Vec<u32>> = part.iter().collect();
-        let my_agree = part.iter().all(|b| klados_solve::solvers::ncpack::dpc_agrees_pub(&inst,b));
-        let my_noncross = klados_solve::solvers::ncpack::dpc_noncross_pub(&inst,&blocks);
+        let my_agree = part
+            .iter()
+            .all(|b| klados_solve::solvers::ncpack::dpc_agrees_pub(&inst, b));
+        let my_noncross = klados_solve::solvers::ncpack::dpc_noncross_pub(&inst, &blocks);
         let my_ok = my_agree && my_noncross;
         if my_ok != validator_ok {
-            disagree+=1;
-            if disagree<=10 { eprintln!("DISAGREE part={:?} validator={} my_ok={} (agree={} noncross={})", part, validator_ok, my_ok, my_agree, my_noncross); }
+            disagree += 1;
+            if disagree <= 10 {
+                eprintln!(
+                    "DISAGREE part={:?} validator={} my_ok={} (agree={} noncross={})",
+                    part, validator_ok, my_ok, my_agree, my_noncross
+                );
+            }
         }
     }
     eprintln!("total disagreements: {disagree}");
