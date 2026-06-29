@@ -11,6 +11,7 @@ pub mod fpt_maf;
 pub mod maf_branch_price_multi;
 pub mod maf_ilp;
 pub mod maf_sat;
+pub mod merge_bb;
 pub mod ncpack;
 pub mod overlay_exchange;
 pub mod root_corridor;

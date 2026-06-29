@@ -534,3 +534,57 @@ fn simulate_child(
     rmp.apply_bounds(ctx.columns, &child);
     rmp.solve().ok().map(|sol| sol.objective)
 }
+
+/// Runtime-selectable branching strategy so the search driver can A/B
+/// different selectors without recompiling. Chosen via `KLADOS_BP_BRANCH`:
+/// `mostfrac` (default), `strong` (full strong branching, K=`KLADOS_BP_BRANCH_K`,
+/// optional shallow cap `KLADOS_BP_BRANCH_DEPTH`), or `cluster` (4-way triple
+/// branching, min pair mass `KLADOS_BP_BRANCH_TRIPLE_MASS`). Keeps the
+/// monomorphic `S: BranchSelector` path in `solve_node` intact.
+pub enum AnySelector {
+    MostFractional(MostFractionalPair),
+    Strong(StrongBranching),
+    Cluster(ClusterBranching),
+}
+
+impl AnySelector {
+    pub fn from_env() -> Self {
+        match std::env::var("KLADOS_BP_BRANCH").as_deref() {
+            Ok("strong") => {
+                let k = std::env::var("KLADOS_BP_BRANCH_K")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(4);
+                let mut sb = StrongBranching::new(k);
+                if let Some(d) = std::env::var("KLADOS_BP_BRANCH_DEPTH")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                {
+                    sb = sb.with_max_depth(d);
+                }
+                AnySelector::Strong(sb)
+            }
+            Ok("cluster") => {
+                let mut cb = ClusterBranching::new();
+                if let Some(m) = std::env::var("KLADOS_BP_BRANCH_TRIPLE_MASS")
+                    .ok()
+                    .and_then(|s| s.parse::<f64>().ok())
+                {
+                    cb = cb.with_min_triple_pair_mass(m);
+                }
+                AnySelector::Cluster(cb)
+            }
+            _ => AnySelector::MostFractional(MostFractionalPair),
+        }
+    }
+}
+
+impl BranchSelector for AnySelector {
+    fn select(&mut self, ctx: &SelectionContext, rmp: &mut Rmp) -> Option<Vec<Branchings>> {
+        match self {
+            AnySelector::MostFractional(s) => s.select(ctx, rmp),
+            AnySelector::Strong(s) => s.select(ctx, rmp),
+            AnySelector::Cluster(s) => s.select(ctx, rmp),
+        }
+    }
+}

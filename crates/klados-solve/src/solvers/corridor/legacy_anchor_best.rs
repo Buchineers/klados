@@ -155,8 +155,23 @@ impl CorridorSolver {
         };
         let reduced = &kern.instance;
         if reduced.num_trees() != 2 || reduced.num_leaves <= 1 {
-            // Kernelization fully resolved the instance → certified.
-            return Some((instance.trees.clone(), true));
+            // Kernelization fully resolved the instance → certified.  Return
+            // the expanded trivial reduced solution, not the original input
+            // trees (which would duplicate leaves in the output forest).
+            let reduced_solution = if reduced.num_leaves == 0 {
+                Vec::new()
+            } else {
+                vec![reduced.trees[0].clone()]
+            };
+            let expanded = expand_solution(
+                reduced_solution,
+                &kern,
+                instance.reference_tree(),
+                instance.num_leaves,
+            );
+            self.stats.upper_bound = Some(expanded.len());
+            self.stats.lower_bound = expanded.len();
+            return Some((expanded, true));
         }
 
         // Whidden strict cluster decomposition splits big 2-tree instances

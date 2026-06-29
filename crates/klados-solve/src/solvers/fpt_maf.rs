@@ -24,11 +24,18 @@
 //! the best agreement forest found. Exact: returns the minimum-order agreement
 //! forest = the MAF.
 
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use fixedbitset::FixedBitSet;
-use klados_core::{Instance, SolverStats, Tree};
+use klados_core::af_validator::{canonical_newick, validate_agreement_forest};
+use klados_core::{
+    Instance, SolverStats, Tree, cluster_decomposition, cluster_reduction, kernelize,
+};
 
+use crate::solvers::chen_rspr::chen_pair_bounds;
 use crate::{RunConfig, Solver, Track};
 
 const NONE: u32 = u32::MAX;
@@ -402,6 +409,7 @@ impl State {
 struct Search {
     best: usize,
     best_blocks: Vec<Vec<u32>>,
+    lower_bound: usize,
     deadline: Option<Instant>,
     nodes: u64,
     aborted: bool,
@@ -439,8 +447,9 @@ impl Search {
         // Reduction: contract all agreed cherries.
         while st.reduce_once() {}
 
-        // Lower-bound prune.
-        if st.order() >= self.best {
+        // Lower-bound prune: current component order plus any global bound
+        // inherited from the reduced instance.
+        if st.order().max(self.lower_bound) >= self.best {
             return;
         }
 
@@ -477,7 +486,13 @@ impl Search {
 
 /// Solve the exact multi-tree MAF on binary rooted trees. Returns the partition
 /// into label blocks, or `None` if aborted (budget) before proving optimum.
-fn solve_maf(trees: &[Tree], num_leaves: u32, deadline: Option<Instant>) -> Option<Vec<Vec<u32>>> {
+fn solve_maf(
+    trees: &[Tree],
+    num_leaves: u32,
+    deadline: Option<Instant>,
+    initial_blocks: Option<Vec<Vec<u32>>>,
+    lower_bound: usize,
+) -> Option<Vec<Vec<u32>>> {
     let n = num_leaves;
     let maxlab = (2 * n + 1) as usize;
 
@@ -494,16 +509,24 @@ fn solve_maf(trees: &[Tree], num_leaves: u32, deadline: Option<Instant>) -> Opti
         next_label: n + 1,
     };
 
-    let (incumbent_order, incumbent_blocks) = st.clone().greedy_finish();
+    let (greedy_order, greedy_blocks) = st.clone().greedy_finish();
+    let (incumbent_order, incumbent_blocks) = match initial_blocks {
+        Some(blocks) if blocks.len() < greedy_order => (blocks.len(), blocks),
+        _ => (greedy_order, greedy_blocks),
+    };
 
     let mut search = Search {
         best: incumbent_order,
         best_blocks: incumbent_blocks,
+        lower_bound,
         deadline,
         nodes: 0,
         aborted: false,
         depth_cap: 4 * num_leaves + 20,
     };
+    if search.best <= search.lower_bound {
+        return Some(search.best_blocks);
+    }
     search.dfs(st, 0);
 
     if search.aborted && search.best == usize::MAX {
@@ -515,6 +538,250 @@ fn solve_maf(trees: &[Tree], num_leaves: u32, deadline: Option<Instant>) -> Opti
         None
     } else {
         Some(search.best_blocks)
+    }
+}
+
+fn solve_recursive(inst: &Instance, deadline: Option<Instant>) -> Option<Vec<Tree>> {
+    let memo = Rc::new(RefCell::new(HashMap::new()));
+    solve_recursive_memo(inst, deadline, &memo)
+}
+
+fn solve_recursive_memo(
+    inst: &Instance,
+    deadline: Option<Instant>,
+    memo: &Rc<RefCell<HashMap<String, Vec<Vec<u32>>>>>,
+) -> Option<Vec<Tree>> {
+    if deadline.is_some_and(|d| Instant::now() >= d) {
+        return None;
+    }
+    if inst.trees.is_empty() {
+        return None;
+    }
+    if inst.num_trees() == 1 {
+        return Some(inst.trees.clone());
+    }
+    if inst.num_leaves <= 1 {
+        return Some(inst.trees[0..1].to_vec());
+    }
+
+    let kern = kernelize::kernelize_best(inst, &kernelize::KernelizeConfig::default());
+    let reduced = &kern.instance;
+
+    if reduced.num_leaves <= 1 {
+        let reduced_solution = if reduced.num_leaves == 0 {
+            Vec::new()
+        } else {
+            vec![reduced.trees[0].clone()]
+        };
+        return Some(kernelize::expand_solution(
+            reduced_solution,
+            &kern,
+            &inst.trees[0],
+            inst.num_leaves,
+        ));
+    }
+
+    let memo_key = instance_key(reduced);
+    if let Some(cached_blocks) = memo.borrow().get(&memo_key).cloned() {
+        let reduced_components =
+            blocks_to_trees(&cached_blocks, reduced.reference_tree(), reduced.num_leaves);
+        return Some(kernelize::expand_solution(
+            reduced_components,
+            &kern,
+            &inst.trees[0],
+            inst.num_leaves,
+        ));
+    }
+
+    if let Some(cluster_reduction::ClusterReductionResult::Solved(solution)) =
+        cluster_reduction::try_cluster_reduction(reduced, &mut |sub: &Instance| {
+            solve_recursive_memo(sub, deadline, memo)
+        })
+    {
+        let blocks = forest_to_blocks(&solution.components);
+        memo.borrow_mut().insert(memo_key.clone(), blocks);
+        return Some(kernelize::expand_solution(
+            solution.components,
+            &kern,
+            &inst.trees[0],
+            inst.num_leaves,
+        ));
+    }
+
+    if reduced.num_trees() >= 3
+        && let Some(solution) =
+            cluster_decomposition::try_rspr_cluster_decomposition(reduced, &mut |sub: &Instance| {
+                solve_recursive_memo(sub, deadline, memo)
+            })
+        && validate_agreement_forest(reduced, &solution).is_ok()
+    {
+        let blocks = forest_to_blocks(&solution);
+        memo.borrow_mut().insert(memo_key.clone(), blocks);
+        return Some(kernelize::expand_solution(
+            solution,
+            &kern,
+            &inst.trees[0],
+            inst.num_leaves,
+        ));
+    }
+
+    if reduced.num_trees() == 2
+        && reduced.num_leaves >= 20
+        && let Some(solution) = crate::decomp::whidden_cluster::try_whidden_decomp_2tree(
+            reduced,
+            &mut |sub: &Instance| solve_recursive_memo(sub, deadline, memo),
+            &crate::decomp::whidden_cluster::NEVER_TERMINATE,
+        )
+    {
+        let blocks = forest_to_blocks(&solution);
+        memo.borrow_mut().insert(memo_key.clone(), blocks);
+        return Some(kernelize::expand_solution(
+            solution,
+            &kern,
+            &inst.trees[0],
+            inst.num_leaves,
+        ));
+    }
+
+    let initial = initial_incumbent_blocks(reduced);
+    let lower = chen_component_lower_bound(&reduced.trees);
+    let blocks = solve_maf(&reduced.trees, reduced.num_leaves, deadline, initial, lower)?;
+    let reduced_components = blocks_to_trees(&blocks, reduced.reference_tree(), reduced.num_leaves);
+    memo.borrow_mut().insert(memo_key, blocks);
+    Some(kernelize::expand_solution(
+        reduced_components,
+        &kern,
+        &inst.trees[0],
+        inst.num_leaves,
+    ))
+}
+
+fn instance_key(inst: &Instance) -> String {
+    let mut key = format!("m{}n{}:", inst.num_trees(), inst.num_leaves);
+    for t in &inst.trees {
+        key.push_str(&canonical_newick(t));
+        key.push('|');
+    }
+    key
+}
+
+fn forest_to_blocks(forest: &[Tree]) -> Vec<Vec<u32>> {
+    let mut blocks: Vec<Vec<u32>> = forest
+        .iter()
+        .map(|component| {
+            let mut labels: Vec<u32> = component.leaves().collect();
+            labels.sort_unstable();
+            labels
+        })
+        .filter(|labels| !labels.is_empty())
+        .collect();
+    blocks.sort_unstable();
+    blocks
+}
+
+fn blocks_to_trees(blocks: &[Vec<u32>], reference: &Tree, n: u32) -> Vec<Tree> {
+    blocks
+        .iter()
+        .filter(|b| !b.is_empty())
+        .map(|b| {
+            let mut ls = FixedBitSet::with_capacity(n as usize + 1);
+            for &l in b {
+                ls.insert(l as usize);
+            }
+            Tree::forest_component(&ls, reference, n)
+        })
+        .collect()
+}
+
+fn partition_to_blocks(partition: &[usize]) -> Vec<Vec<u32>> {
+    let mut comp_labels: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
+    for (leaf_idx, &comp_id) in partition.iter().enumerate() {
+        comp_labels
+            .entry(comp_id)
+            .or_default()
+            .push((leaf_idx + 1) as u32);
+    }
+    comp_labels.into_values().collect()
+}
+
+fn initial_incumbent_blocks(inst: &Instance) -> Option<Vec<Vec<u32>>> {
+    let m = inst.num_trees();
+    let n = inst.num_leaves as usize;
+    if m <= 2 || n < 8 {
+        return None;
+    }
+
+    // Same idea as BP's local multi-tree UB, but kept modest because FPT's
+    // intended niche is small reduced cores.
+    let trial_budget = 80usize;
+    let ref_count = m.min(6).max(1);
+    let seed_count = (trial_budget / ref_count).max(8);
+    let refs = sampled_reference_indices(m, ref_count);
+    let (mut best_ub, mut best_partition) =
+        klados_core::lower_bound::best_randomized_partition(&inst.trees, &refs, seed_count);
+
+    if m < 12 && n < 80 {
+        let (pr_ub, pr_partition) = klados_core::lower_bound::pairwise_refine_ub(&inst.trees, n);
+        if pr_ub < best_ub {
+            best_ub = pr_ub;
+            best_partition = pr_partition;
+        }
+    }
+
+    if best_ub >= n {
+        return None;
+    }
+    let blocks = partition_to_blocks(&best_partition);
+    let forest = blocks_to_trees(&blocks, inst.reference_tree(), inst.num_leaves);
+    if validate_agreement_forest(inst, &forest).is_ok() {
+        Some(blocks)
+    } else {
+        None
+    }
+}
+
+fn sampled_reference_indices(m: usize, limit: usize) -> Vec<usize> {
+    if limit >= m {
+        return (0..m).collect();
+    }
+    let mut out = Vec::with_capacity(limit);
+    for slot in 0..limit {
+        let idx = slot * (m - 1) / (limit - 1).max(1);
+        if out.last().copied() != Some(idx) {
+            out.push(idx);
+        }
+    }
+    out
+}
+
+fn chen_component_lower_bound(trees: &[Tree]) -> usize {
+    let m = trees.len();
+    if m < 2 {
+        return 1;
+    }
+    let mut lb = 1usize;
+    for i in 0..m {
+        for j in (i + 1)..m {
+            let (pair_cut_lb, _) = chen_pair_bounds(&trees[i], &trees[j]);
+            lb = lb.max(pair_cut_lb + 1);
+        }
+    }
+    lb
+}
+
+fn should_use_root_pool_escape(inst: &Instance) -> bool {
+    if std::env::var("KLADOS_FPT_NO_ROOT_POOL").as_deref() == Ok("1") {
+        return false;
+    }
+    // The cherry FPT is excellent on tiny reduced public cores, but the
+    // exact-public tail contains many medium/large multi-tree instances where
+    // the root column pool closes immediately while the FPT tree explodes.  For
+    // two-tree instances, the corridor path is usually better/certified up to a
+    // few hundred leaves, so only divert the huge cases.
+    if inst.num_trees() == 2 {
+        inst.num_leaves >= 350
+    } else {
+        inst.num_leaves > 20
     }
 }
 
@@ -545,20 +812,38 @@ impl Solver for FptMafSolver {
             return None;
         }
         let deadline = cfg.budget.map(|b: Duration| Instant::now() + b);
-        let blocks = solve_maf(&inst.trees, inst.num_leaves, deadline)?;
-
-        let reference = &inst.trees[0];
-        let n = inst.num_leaves;
-        let forest: Vec<Tree> = blocks
-            .iter()
-            .map(|b| {
-                let mut ls = FixedBitSet::with_capacity(n as usize + 1);
-                for &l in b {
-                    ls.insert(l as usize);
-                }
-                Tree::forest_component(&ls, reference, n)
-            })
-            .collect();
+        // Exact-track invariant: emit a forest ONLY when it is proven optimal.
+        // The root-pool escape is a heuristic incumbent generator that also
+        // returns a (sometimes loose) lower bound; trust its forest only when it
+        // *certifies* optimality (`lb >= ub`). Otherwise we must NOT return its
+        // unproven incumbent — fall through to the exact recursive solver, which
+        // returns `None` rather than an unproven forest when it cannot finish in
+        // budget. This keeps the fast certified path while never lying.
+        if cfg.track == Track::Exact
+            && should_use_root_pool_escape(inst)
+            && let Some(outcome) =
+                crate::solvers::root_pool::RootPoolSolver::new().solve_with_outcome(inst)
+            && matches!(outcome.lower_bound, Some(lb) if lb >= outcome.forest.len())
+            && validate_agreement_forest(inst, &outcome.forest).is_ok()
+        {
+            self.stats.upper_bound = Some(outcome.forest.len());
+            self.stats.lower_bound = outcome.forest.len();
+            return Some(outcome.forest);
+        }
+        if cfg.track == Track::Exact
+            && inst.num_trees() == 2
+            && inst.num_leaves >= 64
+            && std::env::var("KLADOS_FPT_NO_M2_CORRIDOR").as_deref() != Ok("1")
+            && let Some(forest) =
+                crate::solvers::corridor::CorridorSolver::new().solve_m2_certified(inst)
+        {
+            self.stats.upper_bound = Some(forest.len());
+            self.stats.lower_bound = forest.len();
+            return Some(forest);
+        }
+        let forest = solve_recursive(inst, deadline)?;
+        self.stats.upper_bound = Some(forest.len());
+        self.stats.lower_bound = forest.len();
         Some(forest)
     }
 

@@ -53,6 +53,11 @@ pub fn catalog() -> &'static [SolverInfo] {
             run: fpt_maf::main,
         },
         SolverInfo {
+            name: "merge-bb",
+            description: "Merge-space branch-and-bound for multi-tree MAF (exact, mu*-parameterized)",
+            run: merge_bb::main,
+        },
+        SolverInfo {
             name: "ncpack",
             description: "Non-crossing packing for high-frag multi-tree MAF (matching + lifts)",
             run: ncpack::main,

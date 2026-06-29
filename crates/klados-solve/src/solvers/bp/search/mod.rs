@@ -6,6 +6,6 @@ pub mod state;
 pub mod telemetry;
 
 pub use branchings::{Branchings, LeafPair};
-pub use selection::{BranchSelector, MostFractionalPair, SelectionContext};
+pub use selection::{AnySelector, BranchSelector, MostFractionalPair, SelectionContext};
 pub use state::{Incumbent, SearchState};
 pub use telemetry::{Telemetry, Timings};

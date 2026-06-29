@@ -562,7 +562,10 @@ where
     // intrinsically loose, and no branching reform tightens it. Levers
     // that *might* help are speed (per-node cost) and LP tightness
     // itself (cuts that aren't dominated).
-    let mut selector = crate::solvers::bp::search::selection::MostFractionalPair;
+    // Runtime-selectable: KLADOS_BP_BRANCH=mostfrac|strong|cluster (default
+    // mostfrac). Lets us A/B the dormant strong/cluster selectors on the
+    // node-count-bound gap-≤2 cores without recompiling.
+    let mut selector = crate::solvers::bp::search::selection::AnySelector::from_env();
     let mut tel = Telemetry::default();
     let mut root_regions: Option<RootSupportRegions> = None;
 
@@ -3624,6 +3627,51 @@ fn try_mwis_finish(
         }
         elem_groups.push(bs);
     }
+    // Research probe (`KLADOS_BP_MWIS_DUMP=<path>`): append the raw complete
+    // component-conflict graph (intersection graph: elements = leaves + (tree,
+    // node); components conflict iff they share an element) so the MWIS-reduction
+    // shrinkage can be measured offline with the full KaMIS rule set. One record
+    // per stuck core; format: header line then `weight elem0 elem1 ...` per
+    // component.
+    if let Ok(dump_path) = std::env::var("KLADOS_BP_MWIS_DUMP") {
+        use std::io::Write as _;
+        let num_elems = elem_members.len();
+        let total_inc: usize = comp_elems.iter().map(|c| c.len()).sum();
+        let mut buf = String::new();
+        buf.push_str(&format!(
+            "# CORE leaves={} m={} trees={} elems={} incidences={} lb={} ub={} frac_pairs={}\n",
+            num_leaves,
+            m,
+            trees.len(),
+            num_elems,
+            total_inc,
+            lb,
+            state.best_ub(),
+            frac_pairs,
+        ));
+        for (ci, elems) in comp_elems.iter().enumerate() {
+            buf.push_str(&weights[ci].to_string());
+            for e in elems {
+                buf.push(' ');
+                buf.push_str(&e.to_string());
+            }
+            buf.push('\n');
+        }
+        buf.push_str("# END\n");
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&dump_path)
+        {
+            let _ = f.write_all(buf.as_bytes());
+        }
+        debug!(
+            target: LOG_TARGET,
+            "mwis-dump: leaves={} m={} elems={} incidences={} -> {}",
+            num_leaves, m, num_elems, total_inc, dump_path,
+        );
+    }
+
     let mut solve_elem_groups = elem_groups;
     let mut solve_comp_elems = comp_elems;
     let mut solve_weights = weights;
