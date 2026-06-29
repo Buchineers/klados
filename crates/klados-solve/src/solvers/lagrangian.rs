@@ -218,7 +218,7 @@ impl Default for LagrangianConfig {
             dive_reopt: 3,
             dive_warmup: 0.4,
             lns_max: 250,
-            lns_cap_ms: 2_000,
+            lns_cap_ms: 1_000,
             bnb: false,
             topdown_windows: false,
         }
