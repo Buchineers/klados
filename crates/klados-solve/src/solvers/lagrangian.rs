@@ -2501,23 +2501,51 @@ impl LagrangianSolver {
             }
         }
 
-        let internal: Vec<NodeId> = (0..t1.num_nodes() as u32)
-            .filter(|&v| !t1.is_leaf(v))
+        let mut internal: Vec<NodeId> = (0..t1.num_nodes() as u32)
+            .filter(|&v| {
+                if t1.is_leaf(v) {
+                    return false;
+                }
+                let sz = t1.subtree_size[v as usize] as usize;
+                (4..=region_max).contains(&sz)
+            })
             .collect();
         if internal.is_empty() {
             return incumbent;
         }
-        let mut rng: u64 = 0xD1B5_4A32_D192_ED03;
+        // Try every plausible region once before repeating. The old pure-random
+        // sampler could spend much of the tail revisiting the same subtrees; an
+        // interleaved large/small order balances high-leverage resolves with
+        // cheaper neighborhoods that are more likely to prove inside the cap.
+        internal.sort_unstable_by(|&a, &b| {
+            t1.subtree_size[b as usize]
+                .cmp(&t1.subtree_size[a as usize])
+                .then_with(|| a.cmp(&b))
+        });
+        let mut ordered = Vec::with_capacity(internal.len());
+        let (mut lo, mut hi) = (0usize, internal.len() - 1);
+        while lo <= hi {
+            ordered.push(internal[lo]);
+            lo += 1;
+            if lo > hi {
+                break;
+            }
+            ordered.push(internal[hi]);
+            hi -= 1;
+        }
+        internal = ordered;
+        let mut cursor = 0usize;
         let (mut tries, mut accepts, mut invalid) = (0usize, 0usize, 0usize);
 
         while !(self.terminate.load(Ordering::Relaxed)
             || deadline.is_some_and(|d| Instant::now() >= d))
         {
             tries += 1;
-            rng ^= rng << 13;
-            rng ^= rng >> 7;
-            rng ^= rng << 17;
-            let v = internal[(rng as usize) % internal.len()];
+            let v = internal[cursor];
+            cursor += 1;
+            if cursor == internal.len() {
+                cursor = 0;
+            }
 
             // Leaves under v in T₁.
             let mut region: Vec<u32> = Vec::new();
@@ -2531,9 +2559,7 @@ impl LagrangianSolver {
                     stack.push(r);
                 }
             }
-            if region.len() < 4 || region.len() > region_max {
-                continue;
-            }
+            debug_assert!((4..=region_max).contains(&region.len()));
             let mut in_region = vec![false; nl + 1];
             for &l in &region {
                 in_region[l as usize] = true;
