@@ -534,9 +534,9 @@ dependencies = [
 
 [[package]]
 name = "highs-sys"
-version = "1.14.2"
+version = "1.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11a9fa9dea5b5f277075460b695db30ad7e5ce28554f2dd27c312c640acd101f"
+checksum = "8a7a67dd782be8846254f8d4c89a51da57b76c41ce72908b626005ef8b001019"
 dependencies = [
  "bindgen",
  "cmake",
