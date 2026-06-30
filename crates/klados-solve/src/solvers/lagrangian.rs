@@ -2487,7 +2487,6 @@ impl LagrangianSolver {
         let trees = &reduced.trees;
         let n = reduced.num_leaves;
         let nl = n as usize;
-        let t1 = &trees[0];
         let region_max: usize = self.config.lns_max;
         let cap = Duration::from_millis(self.config.lns_cap_ms);
 
@@ -2501,13 +2500,17 @@ impl LagrangianSolver {
             }
         }
 
-        let mut internal: Vec<NodeId> = (0..t1.num_nodes() as u32)
-            .filter(|&v| {
-                if t1.is_leaf(v) {
-                    return false;
-                }
-                let sz = t1.subtree_size[v as usize] as usize;
-                (4..=region_max).contains(&sz)
+        let mut internal: Vec<(usize, NodeId)> = trees
+            .iter()
+            .enumerate()
+            .flat_map(|(ti, t)| {
+                (0..t.num_nodes() as u32).filter_map(move |v| {
+                    if t.is_leaf(v) {
+                        return None;
+                    }
+                    let sz = t.subtree_size[v as usize] as usize;
+                    (4..=region_max).contains(&sz).then_some((ti, v))
+                })
             })
             .collect();
         if internal.is_empty() {
@@ -2517,9 +2520,10 @@ impl LagrangianSolver {
         // sampler could spend much of the tail revisiting the same subtrees; an
         // interleaved large/small order balances high-leverage resolves with
         // cheaper neighborhoods that are more likely to prove inside the cap.
-        internal.sort_unstable_by(|&a, &b| {
-            t1.subtree_size[b as usize]
-                .cmp(&t1.subtree_size[a as usize])
+        internal.sort_unstable_by(|&(ta, a), &(tb, b)| {
+            trees[tb].subtree_size[b as usize]
+                .cmp(&trees[ta].subtree_size[a as usize])
+                .then_with(|| ta.cmp(&tb))
                 .then_with(|| a.cmp(&b))
         });
         let mut ordered = Vec::with_capacity(internal.len());
@@ -2541,20 +2545,21 @@ impl LagrangianSolver {
             || deadline.is_some_and(|d| Instant::now() >= d))
         {
             tries += 1;
-            let v = internal[cursor];
+            let (ti, v) = internal[cursor];
+            let tref = &trees[ti];
             cursor += 1;
             if cursor == internal.len() {
                 cursor = 0;
             }
 
-            // Leaves under v in T₁.
+            // Leaves under v in either input tree.
             let mut region: Vec<u32> = Vec::new();
             let mut stack = vec![v];
             while let Some(u) = stack.pop() {
-                if t1.is_leaf(u) {
-                    region.push(t1.label[u as usize]);
+                if tref.is_leaf(u) {
+                    region.push(tref.label[u as usize]);
                 } else {
-                    let (l, r) = t1.children_pair(u);
+                    let (l, r) = tref.children_pair(u);
                     stack.push(l);
                     stack.push(r);
                 }
