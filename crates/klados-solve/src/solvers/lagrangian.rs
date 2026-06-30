@@ -201,6 +201,15 @@ pub struct LagrangianConfig {
     /// have larger, higher-distance leaked regions that need the full cap to
     /// prove the merge (measured: short cap loses the big giant gains).
     pub lns_closure_bign: usize,
+    /// Iterated-local-search perturbation: when a full LNS cycle produces zero
+    /// accepts (the incumbent has converged at the current region set), restore
+    /// the best-ever forest, split a few random components along their own edges
+    /// (a valid, k-increasing kick), and continue — the LNS then re-merges the
+    /// pieces differently, escaping the local optimum. The best-ever forest is
+    /// tracked and returned, so a kick never worsens the result.
+    pub lns_perturb: bool,
+    /// Number of components to split per perturbation kick.
+    pub lns_perturb_strength: usize,
     pub bnb: bool,
     pub topdown_windows: bool,
 }
@@ -243,6 +252,8 @@ impl Default for LagrangianConfig {
             lns_closure_cap: 400,
             lns_closure_cap_ms: 400,
             lns_closure_bign: 5_000,
+            lns_perturb: false,
+            lns_perturb_strength: 4,
             bnb: false,
             topdown_windows: false,
         }
@@ -2565,10 +2576,47 @@ impl LagrangianSolver {
         let mut cursor = 0usize;
         let (mut tries, mut accepts, mut invalid) = (0usize, 0usize, 0usize);
 
+        // ILS perturbation state. `best`/`best_len` is the best forest ever seen;
+        // a kick may transiently grow the incumbent, but we only ever return the
+        // best. A "cycle" is one full pass over `internal`; zero accepts in a
+        // cycle ⇒ the incumbent has converged at this region set ⇒ kick it.
+        let perturb_on = self.config.lns_perturb;
+        let cycle_len = internal.len();
+        let mut best = incumbent.clone();
+        let mut best_len = best.len();
+        let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut since_cycle = 0usize;
+        let mut cycle_accepts = 0usize;
+        let mut kicks = 0usize;
+
         while !(self.terminate.load(Ordering::Relaxed)
             || deadline.is_some_and(|d| Instant::now() >= d))
         {
             tries += 1;
+            // Cycle boundary: if a whole pass found nothing, kick out of the local
+            // optimum (restore best, split a few components), else keep cycling.
+            if perturb_on {
+                since_cycle += 1;
+                if since_cycle >= cycle_len {
+                    if cycle_accepts == 0 {
+                        if incumbent.len() > best_len {
+                            incumbent = best.clone();
+                        }
+                        self.perturb_forest(
+                            &mut incumbent,
+                            &mut comp_of,
+                            trees,
+                            n,
+                            nl,
+                            self.config.lns_perturb_strength,
+                            &mut rng,
+                        );
+                        kicks += 1;
+                    }
+                    since_cycle = 0;
+                    cycle_accepts = 0;
+                }
+            }
             let (ti, v) = internal[cursor];
             let tref = &trees[ti];
             cursor += 1;
@@ -2700,12 +2748,17 @@ impl LagrangianSolver {
             {
                 incumbent = candidate;
                 accepts += 1;
+                cycle_accepts += 1;
                 for (ci, c) in incumbent.iter().enumerate() {
                     for l in c.leaves() {
                         if (l as usize) <= nl {
                             comp_of[l as usize] = ci;
                         }
                     }
+                }
+                if incumbent.len() < best_len {
+                    best_len = incumbent.len();
+                    best = incumbent.clone();
                 }
                 debug!(
                     "[lagr][lns] accept k={} (region={} comps {}→{}) t={:.1}s",
@@ -2727,14 +2780,64 @@ impl LagrangianSolver {
             }
         }
         debug!(
-            "[lagr][lns] done tries={} accepts={} invalid={} k={} t={:.1}s",
+            "[lagr][lns] done tries={} accepts={} invalid={} kicks={} k={} t={:.1}s",
             tries,
             accepts,
             invalid,
-            incumbent.len(),
+            kicks,
+            best_len,
             start.elapsed().as_secs_f64()
         );
-        incumbent
+        best
+    }
+
+    /// ILS kick: split `strength` random components along their own tree edges
+    /// (valid, k-increasing), then rebuild `comp_of`. The subsequent LNS cycle
+    /// re-merges the freed pieces differently, escaping the local optimum.
+    #[allow(clippy::too_many_arguments)]
+    fn perturb_forest(
+        &self,
+        incumbent: &mut Vec<Tree>,
+        comp_of: &mut [usize],
+        trees: &[Tree],
+        n: u32,
+        nl: usize,
+        strength: usize,
+        rng: &mut u64,
+    ) {
+        let mut done = 0usize;
+        let mut guard = 0usize;
+        while done < strength && guard < strength * 8 + 8 {
+            guard += 1;
+            if incumbent.is_empty() {
+                break;
+            }
+            let ci = (xs(rng) as usize) % incumbent.len();
+            let Some((p1, p2)) = split_component(&incumbent[ci], rng) else {
+                continue;
+            };
+            let mut bs1 = FixedBitSet::with_capacity(nl + 1);
+            for l in &p1 {
+                bs1.insert(*l as usize);
+            }
+            let mut bs2 = FixedBitSet::with_capacity(nl + 1);
+            for l in &p2 {
+                bs2.insert(*l as usize);
+            }
+            incumbent[ci] = Tree::forest_component(&bs1, &trees[0], n);
+            incumbent.push(Tree::forest_component(&bs2, &trees[0], n));
+            done += 1;
+        }
+        for x in comp_of.iter_mut() {
+            *x = usize::MAX;
+        }
+        for (ci, c) in incumbent.iter().enumerate() {
+            for l in c.leaves() {
+                if (l as usize) <= nl {
+                    comp_of[l as usize] = ci;
+                }
+            }
+        }
     }
 
     /// Warm-started exact-LP column generation (bp's `Rmp`). Each iteration
@@ -4058,6 +4161,47 @@ fn greedy_pack(
 /// leaves and can (intermittently) produce components whose original-tree
 /// spanning subtrees interleave — a node-disjointness violation that the
 /// validator rejects outright (score 0). We never want to emit that. Keep
+/// Xorshift step for the ILS perturbation RNG (deterministic, seeded).
+fn xs(state: &mut u64) -> u64 {
+    let mut x = *state;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *state = x;
+    x
+}
+
+/// Split a component into two valid AF components along one of its own tree
+/// edges (cut the edge above a random non-root node `v`: one piece is the leaves
+/// under `v`, the other the rest). Because the component's topology is an
+/// embedded subtree of both input trees, any such cut yields two node-disjoint
+/// agreement components. Returns the two leaf sets, or `None` for a singleton.
+fn split_component(c: &Tree, rng: &mut u64) -> Option<(Vec<u32>, Vec<u32>)> {
+    let nn = c.num_nodes() as u32;
+    let cand: Vec<u32> = (0..nn).filter(|&v| c.parent[v as usize] != NONE).collect();
+    if cand.is_empty() {
+        return None; // single-node component (one leaf)
+    }
+    let v = cand[(xs(rng) as usize) % cand.len()];
+    let mut p1: Vec<u32> = Vec::new();
+    let mut stack = vec![v];
+    while let Some(u) = stack.pop() {
+        if c.is_leaf(u) {
+            p1.push(c.label[u as usize]);
+        } else {
+            let (l, r) = c.children_pair(u);
+            stack.push(l);
+            stack.push(r);
+        }
+    }
+    let p1set: FxHashSet<u32> = p1.iter().copied().collect();
+    let p2: Vec<u32> = c.leaves().filter(|l| !p1set.contains(l)).collect();
+    if p1.is_empty() || p2.is_empty() {
+        return None;
+    }
+    Some((p1, p2))
+}
+
 /// components largest-first while they remain valid agreement components AND
 /// node-disjoint from those already kept; explode any offender into singletons.
 /// Returns `(repaired_forest, num_components_exploded)`.
@@ -4197,6 +4341,7 @@ pub fn main() {
             track: Track::Heuristic,
             specific: LagrangianConfig {
                 lns_closure: true,
+                lns_perturb: true,
                 ..LagrangianConfig::default()
             },
             ..Default::default()
