@@ -469,8 +469,6 @@ impl LeafPairDpPricer {
             .sum()
     }
 
-
-
     /// Diagnostic gap from the chosen side extensions to the leaf-only
     /// alternatives.
     ///

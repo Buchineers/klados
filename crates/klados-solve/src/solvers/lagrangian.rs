@@ -181,6 +181,26 @@ pub struct LagrangianConfig {
     pub dive_warmup: f64,
     pub lns_max: usize,
     pub lns_cap_ms: u64,
+    /// Relax the LNS clean-cut: when a subtree region's touched incumbent
+    /// components leak outside the subtree, re-solve the *closure* (the union of
+    /// touched components) instead of skipping the region. The final
+    /// `validate_agreement_forest` rejects any node-overlapping splice, so this
+    /// only ever broadens the neighborhood. Off ⇒ original strict subtree cut.
+    pub lns_closure: bool,
+    /// Max leaves in a closure-mode re-solve (strict mode is implicitly bounded
+    /// by `lns_max`). Keeps the capped exact B&P re-solve tractable.
+    pub lns_closure_cap: usize,
+    /// Per-region exact-resolve cap (ms) for *leaked* closure regions on
+    /// instances with `num_leaves <= lns_closure_bign`. Shorter than `lns_cap_ms`
+    /// so a non-proving leaked region steals less of the cycle from productive
+    /// clean cuts — small/mid instances cycle faster and gain more. Clean cuts
+    /// always keep the full `lns_cap_ms`.
+    pub lns_closure_cap_ms: u64,
+    /// Leaf threshold above which leaked closure re-solves get the *full*
+    /// `lns_cap_ms` instead of the shorter `lns_closure_cap_ms`: giant instances
+    /// have larger, higher-distance leaked regions that need the full cap to
+    /// prove the merge (measured: short cap loses the big giant gains).
+    pub lns_closure_bign: usize,
     pub bnb: bool,
     pub topdown_windows: bool,
 }
@@ -219,6 +239,10 @@ impl Default for LagrangianConfig {
             dive_warmup: 0.4,
             lns_max: 250,
             lns_cap_ms: 1_000,
+            lns_closure: false,
+            lns_closure_cap: 400,
+            lns_closure_cap_ms: 400,
+            lns_closure_bign: 5_000,
             bnb: false,
             topdown_windows: false,
         }
@@ -2579,23 +2603,34 @@ impl LagrangianSolver {
                     touched.push(ci);
                 }
             }
+            // Closure of the touched components (all their leaves). In strict mode
+            // we require this to equal the region (a clean subtree cut); in
+            // closure mode we re-solve the closure even when components leak
+            // outside the subtree, bounded by `lns_closure_cap`, and let the
+            // validator reject any node-overlapping splice.
             let mut clean = true;
+            let mut bad = false;
             let mut l_leaves: Vec<u32> = Vec::new();
-            for &ci in &touched {
-                let mut inside = true;
+            'comps: for &ci in &touched {
                 for l in incumbent[ci].leaves() {
-                    if (l as usize) > nl || !in_region[l as usize] {
-                        inside = false;
-                        break;
+                    if (l as usize) > nl {
+                        bad = true; // out-of-core leaf — never re-solve
+                        break 'comps;
+                    }
+                    if !in_region[l as usize] {
+                        clean = false;
                     }
                     l_leaves.push(l);
                 }
-                if !inside {
-                    clean = false;
-                    break;
-                }
             }
-            if !clean || touched.len() < 2 || l_leaves.len() < 4 {
+            if bad || touched.len() < 2 || l_leaves.len() < 4 {
+                continue;
+            }
+            if self.config.lns_closure {
+                if l_leaves.len() > self.config.lns_closure_cap {
+                    continue;
+                }
+            } else if !clean {
                 continue;
             }
 
@@ -2617,8 +2652,23 @@ impl LagrangianSolver {
                 m as u32,
             );
 
-            // Re-solve the region optimally with B&P (capped).
-            let sub_sol = match self.solve_cluster_exact(&sub_inst, Instant::now() + cap) {
+            // Re-solve the region optimally with B&P (capped). Leaked closure
+            // regions get the shorter cap so a non-proving one steals less of the
+            // cycle from productive clean cuts.
+            let region_cap = if clean {
+                cap
+            } else {
+                // Leaked closure re-solve: size-adaptive cap (short for small/mid
+                // → faster cycling/more revisits; full for giants → time to prove
+                // the larger leaked merges).
+                let ms = if nl > self.config.lns_closure_bign {
+                    self.config.lns_cap_ms
+                } else {
+                    self.config.lns_closure_cap_ms
+                };
+                Duration::from_millis(ms)
+            };
+            let sub_sol = match self.solve_cluster_exact(&sub_inst, Instant::now() + region_cap) {
                 Some(s) => s,
                 None => continue, // capped / invalid
             };
@@ -4145,7 +4195,10 @@ pub fn main() {
         LagrangianSolver::new(),
         RunConfig {
             track: Track::Heuristic,
-            specific: LagrangianConfig::default(),
+            specific: LagrangianConfig {
+                lns_closure: true,
+                ..LagrangianConfig::default()
+            },
             ..Default::default()
         },
     );
