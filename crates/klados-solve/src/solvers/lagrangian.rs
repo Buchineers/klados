@@ -2514,7 +2514,16 @@ impl LagrangianSolver {
                 if cur.is_empty() {
                     break;
                 }
-                let kick = 2 + (stalls % 6);
+                // On large forests the fixed 2-7 kick is ~0.1% of the packing —
+                // far too small to escape the plateau. Scale it with the packing
+                // size there (measured: giant ILS wastes ~150s post-plateau that
+                // a real diversification can use). Small forests keep the tuned
+                // fixed kick (mid/small behavior unchanged).
+                let kick = if cur.len() > 3000 {
+                    (cur.len() / 80).max(8) + (stalls % 6)
+                } else {
+                    2 + (stalls % 6)
+                };
                 for _ in 0..kick {
                     rng ^= rng << 13;
                     rng ^= rng >> 7;
