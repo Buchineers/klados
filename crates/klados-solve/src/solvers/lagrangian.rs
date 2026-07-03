@@ -83,6 +83,11 @@ const DECOMP_ATTEMPT: Duration = Duration::from_secs(25);
 /// time-limit overrun that blows the SIGTERM grace window).
 const MIP_GAP_LIMIT: usize = 4;
 
+/// Max pool size for the post-ILS set-packing MIP (`pool_mip`). Above this the
+/// LP over the pool is slow enough to risk overrunning the SIGTERM grace with no
+/// output — giants (~60k-col pools) are excluded; mids/smalls (~10k) run.
+const POOL_MIP_MAX_COLS: usize = 15_000;
+
 /// Safe ceiling on the anchor DP's dense `n₀·n₁` table (kept under the
 /// pricer's own ~64M-cell cap). Above this we price in tree-local windows.
 const CELL_CAP_SAFE: u64 = 60_000_000;
@@ -212,6 +217,18 @@ pub struct LagrangianConfig {
     pub lns_perturb_strength: usize,
     pub bnb: bool,
     pub topdown_windows: bool,
+    /// After the packing ILS, solve the set-packing over the column pool exactly
+    /// (support-restricted branch-and-cut MIP over HiGHS) and keep its forest if
+    /// it has fewer components — the greedy ILS routinely leaves ~0.5-1% in the
+    /// pool that the MIP recovers. Monotone (only ever replaces the incumbent
+    /// with a strictly smaller valid AF). Off by default; on for the heuristic
+    /// entry. Gated to tractable pools (`POOL_MIP_MAX_COLS`). See
+    /// [`Self::pool_mip_probe`].
+    pub pool_mip: bool,
+    /// Per-MIP-solve time cap (ms) for `pool_mip`. Kept well under the budget
+    /// grace so a HiGHS solve (which does not poll the stop flag) cannot overrun
+    /// the SIGTERM window.
+    pub pool_mip_ms: u64,
 }
 
 impl Default for LagrangianConfig {
@@ -256,6 +273,8 @@ impl Default for LagrangianConfig {
             lns_perturb_strength: 4,
             bnb: false,
             topdown_windows: false,
+            pool_mip: false,
+            pool_mip_ms: 15_000,
         }
     }
 }
@@ -1460,6 +1479,24 @@ impl LagrangianSolver {
             }
         }
 
+        // ---- Exact set-packing MIP over the pool (support-restricted branch-
+        //      and-cut). Recovers the ~0.5-1% the greedy ILS leaves in the pool.
+        //      Gated to tractable pools: a big-pool LP/MIP would overrun the
+        //      SIGTERM grace with no output. Only run with a safe time margin. ----
+        let mip_time_ok =
+            deadline.is_none_or(|d| d.saturating_duration_since(Instant::now()).as_secs() >= 25);
+        if self.config.pool_mip
+            && !proved
+            && pool.len() <= POOL_MIP_MAX_COLS
+            && mip_time_ok
+            && !self.terminate.load(Ordering::Relaxed)
+            && let Some((forest, comps)) =
+                self.pool_mip_probe(trees, n, nl, &pool, best_components, deadline, start)
+        {
+            best_components = comps;
+            best_forest = forest;
+        }
+
         debug!(
             "{ind}[lagr] DONE reduced_n={} reduced_best={} lb={:.1} iters={} pool={} t={:.1}s",
             n,
@@ -2503,6 +2540,139 @@ impl LagrangianSolver {
             }
         }
         (0..ncol).filter(|&i| best_in_sel[i]).collect()
+    }
+
+    /// Exact set-packing over the column pool (see `LagrangianConfig.pool_mip`),
+    /// returning the decoded forest when it beats `incumbent_k`. The pool + all
+    /// singletons become an `Rmp`; its LP is solved with lazy node-disjointness
+    /// cut separation; the MIP is restricted to the LP-support columns (so it
+    /// proves fast) and solved under a MIP↔cut-separation loop (the lazy node
+    /// rows mean a raw MIP can pick overlapping columns). The greedy ILS is a
+    /// strong but not exact set-packing heuristic, so the MIP routinely finds a
+    /// packing a few components smaller that lives in the pool already.
+    fn pool_mip_probe(
+        &self,
+        trees: &[Tree],
+        n: u32,
+        nl: usize,
+        pool: &[Block],
+        incumbent_k: usize,
+        deadline: Option<Instant>,
+        start: Instant,
+    ) -> Option<(Vec<Tree>, usize)> {
+        // Pool blocks + all singletons → AfColumns (singletons make every leaf
+        // coverable, so the MIP objective is exactly k).
+        let mut builder = ColumnBuilder::new(trees);
+        let mut afpool: Vec<AfColumn> = Vec::new();
+        for l in 1..=n {
+            if let Some(c) = builder.try_build(vec![l], trees) {
+                afpool.push(c);
+            }
+        }
+        for b in pool {
+            if b.labels.len() >= 2
+                && let Some(c) = builder.try_build(b.labels.clone(), trees)
+            {
+                afpool.push(c);
+            }
+        }
+        let mut rmp = Rmp::new(&afpool, trees, nl);
+        let branchings = Branchings::default();
+        // LP + lazy node-disjointness cut separation until the LP is a valid AF
+        // relaxation (no node-row violations).
+        rmp.apply_bounds(&afpool, &branchings);
+        let mut sol = rmp.solve().ok()?;
+        loop {
+            if self.terminate.load(Ordering::Relaxed)
+                || deadline.is_some_and(|d| Instant::now() >= d)
+            {
+                return None;
+            }
+            let cuts = rmp.separate_and_add_cuts(&afpool, &sol.column_values, 1e-6);
+            if cuts == 0 {
+                break;
+            }
+            rmp.apply_bounds(&afpool, &branchings);
+            sol = rmp.solve().ok()?;
+        }
+        let lp = sol.objective;
+        // The whole-pool MIP is intractable at scale (the ~1% integer gap is too
+        // wide for reduced-cost fixing to shrink it). Restrict the MIP to the
+        // LP-SUPPORT columns (the ones the fractional optimum actually uses) plus
+        // all singletons: a few-hundred-column MIP HiGHS proves in well under a
+        // second, and its integer optimum over the support is a strong primal.
+        let support: Vec<AfColumn> = (0..afpool.len())
+            .filter(|&i| afpool[i].labels().len() == 1 || sol.column_values[i] > 1e-4)
+            .map(|i| afpool[i].clone())
+            .collect();
+        let mut rmp2 = Rmp::new(&support, trees, nl);
+        rmp2.apply_bounds(&support, &branchings);
+        let mut sol2 = rmp2.solve().ok()?;
+        loop {
+            if self.terminate.load(Ordering::Relaxed)
+                || deadline.is_some_and(|d| Instant::now() >= d)
+            {
+                return None;
+            }
+            let cuts = rmp2.separate_and_add_cuts(&support, &sol2.column_values, 1e-6);
+            if cuts == 0 {
+                break;
+            }
+            rmp2.apply_bounds(&support, &branchings);
+            sol2 = rmp2.solve().ok()?;
+        }
+        debug!(
+            "[lagr][poolmip] LP={:.2} vs ls_k={} (gap {:.1}%, support={}/{}) t={:.1}s — solving MIP",
+            lp,
+            incumbent_k,
+            100.0 * (incumbent_k as f64 - lp) / lp.max(1.0),
+            support.len(),
+            afpool.len(),
+            start.elapsed().as_secs_f64()
+        );
+        // Branch-and-cut: the node-disjointness rows are lazy, so a one-shot MIP
+        // can select node-overlapping columns. Separate the violated node rows on
+        // the integer solution and re-solve until the MIP is node-valid.
+        let secs = (self.config.pool_mip_ms as f64 / 1000.0).max(1.0);
+        let unindexed = self.flat_terminal.load(Ordering::Relaxed);
+        let mut result = None;
+        for round in 0..12 {
+            // SIGTERM safety: a HiGHS MIP call does not poll `terminate`, so never
+            // START a round unless the full per-MIP cap fits before the deadline
+            // (else the solve could overrun the SIGTERM grace with no output).
+            if self.terminate.load(Ordering::Relaxed)
+                || deadline.is_some_and(|d| {
+                    d.saturating_duration_since(Instant::now()).as_secs_f64() < secs + 2.0
+                })
+            {
+                break;
+            }
+            let mip = match rmp2.solve_mip_with_time_limit(secs) {
+                Ok(Some(m)) => m,
+                _ => break, // not solved in the cap
+            };
+            let cuts = rmp2.separate_and_add_cuts(&support, &mip.column_values, 1e-6);
+            if cuts > 0 {
+                rmp2.apply_bounds(&support, &branchings);
+                continue; // re-solve with the new node constraints
+            }
+            // node-valid integer solution: decode
+            if let Some((forest, comps)) =
+                forest_from_lp(&support, &mip.column_values, trees, n, unindexed)
+            {
+                debug!(
+                    "[lagr][poolmip] MIP_k={} vs ls_k={} lp={:.2} (round={}) t={:.1}s",
+                    comps,
+                    incumbent_k,
+                    lp,
+                    round,
+                    start.elapsed().as_secs_f64()
+                );
+                result = (comps < incumbent_k).then_some((forest, comps));
+            }
+            break;
+        }
+        result
     }
 
     /// LNS (large-neighbourhood search): repeatedly pick a *clean* region of the
@@ -4342,6 +4512,8 @@ pub fn main() {
             specific: LagrangianConfig {
                 lns_closure: true,
                 lns_perturb: true,
+                pool_mip: true,
+                pool_mip_ms: 15_000,
                 ..LagrangianConfig::default()
             },
             ..Default::default()
