@@ -412,6 +412,119 @@ impl Rmp {
         added
     }
 
+    /// Node-packing conflict adjacency over ALL columns: `col i ~ col j` iff they
+    /// share a tree node (so at most one can be selected). This is
+    /// value-INDEPENDENT, so the caller builds it ONCE per node and reuses it
+    /// across every cut round — the column pool is frozen during a node's cutting.
+    /// Nodes covered by a huge number of columns are skipped: the clique they
+    /// induce is dominated by that node's own ≤1 row, so it is redundant.
+    pub fn build_clique_nbr(
+        &self,
+        columns: &[AfColumn],
+    ) -> Vec<std::collections::HashSet<usize>> {
+        use std::collections::HashMap;
+        let max_nodes = self.max_nodes;
+        let mut node_cols: HashMap<u32, Vec<usize>> = HashMap::new();
+        for (ci, col) in columns.iter().enumerate() {
+            for (ti, nodes) in col.coverage().nodes_per_tree.iter().enumerate() {
+                let base = (ti * max_nodes) as u32;
+                for &nd in nodes {
+                    node_cols.entry(base + nd as u32).or_default().push(ci);
+                }
+            }
+        }
+        let mut nbr = vec![std::collections::HashSet::<usize>::new(); columns.len()];
+        for cols in node_cols.values() {
+            if cols.len() > 400 {
+                continue; // skip ubiquitous nodes (clique is dominated by the ≤1 row)
+            }
+            for i in 0..cols.len() {
+                for j in (i + 1)..cols.len() {
+                    nbr[cols[i]].insert(cols[j]);
+                    nbr[cols[j]].insert(cols[i]);
+                }
+            }
+        }
+        nbr
+    }
+
+    /// Separate violated CLIQUE inequalities on the node-packing conflict graph
+    /// (adjacency `nbr` from `build_clique_nbr`). For a clique K of pairwise-
+    /// conflicting columns, `sum_{c∈K} x_c ≤ 1` — strengthens the base node-≤1
+    /// rows when conflicts run through DIFFERENT nodes. Greedy weighted-clique
+    /// separation from high-value fractional seeds; adds ≤ `max_new` most-violated.
+    pub fn separate_and_add_clique(
+        &mut self,
+        column_values: &[f64],
+        eps: f64,
+        max_new: usize,
+        nbr: &[std::collections::HashSet<usize>],
+    ) -> usize {
+        use std::collections::HashSet;
+        let n = nbr.len().min(column_values.len());
+        let active: Vec<usize> = (0..n).filter(|&ci| column_values[ci] > eps).collect();
+        // greedy weighted cliques from high-x seeds (candidates kept active-only)
+        let mut seeds = active.clone();
+        seeds.sort_by(|&a, &b| column_values[b].partial_cmp(&column_values[a]).unwrap());
+        let mut scored: Vec<(Vec<usize>, f64)> = Vec::new();
+        let mut seen: HashSet<Vec<usize>> = HashSet::new();
+        const SEED_CAP: usize = 400;
+        for &seed in seeds.iter().take(SEED_CAP) {
+            let mut clique = vec![seed];
+            let mut weight = column_values[seed];
+            let mut cand: HashSet<usize> = nbr[seed]
+                .iter()
+                .cloned()
+                .filter(|&c| column_values[c] > eps)
+                .collect();
+            loop {
+                let best = cand
+                    .iter()
+                    .cloned()
+                    .max_by(|&a, &b| column_values[a].partial_cmp(&column_values[b]).unwrap());
+                let v = match best {
+                    Some(v) => v,
+                    None => break,
+                };
+                clique.push(v);
+                weight += column_values[v];
+                cand = cand.intersection(&nbr[v]).cloned().collect();
+                cand.remove(&v);
+            }
+            if clique.len() >= 2 && weight > 1.0 + eps {
+                let mut key = clique.clone();
+                key.sort_unstable();
+                if seen.insert(key.clone()) {
+                    scored.push((key, weight));
+                }
+            }
+        }
+        if scored.is_empty() {
+            return 0;
+        }
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        scored.truncate(max_new);
+        let mut added = 0usize;
+        for (clique, _w) in scored {
+            let indices: Vec<i32> = clique.iter().map(|&ci| self.col_handle[ci]).collect();
+            let values = vec![1.0_f64; indices.len()];
+            let ptr = self.model.as_mut().expect("model present").as_mut_ptr();
+            unsafe {
+                highs_sys::Highs_addRow(
+                    ptr,
+                    f64::NEG_INFINITY,
+                    1.0,
+                    indices.len() as i32,
+                    indices.as_ptr(),
+                    values.as_ptr(),
+                );
+            }
+            self.num_rows += 1;
+            added += 1;
+        }
+        added
+    }
+
     /// Apply per-column bounds derived from `branchings`. RCVF-fixed columns
     /// stay pinned at zero regardless of the branching state.
     pub fn apply_bounds(&mut self, columns: &[AfColumn], branchings: &Branchings) {

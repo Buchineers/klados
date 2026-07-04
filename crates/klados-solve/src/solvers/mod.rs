@@ -6,6 +6,7 @@
 // ── exact-origin solvers ────────────────────────────────────────────────────
 pub mod bp;
 pub mod chen_rspr;
+pub mod collapse;
 pub mod corridor;
 pub mod maf_branch_price_multi;
 pub mod maf_ilp;
