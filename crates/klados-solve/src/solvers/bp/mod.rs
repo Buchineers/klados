@@ -362,6 +362,14 @@ fn solve_recursive_memo(
     }
 
     if cancel.is_cancelled() {
+        // Heuristic timeout: return a fast FEASIBLE 2-approx for this unfinished
+        // sub-instance, not all-singletons — otherwise every piece the recursion
+        // hadn't reached when SIGTERM fired cripples the emitted incumbent.
+        if instance.num_trees() == 2 {
+            let (_, _, leafsets) =
+                chen_pair_agreement(&instance.trees[0], &instance.trees[1]);
+            return Some(crate::solvers::chen_rspr::leafsets_to_trees(&leafsets, instance));
+        }
         let forest: Vec<Tree> = (1..=instance.num_leaves)
             .map(|l| klados_core::Tree::singleton(l, instance.num_leaves))
             .collect();
@@ -860,10 +868,17 @@ fn make_leafset(labels: &[u32], num_leaves: u32) -> FixedBitSet {
 use crate::{RunConfig, Solver, Track};
 
 pub fn main() {
+    // The heuristic build arms the SIGTERM handler so bp emits its best
+    // incumbent on timeout; the exact build emits only a proven optimum.
+    let track = if std::env::var("KLADOS_BP_HEURISTIC").is_ok() {
+        Track::Heuristic
+    } else {
+        Track::Exact
+    };
     crate::run(
         BpSolver::new(),
         RunConfig {
-            track: Track::Exact,
+            track,
             specific: BpConfig::default(),
             ..Default::default()
         },

@@ -321,6 +321,10 @@ pub struct LagrangianSolver {
     /// instance, and tripping the global `terminate` there would abandon the
     /// real flat solve. Gates every approx-target check.
     abort_armed: AtomicBool,
+    /// Best depth-0 forest found by the tree-DP exact extraction over the pool
+    /// LP support (reduced labels). Captured in the subgradient loop; `solve`
+    /// overrides its incumbent with this before expansion. Cleared per solve.
+    treedp_reduced: std::sync::Mutex<Option<Vec<Tree>>>,
 }
 
 impl LagrangianSolver {
@@ -336,6 +340,7 @@ impl LagrangianSolver {
             param_reduction: AtomicUsize::new(0),
             abort_k_reduced: AtomicUsize::new(usize::MAX),
             abort_armed: AtomicBool::new(false),
+            treedp_reduced: std::sync::Mutex::new(None),
         }
     }
 
@@ -371,6 +376,7 @@ impl LagrangianSolver {
         self.abort_k_reduced.store(usize::MAX, Ordering::Relaxed);
         self.abort_armed.store(false, Ordering::Relaxed);
         self.stats.lower_bound = 0;
+        *self.treedp_reduced.lock().unwrap() = None;
 
         // Compute the Chen 2-approx forest up front (original labels): it is O(n)
         // and drives the lower-bound-track fast path below. It is no longer
@@ -544,6 +550,16 @@ impl LagrangianSolver {
         // EVERY remaining second re-solving incumbent regions exactly (LNS) and
         // splicing back any that shrink — monotone, never worsens the forest.
         // Default ON (`LagrangianConfig.lns_on = false` disables). Runs until deadline/SIGTERM.
+        // Override with the tree-DP exact extraction if it beat the pipeline's
+        // incumbent (over the reduced core). Exact extraction ≥ greedy on the
+        // same pool, so this only ever helps.
+        if let Some(tf) = self.treedp_reduced.lock().unwrap().take()
+            && tf.len() < reduced_forest.len()
+            && validate_agreement_forest(reduced, &tf).is_ok()
+        {
+            debug!("[lagr] tree-DP override: {} -> {}", reduced_forest.len(), tf.len());
+            reduced_forest = tf;
+        }
         let lns_on = self.config.lns_on;
         if lns_on && !proved && reduced.num_trees() == 2 && !self.terminate.load(Ordering::Relaxed)
         {
@@ -844,7 +860,7 @@ impl LagrangianSolver {
         // Periodically solve the exact LP over the current pool and overwrite
         // α/β with the LP duals: the pricer + greedy then aim at the true LP
         // optimum while the subgradient keeps diversifying around it.
-        let hybrid = self.config.hybrid;
+        let hybrid = self.config.hybrid || std::env::var("KLADOS_LAGR_HYBRID").is_ok();
         let refresh_every = self.config.refresh_every.max(1);
         let mut h_builder = ColumnBuilder::new(trees);
         let mut h_afpool: Vec<AfColumn> = Vec::new();
@@ -875,7 +891,9 @@ impl LagrangianSolver {
         // on a reserved time fraction — so it works with no deadline (the
         // default, SIGTERM-driven) instead of needing a hardcoded horizon to
         // carve a tail from. `LagrangianConfig.no_ls` disables it.
-        let ls_on = !self.config.no_ls;
+        // Tree-DP extraction replaces best_forest directly (not via best_sel),
+        // so the pool-index local search would clobber it — disable LS then.
+        let ls_on = !self.config.no_ls && std::env::var("KLADOS_LAGR_TREEDP").is_err();
 
         // Config-gated per-center profiling of the hot loop.
         let profile = self.config.profile;
@@ -1118,6 +1136,53 @@ impl LagrangianSolver {
                                 Err(_) => break,
                             }
                         }
+                        // EXPERIMENT: tree-DP exact extraction over lagrangian's
+                        // rich-pool LP support vs its greedy incumbent. If the
+                        // support's column-crossing graph is tw-small, this
+                        // captures the ~3% the greedy leaves (that the pool-MIP
+                        // is too slow for), by construction ≥ greedy.
+                        if std::env::var("KLADOS_LAGR_TREEDP").is_ok() {
+                            let tw_cap: usize = std::env::var("KLADOS_LAGR_TREEDP_TWCAP")
+                                .ok()
+                                .and_then(|v| v.parse().ok())
+                                .unwrap_or(24);
+                            let supp = sol
+                                .column_values
+                                .iter()
+                                .filter(|&&x| x > 1e-9)
+                                .count();
+                            if let Some(groups) = crate::solvers::collapse::master_via_tree_dp(
+                                &h_afpool,
+                                &sol.column_values,
+                                n as usize,
+                                tw_cap,
+                            ) {
+                                if groups.len() < best_components {
+                                    let forest =
+                                        forest_from_partition(&groups, trees, n, unindexed);
+                                    let inst = Instance::new(trees.to_vec(), n);
+                                    let ok = validate_agreement_forest(&inst, &forest).is_ok();
+                                    eprintln!(
+                                        "[lagr-treedp] iter={} supp={} tree_dp_k={} forest_len={} valid={} (greedy {}) lp={:.1}",
+                                        iter, supp, groups.len(), forest.len(), ok, best_components, sol.objective
+                                    );
+                                    if ok && forest.len() < best_components {
+                                        best_forest = forest.clone();
+                                        best_components = best_forest.len();
+                                    }
+                                    // Capture the depth-0 result so `solve` can
+                                    // override its incumbent regardless of what
+                                    // the downstream pipeline recomputes.
+                                    if ok && unindexed {
+                                        let mut slot = self.treedp_reduced.lock().unwrap();
+                                        if slot.as_ref().is_none_or(|f| forest.len() < f.len()) {
+                                            *slot = Some(forest);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         // Pull the subgradient's dual center toward the LP duals.
                         // blend=1 → full snap; <1 keeps some subgradient drift.
                         let blend = self.config.hybrid_blend.clamp(0.0, 1.0);
