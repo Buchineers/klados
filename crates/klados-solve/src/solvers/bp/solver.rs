@@ -1184,16 +1184,32 @@ fn solve_node<P: Pricer, S: BranchSelector>(
                 );
                 tel.had_converged = true;
                 node_converged = true;
-                // Branch-CUT-and-price: tighten the converged LP with clique
-                // inequalities on the node-packing conflict graph. Valid cuts →
-                // the re-solved objective is a higher, valid LB. DEFAULT ON (this
-                // is what proves the high-frag multi-tree cores plain B&P can't);
-                // KLADOS_BP_NOCLIQUE reverts to plain branch-and-price.
-                if std::env::var("KLADOS_BP_NOCLIQUE").is_err() {
+                // Branch-CUT-and-price with clique inequalities on the node-packing
+                // conflict graph. DISABLED BY DEFAULT (opt-in KLADOS_BP_CLIQUE)
+                // because — when made SOUND — they give ZERO benefit. Full story:
+                //
+                // The clique cut `Σ_{c∈K} x_c ≤ 1` (K = columns pairwise sharing an
+                // internal LCA-path node, the af_validator's own nesting condition)
+                // IS a valid inequality. BUT an earlier version added it and only
+                // re-solved the LP over the FROZEN column pool — no re-pricing. That
+                // gives the restricted-master objective, an UPPER bound on the true
+                // LP relaxation that can EXCEED the IP optimum (n=38 core → 28.5 >
+                // opt 28) → invalid prune → 19 suboptimal "proven optimal" answers.
+                //
+                // The correct fix is the re-pricing loop below (after a cut changes
+                // the duals, re-run column generation to restore a valid lower
+                // bound). With it, answers are correct — but the measured bound gain
+                // is exactly 0.0 (pub124 core: 118.66 → 118.66): the node-packing
+                // clique cuts are DOMINATED by column generation (the pricer
+                // regenerates columns that route around them at no bound cost). So
+                // sound clique cuts add nothing and cost extra pricing → default OFF.
+                // The base node ≤1 cuts in the main CG loop DO tighten and stay on.
+                // Opt-in kept (correct via re-pricing) only for experiments.
+                if std::env::var("KLADOS_BP_CLIQUE").is_ok() {
                     let lp_before = lp.objective;
                     let mut cur = lp;
                     let mut total_added = 0usize;
-                    for _round in 0..40 {
+                    'clique_rounds: for _round in 0..40 {
                         let added = rmp.separate_and_add_clique(
                             state.columns(),
                             &cur.column_values,
@@ -1208,6 +1224,71 @@ fn solve_node<P: Pricer, S: BranchSelector>(
                             Ok(x) => x,
                             Err(_) => break,
                         };
+                        // RE-PRICE to convergence after the cut. This is REQUIRED for
+                        // soundness: a clique cut changes the duals, so improving
+                        // columns generally exist w.r.t. the new duals. Without
+                        // re-pricing, `cur.objective` is only the RESTRICTED-master
+                        // objective over the frozen pool — an UPPER bound on the true
+                        // LP relaxation, which can EXCEED the IP optimum → invalid
+                        // prune → wrong "proven" answer (measured: n=38 core → 28.5 >
+                        // opt 28). Re-pricing restores a valid lower bound in
+                        // [pre-cut lp, ip_opt]. (The base node cuts in the main CG
+                        // loop already re-price via `continue`; only this clique loop
+                        // did not — that was the soundness bug.)
+                        loop {
+                            let nc = rmp.separate_and_add_cuts(
+                                state.columns(),
+                                &cur.column_values,
+                                1.0e-6,
+                            );
+                            if nc > 0 {
+                                tel.cuts_added += nc;
+                                cur = match rmp.solve() {
+                                    Ok(x) => x,
+                                    Err(_) => break 'clique_rounds,
+                                };
+                                continue;
+                            }
+                            let res = pricer.price(
+                                &PricingContext {
+                                    trees,
+                                    num_leaves: state.num_leaves(),
+                                    alpha: &cur.leaf_duals,
+                                    beta: &cur.node_duals,
+                                    columns: state.columns(),
+                                    seen: state.seen(),
+                                    branchings,
+                                    terminate: cancel.flag(),
+                                    deadline: cancel.deadline(),
+                                },
+                                scratch,
+                            );
+                            match res {
+                                PricingResult::Found(cols) => {
+                                    let mut any = false;
+                                    for c in cols {
+                                        if state.add_column(c).is_some() {
+                                            rmp.add_column(state.columns().last().unwrap());
+                                            any = true;
+                                        }
+                                    }
+                                    if !any {
+                                        break;
+                                    }
+                                    cur = match rmp.solve() {
+                                        Ok(x) => x,
+                                        Err(_) => break 'clique_rounds,
+                                    };
+                                }
+                                // Improving-but-unemittable: LP not certified, stop
+                                // cutting and let the node branch on the pre-cut lp.
+                                PricingResult::Improving => {
+                                    cur.objective = lp_before;
+                                    break 'clique_rounds;
+                                }
+                                PricingResult::Converged => break,
+                            }
+                        }
                     }
                     if total_added > 0 {
                         debug!(
