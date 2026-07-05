@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use fixedbitset::FixedBitSet;
 use klados_core::af_validator::{AfValidation, validate_agreement_forest};
-use klados_core::kernelize::{expand_solution, kernelize_best};
+use klados_core::kernelize::{expand_solution, kernelize_best, restrict_instance_simple};
 use klados_core::lower_bound::{best_randomized_partition, pairwise_refine_ub};
 use klados_core::{Instance, SolverStats, Tree};
 use log::debug;
@@ -49,6 +49,12 @@ pub struct RootPoolConfig {
     pub lazy_audit: bool,
     pub shell_enum_max_passes: usize,
     pub anchor_k: u32,
+    /// Coarsen-Collapse: solve the master via the column-crossing tree-DP
+    /// (exact-over-pool, ms) instead of the pool-MIP.
+    pub use_treedp: bool,
+    /// Current recursion depth of the coupled-block re-pricing (0 at the top).
+    /// Bounded by `KLADOS_RP_RECURSE`; enriches the pool on unconverged large cores.
+    pub recurse_depth: usize,
 }
 
 impl Default for RootPoolConfig {
@@ -70,6 +76,8 @@ impl Default for RootPoolConfig {
             lazy_audit: false,
             shell_enum_max_passes: 32,
             anchor_k: 8,
+            use_treedp: false,
+            recurse_depth: 0,
         }
     }
 }
@@ -78,6 +86,10 @@ pub struct RootPoolSolver {
     stats: SolverStats,
     config: RootPoolConfig,
 }
+
+/// Guard so the env-gated y* decompose-solve experiment runs only at the
+/// outermost core, not in the recursive sub-solves it spawns.
+static YSTAR_IN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub struct RootPoolOutcome {
     pub forest: Vec<Tree>,
@@ -108,8 +120,10 @@ impl RootPoolSolver {
             if kern.instance.num_leaves < instance.num_leaves || kern.param_reduction > 0 {
                 if kern.instance.num_trees() == 2 && kern.instance.num_leaves >= 20 {
                     let mut all_certified = true;
+                    let sub_config = self.config.clone();
                     let mut solve_sub = |sub: &Instance| {
                         let mut solver = RootPoolSolver::new();
+                        solver.config = sub_config.clone();
                         let out = solver.solve_with_outcome(sub)?;
                         if !matches!(out.lower_bound, Some(lb) if lb >= out.forest.len()) {
                             all_certified = false;
@@ -155,8 +169,10 @@ impl RootPoolSolver {
         }
         if instance.num_trees() == 2 && instance.num_leaves >= 20 {
             let mut all_certified = true;
+            let sub_config = self.config.clone();
             let mut solve_sub = |sub: &Instance| {
                 let mut solver = RootPoolSolver::new();
+                solver.config = sub_config.clone();
                 let out = solver.solve_with_outcome(sub)?;
                 if !matches!(out.lower_bound, Some(lb) if lb >= out.forest.len()) {
                     all_certified = false;
@@ -205,6 +221,35 @@ impl Solver for RootPoolSolver {
 impl RootPoolSolver {
     fn solve_core(&mut self, instance: &Instance) -> Option<RootPoolOutcome> {
         let started = Instant::now();
+        // env overrides for CG budget (y* convergence experiment)
+        if let Ok(v) = std::env::var("KLADOS_RP_MAX_ITERS") {
+            if let Ok(x) = v.parse() {
+                self.config.max_cg_iters = x;
+            }
+        }
+        if let Ok(v) = std::env::var("KLADOS_RP_MAX_MS") {
+            if let Ok(x) = v.parse() {
+                self.config.max_wall_ms = x;
+            }
+        }
+        if std::env::var("KLADOS_RP_LAZY_AUDIT").is_ok() {
+            self.config.lazy_audit = true;
+        }
+        if let Ok(v) = std::env::var("KLADOS_RP_MIP_TL") {
+            if let Ok(x) = v.parse() {
+                self.config.mip_time_limit = x;
+            }
+        }
+        if let Ok(v) = std::env::var("KLADOS_RP_MIP_PASSES") {
+            if let Ok(x) = v.parse() {
+                self.config.mip_passes = x;
+            }
+        }
+        if let Ok(v) = std::env::var("KLADOS_RP_ANCHOR_K") {
+            if let Ok(x) = v.parse() {
+                self.config.anchor_k = x;
+            }
+        }
         let trees = &instance.trees;
         let n = instance.num_leaves as usize;
         if trees.is_empty() {
@@ -411,6 +456,137 @@ impl RootPoolSolver {
             }
         }
 
+        // y* marginal dump (env-gated, measure-only): write the converged root
+        // LP support (value + labels) so a separability probe can build the LP
+        // co-membership graph y*_{uv} = sum_{c ⊇ {u,v}} x*_c and test whether the
+        // *post-optimization* mass separates where the raw structure does not.
+        if let Ok(path) = std::env::var("KLADOS_YSTAR_DUMP")
+            && let Some(lp) = final_lp.as_ref()
+        {
+            let eps = 1.0e-9;
+            let col_lim = columns.len().min(lp.column_values.len());
+            use std::io::Write;
+            eprintln!(
+                "[ystar] dumping core n={} support={}",
+                n,
+                (0..col_lim).filter(|&i| lp.column_values[i] > eps).count()
+            );
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let _ = writeln!(
+                    f,
+                    "# CORE n={} m={} obj={:.6} ub={} support={} cg_iters={} converged={} cols={}",
+                    n,
+                    trees.len(),
+                    lp.objective,
+                    best_cols.len(),
+                    (0..col_lim).filter(|&i| lp.column_values[i] > eps).count(),
+                    cg_iters,
+                    converged,
+                    columns.len()
+                );
+                for i in 0..col_lim {
+                    let x = lp.column_values[i];
+                    if x > eps {
+                        let labs: Vec<String> =
+                            columns[i].labels().iter().map(|l| l.to_string()).collect();
+                        let _ = writeln!(f, "{:.6}\t{}", x, labs.join(","));
+                    }
+                }
+                use pace26io::newick::NewickWriter;
+                for t in trees.iter() {
+                    let _ = writeln!(f, "TREE\t{}", t.cursor().to_newick_string());
+                }
+            }
+        }
+
+        // y* DECOMPOSE-SOLVE-RECOMBINE experiment (env-gated, measure-only).
+        // Partition leaves by connected comps of the converged-LP support
+        // co-membership, solve each piece, recombine, validate, and report
+        // decomposed-sum vs whole-UB vs LP-LB. Tests soundness + quality of the
+        // y* decomposition on the irreducible (post-whidden) core.
+        if std::env::var("KLADOS_YSTAR_SOLVE").is_ok()
+            && converged
+            && !YSTAR_IN.swap(true, std::sync::atomic::Ordering::SeqCst)
+            && let Some(lp) = final_lp.as_ref()
+        {
+            let eps = 1.0e-9;
+            let col_lim = columns.len().min(lp.column_values.len());
+            let mut uf: Vec<usize> = (0..=n).collect();
+            fn find(uf: &mut [usize], mut x: usize) -> usize {
+                while uf[x] != x {
+                    uf[x] = uf[uf[x]];
+                    x = uf[x];
+                }
+                x
+            }
+            for i in 0..col_lim {
+                if lp.column_values[i] > eps {
+                    let labs = columns[i].labels();
+                    if labs.len() >= 2 {
+                        let r0 = find(&mut uf, labs[0] as usize);
+                        for &l in &labs[1..] {
+                            let r = find(&mut uf, l as usize);
+                            uf[r] = r0;
+                        }
+                    }
+                }
+            }
+            let mut groups: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
+            for l in 1..=n {
+                let r = find(&mut uf, l);
+                groups.entry(r).or_default().push(l as u32);
+            }
+            let ngroups = groups.len();
+            let largest = groups.values().map(|v| v.len()).max().unwrap_or(0);
+            let reference = instance.reference_tree();
+            let mut recombined: Vec<Tree> = Vec::new();
+            let mut decomposed_sum = 0usize;
+            for leaves in groups.values() {
+                let mut keep = FixedBitSet::with_capacity(n + 1);
+                for &l in leaves {
+                    keep.insert(l as usize);
+                }
+                let (sub, revmap) = restrict_instance_simple(instance, &keep);
+                let mut solver = RootPoolSolver::new();
+                solver.config.max_wall_ms = 8000;
+                let comps: Vec<Vec<u32>> = match solver.solve_with_outcome(&sub) {
+                    Some(out) => out
+                        .forest
+                        .iter()
+                        .map(|t| t.leaves().map(|nl| revmap[nl as usize]).collect())
+                        .collect(),
+                    None => leaves.iter().map(|&l| vec![l]).collect(),
+                };
+                decomposed_sum += comps.len();
+                for comp in comps {
+                    let mut ls = FixedBitSet::with_capacity(n + 1);
+                    for &l in &comp {
+                        ls.insert(l as usize);
+                    }
+                    recombined.push(Tree::forest_component(&ls, reference, n as u32));
+                }
+            }
+            let valid = matches!(
+                validate_agreement_forest(instance, &recombined),
+                AfValidation::Ok
+            );
+            eprintln!(
+                "[ystar-solve] core n={} groups={} largest={} decomposed_sum={} whole_ub={} lp_lb={:.1} valid={}",
+                n,
+                ngroups,
+                largest,
+                decomposed_sum,
+                best_cols.len(),
+                lp.objective,
+                valid
+            );
+            YSTAR_IN.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+
         // Experimental "dual-face" mode: integerize only the positive
         // support of the converged root LP.  This is the zero reduced-cost
         // face exposed by the duals, and on hard m>=3 instances it is often
@@ -507,9 +683,191 @@ impl RootPoolSolver {
             best_cols = labels;
         }
 
+        // y* COLUMN ENRICHMENT (env-gated): solve each y* co-membership piece,
+        // harvest its agreement blocks as valid whole-core columns (T1|B≅T2|B is
+        // induced-only, preserved under restriction), add to THE ONE pool, then
+        // let the master MIP below extract over the enriched pool. Single
+        // instance => no boundary/correspondence problem; attacks the thin-pool
+        // integrality gap.
+        if std::env::var("KLADOS_YSTAR_ENRICH").is_ok()
+            && converged
+            && !YSTAR_IN.swap(true, std::sync::atomic::Ordering::SeqCst)
+            && let Some(lp) = final_lp.as_ref()
+        {
+            let eps = 1.0e-9;
+            let col_lim = columns.len().min(lp.column_values.len());
+            let mut uf: Vec<usize> = (0..=n).collect();
+            fn find(uf: &mut [usize], mut x: usize) -> usize {
+                while uf[x] != x {
+                    uf[x] = uf[uf[x]];
+                    x = uf[x];
+                }
+                x
+            }
+            for i in 0..col_lim {
+                if lp.column_values[i] > eps {
+                    let labs = columns[i].labels();
+                    if labs.len() >= 2 {
+                        let r0 = find(&mut uf, labs[0] as usize);
+                        for &l in &labs[1..] {
+                            let r = find(&mut uf, l as usize);
+                            uf[r] = r0;
+                        }
+                    }
+                }
+            }
+            let mut groups: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
+            for l in 1..=n {
+                let r = find(&mut uf, l);
+                groups.entry(r).or_default().push(l as u32);
+            }
+            let pool_before = columns.len();
+            let mut harvested = 0usize;
+            for leaves in groups.values() {
+                if leaves.len() < 3 {
+                    continue;
+                }
+                let mut keep = FixedBitSet::with_capacity(n + 1);
+                for &l in leaves {
+                    keep.insert(l as usize);
+                }
+                let (sub, revmap) = restrict_instance_simple(instance, &keep);
+                let mut solver = RootPoolSolver::new();
+                solver.config.max_wall_ms = 8000;
+                if let Some(out) = solver.solve_with_outcome(&sub) {
+                    for comp in &out.forest {
+                        let orig: Vec<u32> =
+                            comp.leaves().map(|nl| revmap[nl as usize]).collect();
+                        if orig.len() < 2 {
+                            continue;
+                        }
+                        if seen.insert(orig.clone())
+                            && let Some(col) = builder.try_build(orig, trees)
+                        {
+                            rmp.add_column(&col);
+                            columns.push(col);
+                            harvested += 1;
+                        }
+                    }
+                }
+            }
+            eprintln!(
+                "[ystar-enrich] core n={} groups={} pool {}→{} (+{} harvested cols)",
+                n,
+                groups.len(),
+                pool_before,
+                columns.len(),
+                harvested
+            );
+            YSTAR_IN.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        // INTERLEAVED RECURSION: on a large core whose LP did NOT converge, the
+        // support is thin in the "coupled block" (the largest crossing-graph
+        // component). Restrict to it, re-price recursively (smaller ⇒ CG
+        // converges) and fold the sub-solution's components back into the pool
+        // as columns; the tree-DP below then uses them. Bounded by
+        // `KLADOS_RP_RECURSE` (depth cap).
+        let recurse_cap: usize = std::env::var("KLADOS_RP_RECURSE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        if self.config.recurse_depth < recurse_cap
+            && !converged
+            && n >= 400
+            && let Some(lp) = final_lp.as_ref()
+        {
+            let coupled =
+                crate::solvers::collapse::coupled_leaves(&columns, &lp.column_values, n);
+            if coupled.len() >= 40 {
+                let mut keep = FixedBitSet::with_capacity(n + 1);
+                for &l in &coupled {
+                    keep.insert(l as usize);
+                }
+                let (sub, revmap) = restrict_instance_simple(instance, &keep);
+                let mut subcfg = self.config.clone();
+                subcfg.recurse_depth += 1;
+                // bound recursion cost: each level gets half the parent budget
+                subcfg.max_wall_ms = (self.config.max_wall_ms / 2).max(8000);
+                let mut subsolver = RootPoolSolver::new();
+                subsolver.config = subcfg;
+                let pool_before = columns.len();
+                let mut harvested = 0usize;
+                if let Some(out) = subsolver.solve_with_outcome(&sub) {
+                    for comp in &out.forest {
+                        let orig: Vec<u32> =
+                            comp.leaves().map(|nl| revmap[nl as usize]).collect();
+                        if orig.len() < 2 {
+                            continue;
+                        }
+                        if seen.insert(orig.clone())
+                            && let Some(col) = builder.try_build(orig, trees)
+                        {
+                            rmp.add_column(&col);
+                            columns.push(col);
+                            harvested += 1;
+                        }
+                    }
+                }
+                eprintln!(
+                    "[recurse] core n={} depth={} coupled={} pool {}→{} (+{} cols)",
+                    n,
+                    self.config.recurse_depth,
+                    coupled.len(),
+                    pool_before,
+                    columns.len(),
+                    harvested
+                );
+            }
+        }
+
+        // COARSEN-COLLAPSE: solve the master (min-components partition over the
+        // converged pool) as MAX-WEIGHT INDEPENDENT SET in the column-crossing
+        // graph via tree-DP. On the LP-coarsened pool this graph has small
+        // treewidth, so this is an exact, millisecond master solve that beats
+        // the generic pool-MIP. Falls through to the MIP if treewidth too large.
+        let mut treedp_won = false;
+        if (self.config.use_treedp || std::env::var("KLADOS_RP_TREEDP").is_ok())
+            && let Some(lp) = final_lp.as_ref()
+        {
+            let tw_cap: usize = std::env::var("KLADOS_RP_TREEDP_TWCAP")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(20);
+            match crate::solvers::collapse::master_via_tree_dp(&columns, &lp.column_values, n, tw_cap)
+            {
+                Some(groups) => {
+                    let forest = labels_to_trees(instance, &groups);
+                    let valid =
+                        matches!(validate_agreement_forest(instance, &forest), AfValidation::Ok);
+                    let lp_ceil = (lp.objective - 1.0e-6).ceil() as usize;
+                    eprintln!(
+                        "[tree-dp] n={} master={} lp_ceil={} gap={} valid={} conv={} {}",
+                        n,
+                        groups.len(),
+                        lp_ceil,
+                        groups.len().saturating_sub(lp_ceil),
+                        valid,
+                        converged,
+                        if valid && converged && groups.len() == lp_ceil {
+                            "PROVEN"
+                        } else {
+                            ""
+                        }
+                    );
+                    if valid && groups.len() < best_cols.len() {
+                        best_cols = groups;
+                        treedp_won = true;
+                    }
+                }
+                None => eprintln!("[tree-dp] n={} tw>{} bail", n, tw_cap),
+            }
+        }
+
         // If the root LP already meets the incumbent, the pool MIP cannot
         // improve anything.  This is the fast certification case root-corridor
         // is looking for.
+        let _ = treedp_won;
         if !support_only
             && !shell_only
             && !matches!(root_lower_bound, Some(lb) if lb >= best_cols.len())
@@ -1047,6 +1405,28 @@ pub fn main() {
         RunConfig {
             track: Track::Heuristic,
             specific: RootPoolConfig::default(),
+            ..Default::default()
+        },
+    );
+}
+
+/// Coarsen-Collapse solver: kernelize + decompose, then solve each irreducible
+/// core's master via the column-crossing tree-DP (exact-over-pool, ms). Always
+/// emits (heuristic track) — returns the near-optimal partition fast where the
+/// exact B&P proof would time out.
+pub fn collapse_main() {
+    let specific = RootPoolConfig {
+        use_treedp: true,
+        // more CG budget per core so the support (hence the tree-DP master) is
+        // well-converged; the tree-DP itself is ms.
+        max_wall_ms: 10_000,
+        ..RootPoolConfig::default()
+    };
+    crate::run(
+        RootPoolSolver::new(),
+        RunConfig {
+            track: Track::Heuristic,
+            specific,
             ..Default::default()
         },
     );

@@ -412,6 +412,286 @@ impl Rmp {
         added
     }
 
+    /// Separate violated CLIQUE inequalities on the node-packing conflict graph.
+    /// Two columns conflict iff they share a tree node (can't both be selected);
+    /// for a clique K of pairwise-conflicting columns, `sum_{c∈K} x_c ≤ 1`. This
+    /// strengthens the base node-≤1 rows when conflicts run through DIFFERENT
+    /// nodes (a single node-row can't see it). Greedy weighted-clique separation
+    /// from high-value fractional seeds. Adds ≤ `max_new` most-violated cuts.
+    ///
+    /// The conflict graph is built over the ACTIVE (fractional) columns each
+    /// call: that set is small, so the degree cap rarely fires and the cuts stay
+    /// full-strength. (Building once over ALL columns to reuse across rounds made
+    /// the cap fire on the all-column count as the pool grew, dropping cuts on
+    /// popular nodes → weaker bounds → far more branching. Do NOT do that.)
+    pub fn separate_and_add_clique(
+        &mut self,
+        columns: &[AfColumn],
+        column_values: &[f64],
+        eps: f64,
+        max_new: usize,
+    ) -> usize {
+        use std::collections::{HashMap, HashSet};
+        let max_nodes = self.max_nodes;
+        let col_nodes = |ci: usize| -> Vec<u32> {
+            let mut out = Vec::new();
+            for (ti, nodes) in columns[ci].coverage().nodes_per_tree.iter().enumerate() {
+                let base = (ti * max_nodes) as u32;
+                for &nd in nodes {
+                    out.push(base + nd as u32);
+                }
+            }
+            out
+        };
+        let active: Vec<usize> = (0..columns.len().min(column_values.len()))
+            .filter(|&ci| column_values[ci] > eps)
+            .collect();
+        // node -> active cols covering it; conflict edge = shared node.
+        let mut node_cols: HashMap<u32, Vec<usize>> = HashMap::new();
+        for &ci in &active {
+            for nd in col_nodes(ci) {
+                node_cols.entry(nd).or_default().push(ci);
+            }
+        }
+        let mut nbr: HashMap<usize, HashSet<usize>> = HashMap::new();
+        for cols in node_cols.values() {
+            if cols.len() > 400 {
+                continue; // skip ubiquitous nodes (near-universal, uninformative)
+            }
+            for i in 0..cols.len() {
+                for j in (i + 1)..cols.len() {
+                    nbr.entry(cols[i]).or_default().insert(cols[j]);
+                    nbr.entry(cols[j]).or_default().insert(cols[i]);
+                }
+            }
+        }
+        let n_active = active.len();
+        // Enumerate violated cliques into `scored`. Selection quality drives the
+        // node count (which drives ~91% of runtime), so this matters a lot.
+        //
+        // Two selection tweaks, now auto-driven by the m-gate below (env-overridable):
+        //   `ortho` = ORTHOGONALITY FILTER: skip a clique sharing >50% columns with
+        //     an already-chosen one. `div` = DETERMINISM: break clique growth/sort
+        //     ties by column index (reproducible; kills the run-to-run node variance).
+        //   NEW DEFAULT: at low m use div+ortho (the validated reproducible 2276 on
+        //     pub122), at high m use plain random greedy (the validated 133 config).
+        //   Overrides: KLADOS_BP_CLIQUE_ORTHO forces filter on; _NOORTHO forces it
+        //     off; _DIV forces determinism on; _MAXM tunes the gate.
+        //
+        // Gate the filter on m = NUMBER OF TREES. This is THE discriminator
+        // (measured 2026-07-05): the orthogonality filter helps at LOW m (few
+        // trees → node-packing conflicts run through few nodes → greedy cliques
+        // heavily OVERLAP → the dropped cuts are redundant → leaner LP, ~3-4x
+        // fewer nodes: pub122 m16 gives 2276 vs greedy's 2843-9875) but HURTS at
+        // HIGH m (many trees → conflicts are DIVERSE → the "overlapping" cuts each
+        // add bound → filtering weakens the LP → more branching: m34n93 428→729s).
+        // n_active does NOT separate these (pub122's hard n=75 core root≈181,
+        // m34n93≈204 — nearly equal); m does (16 vs 34).
+        //
+        // DEFAULT maxm=16 is CONSERVATIVE by design: it enables the filter only for
+        // the PROVEN-good low-m regime (m16 pub122: reproducible 2276 vs greedy's
+        // 565s+ blowup) and leaves EVERYTHING m≥17 on the validated 133-config plain
+        // greedy. Rationale: the handoff measured ortho+div pushing a HIGH-m
+        // near-budget instance to 1676s (m20n95, ~1800s edge) — a 1.7x filter hit
+        // there risks timeout → losing instances. So do NOT raise maxm past ~16
+        // without A/B-ing the near-budget m17-24 band first (env KLADOS_BP_CLIQUE_MAXM).
+        let num_trees = self.node_to_cols.len();
+        let maxm: usize = std::env::var("KLADOS_BP_CLIQUE_MAXM")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(16);
+        let ortho = if std::env::var("KLADOS_BP_CLIQUE_NOORTHO").is_ok() {
+            false
+        } else if std::env::var("KLADOS_BP_CLIQUE_ORTHO").is_ok() {
+            true
+        } else {
+            num_trees <= maxm
+        };
+        // When the filter is ON (sparse core), also take the DETERMINISTIC clique
+        // growth/sort tie-break: ortho ALONE is non-deterministic (HashSet order)
+        // and its draw varies (pub122/n75: 2276↔2843 nodes, 120s↔239s). The
+        // validated good combo is div+ortho (reproducible 2276). On the greedy
+        // (dense) path we keep plain random greedy = the validated 133 config.
+        let div = ortho || std::env::var("KLADOS_BP_CLIQUE_DIV").is_ok();
+        if std::env::var("KLADOS_BP_CLIQUE_DIAG").is_ok() {
+            eprintln!(
+                "[clique-sep] m={num_trees} maxm={maxm} n_active={n_active} ortho={ortho} div={div}"
+            );
+        }
+        let mut scored: Vec<(Vec<usize>, f64)> = Vec::new();
+        if std::env::var("KLADOS_BP_CLIQUE_EXACT").is_ok() {
+            // EXACT: Bron–Kerbosch enumerates ALL maximal cliques (max-weight
+            // cuts). Measured WORSE than greedy (concentrated/overlapping cuts).
+            Self::bron_kerbosch_cliques(&active, &nbr, column_values, eps, &mut scored);
+        } else {
+            // GREEDY: one maximal clique per high-x seed.
+            let empty: HashSet<usize> = HashSet::new();
+            let mut seeds = active.clone();
+            seeds.sort_by(|&a, &b| {
+                column_values[b]
+                    .partial_cmp(&column_values[a])
+                    .unwrap()
+                    .then(a.cmp(&b))
+            });
+            let mut seen: HashSet<Vec<usize>> = HashSet::new();
+            const SEED_CAP: usize = 400;
+            for &seed in seeds.iter().take(SEED_CAP) {
+                let mut clique = vec![seed];
+                let mut weight = column_values[seed];
+                let mut cand: HashSet<usize> = nbr.get(&seed).cloned().unwrap_or_default();
+                loop {
+                    let best = cand.iter().cloned().max_by(|&a, &b| {
+                        let c = column_values[a].partial_cmp(&column_values[b]).unwrap();
+                        // deterministic tie-break (lowest index) only in div mode
+                        if div { c.then(b.cmp(&a)) } else { c }
+                    });
+                    let v = match best {
+                        Some(v) => v,
+                        None => break,
+                    };
+                    clique.push(v);
+                    weight += column_values[v];
+                    let vn = nbr.get(&v).unwrap_or(&empty);
+                    cand = cand.intersection(vn).cloned().collect();
+                    cand.remove(&v);
+                }
+                if clique.len() >= 2 && weight > 1.0 + eps {
+                    let mut key = clique.clone();
+                    key.sort_unstable();
+                    if seen.insert(key.clone()) {
+                        scored.push((key, weight));
+                    }
+                }
+            }
+        }
+        if scored.is_empty() {
+            return 0;
+        }
+        // weight desc; div adds a deterministic tie-break (lexicographic column
+        // set) so the whole selection is reproducible. Default path unchanged.
+        if div {
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then(a.0.cmp(&b.0)));
+        } else {
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        }
+        // Select up to `max_new` cuts. ortho: skip a clique sharing >50% of its
+        // columns with an already-chosen one (opt-in; hurts dense high-m graphs).
+        let chosen: Vec<Vec<usize>> = if ortho {
+            let mut sel: Vec<Vec<usize>> = Vec::new();
+            for (clique, _w) in scored.iter() {
+                if sel.len() >= max_new {
+                    break;
+                }
+                let overlaps = sel.iter().any(|s| {
+                    let shared = clique.iter().filter(|&&col| s.contains(&col)).count();
+                    (shared as f64) > 0.5 * (clique.len() as f64)
+                });
+                if !overlaps {
+                    sel.push(clique.clone());
+                }
+            }
+            sel
+        } else {
+            scored.into_iter().take(max_new).map(|(c, _)| c).collect()
+        };
+        let mut added = 0usize;
+        for clique in chosen {
+            let indices: Vec<i32> = clique.iter().map(|&ci| self.col_handle[ci]).collect();
+            let values = vec![1.0_f64; indices.len()];
+            let ptr = self.model.as_mut().expect("model present").as_mut_ptr();
+            unsafe {
+                highs_sys::Highs_addRow(
+                    ptr,
+                    f64::NEG_INFINITY,
+                    1.0,
+                    indices.len() as i32,
+                    indices.as_ptr(),
+                    values.as_ptr(),
+                );
+            }
+            self.num_rows += 1;
+            added += 1;
+        }
+        added
+    }
+
+    /// Enumerate all violated maximal cliques of the conflict graph via
+    /// Bron–Kerbosch with pivoting. Deterministic (fixed vertex order) and exact
+    /// over maximal cliques (a max-weight clique is always maximal), so it finds
+    /// the strongest cuts. Bounded by a recursion budget for dense graphs.
+    fn bron_kerbosch_cliques(
+        active: &[usize],
+        nbr: &std::collections::HashMap<usize, std::collections::HashSet<usize>>,
+        values: &[f64],
+        eps: f64,
+        out: &mut Vec<(Vec<usize>, f64)>,
+    ) {
+        // Isolated vertices can't form a clique with weight > 1 (a singleton has
+        // weight ≤ 1 at a fractional LP), so seed P only with vertices that have
+        // at least one conflict edge.
+        let mut p: Vec<usize> = active
+            .iter()
+            .cloned()
+            .filter(|v| nbr.get(v).is_some_and(|s| !s.is_empty()))
+            .collect();
+        let mut r: Vec<usize> = Vec::new();
+        let mut x: Vec<usize> = Vec::new();
+        let mut budget: usize = 2_000_000;
+        Self::bk_recurse(&mut r, &mut p, &mut x, nbr, values, eps, out, &mut budget);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bk_recurse(
+        r: &mut Vec<usize>,
+        p: &mut Vec<usize>,
+        x: &mut Vec<usize>,
+        nbr: &std::collections::HashMap<usize, std::collections::HashSet<usize>>,
+        values: &[f64],
+        eps: f64,
+        out: &mut Vec<(Vec<usize>, f64)>,
+        budget: &mut usize,
+    ) {
+        if *budget == 0 {
+            return;
+        }
+        *budget -= 1;
+        if p.is_empty() && x.is_empty() {
+            if r.len() >= 2 {
+                let w: f64 = r.iter().map(|&c| values[c]).sum();
+                if w > 1.0 + eps {
+                    let mut k = r.clone();
+                    k.sort_unstable();
+                    out.push((k, w));
+                }
+            }
+            return;
+        }
+        let default_empty = std::collections::HashSet::new();
+        // pivot in P∪X maximising |P ∩ N(u)| (Tomita) → fewest branches
+        let mut pivot = usize::MAX;
+        let mut best: i64 = -1;
+        for &u in p.iter().chain(x.iter()) {
+            let un = nbr.get(&u).unwrap_or(&default_empty);
+            let cnt = p.iter().filter(|w| un.contains(w)).count() as i64;
+            if cnt > best {
+                best = cnt;
+                pivot = u;
+            }
+        }
+        let pn = nbr.get(&pivot).unwrap_or(&default_empty);
+        let cand: Vec<usize> = p.iter().filter(|v| !pn.contains(v)).cloned().collect();
+        for v in cand {
+            let vn = nbr.get(&v).unwrap_or(&default_empty);
+            let mut np: Vec<usize> = p.iter().filter(|w| vn.contains(w)).cloned().collect();
+            let mut nx: Vec<usize> = x.iter().filter(|w| vn.contains(w)).cloned().collect();
+            r.push(v);
+            Self::bk_recurse(r, &mut np, &mut nx, nbr, values, eps, out, budget);
+            r.pop();
+            p.retain(|&w| w != v);
+            x.push(v);
+        }
+    }
+
     /// Apply per-column bounds derived from `branchings`. RCVF-fixed columns
     /// stay pinned at zero regardless of the branching state.
     pub fn apply_bounds(&mut self, columns: &[AfColumn], branchings: &Branchings) {

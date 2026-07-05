@@ -73,6 +73,11 @@ pub fn catalog() -> &'static [SolverInfo] {
             run: root_pool::main,
         },
         SolverInfo {
+            name: "collapse",
+            description: "Coarsen-Collapse: CG + column-crossing tree-DP master (fast, anytime)",
+            run: root_pool::collapse_main,
+        },
+        SolverInfo {
             name: "overlay-exchange",
             description: "Incumbent-overlay replacement (prototype)",
             run: overlay_exchange::main,

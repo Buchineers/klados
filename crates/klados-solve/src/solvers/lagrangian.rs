@@ -83,6 +83,11 @@ const DECOMP_ATTEMPT: Duration = Duration::from_secs(25);
 /// time-limit overrun that blows the SIGTERM grace window).
 const MIP_GAP_LIMIT: usize = 4;
 
+/// Max pool size for the post-ILS set-packing MIP (`pool_mip`). Above this the
+/// LP over the pool is slow enough to risk overrunning the SIGTERM grace with no
+/// output — giants (~60k-col pools) are excluded; mids/smalls (~10k) run.
+const POOL_MIP_MAX_COLS: usize = 15_000;
+
 /// Safe ceiling on the anchor DP's dense `n₀·n₁` table (kept under the
 /// pricer's own ~64M-cell cap). Above this we price in tree-local windows.
 const CELL_CAP_SAFE: u64 = 60_000_000;
@@ -181,8 +186,49 @@ pub struct LagrangianConfig {
     pub dive_warmup: f64,
     pub lns_max: usize,
     pub lns_cap_ms: u64,
+    /// Relax the LNS clean-cut: when a subtree region's touched incumbent
+    /// components leak outside the subtree, re-solve the *closure* (the union of
+    /// touched components) instead of skipping the region. The final
+    /// `validate_agreement_forest` rejects any node-overlapping splice, so this
+    /// only ever broadens the neighborhood. Off ⇒ original strict subtree cut.
+    pub lns_closure: bool,
+    /// Max leaves in a closure-mode re-solve (strict mode is implicitly bounded
+    /// by `lns_max`). Keeps the capped exact B&P re-solve tractable.
+    pub lns_closure_cap: usize,
+    /// Per-region exact-resolve cap (ms) for *leaked* closure regions on
+    /// instances with `num_leaves <= lns_closure_bign`. Shorter than `lns_cap_ms`
+    /// so a non-proving leaked region steals less of the cycle from productive
+    /// clean cuts — small/mid instances cycle faster and gain more. Clean cuts
+    /// always keep the full `lns_cap_ms`.
+    pub lns_closure_cap_ms: u64,
+    /// Leaf threshold above which leaked closure re-solves get the *full*
+    /// `lns_cap_ms` instead of the shorter `lns_closure_cap_ms`: giant instances
+    /// have larger, higher-distance leaked regions that need the full cap to
+    /// prove the merge (measured: short cap loses the big giant gains).
+    pub lns_closure_bign: usize,
+    /// Iterated-local-search perturbation: when a full LNS cycle produces zero
+    /// accepts (the incumbent has converged at the current region set), restore
+    /// the best-ever forest, split a few random components along their own edges
+    /// (a valid, k-increasing kick), and continue — the LNS then re-merges the
+    /// pieces differently, escaping the local optimum. The best-ever forest is
+    /// tracked and returned, so a kick never worsens the result.
+    pub lns_perturb: bool,
+    /// Number of components to split per perturbation kick.
+    pub lns_perturb_strength: usize,
     pub bnb: bool,
     pub topdown_windows: bool,
+    /// After the packing ILS, solve the set-packing over the column pool exactly
+    /// (support-restricted branch-and-cut MIP over HiGHS) and keep its forest if
+    /// it has fewer components — the greedy ILS routinely leaves ~0.5-1% in the
+    /// pool that the MIP recovers. Monotone (only ever replaces the incumbent
+    /// with a strictly smaller valid AF). Off by default; on for the heuristic
+    /// entry. Gated to tractable pools (`POOL_MIP_MAX_COLS`). See
+    /// [`Self::pool_mip_probe`].
+    pub pool_mip: bool,
+    /// Per-MIP-solve time cap (ms) for `pool_mip`. Kept well under the budget
+    /// grace so a HiGHS solve (which does not poll the stop flag) cannot overrun
+    /// the SIGTERM window.
+    pub pool_mip_ms: u64,
 }
 
 impl Default for LagrangianConfig {
@@ -218,9 +264,17 @@ impl Default for LagrangianConfig {
             dive_reopt: 3,
             dive_warmup: 0.4,
             lns_max: 250,
-            lns_cap_ms: 2_000,
+            lns_cap_ms: 1_000,
+            lns_closure: false,
+            lns_closure_cap: 400,
+            lns_closure_cap_ms: 400,
+            lns_closure_bign: 5_000,
+            lns_perturb: false,
+            lns_perturb_strength: 4,
             bnb: false,
             topdown_windows: false,
+            pool_mip: false,
+            pool_mip_ms: 15_000,
         }
     }
 }
@@ -267,6 +321,10 @@ pub struct LagrangianSolver {
     /// instance, and tripping the global `terminate` there would abandon the
     /// real flat solve. Gates every approx-target check.
     abort_armed: AtomicBool,
+    /// Best depth-0 forest found by the tree-DP exact extraction over the pool
+    /// LP support (reduced labels). Captured in the subgradient loop; `solve`
+    /// overrides its incumbent with this before expansion. Cleared per solve.
+    treedp_reduced: std::sync::Mutex<Option<Vec<Tree>>>,
 }
 
 impl LagrangianSolver {
@@ -282,6 +340,7 @@ impl LagrangianSolver {
             param_reduction: AtomicUsize::new(0),
             abort_k_reduced: AtomicUsize::new(usize::MAX),
             abort_armed: AtomicBool::new(false),
+            treedp_reduced: std::sync::Mutex::new(None),
         }
     }
 
@@ -317,6 +376,7 @@ impl LagrangianSolver {
         self.abort_k_reduced.store(usize::MAX, Ordering::Relaxed);
         self.abort_armed.store(false, Ordering::Relaxed);
         self.stats.lower_bound = 0;
+        *self.treedp_reduced.lock().unwrap() = None;
 
         // Compute the Chen 2-approx forest up front (original labels): it is O(n)
         // and drives the lower-bound-track fast path below. It is no longer
@@ -490,6 +550,16 @@ impl LagrangianSolver {
         // EVERY remaining second re-solving incumbent regions exactly (LNS) and
         // splicing back any that shrink — monotone, never worsens the forest.
         // Default ON (`LagrangianConfig.lns_on = false` disables). Runs until deadline/SIGTERM.
+        // Override with the tree-DP exact extraction if it beat the pipeline's
+        // incumbent (over the reduced core). Exact extraction ≥ greedy on the
+        // same pool, so this only ever helps.
+        if let Some(tf) = self.treedp_reduced.lock().unwrap().take()
+            && tf.len() < reduced_forest.len()
+            && validate_agreement_forest(reduced, &tf).is_ok()
+        {
+            debug!("[lagr] tree-DP override: {} -> {}", reduced_forest.len(), tf.len());
+            reduced_forest = tf;
+        }
         let lns_on = self.config.lns_on;
         if lns_on && !proved && reduced.num_trees() == 2 && !self.terminate.load(Ordering::Relaxed)
         {
@@ -790,7 +860,14 @@ impl LagrangianSolver {
         // Periodically solve the exact LP over the current pool and overwrite
         // α/β with the LP duals: the pricer + greedy then aim at the true LP
         // optimum while the subgradient keeps diversifying around it.
-        let hybrid = self.config.hybrid;
+        // Tree-DP exact extraction over the rich pool: DEFAULT ON (opt-out via
+        // KLADOS_LAGR_NO_TREEDP). It runs over the periodic exact-LP support, so it
+        // implies `hybrid`. It is a best-of (the override in solve_reduced_core
+        // only takes the tree-DP forest when it beats greedy+LS), so it is never
+        // worse; measured -3..-82 components vs default on n=1287..8964.
+        let treedp_on = std::env::var("KLADOS_LAGR_NO_TREEDP").is_err();
+        let hybrid =
+            treedp_on || self.config.hybrid || std::env::var("KLADOS_LAGR_HYBRID").is_ok();
         let refresh_every = self.config.refresh_every.max(1);
         let mut h_builder = ColumnBuilder::new(trees);
         let mut h_afpool: Vec<AfColumn> = Vec::new();
@@ -821,6 +898,10 @@ impl LagrangianSolver {
         // on a reserved time fraction — so it works with no deadline (the
         // default, SIGTERM-driven) instead of needing a hardcoded horizon to
         // carve a tail from. `LagrangianConfig.no_ls` disables it.
+        // Keep LS ON even with tree-DP extraction: LS refines best_forest via
+        // pool indices, and the tree-DP result is preserved separately in
+        // `treedp_reduced` and re-applied as a best-of override in
+        // solve_reduced_core — so LS can only help, never clobber the tree-DP gain.
         let ls_on = !self.config.no_ls;
 
         // Config-gated per-center profiling of the hot loop.
@@ -1064,6 +1145,53 @@ impl LagrangianSolver {
                                 Err(_) => break,
                             }
                         }
+                        // EXPERIMENT: tree-DP exact extraction over lagrangian's
+                        // rich-pool LP support vs its greedy incumbent. If the
+                        // support's column-crossing graph is tw-small, this
+                        // captures the ~3% the greedy leaves (that the pool-MIP
+                        // is too slow for), by construction ≥ greedy.
+                        if treedp_on {
+                            let tw_cap: usize = std::env::var("KLADOS_LAGR_TREEDP_TWCAP")
+                                .ok()
+                                .and_then(|v| v.parse().ok())
+                                .unwrap_or(24);
+                            let supp = sol
+                                .column_values
+                                .iter()
+                                .filter(|&&x| x > 1e-9)
+                                .count();
+                            if let Some(groups) = crate::solvers::collapse::master_via_tree_dp(
+                                &h_afpool,
+                                &sol.column_values,
+                                n as usize,
+                                tw_cap,
+                            ) {
+                                if groups.len() < best_components {
+                                    let forest =
+                                        forest_from_partition(&groups, trees, n, unindexed);
+                                    let inst = Instance::new(trees.to_vec(), n);
+                                    let ok = validate_agreement_forest(&inst, &forest).is_ok();
+                                    debug!(
+                                        "[lagr-treedp] iter={} supp={} tree_dp_k={} forest_len={} valid={} (greedy {}) lp={:.1}",
+                                        iter, supp, groups.len(), forest.len(), ok, best_components, sol.objective
+                                    );
+                                    if ok && forest.len() < best_components {
+                                        best_forest = forest.clone();
+                                        best_components = best_forest.len();
+                                    }
+                                    // Capture the depth-0 result so `solve` can
+                                    // override its incumbent regardless of what
+                                    // the downstream pipeline recomputes.
+                                    if ok && unindexed {
+                                        let mut slot = self.treedp_reduced.lock().unwrap();
+                                        if slot.as_ref().is_none_or(|f| forest.len() < f.len()) {
+                                            *slot = Some(forest);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         // Pull the subgradient's dual center toward the LP duals.
                         // blend=1 → full snap; <1 keeps some subgradient drift.
                         let blend = self.config.hybrid_blend.clamp(0.0, 1.0);
@@ -1423,6 +1551,24 @@ impl LagrangianSolver {
                 best_components = k1;
                 best_forest = build_forest(&pool, &sel1, trees, n, unindexed);
             }
+        }
+
+        // ---- Exact set-packing MIP over the pool (support-restricted branch-
+        //      and-cut). Recovers the ~0.5-1% the greedy ILS leaves in the pool.
+        //      Gated to tractable pools: a big-pool LP/MIP would overrun the
+        //      SIGTERM grace with no output. Only run with a safe time margin. ----
+        let mip_time_ok =
+            deadline.is_none_or(|d| d.saturating_duration_since(Instant::now()).as_secs() >= 25);
+        if self.config.pool_mip
+            && !proved
+            && pool.len() <= POOL_MIP_MAX_COLS
+            && mip_time_ok
+            && !self.terminate.load(Ordering::Relaxed)
+            && let Some((forest, comps)) =
+                self.pool_mip_probe(trees, n, nl, &pool, best_components, deadline, start)
+        {
+            best_components = comps;
+            best_forest = forest;
         }
 
         debug!(
@@ -2442,7 +2588,16 @@ impl LagrangianSolver {
                 if cur.is_empty() {
                     break;
                 }
-                let kick = 2 + (stalls % 6);
+                // On large forests the fixed 2-7 kick is ~0.1% of the packing —
+                // far too small to escape the plateau. Scale it with the packing
+                // size there (measured: giant ILS wastes ~150s post-plateau that
+                // a real diversification can use). Small forests keep the tuned
+                // fixed kick (mid/small behavior unchanged).
+                let kick = if cur.len() > 3000 {
+                    (cur.len() / 80).max(8) + (stalls % 6)
+                } else {
+                    2 + (stalls % 6)
+                };
                 for _ in 0..kick {
                     rng ^= rng << 13;
                     rng ^= rng >> 7;
@@ -2470,6 +2625,139 @@ impl LagrangianSolver {
         (0..ncol).filter(|&i| best_in_sel[i]).collect()
     }
 
+    /// Exact set-packing over the column pool (see `LagrangianConfig.pool_mip`),
+    /// returning the decoded forest when it beats `incumbent_k`. The pool + all
+    /// singletons become an `Rmp`; its LP is solved with lazy node-disjointness
+    /// cut separation; the MIP is restricted to the LP-support columns (so it
+    /// proves fast) and solved under a MIP↔cut-separation loop (the lazy node
+    /// rows mean a raw MIP can pick overlapping columns). The greedy ILS is a
+    /// strong but not exact set-packing heuristic, so the MIP routinely finds a
+    /// packing a few components smaller that lives in the pool already.
+    fn pool_mip_probe(
+        &self,
+        trees: &[Tree],
+        n: u32,
+        nl: usize,
+        pool: &[Block],
+        incumbent_k: usize,
+        deadline: Option<Instant>,
+        start: Instant,
+    ) -> Option<(Vec<Tree>, usize)> {
+        // Pool blocks + all singletons → AfColumns (singletons make every leaf
+        // coverable, so the MIP objective is exactly k).
+        let mut builder = ColumnBuilder::new(trees);
+        let mut afpool: Vec<AfColumn> = Vec::new();
+        for l in 1..=n {
+            if let Some(c) = builder.try_build(vec![l], trees) {
+                afpool.push(c);
+            }
+        }
+        for b in pool {
+            if b.labels.len() >= 2
+                && let Some(c) = builder.try_build(b.labels.clone(), trees)
+            {
+                afpool.push(c);
+            }
+        }
+        let mut rmp = Rmp::new(&afpool, trees, nl);
+        let branchings = Branchings::default();
+        // LP + lazy node-disjointness cut separation until the LP is a valid AF
+        // relaxation (no node-row violations).
+        rmp.apply_bounds(&afpool, &branchings);
+        let mut sol = rmp.solve().ok()?;
+        loop {
+            if self.terminate.load(Ordering::Relaxed)
+                || deadline.is_some_and(|d| Instant::now() >= d)
+            {
+                return None;
+            }
+            let cuts = rmp.separate_and_add_cuts(&afpool, &sol.column_values, 1e-6);
+            if cuts == 0 {
+                break;
+            }
+            rmp.apply_bounds(&afpool, &branchings);
+            sol = rmp.solve().ok()?;
+        }
+        let lp = sol.objective;
+        // The whole-pool MIP is intractable at scale (the ~1% integer gap is too
+        // wide for reduced-cost fixing to shrink it). Restrict the MIP to the
+        // LP-SUPPORT columns (the ones the fractional optimum actually uses) plus
+        // all singletons: a few-hundred-column MIP HiGHS proves in well under a
+        // second, and its integer optimum over the support is a strong primal.
+        let support: Vec<AfColumn> = (0..afpool.len())
+            .filter(|&i| afpool[i].labels().len() == 1 || sol.column_values[i] > 1e-4)
+            .map(|i| afpool[i].clone())
+            .collect();
+        let mut rmp2 = Rmp::new(&support, trees, nl);
+        rmp2.apply_bounds(&support, &branchings);
+        let mut sol2 = rmp2.solve().ok()?;
+        loop {
+            if self.terminate.load(Ordering::Relaxed)
+                || deadline.is_some_and(|d| Instant::now() >= d)
+            {
+                return None;
+            }
+            let cuts = rmp2.separate_and_add_cuts(&support, &sol2.column_values, 1e-6);
+            if cuts == 0 {
+                break;
+            }
+            rmp2.apply_bounds(&support, &branchings);
+            sol2 = rmp2.solve().ok()?;
+        }
+        debug!(
+            "[lagr][poolmip] LP={:.2} vs ls_k={} (gap {:.1}%, support={}/{}) t={:.1}s — solving MIP",
+            lp,
+            incumbent_k,
+            100.0 * (incumbent_k as f64 - lp) / lp.max(1.0),
+            support.len(),
+            afpool.len(),
+            start.elapsed().as_secs_f64()
+        );
+        // Branch-and-cut: the node-disjointness rows are lazy, so a one-shot MIP
+        // can select node-overlapping columns. Separate the violated node rows on
+        // the integer solution and re-solve until the MIP is node-valid.
+        let secs = (self.config.pool_mip_ms as f64 / 1000.0).max(1.0);
+        let unindexed = self.flat_terminal.load(Ordering::Relaxed);
+        let mut result = None;
+        for round in 0..12 {
+            // SIGTERM safety: a HiGHS MIP call does not poll `terminate`, so never
+            // START a round unless the full per-MIP cap fits before the deadline
+            // (else the solve could overrun the SIGTERM grace with no output).
+            if self.terminate.load(Ordering::Relaxed)
+                || deadline.is_some_and(|d| {
+                    d.saturating_duration_since(Instant::now()).as_secs_f64() < secs + 2.0
+                })
+            {
+                break;
+            }
+            let mip = match rmp2.solve_mip_with_time_limit(secs) {
+                Ok(Some(m)) => m,
+                _ => break, // not solved in the cap
+            };
+            let cuts = rmp2.separate_and_add_cuts(&support, &mip.column_values, 1e-6);
+            if cuts > 0 {
+                rmp2.apply_bounds(&support, &branchings);
+                continue; // re-solve with the new node constraints
+            }
+            // node-valid integer solution: decode
+            if let Some((forest, comps)) =
+                forest_from_lp(&support, &mip.column_values, trees, n, unindexed)
+            {
+                debug!(
+                    "[lagr][poolmip] MIP_k={} vs ls_k={} lp={:.2} (round={}) t={:.1}s",
+                    comps,
+                    incumbent_k,
+                    lp,
+                    round,
+                    start.elapsed().as_secs_f64()
+                );
+                result = (comps < incumbent_k).then_some((forest, comps));
+            }
+            break;
+        }
+        result
+    }
+
     /// LNS (large-neighbourhood search): repeatedly pick a *clean* region of the
     /// incumbent — a T₁ subtree whose leaves are exactly the union of some whole
     /// incumbent components — re-solve that region **optimally with B&P** (small
@@ -2487,7 +2775,6 @@ impl LagrangianSolver {
         let trees = &reduced.trees;
         let n = reduced.num_leaves;
         let nl = n as usize;
-        let t1 = &trees[0];
         let region_max: usize = self.config.lns_max;
         let cap = Duration::from_millis(self.config.lns_cap_ms);
 
@@ -2501,39 +2788,108 @@ impl LagrangianSolver {
             }
         }
 
-        let internal: Vec<NodeId> = (0..t1.num_nodes() as u32)
-            .filter(|&v| !t1.is_leaf(v))
+        let mut internal: Vec<(usize, NodeId)> = trees
+            .iter()
+            .enumerate()
+            .flat_map(|(ti, t)| {
+                (0..t.num_nodes() as u32).filter_map(move |v| {
+                    if t.is_leaf(v) {
+                        return None;
+                    }
+                    let sz = t.subtree_size[v as usize] as usize;
+                    (4..=region_max).contains(&sz).then_some((ti, v))
+                })
+            })
             .collect();
         if internal.is_empty() {
             return incumbent;
         }
-        let mut rng: u64 = 0xD1B5_4A32_D192_ED03;
+        // Try every plausible region once before repeating. The old pure-random
+        // sampler could spend much of the tail revisiting the same subtrees; an
+        // interleaved large/small order balances high-leverage resolves with
+        // cheaper neighborhoods that are more likely to prove inside the cap.
+        internal.sort_unstable_by(|&(ta, a), &(tb, b)| {
+            trees[tb].subtree_size[b as usize]
+                .cmp(&trees[ta].subtree_size[a as usize])
+                .then_with(|| ta.cmp(&tb))
+                .then_with(|| a.cmp(&b))
+        });
+        let mut ordered = Vec::with_capacity(internal.len());
+        let (mut lo, mut hi) = (0usize, internal.len() - 1);
+        while lo <= hi {
+            ordered.push(internal[lo]);
+            lo += 1;
+            if lo > hi {
+                break;
+            }
+            ordered.push(internal[hi]);
+            hi -= 1;
+        }
+        internal = ordered;
+        let mut cursor = 0usize;
         let (mut tries, mut accepts, mut invalid) = (0usize, 0usize, 0usize);
+
+        // ILS perturbation state. `best`/`best_len` is the best forest ever seen;
+        // a kick may transiently grow the incumbent, but we only ever return the
+        // best. A "cycle" is one full pass over `internal`; zero accepts in a
+        // cycle ⇒ the incumbent has converged at this region set ⇒ kick it.
+        let perturb_on = self.config.lns_perturb;
+        let cycle_len = internal.len();
+        let mut best = incumbent.clone();
+        let mut best_len = best.len();
+        let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut since_cycle = 0usize;
+        let mut cycle_accepts = 0usize;
+        let mut kicks = 0usize;
 
         while !(self.terminate.load(Ordering::Relaxed)
             || deadline.is_some_and(|d| Instant::now() >= d))
         {
             tries += 1;
-            rng ^= rng << 13;
-            rng ^= rng >> 7;
-            rng ^= rng << 17;
-            let v = internal[(rng as usize) % internal.len()];
+            // Cycle boundary: if a whole pass found nothing, kick out of the local
+            // optimum (restore best, split a few components), else keep cycling.
+            if perturb_on {
+                since_cycle += 1;
+                if since_cycle >= cycle_len {
+                    if cycle_accepts == 0 {
+                        if incumbent.len() > best_len {
+                            incumbent = best.clone();
+                        }
+                        self.perturb_forest(
+                            &mut incumbent,
+                            &mut comp_of,
+                            trees,
+                            n,
+                            nl,
+                            self.config.lns_perturb_strength,
+                            &mut rng,
+                        );
+                        kicks += 1;
+                    }
+                    since_cycle = 0;
+                    cycle_accepts = 0;
+                }
+            }
+            let (ti, v) = internal[cursor];
+            let tref = &trees[ti];
+            cursor += 1;
+            if cursor == internal.len() {
+                cursor = 0;
+            }
 
-            // Leaves under v in T₁.
+            // Leaves under v in either input tree.
             let mut region: Vec<u32> = Vec::new();
             let mut stack = vec![v];
             while let Some(u) = stack.pop() {
-                if t1.is_leaf(u) {
-                    region.push(t1.label[u as usize]);
+                if tref.is_leaf(u) {
+                    region.push(tref.label[u as usize]);
                 } else {
-                    let (l, r) = t1.children_pair(u);
+                    let (l, r) = tref.children_pair(u);
                     stack.push(l);
                     stack.push(r);
                 }
             }
-            if region.len() < 4 || region.len() > region_max {
-                continue;
-            }
+            debug_assert!((4..=region_max).contains(&region.len()));
             let mut in_region = vec![false; nl + 1];
             for &l in &region {
                 in_region[l as usize] = true;
@@ -2548,23 +2904,34 @@ impl LagrangianSolver {
                     touched.push(ci);
                 }
             }
+            // Closure of the touched components (all their leaves). In strict mode
+            // we require this to equal the region (a clean subtree cut); in
+            // closure mode we re-solve the closure even when components leak
+            // outside the subtree, bounded by `lns_closure_cap`, and let the
+            // validator reject any node-overlapping splice.
             let mut clean = true;
+            let mut bad = false;
             let mut l_leaves: Vec<u32> = Vec::new();
-            for &ci in &touched {
-                let mut inside = true;
+            'comps: for &ci in &touched {
                 for l in incumbent[ci].leaves() {
-                    if (l as usize) > nl || !in_region[l as usize] {
-                        inside = false;
-                        break;
+                    if (l as usize) > nl {
+                        bad = true; // out-of-core leaf — never re-solve
+                        break 'comps;
+                    }
+                    if !in_region[l as usize] {
+                        clean = false;
                     }
                     l_leaves.push(l);
                 }
-                if !inside {
-                    clean = false;
-                    break;
-                }
             }
-            if !clean || touched.len() < 2 || l_leaves.len() < 4 {
+            if bad || touched.len() < 2 || l_leaves.len() < 4 {
+                continue;
+            }
+            if self.config.lns_closure {
+                if l_leaves.len() > self.config.lns_closure_cap {
+                    continue;
+                }
+            } else if !clean {
                 continue;
             }
 
@@ -2586,8 +2953,23 @@ impl LagrangianSolver {
                 m as u32,
             );
 
-            // Re-solve the region optimally with B&P (capped).
-            let sub_sol = match self.solve_cluster_exact(&sub_inst, Instant::now() + cap) {
+            // Re-solve the region optimally with B&P (capped). Leaked closure
+            // regions get the shorter cap so a non-proving one steals less of the
+            // cycle from productive clean cuts.
+            let region_cap = if clean {
+                cap
+            } else {
+                // Leaked closure re-solve: size-adaptive cap (short for small/mid
+                // → faster cycling/more revisits; full for giants → time to prove
+                // the larger leaked merges).
+                let ms = if nl > self.config.lns_closure_bign {
+                    self.config.lns_cap_ms
+                } else {
+                    self.config.lns_closure_cap_ms
+                };
+                Duration::from_millis(ms)
+            };
+            let sub_sol = match self.solve_cluster_exact(&sub_inst, Instant::now() + region_cap) {
                 Some(s) => s,
                 None => continue, // capped / invalid
             };
@@ -2619,12 +3001,17 @@ impl LagrangianSolver {
             {
                 incumbent = candidate;
                 accepts += 1;
+                cycle_accepts += 1;
                 for (ci, c) in incumbent.iter().enumerate() {
                     for l in c.leaves() {
                         if (l as usize) <= nl {
                             comp_of[l as usize] = ci;
                         }
                     }
+                }
+                if incumbent.len() < best_len {
+                    best_len = incumbent.len();
+                    best = incumbent.clone();
                 }
                 debug!(
                     "[lagr][lns] accept k={} (region={} comps {}→{}) t={:.1}s",
@@ -2646,14 +3033,64 @@ impl LagrangianSolver {
             }
         }
         debug!(
-            "[lagr][lns] done tries={} accepts={} invalid={} k={} t={:.1}s",
+            "[lagr][lns] done tries={} accepts={} invalid={} kicks={} k={} t={:.1}s",
             tries,
             accepts,
             invalid,
-            incumbent.len(),
+            kicks,
+            best_len,
             start.elapsed().as_secs_f64()
         );
-        incumbent
+        best
+    }
+
+    /// ILS kick: split `strength` random components along their own tree edges
+    /// (valid, k-increasing), then rebuild `comp_of`. The subsequent LNS cycle
+    /// re-merges the freed pieces differently, escaping the local optimum.
+    #[allow(clippy::too_many_arguments)]
+    fn perturb_forest(
+        &self,
+        incumbent: &mut Vec<Tree>,
+        comp_of: &mut [usize],
+        trees: &[Tree],
+        n: u32,
+        nl: usize,
+        strength: usize,
+        rng: &mut u64,
+    ) {
+        let mut done = 0usize;
+        let mut guard = 0usize;
+        while done < strength && guard < strength * 8 + 8 {
+            guard += 1;
+            if incumbent.is_empty() {
+                break;
+            }
+            let ci = (xs(rng) as usize) % incumbent.len();
+            let Some((p1, p2)) = split_component(&incumbent[ci], rng) else {
+                continue;
+            };
+            let mut bs1 = FixedBitSet::with_capacity(nl + 1);
+            for l in &p1 {
+                bs1.insert(*l as usize);
+            }
+            let mut bs2 = FixedBitSet::with_capacity(nl + 1);
+            for l in &p2 {
+                bs2.insert(*l as usize);
+            }
+            incumbent[ci] = Tree::forest_component(&bs1, &trees[0], n);
+            incumbent.push(Tree::forest_component(&bs2, &trees[0], n));
+            done += 1;
+        }
+        for x in comp_of.iter_mut() {
+            *x = usize::MAX;
+        }
+        for (ci, c) in incumbent.iter().enumerate() {
+            for l in c.leaves() {
+                if (l as usize) <= nl {
+                    comp_of[l as usize] = ci;
+                }
+            }
+        }
     }
 
     /// Warm-started exact-LP column generation (bp's `Rmp`). Each iteration
@@ -3977,6 +4414,47 @@ fn greedy_pack(
 /// leaves and can (intermittently) produce components whose original-tree
 /// spanning subtrees interleave — a node-disjointness violation that the
 /// validator rejects outright (score 0). We never want to emit that. Keep
+/// Xorshift step for the ILS perturbation RNG (deterministic, seeded).
+fn xs(state: &mut u64) -> u64 {
+    let mut x = *state;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *state = x;
+    x
+}
+
+/// Split a component into two valid AF components along one of its own tree
+/// edges (cut the edge above a random non-root node `v`: one piece is the leaves
+/// under `v`, the other the rest). Because the component's topology is an
+/// embedded subtree of both input trees, any such cut yields two node-disjoint
+/// agreement components. Returns the two leaf sets, or `None` for a singleton.
+fn split_component(c: &Tree, rng: &mut u64) -> Option<(Vec<u32>, Vec<u32>)> {
+    let nn = c.num_nodes() as u32;
+    let cand: Vec<u32> = (0..nn).filter(|&v| c.parent[v as usize] != NONE).collect();
+    if cand.is_empty() {
+        return None; // single-node component (one leaf)
+    }
+    let v = cand[(xs(rng) as usize) % cand.len()];
+    let mut p1: Vec<u32> = Vec::new();
+    let mut stack = vec![v];
+    while let Some(u) = stack.pop() {
+        if c.is_leaf(u) {
+            p1.push(c.label[u as usize]);
+        } else {
+            let (l, r) = c.children_pair(u);
+            stack.push(l);
+            stack.push(r);
+        }
+    }
+    let p1set: FxHashSet<u32> = p1.iter().copied().collect();
+    let p2: Vec<u32> = c.leaves().filter(|l| !p1set.contains(l)).collect();
+    if p1.is_empty() || p2.is_empty() {
+        return None;
+    }
+    Some((p1, p2))
+}
+
 /// components largest-first while they remain valid agreement components AND
 /// node-disjoint from those already kept; explode any offender into singletons.
 /// Returns `(repaired_forest, num_components_exploded)`.
@@ -4114,7 +4592,13 @@ pub fn main() {
         LagrangianSolver::new(),
         RunConfig {
             track: Track::Heuristic,
-            specific: LagrangianConfig::default(),
+            specific: LagrangianConfig {
+                lns_closure: true,
+                lns_perturb: true,
+                pool_mip: true,
+                pool_mip_ms: 15_000,
+                ..LagrangianConfig::default()
+            },
             ..Default::default()
         },
     );

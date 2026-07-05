@@ -531,6 +531,8 @@ where
             return Some(components);
         }
 
+        interleave_node_diag(reduced, trees, &b, &tel);
+
         let outcome = solve_node(
             &mut state,
             &b,
@@ -617,6 +619,404 @@ where
     Some(components)
 }
 
+/// MEASURE-ONLY interleaved-reduction diagnostic (env `KLADOS_BP_INTERLEAVE_DIAG=<N>`,
+/// runs every N explored nodes; 0/unset = off). At a real search node it builds the
+/// virtual constrained instance from the current must-link set — contract every
+/// must-link class that forms a clade in ALL trees to a representative — then
+/// re-kernelizes and re-runs cluster detection, logging how reducible/decomposable
+/// the node's subproblem has become. This tests whether real B&P branching drives
+/// the core toward a reducible state (and whether must-link classes even grow).
+fn interleave_node_diag(reduced: &Instance, trees: &[Tree], b: &Branchings, tel: &Telemetry) {
+    let every: usize = std::env::var("KLADOS_BP_INTERLEAVE_DIAG")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if every == 0 || tel.nodes_explored % every != 0 {
+        return;
+    }
+    let n = reduced.num_leaves as usize;
+
+    // Union-find over must-link pairs → classes.
+    let mut uf: Vec<u32> = (0..=n as u32).collect();
+    fn find(uf: &mut [u32], x: u32) -> u32 {
+        let mut r = x;
+        while uf[r as usize] != r {
+            r = uf[r as usize];
+        }
+        let mut c = x;
+        while uf[c as usize] != r {
+            let nx = uf[c as usize];
+            uf[c as usize] = r;
+            c = nx;
+        }
+        r
+    }
+    for ml in b.must_link() {
+        let ra = find(&mut uf, ml.a);
+        let rb = find(&mut uf, ml.b);
+        if ra != rb {
+            uf[ra as usize] = rb;
+        }
+    }
+    let mut classes: HashMap<u32, Vec<u32>> = HashMap::new();
+    for l in 1..=n as u32 {
+        let r = find(&mut uf, l);
+        classes.entry(r).or_default().push(l);
+    }
+
+    // Contract must-link classes that form a clade in every tree (keep 1 rep).
+    let mut keep = FixedBitSet::with_capacity(n + 1);
+    keep.insert_range(1..(n + 1));
+    let (mut ml_classes, mut clade, mut nonclade, mut biggest_class) = (0usize, 0usize, 0usize, 0usize);
+    for members in classes.values() {
+        if members.len() < 2 {
+            continue;
+        }
+        ml_classes += 1;
+        biggest_class = biggest_class.max(members.len());
+        let is_clade = trees.iter().all(|t| {
+            let mut lca = t.node_by_label(members[0]);
+            for &m in &members[1..] {
+                lca = t.nearest_common_ancestor(lca, t.node_by_label(m));
+            }
+            t.subtree_size[lca as usize] as usize == members.len()
+        });
+        if is_clade {
+            clade += 1;
+            for &m in &members[1..] {
+                keep.set(m as usize, false);
+            }
+        } else {
+            nonclade += 1;
+        }
+    }
+
+    let contracted = klados_core::kernelize::restrict_instance_simple(reduced, &keep).0;
+    let contracted_n = contracted.num_leaves;
+    let kern = klados_core::kernelize::kernelize_best(
+        &contracted,
+        &klados_core::kernelize::KernelizeConfig::default(),
+    );
+    let kern_n = kern.instance.num_leaves as usize;
+    let (nclusters, largest_sub) =
+        match klados_core::cluster_decomposition::find_clusters(&kern.instance) {
+            None => (0usize, kern_n),
+            Some(cs) => {
+                let (mut clustered, mut largest) = (0usize, 0usize);
+                for c in &cs {
+                    let s = c.leaves.count_ones(..);
+                    clustered += s;
+                    largest = largest.max(s);
+                }
+                (cs.len(), largest.max(kern_n - clustered + cs.len()))
+            }
+        };
+
+    eprintln!(
+        "[ilv] node={} depth={} |M|={} |N|={} mlCls={} clade={} nonclade={} maxCls={} contracted={} kern={} clusters={} largestSub={} ({:.0}% of core {})",
+        tel.nodes_explored,
+        b.depth(),
+        b.must_link().len(),
+        b.cannot_link().len(),
+        ml_classes,
+        clade,
+        nonclade,
+        biggest_class,
+        contracted_n,
+        kern_n,
+        nclusters,
+        largest_sub,
+        100.0 * largest_sub as f64 / n as f64,
+        n,
+    );
+}
+
+/// MEASURE-ONLY pricing-based forced-singleton potential (env `KLADOS_BP_FS_DIAG=1`).
+/// At a converged root LP: a leaf `l` is a forced singleton in every improving
+/// integer solution if EVERY column with `l` and ≥2 leaves is RCVF-fixable
+/// (`lp_obj + rc(c) > ub-1`). We estimate this over the POOL (optimistic upper
+/// bound — sound detection needs per-leaf constrained pricing). This tests
+/// whether the LP/pricing signal can shrink singleton-dominated cores.
+fn pricing_reduction_diag(
+    n: usize,
+    lp_obj: f64,
+    alpha: &[f64],
+    beta: &[Vec<f64>],
+    columns: &[AfColumn],
+    best_ub: usize,
+) {
+    if std::env::var("KLADOS_BP_FS_DIAG").ok().as_deref() != Some("1") {
+        return;
+    }
+    // Real UB vs a hypothetical TIGHT UB (as if the primal matched the LP bound):
+    // decouples "is the reduction signal present" from "is the current incumbent good".
+    let ub_tight = (lp_obj.ceil() as usize + 1).max(1);
+    let thr_real = best_ub as f64 - 1.0 + 1.0e-6;
+    let thr_tight = ub_tight as f64 - 1.0 + 1.0e-6;
+    let mut min_rc = vec![f64::INFINITY; n + 1];
+    let mut appears = vec![false; n + 1];
+    let (mut multi_cols, mut fix_real, mut fix_tight) = (0usize, 0usize, 0usize);
+    for c in columns {
+        if c.labels().len() < 2 {
+            continue;
+        }
+        multi_cols += 1;
+        let rc = 1.0 - c.pricing_score(alpha, beta);
+        if lp_obj + rc > thr_real {
+            fix_real += 1;
+        }
+        if lp_obj + rc > thr_tight {
+            fix_tight += 1;
+        }
+        for &l in c.labels() {
+            appears[l as usize] = true;
+            if rc < min_rc[l as usize] {
+                min_rc[l as usize] = rc;
+            }
+        }
+    }
+    let (mut forced_real, mut forced_tight, mut no_multi) = (0usize, 0usize, 0usize);
+    for l in 1..=n {
+        if !appears[l] {
+            no_multi += 1;
+            continue;
+        }
+        if lp_obj + min_rc[l] > thr_real {
+            forced_real += 1;
+        }
+        if lp_obj + min_rc[l] > thr_tight {
+            forced_tight += 1;
+        }
+    }
+    let pct = |x: usize| 100.0 * x as f64 / n as f64;
+    eprintln!(
+        "[fs] n={n} lp={lp_obj:.1} ubReal={best_ub} ubTight={ub_tight} multiCols={multi_cols} | \
+         REAL: fixable={fix_real} forcedSingle={forced_real} ({:.0}%) | \
+         TIGHT: fixable={fix_tight} ({:.0}%) forcedSingle={forced_tight} ({:.0}%) | noMultiCol={no_multi}",
+        pct(forced_real),
+        100.0 * fix_tight as f64 / multi_cols.max(1) as f64,
+        pct(forced_tight),
+    );
+}
+
+/// Converge the ROOT LP of `instance` (no branching): seed singletons + Chen
+/// columns, then column-generate until the pricer reports Converged/Improving.
+/// Returns `(lp_obj, all columns, leaf_duals, node_duals)`. Cascade probe only.
+fn converge_root_lp(
+    instance: &Instance,
+    cfg: &crate::solvers::bp::BpConfig,
+    cancel: &crate::solvers::bp::Cancel,
+) -> Option<(f64, Vec<AfColumn>, Vec<f64>, Vec<Vec<f64>>, usize)> {
+    let trees = &instance.trees;
+    let n = instance.num_leaves as usize;
+    if trees.len() != 2 || n < 2 {
+        return None;
+    }
+    let mut seed_builder = ColumnBuilder::new(trees);
+    let initial: Vec<AfColumn> = (1..=n as u32)
+        .map(|l| seed_builder.build_unchecked(vec![l], trees))
+        .collect();
+    let mut state = SearchState::seed_singletons(n, initial.clone());
+    let mut rmp = Rmp::new(&initial, trees, n);
+    if n >= 4 {
+        let (_, _, leafsets) = chen_pair_agreement(&trees[0], &trees[1]);
+        for labels in leafsets {
+            if labels.len() < 2 {
+                continue;
+            }
+            let column = seed_builder.build_unchecked(labels, trees);
+            if state.add_column(column).is_some() {
+                rmp.add_column(state.columns().last().unwrap());
+            }
+        }
+    }
+    let mut scratch = PricerScratch::new(trees);
+    scratch.m2_batch = cfg.m2_batch;
+    scratch.m2_exact_dp_cells = cfg.m2_exact_dp_cells;
+    scratch.m2_exact_reserve_cap = cfg.m2_exact_reserve_cap;
+    scratch.use_anchor_cache = cfg.use_anchor_cache;
+    let mut pricer = dispatch_by_m(trees);
+    let default_branch = Branchings::default();
+    let lp = loop {
+        let lp = rmp.solve().ok()?;
+        if cancel.is_cancelled() {
+            return None;
+        }
+        let new_cuts = rmp.separate_and_add_cuts(state.columns(), &lp.column_values, 1.0e-6);
+        if new_cuts > 0 {
+            continue;
+        }
+        let result = pricer.price(
+            &PricingContext {
+                trees,
+                num_leaves: state.num_leaves(),
+                alpha: &lp.leaf_duals,
+                beta: &lp.node_duals,
+                columns: state.columns(),
+                seen: state.seen(),
+                branchings: &default_branch,
+                terminate: cancel.flag(),
+                deadline: cancel.deadline(),
+            },
+            &mut scratch,
+        );
+        match result {
+            PricingResult::Found(cols) => {
+                for c in cols {
+                    if state.add_column(c).is_some() {
+                        rmp.add_column(state.columns().last().unwrap());
+                    }
+                }
+                continue;
+            }
+            PricingResult::Improving | PricingResult::Converged => break lp,
+        }
+    };
+    // Greedy LP-support rounding → a REAL feasible UB (mirrors root_pool::round_lp):
+    // value-first (size tiebreak) node- and leaf-disjoint packing.
+    let rounded_ub = {
+        let cols = state.columns();
+        let values = &lp.column_values;
+        let mut idx: Vec<usize> = (0..cols.len())
+            .filter(|&i| values.get(i).copied().unwrap_or(0.0) > 1.0e-8 && cols[i].labels().len() >= 2)
+            .collect();
+        idx.sort_by(|&a, &b| {
+            values[b]
+                .partial_cmp(&values[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| cols[b].labels().len().cmp(&cols[a].labels().len()))
+        });
+        let mut used_leaves = vec![false; n + 1];
+        let mut used_nodes: Vec<std::collections::HashSet<usize>> = vec![Default::default(); trees.len()];
+        let mut savings: i64 = 0;
+        for ci in idx {
+            let c = &cols[ci];
+            if c.labels().iter().any(|&l| used_leaves[l as usize]) {
+                continue;
+            }
+            let mut ok = true;
+            'chk: for (ti, nodes) in c.coverage().iter_per_tree().enumerate() {
+                for v in nodes.iter().copied() {
+                    if used_nodes[ti].contains(&v) {
+                        ok = false;
+                        break 'chk;
+                    }
+                }
+            }
+            if !ok {
+                continue;
+            }
+            for &l in c.labels() {
+                used_leaves[l as usize] = true;
+            }
+            for (ti, nodes) in c.coverage().iter_per_tree().enumerate() {
+                for v in nodes.iter().copied() {
+                    used_nodes[ti].insert(v);
+                }
+            }
+            savings += c.labels().len() as i64 - 1;
+        }
+        (n as i64 - savings).max(0) as usize
+    };
+    Some((
+        lp.objective,
+        state.columns().to_vec(),
+        lp.leaf_duals.clone(),
+        lp.node_duals.clone(),
+        rounded_ub,
+    ))
+}
+
+/// MEASURE-ONLY cascade probe (env `KLADOS_BP_CASCADE_DIAG=1`; min core size
+/// `KLADOS_BP_CASCADE_MIN`, default 200). Runs ONCE on the first big core. Tests
+/// whether pricing-based forced-singleton reduction under a hypothetical TIGHT
+/// incumbent (ub = ceil(lp)+1) CASCADES: each round converge the root LP, remove
+/// pool-optimistic forced singletons, kernelize, repeat. Logs the n trajectory.
+/// Pool-optimistic ⇒ upper bound on real reduction (sound needs constrained
+/// pricing); a NON-collapse here is a clean negative.
+fn cascade_reduce_probe(
+    core: &Instance,
+    cfg: &crate::solvers::bp::BpConfig,
+    cancel: &crate::solvers::bp::Cancel,
+) {
+    if std::env::var("KLADOS_BP_CASCADE_DIAG").ok().as_deref() != Some("1") {
+        return;
+    }
+    let min_n: usize = std::env::var("KLADOS_BP_CASCADE_MIN")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200);
+    if (core.num_leaves as usize) < min_n {
+        return;
+    }
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    eprintln!("[casc] START core n={}", core.num_leaves);
+    let mut inst = core.clone();
+    let mut removed_total = 0usize;
+    for round in 0..40 {
+        let Some((lp, columns, alpha, beta, rounded_ub)) = converge_root_lp(&inst, cfg, cancel)
+        else {
+            eprintln!("[casc] round {round}: LP failed/cancelled — stop");
+            break;
+        };
+        let n = inst.num_leaves as usize;
+        // Use the REAL achievable UB from LP-rounding (not a hypothetical perfect one).
+        let ub_hypo = lp.ceil() as usize + 1;
+        let ub = rounded_ub.min(n); // rounded pack ≤ n always
+        let threshold = ub as f64 - 1.0 + 1.0e-6;
+        let mut min_rc = vec![f64::INFINITY; n + 1];
+        let mut appears = vec![false; n + 1];
+        for c in &columns {
+            if c.labels().len() < 2 {
+                continue;
+            }
+            let rc = 1.0 - c.pricing_score(&alpha, &beta);
+            for &l in c.labels() {
+                appears[l as usize] = true;
+                if rc < min_rc[l as usize] {
+                    min_rc[l as usize] = rc;
+                }
+            }
+        }
+        let mut forced: Vec<u32> = Vec::new();
+        for l in 1..=n as u32 {
+            if appears[l as usize] && lp + min_rc[l as usize] > threshold {
+                forced.push(l);
+            }
+        }
+        eprintln!(
+            "[casc] round {round}: n={n} lp={lp:.1} ubRounded={ub} (hypoTight={ub_hypo}) gap={} cols={} forcedSingle={} removedTotal={removed_total}",
+            ub as i64 - lp.ceil() as i64,
+            columns.len(),
+            forced.len(),
+        );
+        if forced.is_empty() {
+            eprintln!("[casc] FIXPOINT round {round}: no forced singletons (final n={n})");
+            break;
+        }
+        removed_total += forced.len();
+        let mut keep = FixedBitSet::with_capacity(n + 1);
+        keep.insert_range(1..(n + 1));
+        for &l in &forced {
+            keep.set(l as usize, false);
+        }
+        let reduced = klados_core::kernelize::restrict_instance_simple(&inst, &keep).0;
+        inst = klados_core::kernelize::kernelize_best(
+            &reduced,
+            &klados_core::kernelize::KernelizeConfig::default(),
+        )
+        .instance;
+        if (inst.num_leaves as usize) < 4 {
+            eprintln!("[casc] reduced below 4 leaves — stop (final n={})", inst.num_leaves);
+            break;
+        }
+    }
+    eprintln!("[casc] END removedTotal={removed_total} final_n={}", inst.num_leaves);
+}
+
 fn solve_node<P: Pricer, S: BranchSelector>(
     state: &mut SearchState,
     branchings: &Branchings,
@@ -635,6 +1035,8 @@ fn solve_node<P: Pricer, S: BranchSelector>(
     cfg: &crate::solvers::bp::BpConfig,
 ) -> NodeOutcome {
     tel.nodes_explored += 1;
+
+    cascade_reduce_probe(reduced, cfg, cancel);
 
     // Replay root-RCVF if the incumbent tightened since the last fixing.
     // No-op when untightened (or before root has been solved), so this is
@@ -768,10 +1170,90 @@ fn solve_node<P: Pricer, S: BranchSelector>(
                 );
                 tel.had_converged = true;
                 node_converged = true;
+                // Branch-CUT-and-price: tighten the converged LP with clique
+                // inequalities on the node-packing conflict graph. Valid cuts →
+                // the re-solved objective is a higher, valid LB. DEFAULT ON (this
+                // is what proves the high-frag multi-tree cores plain B&P can't);
+                // KLADOS_BP_NOCLIQUE reverts to plain branch-and-price.
+                if std::env::var("KLADOS_BP_NOCLIQUE").is_err() {
+                    let lp_before = lp.objective;
+                    let mut cur = lp;
+                    let mut total_added = 0usize;
+                    for _round in 0..40 {
+                        let added = rmp.separate_and_add_clique(
+                            state.columns(),
+                            &cur.column_values,
+                            1.0e-6,
+                            20,
+                        );
+                        if added == 0 {
+                            break;
+                        }
+                        total_added += added;
+                        cur = match rmp.solve() {
+                            Ok(x) => x,
+                            Err(_) => break,
+                        };
+                    }
+                    if total_added > 0 {
+                        debug!(
+                            target: LOG_TARGET,
+                            "[clique] lifted lp {:.4} -> {:.4} (+{} cuts)",
+                            lp_before, cur.objective, total_added,
+                        );
+                    }
+                    // DIAGNOSTIC: at the core root, log the LP lift the cuts
+                    // achieved + how many + how many distinct columns they touch
+                    // (diversity). Correlate against final node count to find what
+                    // makes a cut selection "good".
+                    if std::env::var("KLADOS_BP_CLIQUE_DIAG").is_ok()
+                        && branchings.depth() == 0
+                    {
+                        info!(
+                            target: LOG_TARGET,
+                            "[clique-root] core_n={} lp_before={:.4} lp_after={:.4} gain={:.4} cuts={}",
+                            reduced.num_leaves,
+                            lp_before,
+                            cur.objective,
+                            cur.objective - lp_before,
+                            total_added,
+                        );
+                    }
+                    break cur;
+                }
                 break lp;
             }
         }
     };
+
+    // Coarsen-Collapse node primal: solve the master over the converged support
+    // via the tree-DP (exact-over-pool MWIS in the column-crossing graph). A far
+    // stronger node UB than chen/relaxed-whidden, computed in ms — tightens
+    // best_ub before the bound-prune so this node and its siblings fathom faster.
+    if node_converged && std::env::var("KLADOS_BP_TREEDP").is_ok() {
+        let tw_cap: usize = std::env::var("KLADOS_BP_TREEDP_TWCAP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20);
+        let nn = reduced.num_leaves as usize;
+        if let Some(groups) =
+            crate::solvers::collapse::master_via_tree_dp(state.columns(), &lp.column_values, nn, tw_cap)
+            && groups.len() < state.best_ub()
+        {
+            let mut partition = vec![usize::MAX; nn];
+            for (cid, g) in groups.iter().enumerate() {
+                for &l in g {
+                    if (l as usize) >= 1 && (l as usize) <= nn {
+                        partition[l as usize - 1] = cid;
+                    }
+                }
+            }
+            if partition.iter().all(|&c| c != usize::MAX) {
+                let mut builder = crate::solvers::bp::column::ColumnBuilder::new(trees);
+                install_partition_incumbent(state, rmp, trees, &mut builder, &partition);
+            }
+        }
+    }
 
     // The LP bound is a valid lower bound ONLY if CG genuinely converged
     // (`Improving` leaves the LP objective below the true node optimum). The
@@ -831,6 +1313,15 @@ fn solve_node<P: Pricer, S: BranchSelector>(
             lp.objective,
             lp.leaf_duals.clone(),
             lp.node_duals.clone(),
+            state.best_ub(),
+        );
+
+        pricing_reduction_diag(
+            reduced.num_leaves as usize,
+            lp.objective,
+            &lp.leaf_duals,
+            &lp.node_duals,
+            state.columns(),
             state.best_ub(),
         );
 

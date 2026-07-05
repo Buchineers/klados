@@ -105,7 +105,49 @@ pub struct MostFractionalPair;
 impl BranchSelector for MostFractionalPair {
     fn select(&mut self, ctx: &SelectionContext, _rmp: &mut Rmp) -> Option<Vec<Branchings>> {
         let (together, support) = pair_mass_and_support(ctx.columns, ctx.values, ctx.num_leaves);
-        let pairs = fractional_pairs(&together, &support, ctx.num_leaves);
+        let mut pairs = fractional_pairs(&together, &support, ctx.num_leaves);
+        // y*-guided proxy: branch on the most-CONTESTED fractional pair first
+        // (highest column-support = the coupled crossing region), rather than
+        // the closest-to-0.5. Resolving a high-support pair collapses many
+        // fractional columns at once. Env-gated for A/B.
+        if std::env::var("KLADOS_BP_CONTESTED").is_ok() {
+            pairs.sort_by(|a, b| {
+                b.2.cmp(&a.2).then(
+                    a.1.partial_cmp(&b.1)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
+            });
+        }
+        // COARSE branching: among the most-fractional candidates, pick the pair
+        // that sits inside the LARGEST fractional column (block). Resolving a big
+        // coupled block per branch is a far coarser decision than a 2-leaf split,
+        // so the certificate tree over the tw-small coupled structure stays small.
+        if std::env::var("KLADOS_BP_COARSE").is_ok() && !pairs.is_empty() {
+            let take = pairs.len().min(64);
+            let mut best_i = 0usize;
+            let mut best_sz = 0usize;
+            for (i, (p, _, _)) in pairs.iter().take(take).enumerate() {
+                let mut maxsz = 0usize;
+                for (ci, &x) in ctx.values.iter().enumerate() {
+                    if x > FRACTIONAL_EPS && x < 1.0 - FRACTIONAL_EPS {
+                        let labs = ctx.columns[ci].labels();
+                        if labs.len() > maxsz
+                            && labs.binary_search(&p.a).is_ok()
+                            && labs.binary_search(&p.b).is_ok()
+                        {
+                            maxsz = labs.len();
+                        }
+                    }
+                }
+                if maxsz > best_sz {
+                    best_sz = maxsz;
+                    best_i = i;
+                }
+            }
+            let pair = pairs[best_i].0;
+            let (left, right) = ctx.branchings.split_on(pair);
+            return Some(vec![left, right]);
+        }
         let pair = pairs.into_iter().next().map(|(p, _, _)| p)?;
         let (left, right) = ctx.branchings.split_on(pair);
         Some(vec![left, right])

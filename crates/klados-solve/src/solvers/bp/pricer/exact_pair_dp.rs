@@ -435,7 +435,11 @@ fn collect_candidates_above(
         for &v in &t1_post {
             let v_idx = v as usize;
             let is_leaf = t1.is_leaf(v);
-            let children = if !is_leaf { Some(t1.children_pair(v)) } else { None };
+            let children = if !is_leaf {
+                Some(t1.children_pair(v))
+            } else {
+                None
+            };
 
             // Compute best_l0 bottom-up
             let mut max_s_l = if l0_active {
