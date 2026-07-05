@@ -467,13 +467,24 @@ impl Rmp {
         }
         // Enumerate violated cliques into `scored`. Selection quality drives the
         // node count (which drives ~91% of runtime), so this matters a lot.
-        // DEFAULT = deterministic diversity-filtered greedy (`div`): tie-break
-        // clique growth by column index (reproducible — kills the run-to-run
-        // node-count variance) and pick ORTHOGONAL cuts below (few diverse cuts
-        // tighten more directions and don't bloat the LP — measured strictly
-        // better than plain greedy and than exact max-weight cliques).
-        // KLADOS_BP_CLIQUE_NODIV reverts to the old non-deterministic greedy.
-        let div = std::env::var("KLADOS_BP_CLIQUE_NODIV").is_err();
+        //
+        // DEFAULT = plain greedy (the validated 133-instance config). The two
+        // selection tweaks below are OPT-IN because they are INSTANCE-DEPENDENT,
+        // not universal wins (measured 2026-07-05):
+        //
+        // `div` = DETERMINISM (opt-in KLADOS_BP_CLIQUE_DIV): break growth/ordering
+        // ties by column index → reproducible (removes the 2x run-to-run node
+        // variance). But it locks ONE fixed draw, which can be WORSE than random
+        // greedy's average (m16n85: det-draw 7000+ nodes vs random 2942).
+        //
+        // `ortho` = ORTHOGONALITY FILTER (opt-in KLADOS_BP_CLIQUE_ORTHO): skip a
+        // clique sharing >50% columns with a chosen one. Helps SPARSE conflict
+        // graphs (moderate m: m16n85 2276 vs 2942 nodes — dropped cuts redundant)
+        // but HURTS DENSE graphs (high m: m34n93 428s→729s — dropped cuts still add
+        // bound, so weaker LP → more branching → can push near-budget high-m
+        // instances over the timeout). NOT default until it's density-gated.
+        let div = std::env::var("KLADOS_BP_CLIQUE_DIV").is_ok();
+        let ortho = std::env::var("KLADOS_BP_CLIQUE_ORTHO").is_ok();
         let mut scored: Vec<(Vec<usize>, f64)> = Vec::new();
         if std::env::var("KLADOS_BP_CLIQUE_EXACT").is_ok() {
             // EXACT: Bron–Kerbosch enumerates ALL maximal cliques (max-weight
@@ -530,9 +541,9 @@ impl Rmp {
         } else {
             scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         }
-        // Select up to `max_new` cuts. div: orthogonality filter — skip a clique
-        // if it shares >50% of its columns with an already-chosen one.
-        let chosen: Vec<Vec<usize>> = if div {
+        // Select up to `max_new` cuts. ortho: skip a clique sharing >50% of its
+        // columns with an already-chosen one (opt-in; hurts dense high-m graphs).
+        let chosen: Vec<Vec<usize>> = if ortho {
             let mut sel: Vec<Vec<usize>> = Vec::new();
             for (clique, _w) in scored.iter() {
                 if sel.len() >= max_new {
