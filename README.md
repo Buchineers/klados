@@ -20,6 +20,24 @@ make fmt                # auto-format code
 
 `make build` and `make build-submission` produce statically linked `x86_64-unknown-linux-musl` binaries (via `cargo-zigbuild` if available, with a fallback to plain `cargo`).
 
+### Debian container build
+
+`docker_setup.sh` installs all dependencies needed inside a Debian 13.5 container and builds the solver binaries:
+
+```bash
+docker run --rm -it \
+  -v "$PWD:/work" \
+  -w /work \
+  debian:13.5 \
+  ./docker_setup.sh
+```
+
+The script places the selected solvers in the following layout:
+
+```text
+solvers/<track>/<solver-name>
+```
+
 ## Usage
 
 ```bash
