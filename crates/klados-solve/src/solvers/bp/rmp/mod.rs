@@ -465,26 +465,59 @@ impl Rmp {
                 }
             }
         }
+        let n_active = active.len();
         // Enumerate violated cliques into `scored`. Selection quality drives the
         // node count (which drives ~91% of runtime), so this matters a lot.
         //
-        // DEFAULT = plain greedy (the validated 133-instance config). The two
-        // selection tweaks below are OPT-IN because they are INSTANCE-DEPENDENT,
-        // not universal wins (measured 2026-07-05):
+        // Two selection tweaks, now auto-driven by the m-gate below (env-overridable):
+        //   `ortho` = ORTHOGONALITY FILTER: skip a clique sharing >50% columns with
+        //     an already-chosen one. `div` = DETERMINISM: break clique growth/sort
+        //     ties by column index (reproducible; kills the run-to-run node variance).
+        //   NEW DEFAULT: at low m use div+ortho (the validated reproducible 2276 on
+        //     pub122), at high m use plain random greedy (the validated 133 config).
+        //   Overrides: KLADOS_BP_CLIQUE_ORTHO forces filter on; _NOORTHO forces it
+        //     off; _DIV forces determinism on; _MAXM tunes the gate.
         //
-        // `div` = DETERMINISM (opt-in KLADOS_BP_CLIQUE_DIV): break growth/ordering
-        // ties by column index → reproducible (removes the 2x run-to-run node
-        // variance). But it locks ONE fixed draw, which can be WORSE than random
-        // greedy's average (m16n85: det-draw 7000+ nodes vs random 2942).
+        // Gate the filter on m = NUMBER OF TREES. This is THE discriminator
+        // (measured 2026-07-05): the orthogonality filter helps at LOW m (few
+        // trees → node-packing conflicts run through few nodes → greedy cliques
+        // heavily OVERLAP → the dropped cuts are redundant → leaner LP, ~3-4x
+        // fewer nodes: pub122 m16 gives 2276 vs greedy's 2843-9875) but HURTS at
+        // HIGH m (many trees → conflicts are DIVERSE → the "overlapping" cuts each
+        // add bound → filtering weakens the LP → more branching: m34n93 428→729s).
+        // n_active does NOT separate these (pub122's hard n=75 core root≈181,
+        // m34n93≈204 — nearly equal); m does (16 vs 34).
         //
-        // `ortho` = ORTHOGONALITY FILTER (opt-in KLADOS_BP_CLIQUE_ORTHO): skip a
-        // clique sharing >50% columns with a chosen one. Helps SPARSE conflict
-        // graphs (moderate m: m16n85 2276 vs 2942 nodes — dropped cuts redundant)
-        // but HURTS DENSE graphs (high m: m34n93 428s→729s — dropped cuts still add
-        // bound, so weaker LP → more branching → can push near-budget high-m
-        // instances over the timeout). NOT default until it's density-gated.
-        let div = std::env::var("KLADOS_BP_CLIQUE_DIV").is_ok();
-        let ortho = std::env::var("KLADOS_BP_CLIQUE_ORTHO").is_ok();
+        // DEFAULT maxm=16 is CONSERVATIVE by design: it enables the filter only for
+        // the PROVEN-good low-m regime (m16 pub122: reproducible 2276 vs greedy's
+        // 565s+ blowup) and leaves EVERYTHING m≥17 on the validated 133-config plain
+        // greedy. Rationale: the handoff measured ortho+div pushing a HIGH-m
+        // near-budget instance to 1676s (m20n95, ~1800s edge) — a 1.7x filter hit
+        // there risks timeout → losing instances. So do NOT raise maxm past ~16
+        // without A/B-ing the near-budget m17-24 band first (env KLADOS_BP_CLIQUE_MAXM).
+        let num_trees = self.node_to_cols.len();
+        let maxm: usize = std::env::var("KLADOS_BP_CLIQUE_MAXM")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(16);
+        let ortho = if std::env::var("KLADOS_BP_CLIQUE_NOORTHO").is_ok() {
+            false
+        } else if std::env::var("KLADOS_BP_CLIQUE_ORTHO").is_ok() {
+            true
+        } else {
+            num_trees <= maxm
+        };
+        // When the filter is ON (sparse core), also take the DETERMINISTIC clique
+        // growth/sort tie-break: ortho ALONE is non-deterministic (HashSet order)
+        // and its draw varies (pub122/n75: 2276↔2843 nodes, 120s↔239s). The
+        // validated good combo is div+ortho (reproducible 2276). On the greedy
+        // (dense) path we keep plain random greedy = the validated 133 config.
+        let div = ortho || std::env::var("KLADOS_BP_CLIQUE_DIV").is_ok();
+        if std::env::var("KLADOS_BP_CLIQUE_DIAG").is_ok() {
+            eprintln!(
+                "[clique-sep] m={num_trees} maxm={maxm} n_active={n_active} ortho={ortho} div={div}"
+            );
+        }
         let mut scored: Vec<(Vec<usize>, f64)> = Vec::new();
         if std::env::var("KLADOS_BP_CLIQUE_EXACT").is_ok() {
             // EXACT: Bron–Kerbosch enumerates ALL maximal cliques (max-weight
