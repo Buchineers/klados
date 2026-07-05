@@ -366,9 +366,10 @@ fn solve_recursive_memo(
         // sub-instance, not all-singletons — otherwise every piece the recursion
         // hadn't reached when SIGTERM fired cripples the emitted incumbent.
         if instance.num_trees() == 2 {
-            let (_, _, leafsets) =
-                chen_pair_agreement(&instance.trees[0], &instance.trees[1]);
-            return Some(crate::solvers::chen_rspr::leafsets_to_trees(&leafsets, instance));
+            let (_, _, leafsets) = chen_pair_agreement(&instance.trees[0], &instance.trees[1]);
+            return Some(crate::solvers::chen_rspr::leafsets_to_trees(
+                &leafsets, instance,
+            ));
         }
         let forest: Vec<Tree> = (1..=instance.num_leaves)
             .map(|l| klados_core::Tree::singleton(l, instance.num_leaves))

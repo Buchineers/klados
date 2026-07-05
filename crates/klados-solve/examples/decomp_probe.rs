@@ -12,10 +12,10 @@
 //!
 //! Two cut orders are reported:
 //!   - `chen`  : singletons of the Chen 2-approx AF (a real, structure-aware cut
-//!               set; over-cuts vs optimal, so treat the x-axis as an upper bound
-//!               on how many *true* cuts are needed).
+//!     set; over-cuts vs optimal, so treat the x-axis as an upper bound
+//!     on how many *true* cuts are needed).
 //!   - `random`: uniformly random leaves (a pessimistic baseline — the search does
-//!               NOT cut randomly, so `chen` should decompose earlier than this).
+//!     NOT cut randomly, so `chen` should decompose earlier than this).
 //!
 //! Usage:
 //!   cargo run --release --example decomp_probe -- <file> [<file> ...]
@@ -49,7 +49,11 @@ fn largest_subproblem(inst: &Instance) -> (usize, usize, usize) {
                 largest_cluster = largest_cluster.max(s);
             }
             let remainder = n - clustered + clusters.len();
-            (clusters.len(), largest_cluster, largest_cluster.max(remainder))
+            (
+                clusters.len(),
+                largest_cluster,
+                largest_cluster.max(remainder),
+            )
         }
     }
 }
@@ -59,7 +63,12 @@ fn probe_point(inst: &Instance) -> (usize, usize, usize, usize) {
     let kern = kernelize::kernelize_best(inst, &KernelizeConfig::default());
     let red = &kern.instance;
     let (nclusters, largest_cluster, largest_sub) = largest_subproblem(red);
-    (red.num_leaves as usize, nclusters, largest_cluster, largest_sub)
+    (
+        red.num_leaves as usize,
+        nclusters,
+        largest_cluster,
+        largest_sub,
+    )
 }
 
 /// Build a residual keeping all core labels EXCEPT the first `k` of `cut_order`.
@@ -122,7 +131,7 @@ fn run_one(path: &str, steps: usize, seed: u64) -> Result<(), Box<dyn std::error
 
     // Chen 2-approx cut set = singleton components of the Chen AF (on the core).
     let (_lo, chen_up, chen_sets) = chen_pair_agreement(&core.trees[0], &core.trees[1]);
-    let mut chen_cuts: Vec<u32> = chen_sets
+    let chen_cuts: Vec<u32> = chen_sets
         .iter()
         .filter(|c| c.len() == 1)
         .map(|c| c[0])
@@ -199,8 +208,14 @@ fn run_one(path: &str, steps: usize, seed: u64) -> Result<(), Box<dyn std::error
         println!(
             "  {:>6.0}% | {:>10} {:>4} {:>7} ({:>3.0}%) | {:>10} {:>4} {:>7} ({:>3.0}%)",
             100.0 * frac,
-            conk, concl, conls, 100.0 * conls as f64 / core_n as f64,
-            cutk, cutcl, cutls, 100.0 * cutls as f64 / core_n as f64,
+            conk,
+            concl,
+            conls,
+            100.0 * conls as f64 / core_n as f64,
+            cutk,
+            cutcl,
+            cutls,
+            100.0 * cutls as f64 / core_n as f64,
         );
     }
     println!(

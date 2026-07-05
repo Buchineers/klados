@@ -112,10 +112,8 @@ impl BranchSelector for MostFractionalPair {
         // fractional columns at once. Env-gated for A/B.
         if std::env::var("KLADOS_BP_CONTESTED").is_ok() {
             pairs.sort_by(|a, b| {
-                b.2.cmp(&a.2).then(
-                    a.1.partial_cmp(&b.1)
-                        .unwrap_or(std::cmp::Ordering::Equal),
-                )
+                b.2.cmp(&a.2)
+                    .then(a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
             });
         }
         // COARSE branching: among the most-fractional candidates, pick the pair

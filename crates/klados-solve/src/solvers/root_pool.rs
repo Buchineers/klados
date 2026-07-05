@@ -222,33 +222,33 @@ impl RootPoolSolver {
     fn solve_core(&mut self, instance: &Instance) -> Option<RootPoolOutcome> {
         let started = Instant::now();
         // env overrides for CG budget (y* convergence experiment)
-        if let Ok(v) = std::env::var("KLADOS_RP_MAX_ITERS") {
-            if let Ok(x) = v.parse() {
-                self.config.max_cg_iters = x;
-            }
+        if let Ok(v) = std::env::var("KLADOS_RP_MAX_ITERS")
+            && let Ok(x) = v.parse()
+        {
+            self.config.max_cg_iters = x;
         }
-        if let Ok(v) = std::env::var("KLADOS_RP_MAX_MS") {
-            if let Ok(x) = v.parse() {
-                self.config.max_wall_ms = x;
-            }
+        if let Ok(v) = std::env::var("KLADOS_RP_MAX_MS")
+            && let Ok(x) = v.parse()
+        {
+            self.config.max_wall_ms = x;
         }
         if std::env::var("KLADOS_RP_LAZY_AUDIT").is_ok() {
             self.config.lazy_audit = true;
         }
-        if let Ok(v) = std::env::var("KLADOS_RP_MIP_TL") {
-            if let Ok(x) = v.parse() {
-                self.config.mip_time_limit = x;
-            }
+        if let Ok(v) = std::env::var("KLADOS_RP_MIP_TL")
+            && let Ok(x) = v.parse()
+        {
+            self.config.mip_time_limit = x;
         }
-        if let Ok(v) = std::env::var("KLADOS_RP_MIP_PASSES") {
-            if let Ok(x) = v.parse() {
-                self.config.mip_passes = x;
-            }
+        if let Ok(v) = std::env::var("KLADOS_RP_MIP_PASSES")
+            && let Ok(x) = v.parse()
+        {
+            self.config.mip_passes = x;
         }
-        if let Ok(v) = std::env::var("KLADOS_RP_ANCHOR_K") {
-            if let Ok(x) = v.parse() {
-                self.config.anchor_k = x;
-            }
+        if let Ok(v) = std::env::var("KLADOS_RP_ANCHOR_K")
+            && let Ok(x) = v.parse()
+        {
+            self.config.anchor_k = x;
         }
         let trees = &instance.trees;
         let n = instance.num_leaves as usize;
@@ -736,8 +736,7 @@ impl RootPoolSolver {
                 solver.config.max_wall_ms = 8000;
                 if let Some(out) = solver.solve_with_outcome(&sub) {
                     for comp in &out.forest {
-                        let orig: Vec<u32> =
-                            comp.leaves().map(|nl| revmap[nl as usize]).collect();
+                        let orig: Vec<u32> = comp.leaves().map(|nl| revmap[nl as usize]).collect();
                         if orig.len() < 2 {
                             continue;
                         }
@@ -777,8 +776,7 @@ impl RootPoolSolver {
             && n >= 400
             && let Some(lp) = final_lp.as_ref()
         {
-            let coupled =
-                crate::solvers::collapse::coupled_leaves(&columns, &lp.column_values, n);
+            let coupled = crate::solvers::collapse::coupled_leaves(&columns, &lp.column_values, n);
             if coupled.len() >= 40 {
                 let mut keep = FixedBitSet::with_capacity(n + 1);
                 for &l in &coupled {
@@ -795,8 +793,7 @@ impl RootPoolSolver {
                 let mut harvested = 0usize;
                 if let Some(out) = subsolver.solve_with_outcome(&sub) {
                     for comp in &out.forest {
-                        let orig: Vec<u32> =
-                            comp.leaves().map(|nl| revmap[nl as usize]).collect();
+                        let orig: Vec<u32> = comp.leaves().map(|nl| revmap[nl as usize]).collect();
                         if orig.len() < 2 {
                             continue;
                         }
@@ -834,12 +831,18 @@ impl RootPoolSolver {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(20);
-            match crate::solvers::collapse::master_via_tree_dp(&columns, &lp.column_values, n, tw_cap)
-            {
+            match crate::solvers::collapse::master_via_tree_dp(
+                &columns,
+                &lp.column_values,
+                n,
+                tw_cap,
+            ) {
                 Some(groups) => {
                     let forest = labels_to_trees(instance, &groups);
-                    let valid =
-                        matches!(validate_agreement_forest(instance, &forest), AfValidation::Ok);
+                    let valid = matches!(
+                        validate_agreement_forest(instance, &forest),
+                        AfValidation::Ok
+                    );
                     let lp_ceil = (lp.objective - 1.0e-6).ceil() as usize;
                     eprintln!(
                         "[tree-dp] n={} master={} lp_ceil={} gap={} valid={} conv={} {}",

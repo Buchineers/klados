@@ -557,7 +557,11 @@ impl LagrangianSolver {
             && tf.len() < reduced_forest.len()
             && validate_agreement_forest(reduced, &tf).is_ok()
         {
-            debug!("[lagr] tree-DP override: {} -> {}", reduced_forest.len(), tf.len());
+            debug!(
+                "[lagr] tree-DP override: {} -> {}",
+                reduced_forest.len(),
+                tf.len()
+            );
             reduced_forest = tf;
         }
         let lns_on = self.config.lns_on;
@@ -866,8 +870,7 @@ impl LagrangianSolver {
         // only takes the tree-DP forest when it beats greedy+LS), so it is never
         // worse; measured -3..-82 components vs default on n=1287..8964.
         let treedp_on = std::env::var("KLADOS_LAGR_NO_TREEDP").is_err();
-        let hybrid =
-            treedp_on || self.config.hybrid || std::env::var("KLADOS_LAGR_HYBRID").is_ok();
+        let hybrid = treedp_on || self.config.hybrid || std::env::var("KLADOS_LAGR_HYBRID").is_ok();
         let refresh_every = self.config.refresh_every.max(1);
         let mut h_builder = ColumnBuilder::new(trees);
         let mut h_afpool: Vec<AfColumn> = Vec::new();
@@ -1155,38 +1158,38 @@ impl LagrangianSolver {
                                 .ok()
                                 .and_then(|v| v.parse().ok())
                                 .unwrap_or(24);
-                            let supp = sol
-                                .column_values
-                                .iter()
-                                .filter(|&&x| x > 1e-9)
-                                .count();
+                            let supp = sol.column_values.iter().filter(|&&x| x > 1e-9).count();
                             if let Some(groups) = crate::solvers::collapse::master_via_tree_dp(
                                 &h_afpool,
                                 &sol.column_values,
                                 n as usize,
                                 tw_cap,
-                            ) {
-                                if groups.len() < best_components {
-                                    let forest =
-                                        forest_from_partition(&groups, trees, n, unindexed);
-                                    let inst = Instance::new(trees.to_vec(), n);
-                                    let ok = validate_agreement_forest(&inst, &forest).is_ok();
-                                    debug!(
-                                        "[lagr-treedp] iter={} supp={} tree_dp_k={} forest_len={} valid={} (greedy {}) lp={:.1}",
-                                        iter, supp, groups.len(), forest.len(), ok, best_components, sol.objective
-                                    );
-                                    if ok && forest.len() < best_components {
-                                        best_forest = forest.clone();
-                                        best_components = best_forest.len();
-                                    }
-                                    // Capture the depth-0 result so `solve` can
-                                    // override its incumbent regardless of what
-                                    // the downstream pipeline recomputes.
-                                    if ok && unindexed {
-                                        let mut slot = self.treedp_reduced.lock().unwrap();
-                                        if slot.as_ref().is_none_or(|f| forest.len() < f.len()) {
-                                            *slot = Some(forest);
-                                        }
+                            ) && groups.len() < best_components
+                            {
+                                let forest = forest_from_partition(&groups, trees, n, unindexed);
+                                let inst = Instance::new(trees.to_vec(), n);
+                                let ok = validate_agreement_forest(&inst, &forest).is_ok();
+                                debug!(
+                                    "[lagr-treedp] iter={} supp={} tree_dp_k={} forest_len={} valid={} (greedy {}) lp={:.1}",
+                                    iter,
+                                    supp,
+                                    groups.len(),
+                                    forest.len(),
+                                    ok,
+                                    best_components,
+                                    sol.objective
+                                );
+                                if ok && forest.len() < best_components {
+                                    best_forest = forest.clone();
+                                    best_components = best_forest.len();
+                                }
+                                // Capture the depth-0 result so `solve` can
+                                // override its incumbent regardless of what
+                                // the downstream pipeline recomputes.
+                                if ok && unindexed {
+                                    let mut slot = self.treedp_reduced.lock().unwrap();
+                                    if slot.as_ref().is_none_or(|f| forest.len() < f.len()) {
+                                        *slot = Some(forest);
                                     }
                                 }
                             }

@@ -631,7 +631,7 @@ fn interleave_node_diag(reduced: &Instance, trees: &[Tree], b: &Branchings, tel:
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    if every == 0 || tel.nodes_explored % every != 0 {
+    if every == 0 || !tel.nodes_explored.is_multiple_of(every) {
         return;
     }
     let n = reduced.num_leaves as usize;
@@ -667,7 +667,8 @@ fn interleave_node_diag(reduced: &Instance, trees: &[Tree], b: &Branchings, tel:
     // Contract must-link classes that form a clade in every tree (keep 1 rep).
     let mut keep = FixedBitSet::with_capacity(n + 1);
     keep.insert_range(1..(n + 1));
-    let (mut ml_classes, mut clade, mut nonclade, mut biggest_class) = (0usize, 0usize, 0usize, 0usize);
+    let (mut ml_classes, mut clade, mut nonclade, mut biggest_class) =
+        (0usize, 0usize, 0usize, 0usize);
     for members in classes.values() {
         if members.len() < 2 {
             continue;
@@ -799,6 +800,10 @@ fn pricing_reduction_diag(
     );
 }
 
+/// Result of converging the root LP: `(lp_obj, all columns, leaf_duals,
+/// node_duals, rounded_ub)`.
+type RootLpResult = (f64, Vec<AfColumn>, Vec<f64>, Vec<Vec<f64>>, usize);
+
 /// Converge the ROOT LP of `instance` (no branching): seed singletons + Chen
 /// columns, then column-generate until the pricer reports Converged/Improving.
 /// Returns `(lp_obj, all columns, leaf_duals, node_duals)`. Cascade probe only.
@@ -806,7 +811,7 @@ fn converge_root_lp(
     instance: &Instance,
     cfg: &crate::solvers::bp::BpConfig,
     cancel: &crate::solvers::bp::Cancel,
-) -> Option<(f64, Vec<AfColumn>, Vec<f64>, Vec<Vec<f64>>, usize)> {
+) -> Option<RootLpResult> {
     let trees = &instance.trees;
     let n = instance.num_leaves as usize;
     if trees.len() != 2 || n < 2 {
@@ -878,7 +883,9 @@ fn converge_root_lp(
         let cols = state.columns();
         let values = &lp.column_values;
         let mut idx: Vec<usize> = (0..cols.len())
-            .filter(|&i| values.get(i).copied().unwrap_or(0.0) > 1.0e-8 && cols[i].labels().len() >= 2)
+            .filter(|&i| {
+                values.get(i).copied().unwrap_or(0.0) > 1.0e-8 && cols[i].labels().len() >= 2
+            })
             .collect();
         idx.sort_by(|&a, &b| {
             values[b]
@@ -887,7 +894,8 @@ fn converge_root_lp(
                 .then_with(|| cols[b].labels().len().cmp(&cols[a].labels().len()))
         });
         let mut used_leaves = vec![false; n + 1];
-        let mut used_nodes: Vec<std::collections::HashSet<usize>> = vec![Default::default(); trees.len()];
+        let mut used_nodes: Vec<std::collections::HashSet<usize>> =
+            vec![Default::default(); trees.len()];
         let mut savings: i64 = 0;
         for ci in idx {
             let c = &cols[ci];
@@ -896,8 +904,8 @@ fn converge_root_lp(
             }
             let mut ok = true;
             'chk: for (ti, nodes) in c.coverage().iter_per_tree().enumerate() {
-                for v in nodes.iter().copied() {
-                    if used_nodes[ti].contains(&v) {
+                for v in nodes {
+                    if used_nodes[ti].contains(v) {
                         ok = false;
                         break 'chk;
                     }
@@ -1010,11 +1018,17 @@ fn cascade_reduce_probe(
         )
         .instance;
         if (inst.num_leaves as usize) < 4 {
-            eprintln!("[casc] reduced below 4 leaves — stop (final n={})", inst.num_leaves);
+            eprintln!(
+                "[casc] reduced below 4 leaves — stop (final n={})",
+                inst.num_leaves
+            );
             break;
         }
     }
-    eprintln!("[casc] END removedTotal={removed_total} final_n={}", inst.num_leaves);
+    eprintln!(
+        "[casc] END removedTotal={removed_total} final_n={}",
+        inst.num_leaves
+    );
 }
 
 fn solve_node<P: Pricer, S: BranchSelector>(
@@ -1206,9 +1220,7 @@ fn solve_node<P: Pricer, S: BranchSelector>(
                     // achieved + how many + how many distinct columns they touch
                     // (diversity). Correlate against final node count to find what
                     // makes a cut selection "good".
-                    if std::env::var("KLADOS_BP_CLIQUE_DIAG").is_ok()
-                        && branchings.depth() == 0
-                    {
+                    if std::env::var("KLADOS_BP_CLIQUE_DIAG").is_ok() && branchings.depth() == 0 {
                         info!(
                             target: LOG_TARGET,
                             "[clique-root] core_n={} lp_before={:.4} lp_after={:.4} gain={:.4} cuts={}",
@@ -1236,9 +1248,12 @@ fn solve_node<P: Pricer, S: BranchSelector>(
             .and_then(|v| v.parse().ok())
             .unwrap_or(20);
         let nn = reduced.num_leaves as usize;
-        if let Some(groups) =
-            crate::solvers::collapse::master_via_tree_dp(state.columns(), &lp.column_values, nn, tw_cap)
-            && groups.len() < state.best_ub()
+        if let Some(groups) = crate::solvers::collapse::master_via_tree_dp(
+            state.columns(),
+            &lp.column_values,
+            nn,
+            tw_cap,
+        ) && groups.len() < state.best_ub()
         {
             let mut partition = vec![usize::MAX; nn];
             for (cid, g) in groups.iter().enumerate() {

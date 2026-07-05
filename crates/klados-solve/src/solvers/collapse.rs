@@ -18,7 +18,11 @@ const NEG: i64 = i64::MIN / 4;
 
 /// Do two multi-leaf columns cross? (share an embedding node in some tree).
 fn columns_cross(a: &AfColumn, b: &AfColumn) -> bool {
-    for (na, nb) in a.coverage().iter_per_tree().zip(b.coverage().iter_per_tree()) {
+    for (na, nb) in a
+        .coverage()
+        .iter_per_tree()
+        .zip(b.coverage().iter_per_tree())
+    {
         // both node lists are sorted+deduped
         let (mut i, mut j) = (0usize, 0usize);
         while i < na.len() && j < nb.len() {
@@ -47,8 +51,7 @@ pub fn mwis_bucket_elim(
     use std::collections::BTreeSet;
 
     // Min-degree elimination order with fill-in; abort if width blows the cap.
-    let mut work: Vec<BTreeSet<usize>> =
-        adj.iter().map(|a| a.iter().copied().collect()).collect();
+    let mut work: Vec<BTreeSet<usize>> = adj.iter().map(|a| a.iter().copied().collect()).collect();
     let mut alive = vec![true; n];
     let mut order = Vec::with_capacity(n);
     let mut tw = 0usize;
@@ -95,7 +98,11 @@ pub fn mwis_bucket_elim(
     for i in 0..n {
         for &j in &adj[i] {
             if i < j {
-                let scope = if posn[i] < posn[j] { vec![i, j] } else { vec![j, i] };
+                let scope = if posn[i] < posn[j] {
+                    vec![i, j]
+                } else {
+                    vec![j, i]
+                };
                 let b = bucket_of(&scope);
                 buckets[b].push(Factor {
                     scope,
@@ -134,7 +141,11 @@ pub fn mwis_bucket_elim(
                     fidx |= ((assign >> sp) & 1) << k;
                 }
                 let val = f.table[fidx];
-                *c = if *c <= NEG || val <= NEG { NEG } else { *c + val };
+                *c = if *c <= NEG || val <= NEG {
+                    NEG
+                } else {
+                    *c + val
+                };
             }
         }
         let vk = spos[v];
@@ -156,7 +167,10 @@ pub fn mwis_bucket_elim(
         trace[v] = Some((rest.clone(), choice));
         if !rest.is_empty() {
             let b = bucket_of(&rest);
-            buckets[b].push(Factor { scope: rest, table: newtab });
+            buckets[b].push(Factor {
+                scope: rest,
+                table: newtab,
+            });
         }
     }
 
@@ -290,7 +304,12 @@ pub fn mwis_components(n: usize, adj: &[Vec<usize>], weight: &[i64], tw_cap: usi
         let local: HashMap<usize, usize> = mem.iter().enumerate().map(|(k, &g)| (g, k)).collect();
         let ladj: Vec<Vec<usize>> = mem
             .iter()
-            .map(|&g| adj[g].iter().filter_map(|w| local.get(w).copied()).collect())
+            .map(|&g| {
+                adj[g]
+                    .iter()
+                    .filter_map(|w| local.get(w).copied())
+                    .collect()
+            })
             .collect();
         let lw: Vec<i64> = mem.iter().map(|&g| weight[g]).collect();
         let lsel = mwis_bucket_elim(mem.len(), &ladj, &lw, tw_cap)
@@ -380,7 +399,11 @@ mod tests {
     }
 
     fn val_of(sel: &[bool], w: &[i64]) -> i64 {
-        sel.iter().zip(w).filter(|(s, _)| **s).map(|(_, &x)| x).sum()
+        sel.iter()
+            .zip(w)
+            .filter(|(s, _)| **s)
+            .map(|(_, &x)| x)
+            .sum()
     }
 
     fn is_independent(sel: &[bool], adj: &[Vec<usize>]) -> bool {
