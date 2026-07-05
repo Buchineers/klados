@@ -1183,11 +1183,15 @@ fn solve_node<P: Pricer, S: BranchSelector>(
                     // incumbent this node. Only then can the prune-guard bound the
                     // cut loop, so only then do we grant the high round budget.
                     let mut tight_ub = false;
-                    // OPT-IN only: the tree-DP primal runs at EVERY node, and that
-                    // per-node cost regressed branch-heavy instances (net loss vs
-                    // the 133 config). Default OFF → plain KLADOS_BP_CLIQUE is the
-                    // 133 behaviour; KLADOS_BP_CLIQUE_TREEDP=1 re-enables the reorder.
-                    if std::env::var("KLADOS_BP_CLIQUE_TREEDP").is_ok() {
+                    // OPT-IN + ROOT-ONLY: the tree-DP primal (exact-over-pool MWIS)
+                    // installs a tight incumbent so the prune-guard below knows when
+                    // to stop cutting. Running it at EVERY node regressed branch-heavy
+                    // instances, so restrict to the core root (depth 0) → one tree-DP
+                    // per core, bounded overhead. Default OFF (plain KLADOS_BP_CLIQUE
+                    // = the 133 config); KLADOS_BP_CLIQUE_TREEDP=1 enables it.
+                    if std::env::var("KLADOS_BP_CLIQUE_TREEDP").is_ok()
+                        && branchings.depth() == 0
+                    {
                         let tw_cap: usize = std::env::var("KLADOS_BP_TREEDP_TWCAP")
                             .ok()
                             .and_then(|v| v.parse().ok())
@@ -1251,8 +1255,15 @@ fn solve_node<P: Pricer, S: BranchSelector>(
                     let mut total_added = 0usize;
                     let ub = state.best_ub();
                     // Conflict graph is value-independent + the pool is frozen during
-                    // this node's cutting → build it ONCE and reuse every round.
-                    let nbr = rmp.build_clique_nbr(state.columns());
+                    // this node's cutting → build it ONCE and reuse every round. The
+                    // node-degree cap bounds the edge build; the default 400 keeps
+                    // the 133 behaviour, while the cut-hard (tight_ub) path keeps more
+                    // edges (2000) so its stronger cuts actually reach the incumbent.
+                    let node_cap: usize = std::env::var("KLADOS_BP_CLIQUE_NODECAP")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(if tight_ub { 2000 } else { 400 });
+                    let nbr = rmp.build_clique_nbr(state.columns(), node_cap);
                     for _round in 0..rounds {
                         // already prunable → no need for more cuts
                         if (cur.objective - 1.0e-6).ceil() as usize >= ub {

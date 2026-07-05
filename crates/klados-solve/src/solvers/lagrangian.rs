@@ -860,7 +860,14 @@ impl LagrangianSolver {
         // Periodically solve the exact LP over the current pool and overwrite
         // α/β with the LP duals: the pricer + greedy then aim at the true LP
         // optimum while the subgradient keeps diversifying around it.
-        let hybrid = self.config.hybrid || std::env::var("KLADOS_LAGR_HYBRID").is_ok();
+        // Tree-DP exact extraction over the rich pool: DEFAULT ON (opt-out via
+        // KLADOS_LAGR_NO_TREEDP). It runs over the periodic exact-LP support, so it
+        // implies `hybrid`. It is a best-of (the override in solve_reduced_core
+        // only takes the tree-DP forest when it beats greedy+LS), so it is never
+        // worse; measured -3..-82 components vs default on n=1287..8964.
+        let treedp_on = std::env::var("KLADOS_LAGR_NO_TREEDP").is_err();
+        let hybrid =
+            treedp_on || self.config.hybrid || std::env::var("KLADOS_LAGR_HYBRID").is_ok();
         let refresh_every = self.config.refresh_every.max(1);
         let mut h_builder = ColumnBuilder::new(trees);
         let mut h_afpool: Vec<AfColumn> = Vec::new();
@@ -891,9 +898,11 @@ impl LagrangianSolver {
         // on a reserved time fraction — so it works with no deadline (the
         // default, SIGTERM-driven) instead of needing a hardcoded horizon to
         // carve a tail from. `LagrangianConfig.no_ls` disables it.
-        // Tree-DP extraction replaces best_forest directly (not via best_sel),
-        // so the pool-index local search would clobber it — disable LS then.
-        let ls_on = !self.config.no_ls && std::env::var("KLADOS_LAGR_TREEDP").is_err();
+        // Keep LS ON even with tree-DP extraction: LS refines best_forest via
+        // pool indices, and the tree-DP result is preserved separately in
+        // `treedp_reduced` and re-applied as a best-of override in
+        // solve_reduced_core — so LS can only help, never clobber the tree-DP gain.
+        let ls_on = !self.config.no_ls;
 
         // Config-gated per-center profiling of the hot loop.
         let profile = self.config.profile;
@@ -1141,7 +1150,7 @@ impl LagrangianSolver {
                         // support's column-crossing graph is tw-small, this
                         // captures the ~3% the greedy leaves (that the pool-MIP
                         // is too slow for), by construction ≥ greedy.
-                        if std::env::var("KLADOS_LAGR_TREEDP").is_ok() {
+                        if treedp_on {
                             let tw_cap: usize = std::env::var("KLADOS_LAGR_TREEDP_TWCAP")
                                 .ok()
                                 .and_then(|v| v.parse().ok())
@@ -1162,7 +1171,7 @@ impl LagrangianSolver {
                                         forest_from_partition(&groups, trees, n, unindexed);
                                     let inst = Instance::new(trees.to_vec(), n);
                                     let ok = validate_agreement_forest(&inst, &forest).is_ok();
-                                    eprintln!(
+                                    debug!(
                                         "[lagr-treedp] iter={} supp={} tree_dp_k={} forest_len={} valid={} (greedy {}) lp={:.1}",
                                         iter, supp, groups.len(), forest.len(), ok, best_components, sol.objective
                                     );
