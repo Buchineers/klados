@@ -1064,7 +1064,6 @@ fn solve_node<P: Pricer, S: BranchSelector>(
     // `node_converged` records whether CG ended on a genuine `Converged` from
     // the pricer. The LP bound (bound-prune, RCVF) may be trusted ONLY then.
     let mut node_converged = false;
-    let mut clique_ran_treedp = false;
     let lp = loop {
         let t0 = Instant::now();
         let lp = match rmp.solve() {
@@ -1172,106 +1171,21 @@ fn solve_node<P: Pricer, S: BranchSelector>(
                 tel.had_converged = true;
                 node_converged = true;
                 // Branch-CUT-and-price: tighten the converged LP with clique
-                // inequalities on the node-packing conflict graph (env-gated).
-                // Valid cuts → the re-solved objective is a higher, valid LB.
-                if std::env::var("KLADOS_BP_CLIQUE").is_ok() {
-                    // FIRST install a TIGHT node incumbent via the tree-DP primal
-                    // (exact-over-pool MWIS) so the prune-guard below knows exactly
-                    // when to stop cutting. Without this, best_ub is loose at the
-                    // root and the cut loop over-cuts (bloats the LP) or under-cuts.
-                    // `tight_ub` = the tree-DP primal actually installed a tighter
-                    // incumbent this node. Only then can the prune-guard bound the
-                    // cut loop, so only then do we grant the high round budget.
-                    let mut tight_ub = false;
-                    // OPT-IN + ROOT-ONLY: the tree-DP primal (exact-over-pool MWIS)
-                    // installs a tight incumbent so the prune-guard below knows when
-                    // to stop cutting. Running it at EVERY node regressed branch-heavy
-                    // instances, so restrict to the core root (depth 0) → one tree-DP
-                    // per core, bounded overhead. Default OFF (plain KLADOS_BP_CLIQUE
-                    // = the 133 config); KLADOS_BP_CLIQUE_TREEDP=1 enables it.
-                    if std::env::var("KLADOS_BP_CLIQUE_TREEDP").is_ok()
-                        && branchings.depth() == 0
-                    {
-                        let tw_cap: usize = std::env::var("KLADOS_BP_TREEDP_TWCAP")
-                            .ok()
-                            .and_then(|v| v.parse().ok())
-                            .unwrap_or(20);
-                        let nn = reduced.num_leaves as usize;
-                        if let Some(groups) = crate::solvers::collapse::master_via_tree_dp(
-                            state.columns(),
-                            &lp.column_values,
-                            nn,
-                            tw_cap,
-                        ) && groups.len() < state.best_ub()
-                        {
-                            let mut partition = vec![usize::MAX; nn];
-                            for (cid, g) in groups.iter().enumerate() {
-                                for &l in g {
-                                    if (l as usize) >= 1 && (l as usize) <= nn {
-                                        partition[l as usize - 1] = cid;
-                                    }
-                                }
-                            }
-                            if partition.iter().all(|&c| c != usize::MAX) {
-                                let mut builder =
-                                    crate::solvers::bp::column::ColumnBuilder::new(trees);
-                                install_partition_incumbent(
-                                    state, rmp, trees, &mut builder, &partition,
-                                );
-                                tight_ub = true;
-                            }
-                        }
-                        clique_ran_treedp = true;
-                    }
-                    // Adaptive cutting: keep adding clique cuts until we can PRUNE
-                    // (ceil(lp) ≥ incumbent), or violations exhaust, or the per-round
-                    // lift drops below min_gain. With a tight incumbent the
-                    // prune-guard bounds the loop, so a high round budget is safe
-                    // (cap-limited nodes like pub111 cut as much as they need);
-                    // without one, fall back to the safe 800-cut cap (the 133 config)
-                    // so tree-DP-bail nodes like pub124 don't over-cut.
-                    let default_rounds = if tight_ub { 400 } else { 40 };
-                    let rounds: usize = std::env::var("KLADOS_BP_CLIQUE_ROUNDS")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(default_rounds);
-                    let per: usize = std::env::var("KLADOS_BP_CLIQUE_PER")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(20);
-                    // stop a node's cutting once a full round lifts the bound by
-                    // less than this (diminishing returns); 0 = only the round cap
-                    // / prune-guard / no-violation stop it (the 133 behaviour).
-                    // On the high-budget (tight_ub) path, stop if a full round
-                    // barely lifts the bound — guards against runaway cutting when
-                    // the tree-DP target is unreachable by cuts. The safe 40-round
-                    // path keeps 0.0 (unchanged 133 behaviour).
-                    let min_gain: f64 = std::env::var("KLADOS_BP_CLIQUE_MINGAIN")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(if tight_ub { 0.01 } else { 0.0 });
+                // inequalities on the node-packing conflict graph. Valid cuts →
+                // the re-solved objective is a higher, valid LB. DEFAULT ON (this
+                // is what proves the high-frag multi-tree cores plain B&P can't);
+                // KLADOS_BP_NOCLIQUE reverts to plain branch-and-price.
+                if std::env::var("KLADOS_BP_NOCLIQUE").is_err() {
                     let lp_before = lp.objective;
                     let mut cur = lp;
                     let mut total_added = 0usize;
-                    let ub = state.best_ub();
-                    // Conflict graph is value-independent + the pool is frozen during
-                    // this node's cutting → build it ONCE and reuse every round. The
-                    // node-degree cap bounds the edge build; the default 400 keeps
-                    // the 133 behaviour, while the cut-hard (tight_ub) path keeps more
-                    // edges (2000) so its stronger cuts actually reach the incumbent.
-                    let node_cap: usize = std::env::var("KLADOS_BP_CLIQUE_NODECAP")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(if tight_ub { 2000 } else { 400 });
-                    let nbr = rmp.build_clique_nbr(state.columns(), node_cap);
-                    for _round in 0..rounds {
-                        // already prunable → no need for more cuts
-                        if (cur.objective - 1.0e-6).ceil() as usize >= ub {
-                            break;
-                        }
-                        let prev = cur.objective;
-                        let added =
-                            rmp.separate_and_add_clique(&cur.column_values, 1.0e-6, per, &nbr);
+                    for _round in 0..40 {
+                        let added = rmp.separate_and_add_clique(
+                            state.columns(),
+                            &cur.column_values,
+                            1.0e-6,
+                            20,
+                        );
                         if added == 0 {
                             break;
                         }
@@ -1280,16 +1194,29 @@ fn solve_node<P: Pricer, S: BranchSelector>(
                             Ok(x) => x,
                             Err(_) => break,
                         };
-                        // diminishing returns: stop if a full round barely moved it
-                        if cur.objective - prev < min_gain {
-                            break;
-                        }
                     }
                     if total_added > 0 {
                         debug!(
                             target: LOG_TARGET,
                             "[clique] lifted lp {:.4} -> {:.4} (+{} cuts)",
                             lp_before, cur.objective, total_added,
+                        );
+                    }
+                    // DIAGNOSTIC: at the core root, log the LP lift the cuts
+                    // achieved + how many + how many distinct columns they touch
+                    // (diversity). Correlate against final node count to find what
+                    // makes a cut selection "good".
+                    if std::env::var("KLADOS_BP_CLIQUE_DIAG").is_ok()
+                        && branchings.depth() == 0
+                    {
+                        info!(
+                            target: LOG_TARGET,
+                            "[clique-root] core_n={} lp_before={:.4} lp_after={:.4} gain={:.4} cuts={}",
+                            reduced.num_leaves,
+                            lp_before,
+                            cur.objective,
+                            cur.objective - lp_before,
+                            total_added,
                         );
                     }
                     break cur;
@@ -1303,7 +1230,7 @@ fn solve_node<P: Pricer, S: BranchSelector>(
     // via the tree-DP (exact-over-pool MWIS in the column-crossing graph). A far
     // stronger node UB than chen/relaxed-whidden, computed in ms — tightens
     // best_ub before the bound-prune so this node and its siblings fathom faster.
-    if node_converged && !clique_ran_treedp && std::env::var("KLADOS_BP_TREEDP").is_ok() {
+    if node_converged && std::env::var("KLADOS_BP_TREEDP").is_ok() {
         let tw_cap: usize = std::env::var("KLADOS_BP_TREEDP_TWCAP")
             .ok()
             .and_then(|v| v.parse().ok())
