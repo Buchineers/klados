@@ -421,6 +421,7 @@ impl Rmp {
     pub fn build_clique_nbr(
         &self,
         columns: &[AfColumn],
+        node_cap: usize,
     ) -> Vec<std::collections::HashSet<usize>> {
         use std::collections::HashMap;
         let max_nodes = self.max_nodes;
@@ -433,10 +434,15 @@ impl Rmp {
                 }
             }
         }
+        // Skip nodes covered by more than `node_cap` columns: the clique they
+        // induce is dominated by that node's own ≤1 row (redundant) and bounds
+        // the O(deg²) edge build. The build spans ALL columns, so a low cap prunes
+        // more than the old per-round active build did — callers that cut hard
+        // (tight_ub path) pass a higher cap.
         let mut nbr = vec![std::collections::HashSet::<usize>::new(); columns.len()];
         for cols in node_cols.values() {
-            if cols.len() > 400 {
-                continue; // skip ubiquitous nodes (clique is dominated by the ≤1 row)
+            if cols.len() > node_cap {
+                continue;
             }
             for i in 0..cols.len() {
                 for j in (i + 1)..cols.len() {
