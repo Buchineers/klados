@@ -864,12 +864,15 @@ impl LagrangianSolver {
         // Periodically solve the exact LP over the current pool and overwrite
         // α/β with the LP duals: the pricer + greedy then aim at the true LP
         // optimum while the subgradient keeps diversifying around it.
-        // Tree-DP exact extraction over the rich pool: DEFAULT ON (opt-out via
-        // KLADOS_LAGR_NO_TREEDP). It runs over the periodic exact-LP support, so it
-        // implies `hybrid`. It is a best-of (the override in solve_reduced_core
-        // only takes the tree-DP forest when it beats greedy+LS), so it is never
-        // worse; measured -3..-82 components vs default on n=1287..8964.
-        let treedp_on = std::env::var("KLADOS_LAGR_NO_TREEDP").is_err();
+        // Tree-DP exact extraction over the rich pool: OPT-IN (via
+        // KLADOS_LAGR_TREEDP). It forces `hybrid` on, i.e. a periodic exact-LP
+        // over the whole column pool; on giants (~60k-col pools) that LP is far
+        // too slow and eats the ILS/LNS budget, regressing every size bucket and
+        // timing out the largest giants. Measured net −160 total + 2 giant
+        // timeouts vs default-off on the 150-instance heuristic set, so it is
+        // kept OFF by default. (The `treedp_on` best-of gains it claimed on some
+        // mids are outweighed by the budget it burns everywhere else.)
+        let treedp_on = std::env::var("KLADOS_LAGR_TREEDP").is_ok();
         let hybrid = treedp_on || self.config.hybrid || std::env::var("KLADOS_LAGR_HYBRID").is_ok();
         let refresh_every = self.config.refresh_every.max(1);
         let mut h_builder = ColumnBuilder::new(trees);
