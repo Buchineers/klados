@@ -48,6 +48,6 @@ make build-submission
 BUILD_DIR="target/x86_64-unknown-linux-musl/release"
 rm -rf solvers
 mkdir -p solvers/exact solvers/lower solvers/heuristic
-mv "$BUILD_DIR/klados-bp" solvers/exact/
+mv "$BUILD_DIR/klados-dispatch" solvers/exact/
 mv "$BUILD_DIR/klados-lower" solvers/lower/
 mv "$BUILD_DIR/klados-lagrangian" solvers/heuristic/
