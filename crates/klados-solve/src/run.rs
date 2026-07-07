@@ -61,7 +61,7 @@ pub fn run<S: Solver>(mut solver: S, mut cfg: RunConfig<S::Config>) {
     };
 
     if let Some(forest) = solver.solve(&inst, &cfg) {
-        let mut out = std::io::stdout().lock();
+        let mut out = std::io::BufWriter::new(std::io::stdout().lock());
         for tree in &forest {
             let _ = tree.cursor().write_newick(&mut out);
             let _ = writeln!(out);
