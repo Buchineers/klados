@@ -8,6 +8,9 @@ Given two or more rooted phylogenetic trees on the same leaf set, klados compute
 
 The solver includes over a dozen exact and heuristic approaches: Branch & Price (BP), ILP, SAT/MaxSAT, corridor method, Lagrangian column generation, RSPR branch-and-bound, and several greedy heuristics.
 
+### Solver description
+The full solver description for the PACE 2026 submission can be found [here](https://buchineers.github.io/klados-paper/paper.pdf).
+
 ## Build
 
 ```bash
